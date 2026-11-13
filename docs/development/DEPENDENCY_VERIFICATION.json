@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-13",
+  "packages": 37,
+  "version_sets_match": true,
+  "distribution_hash_sets_match": true,
+  "canonical_lock_source": "https://pypi.org/simple",
+  "download_mirror": "https://pypi.tuna.tsinghua.edu.cn/simple",
+  "python_test_runtime": "3.13.15",
+  "note": "Mirror was used only for downloads; canonical lock restored after exact version and distribution hash comparison."
+}

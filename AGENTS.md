@@ -2,7 +2,7 @@
 
 ## Current stage
 
-- This repository is in Spec v0.1 Draft. Read `docs/SPEC_V0.1.zh-CN.md` for current scope. Do not implement product features or change the existing production bot unless a subsequent user instruction authorizes that work.
+- The user has authorized implementation from Spec v0.1 and explicit subagent collaboration. Read `docs/SPEC_V0.1.zh-CN.md` and `docs/development/FOUNDATION_CONTRACT.md` for current scope. Keep production unchanged until the applicable release gates are satisfied.
 - Follow the user's latest requirements. Old constraints are historical evidence, not immutable product policy. In particular, the 200-character reply cap is superseded for the proposed new product.
 - Read `docs/ENGINEERING.md` before implementation work. Distinguish proposed requirements from verified functionality.
 - Video understanding, frame extraction, video-audio analysis and video generation are outside the current development plan. Unsupported-video metadata handling is in scope; audio-message handling remains in scope.

@@ -1,0 +1,83 @@
+name: foundation-checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: groupagent_ci
+          POSTGRES_PASSWORD: synthetic_ci_fixture_only
+          POSTGRES_DB: groupagent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U groupagent_ci -d groupagent_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+      GROUPAGENT_TEST_DSN: postgresql://groupagent_ci:synthetic_ci_fixture_only@localhost:5432/groupagent_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, verified 2026-11-13
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6, verified 2026-11-13
+        with:
+          version: "0.12.18"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run --no-sync ruff check src tests scripts
+      - run: uv run --no-sync ruff format --check src tests scripts
+      - run: uv run --no-sync mypy src
+      - run: uv run --no-sync pytest -m "not render" -q
+      - run: uv build
+
+  render:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: groupagent_render_ci
+          POSTGRES_PASSWORD: synthetic_render_fixture_only
+          POSTGRES_DB: groupagent_render_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U groupagent_render_ci -d groupagent_render_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+      GROUPAGENT_TEST_DSN: postgresql://groupagent_render_ci:synthetic_render_fixture_only@localhost:5432/groupagent_render_test
+      GROUPAGENT_RENDER_TESTS: "1"
+      GROUPAGENT_FONT_DIRS: /usr/share/fonts
+      GROUPAGENT_PDF_FONT: /usr/share/fonts/truetype/wqy/wqy-zenhei.ttc
+      GROUPAGENT_OFFICE_FONT: WenQuanYi Zen Hei
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: "0.12.18"
+          python-version: "3.13"
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y libreoffice-writer libreoffice-impress poppler-utils fonts-dejavu-core fonts-wqy-zenhei
+      - run: uv sync --locked
+      - name: Verify rendering dependencies and configured font
+        run: |
+          set -euo pipefail
+          command -v soffice
+          command -v pdftotext
+          command -v pdftoppm
+          test -s "$GROUPAGENT_PDF_FONT"
+          test "$(fc-match --format '%{file}' "$GROUPAGENT_OFFICE_FONT")" = "$GROUPAGENT_PDF_FONT"
+      - name: Render tests including PostgreSQL delivery completion
+        # One serial pytest process owns this job's database and migrations.
+        run: uv run --no-sync pytest -m render -q
