@@ -31,7 +31,15 @@
 
 范围：数据库与文档工具是真实运行；模型、搜索HTTP和微信HTTP使用合成fixture。没有访问付费API、微信群、旧凭据或生产数据库。HTTP契约测试不证明供应商连通性、模型质量或实际收发成功。布局自动检查不等于所有模板的人类视觉审查。
 
-私有仓库已创建；GitHub CI定义包含 Ubuntu 24.04 的 Python3.11/3.13 core job 和独立PostgreSQL的render job。托管运行的最终状态在PR及后续验证记录中更新，不能由本地测试推断。
+私有仓库与[PR #1](https://github.com/huchenzi0609-creator/GroupAgent/pull/1)已建立。[托管运行43463886642](https://github.com/huchenzi0609-creator/GroupAgent/actions/runs/43463886642)于2026-11-14实际通过全部job，对应代码commit `663dab905552bf1f06135849ab4faf1bf007feac`、tree `2bb8b49d25866ff1eb521ebd8202250ea93713a4`：
+
+| Ubuntu 24.04 job | 实际结果 |
+| --- | --- |
+| core Python3.11.16 | lint/format/mypy通过；357 passed、9 render用例按分工deselected；wheel/sdist构建通过 |
+| core Python3.13.15 | lint/format/mypy通过；357 passed、9 render用例按分工deselected；wheel/sdist构建通过 |
+| render Python3.13.15 | 独立PostgreSQL、LibreOffice/Poppler与文泉驿字体；9 passed、357 core用例deselected，含完整交付结案 |
+
+首轮CI发现调度类型注解中的多余 `type: ignore`，本地增量类型缓存未暴露此项；已删除该注解，并用 `mypy --no-incremental src` 和18项调度时间规则用例复查，再由上述全新CI环境验证通过。这是一次实际发现与修复，首轮失败记录保留。
 
 2026-11-14通过已登录的仓库设置页面核验：ruleset及经典branch protection两种入口均提示，当前私有仓库的规则不会强制执行，需迁入符合套餐条件的组织。未调整可见性、购买套餐或创建假装生效的保护；当前采用PR审阅与人工合并纪律，**不能声称main已受技术强制保护**。这是G1仍未满足的条件之一。
 
@@ -51,7 +59,7 @@ export GROUPAGENT_OFFICE_FONT='WenQuanYi Zen Hei'
 uv run --no-sync pytest -q
 ```
 
-`soffice`、`pdftotext`、`pdftoppm` 须可发现。若 `pdftotext` 不在PATH，可设置 `GROUPAGENT_PDFTOTEXT` 为绝对路径。本机测试使用系统的 Arial Unicode 字体，不复制进仓库；Ubuntu的字体嵌入行为须由托管render job验证。
+`soffice`、`pdftotext`、`pdftoppm` 须可发现。若 `pdftotext` 不在PATH，可设置 `GROUPAGENT_PDFTOTEXT` 为绝对路径。本机测试使用系统的 Arial Unicode 字体，不复制进仓库；Ubuntu的文泉驿字体嵌入已由上述托管render job验证。
 
 生成实际中文DOCX并保留渲染证据：
 
@@ -61,7 +69,7 @@ uv run --no-sync groupagent demo --dsn-file runtime/postgres/dsn.txt \
   --office-font-family 'WenQuanYi Zen Hei'
 ```
 
-PDF另外传 `--pdf-font`，所有输出仍是开发演示。当前没有 `serve` / 生产发送守护命令，避免把未验收组件自动接上真实群。
+PDF另外传 `--pdf-font`，所有输出仍是开发演示。Ubuntu文泉驿字体嵌入、中文渲染和完整交付测试已通过上述CI；本机仍使用系统Arial Unicode字体。当前没有 `serve` / 生产发送守护命令，避免把未验收组件自动接上真实群。
 
 ## 下一步与发布门槛
 
@@ -74,3 +82,5 @@ PDF另外传 `--pdf-font`，所有输出仍是开发演示。当前没有 `serve
 5. 完成G3全功能验收、G4至少七天有界试运行和G5备份回滚/生产配置确认后，才安排旧系统迁移与单发送者切换。
 
 这是一项大工程的可审阅实现增量。待验证项按实际阻塞管理，不把mock通过写成完整产品可用，也不要求成员为普通已授权低风险动作反复确认。
+
+后续工作已建立issue：[Harness与隔离 #2](https://github.com/huchenzi0609-creator/GroupAgent/issues/2)、[真实微信 #3](https://github.com/huchenzi0609-creator/GroupAgent/issues/3)、[自然参与与长期记忆 #4](https://github.com/huchenzi0609-creator/GroupAgent/issues/4)、[多模态交付 #5](https://github.com/huchenzi0609-creator/GroupAgent/issues/5)、[自然语言调度 #6](https://github.com/huchenzi0609-creator/GroupAgent/issues/6)、[费用/隐私/运维与发布 #7](https://github.com/huchenzi0609-creator/GroupAgent/issues/7)。没有将剩余工作标记为完成。
