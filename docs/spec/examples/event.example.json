@@ -1,0 +1,22 @@
+{
+  "schema_version": "groupagent.event.v0.1",
+  "id": "event_demo_001",
+  "source_key": "wechat:account_demo:server_message_demo_001",
+  "channel_account_id": "account_demo",
+  "group_id": "group_demo",
+  "actor_id": "member_a_demo",
+  "kind": "image",
+  "occurred_at": "2030-01-01T10:00:00Z",
+  "received_at": "2030-01-01T10:00:01Z",
+  "reply_to": null,
+  "attachments": [
+    {
+      "attachment_id": "attachment_demo_001",
+      "declared_mime": "image/png",
+      "status": "discovered"
+    }
+  ],
+  "payload_ref": "event_payload_demo_001",
+  "trusted_actor_origin": "verified_channel_metadata",
+  "policy_revision": 1
+}

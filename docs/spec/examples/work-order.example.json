@@ -1,0 +1,35 @@
+{
+  "schema_version": "groupagent.work.v0.1",
+  "id": "work_demo_001",
+  "group_id": "group_demo",
+  "requester_id": "member_a_demo",
+  "request_event_id": "event_demo_002",
+  "thread_id": "thread_demo_001",
+  "goal": "根据授权图片和资料制作一份10页的中文课程展示",
+  "goal_revision": 1,
+  "acceptance_criteria": [
+    "PPTX恰好10页且可打开",
+    "引用的外部事实有可核对来源",
+    "渲染检查不存在关键文字溢出",
+    "验证后的文件投递到原群并取得平台接受回执"
+  ],
+  "input_versions": ["artifact_version_demo_001"],
+  "linked_team_task_id": null,
+  "scope": {
+    "allowed_group_ids": ["group_demo"],
+    "allowed_input_versions": ["artifact_version_demo_001"],
+    "public_web_read": true,
+    "workspace_write": true,
+    "delivery_target": "origin_group",
+    "external_account_changes": false
+  },
+  "budget": {
+    "max_model_rounds": 24,
+    "max_total_tokens": 200000,
+    "max_tool_calls": 60,
+    "max_active_seconds": 1200
+  },
+  "policy_revision": 1,
+  "state": "queued",
+  "created_at": "2030-01-01T10:01:00Z"
+}

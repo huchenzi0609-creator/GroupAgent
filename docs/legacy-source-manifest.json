@@ -1,0 +1,20 @@
+{
+  "reviewed_at": "2026-11-13",
+  "timezone": "Asia/Shanghai",
+  "source_directory": "../Project_WechatLeader",
+  "scope": "source-only, no secrets or runtime data",
+  "files": {
+    "leader.py": "65df4623799d1b5aab68c59c3422409d7a91508e69145106131163c7c723816f",
+    "natural.py": "e08d84c09a51f8bf38252a0c3bc7aae6fc916026c9f7266ed842e1ad2a5a3e21",
+    "bridge.py": "eb97a7f9d32e4f48a14729bef2e06163660154fd57f7a8d2211c92ec88f3bb57",
+    "memory.py": "f2ad5df5ad93bb32f1565890a03b6a7d2ebc3f13c014081d87f3f3c0d461cd3e",
+    "compose.yaml": "9bad75aff7fb40f49f3b59bf56eacfa940037ec19ef00afe09ca1e214ad5b824",
+    "BOT_RULES.md": "8673526a0288e28ab89a1fe5e21b6679eef634cd92e4a0a4fedd664b43f42c06"
+  },
+  "baseline_checks": {
+    "command": "python3 -B -m unittest discover -s tests -q",
+    "tests": 36,
+    "result": "passed"
+  },
+  "production_rechecked": false
+}
