@@ -41,6 +41,9 @@ from groupagent.domain import (
 
 Row = dict[str, Any]
 Connection = psycopg.Connection[Row]
+_VERIFIED_REPLY_ORIGINS = frozenset(
+    {"verified_channel_metadata", "agentwechat_authenticated_message_metadata"}
+)
 
 
 def _id() -> str:
@@ -878,7 +881,7 @@ class UnitOfWork:
         event = self.get_event(request_event_id)
         if event.actor_id != self.actor.member_id:
             raise DomainError("permission_denied", "Reply must match the request event's actor")
-        if event.trusted_actor_origin != "verified_channel_metadata" or event.kind in (
+        if event.trusted_actor_origin not in _VERIFIED_REPLY_ORIGINS or event.kind in (
             EventKind.SYSTEM,
             EventKind.MEMBERSHIP,
             EventKind.RECALL,
@@ -934,11 +937,14 @@ class UnitOfWork:
         goal_revision: int | None = None,
         request_event_id: str | None = None,
     ) -> DeliveryIntent:
+        # Reply intents also have a unique request-event key. A targeted arbiter
+        # can pass its precheck, then race into the other unique index. Let all
+        # usable unique constraints arbitrate; validate the logical key below.
         row = self.conn.execute(
             "INSERT INTO ga_deliveries (id, group_id, work_id, goal_revision, created_by, "
             "policy_revision, payload_ref, payload_hash, idempotency_key, request_event_id) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (group_id, idempotency_key) DO NOTHING RETURNING *",
+            "ON CONFLICT DO NOTHING RETURNING *",
             (
                 _id(),
                 self.group_id,
@@ -957,7 +963,10 @@ class UnitOfWork:
                 "SELECT * FROM ga_deliveries WHERE group_id = %s AND idempotency_key = %s",
                 (self.group_id, idempotency_key),
             ).fetchone()
-            assert row is not None
+            if row is None:
+                raise DomainError(
+                    "idempotency_conflict", "Delivery identity conflicts with another purpose"
+                )
             self._delivery_controller(row)
             if (
                 row["work_id"],

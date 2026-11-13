@@ -23,7 +23,7 @@
 
 2026-11-14 本机 macOS arm64，Python 3.13.15、PostgreSQL 16.15：
 
-- 整库 **366 passed**，无skip；其中包括真实 PostgreSQL、9项实际渲染测试、中文三格式、两次独立演示以及完整渲染后交付结案。
+- 最初整库366项通过；在后续并发/来源回归补齐后，最终本地整库 **377 passed**，无skip；其中包括真实 PostgreSQL、9项实际渲染测试、中文三格式、两次独立演示以及完整渲染后交付结案。
 - Ruff lint、格式检查通过；mypy 对40个源文件通过。
 - wheel 与 sdist 构建通过；wheel包含迁移001/002/003，sdist不含 `.cache`、`.venv`、`runtime`、`.git` 或 `vendor`。
 - 配置示例可解析；生产检查仍阻断缺少群配置、金额/价格快照、保留策略、模型与运行时的配置。
@@ -40,6 +40,10 @@
 | render Python3.13.15 | 独立PostgreSQL、LibreOffice/Poppler与文泉驿字体；9 passed、357 core用例deselected，含完整交付结案 |
 
 首轮CI发现调度类型注解中的多余 `type: ignore`，本地增量类型缓存未暴露此项；已删除该注解，并用 `mypy --no-incremental src` 和18项调度时间规则用例复查，再由上述全新CI环境验证通过。这是一次实际发现与修复，首轮失败记录保留。
+
+后续CI重跑又暴露了真实并发缺陷：同一回复同时触发幂等键和请求事件两条唯一约束，指定单一仲裁目标的INSERT可能抛出另一个约束的异常。新增真实PG锁交错用例在旧SQL下稳定复现，改为全部唯一约束参与冲突仲裁后，同内容返回唯一canonical intent、异内容返回明确冲突；迁移及全部唯一约束保持不变。补充20个独立pytest进程、80次确定性交错、640轮四线程同步竞争（2,560次入队），全部通过。
+
+同时修正了认证来源的接线差异：回复服务明确接受已核验的AgentWechat metadata标识，仍拒绝任意未知来源。新增HTTP fixture→真实PG→Coordinator→绑定回复回归通过。最终本地377项、无增量缓存mypy与Ruff全部通过；这批修复的最终托管结果以[PR检查页](https://github.com/huchenzi0609-creator/GroupAgent/pull/1/checks)为准，不把前一个commit的绿灯替代最新commit检查。
 
 2026-11-14通过已登录的仓库设置页面核验：ruleset及经典branch protection两种入口均提示，当前私有仓库的规则不会强制执行，需迁入符合套餐条件的组织。未调整可见性、购买套餐或创建假装生效的保护；当前采用PR审阅与人工合并纪律，**不能声称main已受技术强制保护**。这是G1仍未满足的条件之一。
 

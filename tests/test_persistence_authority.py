@@ -62,11 +62,18 @@ def seed(
 
 
 @pytest.mark.parametrize("role", [Role.OBSERVER, Role.MAINTAINER])
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "verified_channel_metadata",
+        "agentwechat_authenticated_message_metadata",
+    ],
+)
 def test_read_only_reply_roundtrip_preserves_role_and_identity(
-    store: PostgresStore, actor: ActorContext, role: Role
+    store: PostgresStore, actor: ActorContext, role: Role, origin: str
 ) -> None:
     actor = actor.model_copy(update={"role": role})
-    source = seed(store, actor)
+    source = seed(store, actor, origin=origin)
     text = "A scoped read-only answer"
     with store.transaction(actor) as tx:
         intent = tx.enqueue_reply(source.id, text, read_only_authorized=True)

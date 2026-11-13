@@ -132,6 +132,29 @@ async def test_all_skipped_batch_advances_without_foreign_body(intake_setup, dae
         assert not any("/messages/" in request.url.path for request in daemon.requests)
 
 
+async def test_authenticated_channel_request_can_receive_a_bound_reply(intake_setup, daemon):
+    store, channel, config, handler = intake_setup
+    daemon.events, daemon.next_cursor = [channel_event(1)], "1"
+    provider = ScriptedDecisionProvider({})
+    coordinator = Coordinator(config, store, provider)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        intake = ChannelIntake(AgentWechatAdapter(channel, TOKEN, client=client), coordinator)
+        received = await intake.poll_once()
+        with store.transaction(intake.service_actor) as tx:
+            source = tx.get_event(received.event_ids[0])
+        assert source.trusted_actor_origin == "agentwechat_authenticated_message_metadata"
+        provider.decisions[source.source_key] = Decision(
+            kind="reply", reason_code="synthetic_question", response="已收到，我来帮你整理。"
+        )
+        results = await intake.process_pending()
+        assert len(results) == 1 and results[0].delivery_id
+        with store.transaction(coordinator.actor(source)) as tx:
+            delivery = tx.get_delivery(results[0].delivery_id)
+            assert delivery.request_event_id == source.id
+            assert delivery.payload_ref == "text:已收到，我来帮你整理。"
+        assert await intake.process_pending() == []
+
+
 async def test_ack_failure_restarts_at_durable_cursor_and_epoch_reset_is_not_silent(
     intake_setup, daemon
 ):
