@@ -52,9 +52,7 @@ class WeeklyTiming(WallClockTiming):
 
 
 Timing = Annotated[AtTiming | EveryTiming | DailyTiming | WeeklyTiming, Field(discriminator="kind")]
-# TypeAdapter accepts Annotated unions at runtime; its constructor's type[T]
-# overload cannot express this discriminated-union alias to mypy.
-_timing_adapter: TypeAdapter[Timing] = TypeAdapter(Timing)  # type: ignore[arg-type]
+_timing_adapter: TypeAdapter[Timing] = TypeAdapter(Timing)
 
 
 def parse_timing(value: Timing | dict[str, JsonValue]) -> Timing:
