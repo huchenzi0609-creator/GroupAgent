@@ -330,16 +330,27 @@ def ocr_image(content: bytes, *, languages: str = "eng+chi_sim", page_number: in
     executable = shutil.which("tesseract")
     if not executable:
         raise DomainError("media_dependency_missing", "Tesseract is not installed in the worker")
-    attempts: list[Literal[4, 6, 11]] = []
-    modes: tuple[Literal[4, 6, 11], ...] = (6, 11, 11)
+    attempts: list[Literal[3, 4, 6, 11]] = []
+    modes: tuple[Literal[3, 4, 6, 11], ...] = (6, 3, 11)
     preprocessing: Literal["none", "dark_ink_threshold_32"] = "none"
+    first_symbols: (
+        tuple[
+            str,
+            tuple[OCRWord, ...],
+            Literal[3, 4, 6, 11],
+            Literal["none", "dark_ink_threshold_32"],
+        ]
+        | None
+    ) = None
     with tempfile.TemporaryDirectory(prefix="ga-ocr-") as directory:
         source = Path(directory) / "page.png"
         source.write_bytes(raster)
         deadline = time.monotonic() + 60
-        # PSM 6: uniform block; 11: sparse text. Only an entirely empty result
-        # permits another attempt; never replace nonempty text with a preferred
-        # transcript or manufacture word confidence. A final dark-ink view can
+        # PSM 6: uniform block; 3: automatic layout; 11: sparse text. Empty or
+        # punctuation-only results permit another attempt: arrows can be read
+        # as braces without any body text. Keep the first symbol result if no
+        # attempt finds letters/numbers, and never replace recognized words
+        # with a preferred transcript or manufacture confidence. A dark-ink view can
         # separate black glyphs from colored diagram borders. It is reported,
         # has the same dimensions/coordinates, and is not a new source artifact.
         # https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html#page-segmentation-method
@@ -358,8 +369,13 @@ def ocr_image(content: bytes, *, languages: str = "eng+chi_sim", page_number: in
             )
             attempts.append(mode)
             text, words = _tesseract_text(output)
-            if text:
+            if any(character.isalnum() for character in text):
                 break
+            if text and first_symbols is None:
+                first_symbols = text, words, mode, preprocessing
+        else:
+            if first_symbols is not None:
+                text, words, mode, preprocessing = first_symbols
     return OCRPage(
         page_number=page_number,
         text=text,

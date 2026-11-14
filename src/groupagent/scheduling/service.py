@@ -311,6 +311,11 @@ class Scheduler:
                 _text(title, "title")
             if goal is not None:
                 _text(goal, "goal")
+            scope = dict(row["scope"])
+            if goal is not None and goal != row["goal"]:
+                # This hint belongs to the old goal. All callers, including
+                # work tools, must reauthorize it for a replacement goal.
+                scope.pop("reminder_only", None)
             rule = self._timing(timing if timing is not None else row["timing"], now)
             time_zone = time_zone if time_zone is not None else row["time_zone"]
             zone(time_zone)
@@ -333,7 +338,7 @@ class Scheduler:
             updated = tx.conn.execute(
                 "UPDATE ga_schedules SET title = %s, goal = %s, timing = %s, time_zone = %s, "
                 "valid_until = %s, next_due_at = %s, state = %s, policy_revision = %s, "
-                "creator_role = %s, revision = revision + 1, updated_at = clock_timestamp() "
+                "creator_role = %s, scope = %s, revision = revision + 1, updated_at = clock_timestamp() "
                 "WHERE group_id = %s AND id = %s RETURNING *",
                 (
                     title if title is not None else row["title"],
@@ -347,6 +352,7 @@ class Scheduler:
                     actor.role.value
                     if row["creator_id"] == actor.member_id
                     else row["creator_role"],
+                    Jsonb(scope),
                     actor.group_id,
                     schedule_id,
                 ),

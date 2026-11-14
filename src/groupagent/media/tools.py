@@ -8,6 +8,7 @@ from pydantic import Field
 
 from groupagent.domain import DomainError
 from groupagent.tools import IdempotencyMode, ToolContext, ToolData, ToolDefinition, ToolGateway
+from groupagent.tools.models import ToolFailure
 
 from .models import (
     Capability,
@@ -77,18 +78,19 @@ def register_media_tools(
     def configured(identifier: str, capability: Capability) -> ProviderRoute:
         route = routes.get(identifier)
         if route is None or route.capability != capability:
-            raise DomainError(
-                "provider_route_unconfigured", "No configured route provides this capability"
+            raise ToolFailure(
+                "provider_route_unconfigured",
+                "Field route_id must select a configured media_routes entry with the required capability. No worker, provider or budget operation was started.",
+                no_effect=True,
             )
         return route
 
     async def vision(arguments: VisionInput, context: ToolContext) -> VisionResult:
+        route = configured(arguments.route_id, Capability.VISION)
         references = tuple(
             service.load_ref(context, item.file_id, item.version_id) for item in arguments.images
         )
-        return await service.analyze_images(
-            context, references, arguments.prompt, configured(arguments.route_id, Capability.VISION)
-        )
+        return await service.analyze_images(context, references, arguments.prompt, route)
 
     async def ocr(arguments: OCRInput, context: ToolContext) -> OCRResult:
         reference = service.load_ref(context, arguments.file_id, arguments.version_id)
@@ -107,22 +109,25 @@ def register_media_tools(
         return result
 
     async def cloud_ocr(arguments: CloudOCRInput, context: ToolContext) -> OCRResult:
+        route = configured(arguments.route_id, Capability.OCR)
         return await service.ocr(
             context,
             service.load_ref(context, arguments.file_id, arguments.version_id),
-            route=configured(arguments.route_id, Capability.OCR),
+            route=route,
         )
 
     async def asr(arguments: ASRInput, context: ToolContext) -> Transcript:
+        route = configured(arguments.route_id, Capability.ASR)
         terms = await critical_terms(context) if critical_terms else ()
         return await service.transcribe(
             context,
             service.load_ref(context, arguments.file_id, arguments.version_id),
-            configured(arguments.route_id, Capability.ASR),
+            route,
             critical_terms=terms,
         )
 
     async def tts(arguments: SpeechInput, context: ToolContext) -> MediaRef:
+        route = configured(arguments.route_id, Capability.TTS)
         if (
             output_source is None
             or speech_permission is None
@@ -135,13 +140,14 @@ def register_media_tools(
         return await service.synthesize(
             context,
             arguments.text,
-            configured(arguments.route_id, Capability.TTS),
+            route,
             source,
             explicitly_requested=True,
             voice=arguments.voice,
         )
 
     async def image_generate(arguments: ImageGenerationInput, context: ToolContext) -> MediaRef:
+        route = configured(arguments.route_id, Capability.IMAGE_GENERATION)
         if output_source is None:
             raise DomainError(
                 "media_provenance_missing", "Generated output needs trusted request provenance"
@@ -150,7 +156,7 @@ def register_media_tools(
         return await service.generate_image(
             context,
             arguments.prompt,
-            configured(arguments.route_id, Capability.IMAGE_GENERATION),
+            route,
             source,
         )
 

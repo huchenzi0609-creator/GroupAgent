@@ -105,6 +105,31 @@ def create_args(**extra):
     }
 
 
+async def test_tool_goal_update_cannot_keep_a_stale_reminder_hint(env):
+    with env.store.transaction(env.actor) as tx:
+        fingerprints = {env.request.id: tx.event_fingerprint(env.request.id)}
+    rule = env.scheduler.create(
+        env.actor,
+        "Synthetic reminder",
+        "Check the list",
+        EveryTiming(interval_seconds=3600),
+        scope={"reminder_only": True, "source_fingerprints": fingerprints},
+    )
+    receipt = await client(env)(
+        "schedule_update",
+        {
+            "schedule_id": rule.id,
+            "expected_revision": rule.revision,
+            "goal": "Search public sources and summarize",
+        },
+        "replace-reminder-goal",
+    )
+    assert receipt.success and receipt.effect_state == EffectState.SUCCEEDED
+    updated = env.scheduler.get(env.actor, rule.id)
+    assert updated.goal == "Search public sources and summarize"
+    assert "reminder_only" not in updated.scope
+
+
 async def test_create_update_controls_and_cross_gateway_idempotent_receipts(env):
     invoke = client(env)
     created = await invoke("schedule_create", create_args(), "create")

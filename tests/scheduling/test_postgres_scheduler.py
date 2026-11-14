@@ -261,6 +261,25 @@ def test_revision_update_preserves_occurrence_history(
     assert caught.value.code == "version_conflict"
 
 
+@pytest.mark.parametrize("change", ["goal", "same_goal", "timing"])
+def test_only_replacement_goal_clears_old_reminder_hint(scheduler, actor, change):
+    original = hourly(
+        scheduler, actor, scope={"reminder_only": True, "allowed_group_ids": [actor.group_id]}
+    )
+    values = (
+        {"goal": "Search public research and summarize"}
+        if change == "goal"
+        else {"goal": original.goal}
+        if change == "same_goal"
+        else {"timing": EveryTiming(interval_seconds=7200)}
+    )
+    updated = scheduler.update(
+        actor, original.id, expected_revision=original.revision, now=START, **values
+    )
+    assert (updated.scope.get("reminder_only") is True) is (change != "goal")
+    assert updated.scope["allowed_group_ids"] == [actor.group_id]
+
+
 def test_request_replay_and_concurrent_quota_are_serialized(
     store: PostgresStore, actor: ActorContext
 ) -> None:

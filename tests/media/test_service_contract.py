@@ -13,7 +13,7 @@ from groupagent.artifacts import ArtifactStore
 from groupagent.domain import DomainError
 from groupagent.media import MediaHTTPProvider, MediaService, register_media_tools
 from groupagent.media.validation import inspect_audio, inspect_image, split_pcm_wav
-from groupagent.tools import ToolGateway
+from groupagent.tools import EffectState, ToolGateway
 
 from .conftest import png_fixture, wav_fixture
 from .test_providers import route
@@ -298,6 +298,123 @@ async def test_tool_cannot_self_authorize_speech(tmp_path, media_context, media_
             replace(context, idempotency_key="another"),
         )
         assert not result.success and result.error_code == "voice_not_requested"
+
+
+@pytest.mark.parametrize(
+    "tool,capability,arguments",
+    [
+        ("image_analyze", "vision", {"images": [{"file_id": "unused"}], "prompt": "Read"}),
+        ("provider_ocr", "ocr", {"file_id": "unused"}),
+        ("audio_transcribe", "asr", {"file_id": "unused"}),
+        ("speech_synthesize", "tts", {"text": "Synthetic phrase"}),
+    ],
+)
+@pytest.mark.parametrize("wrong_capability", [False, True])
+async def test_bad_route_has_no_effect_before_reference_worker_budget_or_hooks(
+    tmp_path, media_context, monkeypatch, tool, capability, arguments, wrong_capability
+):
+    worker, budget = InlineSyntheticWorker(), NoChargeFixtureBudget()
+
+    def unexpected_reference(*args):
+        raise AssertionError("Route rejection must precede reference access")
+
+    async def unexpected_hook(*args):
+        raise AssertionError("Route rejection must precede permission/provenance hooks")
+
+    with ArtifactStore(tmp_path / "store") as store:
+        service = MediaService(store, worker, budget=budget)
+        monkeypatch.setattr(service, "load_ref", unexpected_reference)
+        other = "asr" if capability == "vision" else "vision"
+        routes = {"correct": route(capability), "wrong": route(other)}
+        gateway = ToolGateway()
+        register_media_tools(
+            gateway,
+            service,
+            routes,
+            output_source=unexpected_hook,
+            speech_permission=unexpected_hook,
+            critical_terms=unexpected_hook,
+        )
+        scope = replace(media_context.scope, allowed_tools=gateway.registered_names)
+        gateway.bind_scope(scope)
+        result = await gateway.invoke(
+            tool,
+            {**arguments, "route_id": "wrong" if wrong_capability else "private-missing-route"},
+            replace(media_context, scope=scope),
+        )
+        assert not result.success and result.error_code == "provider_route_unconfigured"
+        assert result.effect_state == EffectState.NO_EFFECT
+        assert "route_id" in result.message and "private-missing-route" not in result.message
+        assert worker.calls == [] and budget.states == {}
+
+
+async def test_wrong_route_can_be_repaired_without_an_uncertain_effect(
+    tmp_path, media_context, media_source
+):
+    worker, budget, calls = InlineSyntheticWorker(), NoChargeFixtureBudget(), []
+
+    def response(request):
+        calls.append(request)
+        return vision_response(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+        with ArtifactStore(tmp_path / "store") as store:
+            service = MediaService(
+                store,
+                worker,
+                providers={"deepseek": MediaHTTPProvider("deepseek", "fixture-key", client=http)},
+                budget=budget,
+            )
+            reference = await service.ingest_image(media_context, media_source, png_fixture())
+            gateway = ToolGateway()
+            register_media_tools(gateway, service, {"fixture-vision": route("vision")})
+            scope = replace(media_context.scope, allowed_tools=gateway.registered_names)
+            gateway.bind_scope(scope)
+            arguments = {"images": [{"file_id": reference.file_id}], "prompt": "Read"}
+            invalid = await gateway.invoke(
+                "image_analyze",
+                {**arguments, "route_id": "missing"},
+                replace(media_context, scope=scope),
+            )
+            assert invalid.effect_state == EffectState.NO_EFFECT and not calls and not budget.states
+            fixed = await gateway.invoke(
+                "image_analyze",
+                {**arguments, "route_id": "fixture-vision"},
+                replace(media_context, scope=scope, call_id="fixed", idempotency_key="fixed"),
+            )
+            assert fixed.success and fixed.effect_state == EffectState.SUCCEEDED
+            assert len(calls) == 1 and set(budget.states.values()) == {"settled"}
+
+
+@pytest.mark.parametrize("code", ["provider_route_unconfigured", "provider_timeout"])
+async def test_same_error_code_after_route_preflight_remains_unknown(
+    tmp_path, media_context, media_source, monkeypatch, code
+):
+    with ArtifactStore(tmp_path / "store") as store:
+        service = MediaService(store, InlineSyntheticWorker())
+        reference = await service.ingest_image(media_context, media_source, png_fixture())
+        entered = []
+
+        async def failed_after_preflight(*args):
+            entered.append(True)
+            raise DomainError(code, "Synthetic failure after entering media processing")
+
+        monkeypatch.setattr(service, "analyze_images", failed_after_preflight)
+        gateway = ToolGateway()
+        register_media_tools(gateway, service, {"fixture-vision": route("vision")})
+        scope = replace(media_context.scope, allowed_tools=gateway.registered_names)
+        gateway.bind_scope(scope)
+        result = await gateway.invoke(
+            "image_analyze",
+            {
+                "images": [{"file_id": reference.file_id}],
+                "prompt": "Read",
+                "route_id": "fixture-vision",
+            },
+            replace(media_context, scope=scope),
+        )
+        assert entered == [True] and result.error_code == code
+        assert result.effect_state == EffectState.UNKNOWN
 
 
 async def test_fixture_budget_cannot_authorize_live_transport(

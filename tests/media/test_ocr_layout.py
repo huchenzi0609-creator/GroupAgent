@@ -30,9 +30,9 @@ def tsv(text):
     "responses,expected,attempts",
     [
         ([tsv("Already Read")], "Already\nRead", (6,)),
-        ([HEADER, tsv("Start Review Done")], "Start\nReview\nDone", (6, 11)),
-        ([HEADER, HEADER, tsv("Dark ink")], "Dark\nink", (6, 11, 11)),
-        ([HEADER, HEADER, HEADER], "", (6, 11, 11)),
+        ([HEADER, tsv("Start Review Done")], "Start\nReview\nDone", (6, 3)),
+        ([HEADER, HEADER, tsv("Dark ink")], "Dark\nink", (6, 3, 11)),
+        ([HEADER, HEADER, HEADER], "", (6, 3, 11)),
     ],
 )
 def test_fallback_only_for_empty_text_is_bounded_and_records_real_layout(
@@ -84,6 +84,43 @@ def test_timeout_budget_is_shared_across_segmentation_attempts(monkeypatch):
     with pytest.raises(DomainError) as error:
         validation.ocr_image(raster())
     assert error.value.code == "media_timeout" and len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "responses,expected,selected,preprocessing,attempts",
+    [
+        ([tsv("{ {"), tsv("Start Review Done")], "Start\nReview\nDone", 3, "none", (6, 3)),
+        (
+            [tsv("{ {"), HEADER, tsv("Clear text")],
+            "Clear\ntext",
+            11,
+            "dark_ink_threshold_32",
+            (6, 3, 11),
+        ),
+        ([tsv("{ {"), HEADER, HEADER], "{\n{", 6, "none", (6, 3, 11)),
+        ([HEADER, tsv("+ ="), HEADER], "+\n=", 3, "none", (6, 3, 11)),
+        ([tsv("课程 87")], "课程\n87", 6, "none", (6,)),
+        ([tsv("{ Result 42")], "{\nResult\n42", 6, "none", (6,)),
+    ],
+)
+def test_punctuation_can_retry_but_real_words_and_unresolved_symbols_are_preserved(
+    monkeypatch, responses, expected, selected, preprocessing, attempts
+):
+    calls = []
+    monkeypatch.setattr(validation.shutil, "which", lambda name: "/fixture/tesseract")
+
+    def run(arguments, *, timeout):
+        calls.append(int(arguments[arguments.index("--psm") + 1]))
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr(validation, "_run", run)
+    result = validation.ocr_image(raster(), page_number=3)
+    assert result.text == expected and result.page_number == 3
+    assert result.segmentation_mode == selected
+    assert result.attempted_segmentation_modes == attempts and tuple(calls) == attempts
+    assert result.preprocessing == preprocessing
+    assert result.confidence == pytest.approx(0.945)
+    assert result.words[0].box == (40, 40, 130, 70)
 
 
 def test_dark_ink_retry_changes_only_the_ocr_view_and_keeps_source_coordinates(monkeypatch):

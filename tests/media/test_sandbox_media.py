@@ -27,8 +27,8 @@ async def test_real_sparse_flow_diagram_ocr_preserves_actual_method(isolated_wor
     )
     page = result["pages"][0]
     assert all(label in page["text"] for label in ("Start", "Review", "Done"))
-    assert page["method"] == "tesseract" and page["segmentation_mode"] in {6, 11, 4}
-    assert page["attempted_segmentation_modes"] in ([6], [6, 11], [6, 11, 11])
+    assert page["method"] == "tesseract" and page["segmentation_mode"] in {6, 3, 11}
+    assert page["attempted_segmentation_modes"] in ([6], [6, 3], [6, 3, 11])
     assert page["preprocessing"] == (
         "dark_ink_threshold_32" if len(page["attempted_segmentation_modes"]) == 3 else "none"
     )

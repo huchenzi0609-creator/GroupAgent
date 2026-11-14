@@ -80,6 +80,30 @@ def _source_quote_only(text: str, outside: str) -> bool:
     return not rest or _SOURCE_DISCLAIMER.fullmatch(rest) is not None
 
 
+def _has_outer_action(text: str) -> bool:
+    """An outer command needs interpretation; quoted instructions grant nothing."""
+    # A removed quote is a clause boundary, so a following command need not have
+    # punctuation. Keep whitespace inside clauses to preserve "不要 执行".
+    outside = _QUOTED.sub("，", text)
+    for clause in re.split(r"[，,。;；:：\n!?！？]", outside):
+        clause = re.sub(
+            r"^(?:(?:但是|但|不过|然后|现在|还是|请|麻烦(?:你)?|拜托|你|您)\s*)+",
+            "",
+            clause.strip(),
+        )
+        if re.match(r"^(?:不要|别|不用|无需|不能|不必|不得|不应|不是让你|没有让你)", clause):
+            continue
+        if re.match(
+            r"(?:把|将).{0,100}(?:整理|生成|制作|转换|改|写|存|导出|删|登记|给我|发给)"
+            r"|(?:按|照|按照|依照).{0,100}(?:做|执行|办理|处理|给我|修改|登记|安排|分配)"
+            r"|(?:帮我|替我|为我|给我|整理|生成|制作|保存|导出|执行|办理|登记|修改|删除|撤销|安排|提醒|发给我)"
+            r"|(?:这(?:个|项|部分).{0,8})?我(?:来|负责|认领|接手|承担)",
+            clause,
+        ):
+            return True
+    return False
+
+
 def _standalone_state(event: GroupEvent, text: str, context: dict[str, Any]) -> bool:
     """A bounded everyday observation does not itself ask for help or a check-in.
 
@@ -142,6 +166,7 @@ def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
     if (
         (event.kind == EventKind.FORWARDED or explicit_data or _source_quote_only(text, outside))
         and not _OUTER_ASK.search(outside)
+        and not _has_outer_action(text)
         and not _agent_request(outside, context)
     ):
         return Decision(

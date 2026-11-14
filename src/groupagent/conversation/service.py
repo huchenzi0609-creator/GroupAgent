@@ -1154,12 +1154,14 @@ class ConversationCoordinator(Coordinator):
                 "revision": rule.revision,
             }, f"安排好了，下一次是{time}（{rule.time_zone}）；随时可以让我修改或取消。"
         if isinstance(action, ChangeSchedule):
+            scheduler = self.scheduler.in_tx(tx)
+            previous_schedule = scheduler.get(tx.actor, action.schedule_id)
             values = {
                 key: getattr(action, key)
                 for key in ("timing", "goal", "valid_until")
                 if key in action.model_fields_set
             }
-            rule = self.scheduler.in_tx(tx).update(
+            rule = scheduler.update(
                 tx.actor,
                 action.schedule_id,
                 expected_revision=action.expected_revision,
@@ -1171,6 +1173,30 @@ class ConversationCoordinator(Coordinator):
                 "source_event_ids": list(context["_snapshot"]["source_fingerprints"]),
                 "source_fingerprints": context["_snapshot"]["source_fingerprints"],
             }
+            if rule.goal != previous_schedule.goal:
+                # A goal replacement cannot inherit the old reminder hint.
+                # Only the current authorized request/goal may re-establish it.
+                current_request = re.sub(
+                    r"“[^”]*”|『[^』]*』|「[^」]*」|\"[^\"]*\"",
+                    "<quoted data>",
+                    main_request(event.text),
+                )
+                reminder_text = current_request + "\n" + rule.goal
+                scope["reminder_only"] = bool(
+                    re.search(r"(?:提醒|通知)(?:我|我们|大家|一下|：|:)", rule.goal)
+                    or re.search(
+                        r"(?:^|改成|改为|调整为|换成|换为)(?:只|仅|继续|还是)?"
+                        r"(?:提醒|通知)(?:我|我们|大家|一下|：|:)",
+                        current_request,
+                    )
+                ) and not bool(
+                    re.search(
+                        r"(?:不要|不用|不再|取消).{0,5}(?:提醒|通知)"
+                        r"|(?:你|帮我|替我|机器人).{0,8}(?:实际|执行|生成|制作|搜索|检索|整理成)"
+                        r"|(?:并|另外|同时|顺便).{0,5}(?:帮我|替我|由你|你来|机器人|组长)",
+                        reminder_text,
+                    )
+                )
             tx.conn.execute(
                 "UPDATE ga_schedules SET scope=%s WHERE group_id=%s AND id=%s",
                 (Jsonb(scope), tx.group_id, rule.id),

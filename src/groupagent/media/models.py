@@ -87,8 +87,8 @@ class OCRPage(MediaModel):
     text: str
     method: Literal["embedded_text", "tesseract", "deepseek_ocr"]
     confidence: float | None = None
-    segmentation_mode: Literal[4, 6, 11] | None = None
-    attempted_segmentation_modes: tuple[Literal[4, 6, 11], ...] = ()
+    segmentation_mode: Literal[3, 4, 6, 11] | None = None
+    attempted_segmentation_modes: tuple[Literal[3, 4, 6, 11], ...] = ()
     preprocessing: Literal["none", "dark_ink_threshold_32"] = "none"
     words: tuple[OCRWord, ...] = ()
     complete: bool = True

@@ -44,7 +44,8 @@ _BUSINESS = re.compile(
     re.I,
 )
 _SCHEDULING = re.compile(
-    r"提醒|通知|日程|定时|到期|安排.{0,12}(?:时间|任务)|(?:每天|每周|每月|每小时).{0,20}(?:执行|运行|搜索|生成|发来)|schedule|remind|recurr|follow.up",
+    r"提醒|通知|日程|定时|到期|安排.{0,12}(?:时间|任务)|(?:每天|每周|每月|每小时).{0,20}(?:执行|运行|搜索|生成|发来)"
+    r"|(?:完成|失败|收到|上传).{0,20}(?:后|时|触发)|schedule|remind|recurr|follow.up",
     re.I,
 )
 _RESEARCH = re.compile(
@@ -103,10 +104,12 @@ def select_tools(
         raise DomainError("invalid_input", "Eligible tool names must be nonempty strings")
     required = _required(work, available)
     goal = work.goal.strip()
+    criteria = "\n".join(work.acceptance_criteria)
+    requirements = "\n".join((goal, criteria))
     derived = bool(work.scope.get("origin_schedule_id") or work.scope.get("origin_trigger_rule_id"))
     team_write = work.scope.get("team_task_write_allowed") is True
     research = work.scope.get("research_required") is True
-    business = team_write or bool(_BUSINESS.search(goal) or _MEMORY.search(goal))
+    business = team_write or bool(_BUSINESS.search(requirements) or _MEMORY.search(requirements))
     text_only = _text_only(work)
     raw_formats = [ref.get("format") if isinstance(ref, Mapping) else None for ref in input_refs]
     formats = [value.casefold() if isinstance(value, str) else None for value in raw_formats]
@@ -123,29 +126,43 @@ def select_tools(
         and not research
         and not team_write
         and not _ADDITIONAL_DELEGATION.search(goal)
+        # Criteria describe work the agent must actually satisfy, even when
+        # the short goal only asks it to remind the requester.
+        and not any(
+            pattern.search(criteria)
+            for pattern in (
+                _COMPUTE,
+                _FILE_OUTPUT,
+                _MEMORY,
+                _BUSINESS,
+                _SCHEDULING,
+                _RESEARCH,
+                _TRANSCRIPTION,
+            )
+        )
         and required.issubset(_REMINDER_TOOLS)
     ):
         profile = _REMINDER_TOOLS
     elif (
         text_only
         and not business
-        and not _COMPUTE.search(goal)
-        and not _FILE_OUTPUT.search(goal)
-        and not _SCHEDULING.search(goal)
+        and not _COMPUTE.search(requirements)
+        and not _FILE_OUTPUT.search(requirements)
+        and not _SCHEDULING.search(requirements)
     ):
         if (
             formats
             and all(format in _IMAGE for format in formats)
             and not research
-            and not _RESEARCH.search(goal)
+            and not _RESEARCH.search(requirements)
         ):
             profile = _IMAGE_TOOLS
         elif (
             formats
             and all(format in _AUDIO for format in formats)
-            and _TRANSCRIPTION.search(goal)
+            and _TRANSCRIPTION.search(requirements)
             and not research
-            and not _RESEARCH.search(goal)
+            and not _RESEARCH.search(requirements)
         ):
             profile = _AUDIO_TOOLS
         elif (
@@ -165,10 +182,9 @@ def select_tools(
     selected = set(available)
     if not team_write or derived:
         selected.difference_update(_TEAM_WRITES)
-    if (
-        derived
-        or work.scope.get("schedule_creation_allowed") is not True
-        or not _SCHEDULING.search(goal)
-    ):
+    # An eligible authorized event follow-up need not use our schedule keywords.
+    # Keep its existing tools in the general catalog; the backend still checks
+    # the creator, source, lease, quota and derived-depth restriction.
+    if derived or work.scope.get("schedule_creation_allowed") is not True:
         selected.difference_update(_SCHEDULE_WRITES)
     return frozenset(selected | required)

@@ -10,13 +10,15 @@ import pytest
 from PIL import Image
 
 from groupagent.artifacts import ArtifactScope
+from groupagent.coordinator import Decision
 from groupagent.domain import DomainError, EventKind, GroupEvent, TeamTaskState, WorkOrder
 from groupagent.runtime.tool_selection import select_tools
-from groupagent.scheduling import AtTiming, Scheduler
+from groupagent.scheduling import AtTiming, EveryTiming, Scheduler
 from groupagent.scheduling.triggers import EventTriggerService
 from groupagent.tools import ToolContext, ToolScope
 
 from .conftest import source
+from .test_app import app_for, event
 from .test_toolkit_contract import toolkit_setup as toolkit_setup
 
 CATALOG = frozenset(
@@ -144,7 +146,41 @@ def test_file_chart_and_speech_outputs_keep_generation_and_validation(fmt):
         "artifact_deliver",
         "document_validate",
     } <= result
-    assert not result & {"team_task_create", "schedule_create", "trigger_create"}
+    assert "team_task_create" not in result
+    assert {"schedule_create", "trigger_create"} <= result
+
+
+@pytest.mark.parametrize("refs", [[], [{"format": "png"}]])
+def test_authorized_event_followup_keeps_trigger_tools_without_schedule_keywords(refs):
+    current = work("在我的任务A完成后整理一份总结")
+    assert {"trigger_create", "trigger_control"} <= select_tools(current, refs, CATALOG)
+    assert "trigger_create" not in select_tools(current, refs, CATALOG - {"trigger_create"})
+    denied = current.model_copy(update={"scope": {"schedule_creation_allowed": False}})
+    assert "trigger_create" not in select_tools(denied, refs, CATALOG)
+
+
+@pytest.mark.parametrize(
+    "criterion,needed",
+    [
+        ("必须用Python实际计算总和", "python_compute"),
+        ("需要把结果导出成PDF文件", "document_generate"),
+        ("检索公开网页核对来源", "web_search"),
+        ("对照历史记录，说明变化", "memory_search"),
+    ],
+)
+def test_acceptance_criteria_keep_additional_capabilities(criterion, needed):
+    current = work("分析这张图片").model_copy(update={"acceptance_criteria": [criterion]})
+    assert needed in select_tools(current, [{"format": "png"}], CATALOG)
+    assert needed not in select_tools(current, [{"format": "png"}], CATALOG - {needed})
+
+
+def test_reminder_acceptance_criteria_can_require_actual_agent_work():
+    current = work(
+        "提醒我检查清单", origin_schedule_id="synthetic-rule", reminder_only=True
+    ).model_copy(update={"acceptance_criteria": ["必须用Python实际计算总和"]})
+    selected = select_tools(current, [], CATALOG)
+    assert "python_compute" in selected
+    assert not selected & {"schedule_create", "trigger_create", "team_task_create"}
 
 
 @pytest.mark.parametrize(
@@ -225,7 +261,10 @@ def test_selection_does_not_turn_goal_or_input_text_into_write_authority():
 
 
 @pytest.mark.postgres
-async def test_toolkit_validated_image_refs_can_bind_the_minimal_gateway_grant(toolkit_setup):
+@pytest.mark.parametrize("requires_compute", [False, True])
+async def test_toolkit_validated_image_refs_can_bind_the_minimal_gateway_grant(
+    toolkit_setup, requires_compute
+):
     import asyncio
 
     setup, env = toolkit_setup, toolkit_setup.env
@@ -261,6 +300,7 @@ async def test_toolkit_validated_image_refs_can_bind_the_minimal_gateway_grant(t
                     item.id: tx.event_fingerprint(item.id) for item in (request, image_event)
                 },
             },
+            acceptance_criteria=["必须用Python实际计算总和"] if requires_compute else [],
         )
         lease = tx.claim_work(current.id, "synthetic-selector", ttl_seconds=300)
         current = tx.get_work(current.id)
@@ -271,18 +311,88 @@ async def test_toolkit_validated_image_refs_can_bind_the_minimal_gateway_grant(t
     assert len(refs) == 1 and refs[0]["format"] == "png"
     gateway = prepared.engine.gateway
     selected = select_tools(current, refs, prepared.request.allowed_tools)
-    assert selected == IMAGE_TOOLS
+    if requires_compute:
+        assert {"python_compute", "artifact_export", "image_analyze"} <= selected
+    else:
+        assert selected == IMAGE_TOOLS
     assert prepared.request.allowed_tools == selected
     scope = ToolScope(env.actor.group_id, current.id, env.actor, workspace, selected, request.id)
     gateway.bind_scope(scope)
     assert {item["function"]["name"] for item in gateway.describe(scope)} == selected
     refused = await gateway.invoke(
-        "artifact_search",
+        "schedule_create" if requires_compute else "artifact_search",
         {"query": "unnecessary exploration"},
         ToolContext(scope, "denied", "denied", asyncio.Event()),
     )
-    assert not refused.success and refused.error_code == "permission_denied"
+    assert not refused.success
+    assert refused.error_code == (
+        "tool_not_registered" if requires_compute else "permission_denied"
+    )
     assert not setup.model.requests and not setup.http_calls
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    "text,goal,reminder",
+    [
+        ("把之前的提醒改成每天检索公开新闻并生成简短摘要", "每天检索公开新闻并生成简短摘要", False),
+        ("把“提醒我检查清单”改成每天检索公开新闻", "每天检索公开新闻", False),
+        ("不再提醒我，改成由你检索公开新闻", "每天检索公开新闻", False),
+        ("把安排改为只提醒我核对最新清单", "核对最新清单", True),
+    ],
+)
+async def test_goal_change_recomputes_reminder_before_scheduled_work_selection(
+    runtime_env, text, goal, reminder
+):
+    env = runtime_env
+    authorization = source(env, "每小时提醒我检查清单")
+    scheduler = Scheduler(env.store)
+    with env.store.transaction(env.actor) as tx:
+        fingerprints = {authorization.id: tx.event_fingerprint(authorization.id)}
+    rule = scheduler.create(
+        env.actor,
+        "Synthetic reminder",
+        "检查清单",
+        EveryTiming(interval_seconds=3600),
+        scope={"reminder_only": True, "source_fingerprints": fingerprints},
+    )
+    update = event(env, text)
+    app, models = app_for(
+        env,
+        {
+            update.id: Decision(
+                kind="reply",
+                reason_code="synthetic_schedule_change",
+                response="已更新安排",
+                directness="direct",
+                confidence=1,
+                action={
+                    "op": "change_schedule",
+                    "schedule_id": rule.id,
+                    "expected_revision": rule.revision,
+                    "goal": goal,
+                },
+            )
+        },
+    )
+    try:
+        await app.start()
+        await app.coordinator.receive(
+            update, stream_id="synthetic-schedule-update", cursor="1", verified_channel=True
+        )
+        revised = scheduler.get(env.actor, rule.id)
+        assert revised.goal == goal and revised.scope["reminder_only"] is reminder
+        assert revised.next_due_at is not None
+        occurrence = scheduler.due(env.actor, revised.next_due_at)[0]
+        with env.store.transaction(env.actor) as tx:
+            current = tx.get_work(occurrence.work_id)
+        selected = select_tools(current, [], CATALOG)
+        assert (selected == {"request_input"}) is reminder
+        if not reminder:
+            assert {"web_search", "web_fetch"} <= selected
+        assert not models
+    finally:
+        await app.close()
 
 
 @pytest.mark.postgres
