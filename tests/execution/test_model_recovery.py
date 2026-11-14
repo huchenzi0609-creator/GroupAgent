@@ -58,6 +58,10 @@ def unavailable():
     return DomainError("provider_unavailable", "Synthetic response lost")
 
 
+def malformed():
+    return DomainError("invalid_model_response", "Synthetic response or usage cannot be parsed")
+
+
 def final_reply():
     return ModelReply(
         text="Synthetic candidate", usage=TokenUsage(input_tokens=10, output_tokens=5)
@@ -84,11 +88,12 @@ def retry_request(request, **budget):
     )
 
 
+@pytest.mark.parametrize("failure", [unavailable, malformed])
 async def test_live_recovery_keeps_unknown_reservation_and_does_not_replay_tools(
-    execution_request, gateway
+    execution_request, gateway, failure
 ):
     budget = RecordingBudget()
-    model = ModelSequence([write_reply(), unavailable(), final_reply()])
+    model = ModelSequence([write_reply(), failure(), final_reply()])
     engine = ScopedToolEngine(model, gateway, model_budget=budget)
     result = await engine.wait(await engine.start(retry_request(execution_request)))
     assert result.state == RunState.CANDIDATE and result.usage.rounds == 3
@@ -103,7 +108,10 @@ async def test_live_recovery_keeps_unknown_reservation_and_does_not_replay_tools
     assert result.checkpoint.backend_state["model_recovery_pending"] is False
 
 
-@pytest.mark.parametrize("outcomes", [[unavailable()] * 3, [unavailable(), ModelRejected(0)] * 2])
+@pytest.mark.parametrize(
+    "outcomes",
+    [[unavailable()] * 3, [unavailable(), ModelRejected(0)] * 2, [malformed()] * 3],
+)
 async def test_exhausted_live_recovery_remains_unsafe_and_cannot_restart(
     execution_request, gateway, outcomes
 ):
@@ -121,9 +129,12 @@ async def test_exhausted_live_recovery_remains_unsafe_and_cannot_restart(
 
 
 @pytest.mark.parametrize("constraint", ["round", "token", "disabled"])
-async def test_each_retry_rechecks_work_limits(execution_request, gateway, scope, constraint):
+@pytest.mark.parametrize("failure", [unavailable, malformed])
+async def test_each_retry_rechecks_work_limits(
+    execution_request, gateway, scope, constraint, failure
+):
     limits = {}
-    expected = "provider_unavailable"
+    expected = failure().code
     if constraint == "round":
         limits["max_rounds"] = 1
         expected = "round_budget_exhausted"
@@ -140,7 +151,7 @@ async def test_each_retry_rechecks_work_limits(execution_request, gateway, scope
         expected = "token_budget_exhausted"
     else:
         limits["additional_retry_limit"] = 0
-    model = ModelSequence([unavailable(), final_reply()])
+    model = ModelSequence([failure(), final_reply()])
     budget = RecordingBudget()
     engine = ScopedToolEngine(model, gateway, model_budget=budget)
     result = await engine.wait(await engine.start(retry_request(execution_request, **limits)))
@@ -150,10 +161,11 @@ async def test_each_retry_rechecks_work_limits(execution_request, gateway, scope
 
 
 @pytest.mark.parametrize("stop", ["cancel", "time"])
+@pytest.mark.parametrize("failure", [unavailable, malformed])
 async def test_live_recovery_wait_respects_cancel_and_active_deadline(
-    execution_request, gateway, stop
+    execution_request, gateway, stop, failure
 ):
-    model = ModelSequence([unavailable(), final_reply()])
+    model = ModelSequence([failure(), final_reply()])
     engine = None
 
     async def on_event(event):
@@ -231,10 +243,11 @@ def harness_fixture(request, gateway, model, budget):
     return engine, run, payload
 
 
+@pytest.mark.parametrize("failure", [unavailable, malformed])
 async def test_host_harness_retries_only_model_and_preserves_previous_tool_receipt(
-    execution_request, gateway
+    execution_request, gateway, failure
 ):
-    model = ModelSequence([write_reply("mcp__groupagent__"), unavailable(), final_reply()])
+    model = ModelSequence([write_reply("mcp__groupagent__"), failure(), final_reply()])
     budget = RecordingBudget()
     engine, run, payload = harness_fixture(execution_request, gateway, model, budget)
     proposed = await engine._relay_model(run, payload)
@@ -254,17 +267,52 @@ async def test_host_harness_retries_only_model_and_preserves_previous_tool_recei
     assert run.backend_state["model_recovery_pending"] is False
 
 
-async def test_host_harness_exhaustion_cannot_clear_unknown_recovery(execution_request, gateway):
-    model = ModelSequence([unavailable(), ModelRejected(0), unavailable()])
+@pytest.mark.parametrize(
+    "outcomes,expected",
+    [
+        ([unavailable(), ModelRejected(0), unavailable()], "provider_unavailable"),
+        ([malformed()] * 3, "invalid_model_response"),
+    ],
+)
+async def test_host_harness_exhaustion_cannot_clear_unknown_recovery(
+    execution_request, gateway, outcomes, expected
+):
+    model = ModelSequence(outcomes)
     budget = RecordingBudget()
     engine, run, payload = harness_fixture(execution_request, gateway, model, budget)
     with pytest.raises(DomainError) as failure:
         await engine._relay_model(run, payload)
-    assert failure.value.code == "provider_unavailable"
+    assert failure.value.code == expected
     assert len(model.requests) == run.usage.rounds == 3 and not run.safe_to_resume
     assert run.usage.tokens == sum(budget.reserved.values())
     assert run.backend_state["model_recovery_pending"] is True
     assert all(value is None for value in budget.settled.values())
+    await engine._finish(run, RunState.PAUSED, expected)
+    with pytest.raises(DomainError) as refused:
+        await engine.resume(
+            engine._checkpoint(run), execution_request.actor, attempt_id="unsafe-harness-restart"
+        )
+    assert refused.value.code == "recovery_required" and len(model.requests) == 3
+
+
+@pytest.mark.parametrize("backend", ["core", "harness"])
+@pytest.mark.parametrize("code", ["permission_denied", "scope_violation", "invalid_model_reply"])
+async def test_live_model_recovery_does_not_retry_policy_or_reply_errors(
+    execution_request, gateway, backend, code
+):
+    model = ModelSequence([DomainError(code, "Synthetic non-retryable boundary"), final_reply()])
+    budget = RecordingBudget()
+    if backend == "core":
+        engine = ScopedToolEngine(model, gateway, model_budget=budget)
+        result = await engine.wait(await engine.start(retry_request(execution_request)))
+        assert result.error_code == code and not result.checkpoint.safe_to_resume
+    else:
+        engine, run, payload = harness_fixture(execution_request, gateway, model, budget)
+        with pytest.raises(DomainError) as failure:
+            await engine._relay_model(run, payload)
+        assert failure.value.code == code and not run.safe_to_resume
+    assert len(model.requests) == len(budget.reserved) == 1
+    assert budget.settled == {"1": None}
 
 
 class SyntheticHarnessProcess:
@@ -318,8 +366,9 @@ class SyntheticHarnessRunner:
         self.process.kill()
 
 
+@pytest.mark.parametrize("failure", [unavailable, malformed])
 async def test_host_harness_finished_checkpoint_separates_unknown_fees_from_safe_execution(
-    execution_request, gateway, monkeypatch
+    execution_request, gateway, monkeypatch, failure
 ):
     process = SyntheticHarnessProcess()
 
@@ -327,7 +376,7 @@ async def test_host_harness_finished_checkpoint_separates_unknown_fees_from_safe
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
-    model = ModelSequence([write_reply("mcp__groupagent__"), unavailable(), final_reply()])
+    model = ModelSequence([write_reply("mcp__groupagent__"), failure(), final_reply()])
     budget = RecordingBudget()
     checkpoints = []
 

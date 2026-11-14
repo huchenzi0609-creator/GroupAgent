@@ -897,7 +897,10 @@ class ScopedToolEngine:
         # unsafe checkpoint or overlap an inference task whose outcome is late.
         return (
             isinstance(error, DomainError)
-            and (isinstance(error, ModelRejected) or error.code == "provider_unavailable")
+            and (
+                isinstance(error, ModelRejected)
+                or error.code in {"provider_unavailable", "invalid_model_response"}
+            )
             and not run.cancelled.is_set()
             and not any(not task.done() for task in run.model_tasks)
             and not any(receipt.effect_state == EffectState.UNKNOWN for receipt in run.receipts)

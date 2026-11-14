@@ -154,5 +154,5 @@ class OutputRequirement(ActionData):
     expected_text: list[Annotated[str, Field(max_length=1000)]] = Field(
         default_factory=list,
         max_length=30,
-        description="User-required visible text snippets only. A PPTX topic/theme is document title metadata, not automatically visible slide text when different per-slide titles are explicitly given. Do not turn metadata naming or inferred summaries into extra visible-text requirements.",
+        description="User-required visible text snippets only. Title declaration delimiters such as 《Title》 or quotation marks name Title; omit those delimiter characters unless explicitly requested as literal content. A PPTX topic/theme is document title metadata, not automatically visible slide text when different per-slide titles are explicitly given. Do not turn metadata naming or inferred summaries into extra visible-text requirements.",
     )

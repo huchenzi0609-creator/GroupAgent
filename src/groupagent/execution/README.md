@@ -4,7 +4,7 @@
 
 共同边界包括允许工具集合、单轮及总轮数、输入／输出 token、工具调用数、活动时间、每次模型调用的金额 reserve/settle、取消、输入追加、结构化事件与 checkpoint。`ToolGateway.registered_names` 是只读集合；schema 标准化不授予工具权限。权限、群、work、工作区、输入版本与当前 lease 仍在 invoke 与每个实际副作用前复核。
 
-`bind_persistence(event_sink,checkpoint_sink)` 必须在 start 前绑定。`flush_checkpoint(run_id)` 产生新的 progress sequence，并与其他保存序列化。checkpoint 保存累计 round/token/tool/time、候选文本、失败码、可选 backend state 和 `safe_to_resume`；未知工具副作用不能自动重放。模型 HTTP 429 与 `provider_unavailable` 共用有界额外重试次数（默认 2，0 表示禁用），遵循有上限的退避及 Retry-After；每次单独 reserve/settle、计入轮数和保守 token，不因重试重新获得预算。
+`bind_persistence(event_sink,checkpoint_sink)` 必须在 start 前绑定。`flush_checkpoint(run_id)` 产生新的 progress sequence，并与其他保存序列化。checkpoint 保存累计 round/token/tool/time、候选文本、失败码、可选 backend state 和 `safe_to_resume`；未知工具副作用不能自动重放。模型 HTTP 429、`provider_unavailable` 与模型响应解析／usage／arguments 无效的 `invalid_model_response` 共用有界额外重试次数（默认 2，0 表示禁用），遵循有上限的退避及 Retry-After；每次单独 reserve/settle、计入轮数和保守 token，不因重试重新获得预算。响应已解析后的 `invalid_model_reply`、工具及策略错误不进入该重试。
 
 供应商故障仅在原活动 Core 循环／Harness relay 中重新生成尚未交给网关的纯模型响应：前次模型 task 必须已停止，无未知工具效果，不重放历史工具。每次未知费用继续保留最坏预留，`uncertain_model_usage` 保存历史账务不确定性；新的成功响应建立确定执行边界后 `model_recovery_pending=false`，不会退还旧未知费用。重试耗尽、取消、未停止的模型 task、模型超时及其他错误仍暂停／停止；旧 unsafe checkpoint 不会自动恢复，须另行核对。轮数、token、活动时间、工具及金额预算仍在每次调用前复核。
 

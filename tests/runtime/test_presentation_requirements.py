@@ -9,7 +9,7 @@ from groupagent.domain import EventKind, GroupEvent
 from groupagent.runtime.toolkit import _output_requirements
 
 from .test_tool_selection import work
-from .test_toolkit_contract import prepare
+from .test_toolkit_contract import call, candidate, prepare
 from .test_toolkit_contract import toolkit_setup as toolkit_setup
 
 REQUEST = (
@@ -84,6 +84,36 @@ def test_edits_imports_and_other_formats_keep_their_original_contract(changed):
     assert _output_requirements(current, original(REQUEST)) == current.scope["outputs"]
 
 
+@pytest.mark.parametrize(
+    "declaration,wrapped",
+    [
+        ("标题《合成清单》", "《合成清单》"),
+        ("题目为“合成清单”", "“合成清单”"),
+        ('标题是"合成清单"', '"合成清单"'),
+    ],
+)
+@pytest.mark.parametrize("format_name", ["docx", "pdf", "md", "pptx"])
+def test_title_notation_delimiters_are_not_invented_as_visible_content(
+    declaration, wrapped, format_name
+):
+    text = "请生成文件，" + declaration + "，内容为检查条目。"
+    current = work(text, outputs=[{"format": format_name, "expected_text": [wrapped, "检查条目"]}])
+    assert _output_requirements(current, original(text))[0]["expected_text"] == [
+        "合成清单",
+        "检查条目",
+    ]
+    assert current.scope["outputs"][0]["expected_text"][0] == wrapped
+
+
+@pytest.mark.parametrize(
+    "extra", ["请保留书名号。", "包括引号。", "逐字原样。", "正文也写《合成清单》。"]
+)
+def test_literal_or_repeated_title_marks_remain_required(extra):
+    text = "标题《合成清单》，内容为检查条目。" + extra
+    current = work(text, outputs=[{"format": "docx", "expected_text": ["《合成清单》"]}])
+    assert _output_requirements(current, original(text))[0]["expected_text"] == ["《合成清单》"]
+
+
 @pytest.mark.postgres
 async def test_actual_objective_separates_topic_metadata_without_rewriting_stored_router_output(
     toolkit_setup,
@@ -101,3 +131,36 @@ async def test_actual_objective_separates_topic_metadata_without_rewriting_store
     assert output["expected_text"] == ["观察", "讨论"]
     assert run.work.scope["outputs"][0]["expected_text"] == ["合成主题", "观察", "讨论"]
     assert not toolkit_setup.model.requests
+
+
+@pytest.mark.postgres
+async def test_title_notation_normalization_reaches_independent_file_validation(toolkit_setup):
+    text = "请制作Markdown，标题《合成清单》，内容为检查条目。"
+    run = await prepare(
+        toolkit_setup,
+        goal=text,
+        request_text=text,
+        scope={"outputs": [{"format": "md", "expected_text": ["《合成清单》", "检查条目"]}]},
+    )
+    created = await call(
+        run,
+        "document_generate",
+        {
+            "name": "checklist.md",
+            "kind": "report",
+            "title": "合成清单",
+            "sections": [{"title": "内容", "paragraphs": ["检查条目"]}],
+        },
+    )
+    assert created.success
+    selected = await call(run, "artifact_deliver", {"version_ids": [created.output["version_id"]]})
+    assert selected.success
+    accepted = await toolkit_setup.toolkit.validate(
+        run.work,
+        run.lease,
+        toolkit_setup.env.actor,
+        candidate(run, "文件已准备好。", (created, selected)),
+        run.workspace,
+    )
+    assert accepted.checks["result"]
+    assert run.work.scope["outputs"][0]["expected_text"][0] == "《合成清单》"

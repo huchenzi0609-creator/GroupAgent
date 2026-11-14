@@ -93,6 +93,26 @@ def _output_requirements(work: WorkOrder, event: GroupEvent) -> list[dict[str, A
     if work.goal_revision != 1 or work.input_versions or work.scope.get("attachment_event_ids"):
         return outputs
     text = redact_credentials(event.text)
+    # Title notation in an instruction names the title; its delimiters are not
+    # automatically visible content. Explicit literal-mark requests are kept.
+    if not re.search(r"书名号|引号|逐字|字面|原样", text):
+        quoted_titles = {}
+        for declaration in re.finditer(
+            r'(?:标题|题目|主题)(?:为|是)?\s*[:：]?\s*(《([^《》\n]{1,180})》|“([^“”\n]{1,180})”|"([^"\n]{1,180})")',
+            text,
+        ):
+            wrapped = declaration[1]
+            if text.count(wrapped) == 1:
+                quoted_titles[wrapped] = next(
+                    value for value in declaration.groups()[1:] if value is not None
+                )
+        for output in outputs:
+            expected = output.get("expected_text")
+            if output.get("format") in {"md", "docx", "pdf", "pptx"} and isinstance(expected, list):
+                output["expected_text"] = [
+                    quoted_titles.get(value, value) if isinstance(value, str) else value
+                    for value in expected
+                ]
     topic = re.search(r"主题(?:为|是)?\s*《([^《》\n]{1,180})》", text)
     titles = re.findall(
         r'第\s*[0-9一二三四五六七八九十]+\s*页\s*标题(?:为|是)?\s*[“"「『]([^”"」』\n]+)[”"」』]',
@@ -804,6 +824,7 @@ class WorkToolkit:
                         if execution_intent == "reminder"
                         else "Use actual scoped tools to complete this goal; do not just offer a plan.",
                         _REQUEST_CONTEXT_INSTRUCTION,
+                        "标题/题目声明中的《》或引号通常是指令的引用标记，不是要求写入标题的字符；除非用户明确要求保留这些符号，按required_outputs.expected_text中的真实标题文字校验，不要自行再包上引用标记。",
                         "PPT若逐页明确指定了不同标题，required_outputs.metadata_title表示文件主题元数据，不是额外页内文字。用document_read.metadata.title核对真实主题，expected_text仅核对要求的可见文字；不要为让主题出现在可见文本里添加页脚、封面或改写指定页标题。",
                         "表格默认使用layout=records：名称=数值的一组观测按名称/数值两列、一条记录一行。工具会把默认records模式的一行横向纯数值向量规范化为行记录；只有用户明确要求横向或转置表格时才设置layout=columns，不要自行选择columns绕过默认记录布局。",
                         "Before returning an answer, successfully call every tool listed in required_tools; if a required tool is unavailable or denied, report the concrete blocker without re-enabling or bypassing it.",
@@ -1127,6 +1148,7 @@ class WorkToolkit:
                             "不得把尚未发送、等待审核、尚无发送回执当作内容缺陷，也不得要求执行模型提前发送来通过审核；实际派送及回执由后续控制服务独立检查。"
                             + "结合original_request和真实提取证据理解用户词义；当前goal和criteria仍决定后续授权变更。"
                             "报告中的标识码不因此需要满足程序代码语法。只按用户要求和已有证据核验，不添加用户未要求的标准。"
+                            "标题声明用的书名号/引号通常是引用定界标记；除非用户明确要求保留符号，不得仅因实际标题省略这些定界符而拒绝。"
                             "PPT的metadata.title是从实际文件读回的主题元数据；当原文逐页指定了不同标题且未要求可见展示主题时，不要求把主题重复塞进页内文字、增加封面或改变指定标题。"
                             "音频ASR文本的标点不是声学证据，不得据此推断实际停顿、声线或自然度。"
                             "仍须依据真实音频解码、非静音和内容核验结果判断；不得把缺少相关证据自动当作通过。"
