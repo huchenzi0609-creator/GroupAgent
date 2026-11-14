@@ -1,0 +1,6 @@
+# Official PyPI 0.2.2rc2 artifacts, verified 2026-11-14. No floating SDK/runtime.
+deepseek-harness-sdk==0.2.2rc2 \
+    --hash=sha256:ad14f1b1fccb29f7d97e5a7e0ee9dbb96d8af11292308bba66bf19a623d31899
+deepseek-harness-runtime-bin==0.2.2rc2 \
+    --hash=sha256:dc8f6e2c463c9c174b8fbafa394ada62351ff16b9febde4b90dca6b57f1b4e84 \
+    --hash=sha256:3c8f15a7a92b12857032995ec5dbcc105f192c36218e9b6bb2c5b54b4ee7db17

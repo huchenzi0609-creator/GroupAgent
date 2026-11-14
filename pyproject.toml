@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27,<2"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -15,21 +15,22 @@ dependencies = [
   "python-pptx>=1.0,<2",
   "pypdf>=6,<7",
   "reportlab>=4,<5",
-  "Pillow>=11,<13",
+  "Pillow>=13.0.0,<14",
+  "playwright>=1.50,<2",
 ]
 
 [project.scripts]
 groupagent = "groupagent.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8.3,<10", "pytest-asyncio>=1,<2", "ruff>=0.11,<1", "mypy>=1.15,<2", "hypothesis>=6,<7"]
+dev = ["pytest>=8.3,<10", "pytest-asyncio>=1,<2", "ruff>=0.11,<1", "mypy>=1.15,<2", "hypothesis>=6,<7", "hatchling==1.33.0", "pip-audit>=2.9,<3", "pip-licenses>=5,<6"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/groupagent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["postgres: integration tests requiring an isolated PostgreSQL database", "render: document rendering with external tools"]
+markers = ["postgres: integration tests requiring an isolated PostgreSQL database", "render: document rendering with external tools", "sandbox: actual isolated Docker worker tests", "live: explicitly budgeted live provider tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 

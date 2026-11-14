@@ -1,0 +1,9 @@
+#!/usr/local/bin/python3 -I
+"""The trusted SDK may launch dsh; dsh itself cannot access the root relay process."""
+import os
+import sys
+
+os.setgroups([])
+os.setgid(65532)
+os.setuid(65532)
+os.execv("/usr/local/bin/dsh", ["dsh", *sys.argv[1:]])

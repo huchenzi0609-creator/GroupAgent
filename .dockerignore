@@ -1,0 +1,13 @@
+# Only source and reviewed build inputs enter worker images.
+**
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+!deploy/
+!deploy/**
+**/.env*
+**/*.pem
+**/*.key
+**/*local*
+**/secrets/**

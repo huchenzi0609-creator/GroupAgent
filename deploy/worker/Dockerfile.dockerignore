@@ -1,0 +1,9 @@
+**
+!deploy/
+!deploy/worker/
+!deploy/worker/requirements.txt
+!src/
+!src/groupagent/
+!src/groupagent/**
+**/__pycache__/
+**/*.pyc
