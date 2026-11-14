@@ -41,8 +41,20 @@ from groupagent.domain import (
 
 Row = dict[str, Any]
 Connection = psycopg.Connection[Row]
+_RESTORE_LOCK_KEY = 7342938221337
+
+
+class _Unchanged:
+    pass
+
+
+_UNCHANGED = _Unchanged()
 _VERIFIED_REPLY_ORIGINS = frozenset(
-    {"verified_channel_metadata", "agentwechat_authenticated_message_metadata"}
+    {
+        "verified_channel_metadata",
+        "agentwechat_authenticated_message_metadata",
+        "authenticated_audio_transcription",
+    }
 )
 
 
@@ -82,6 +94,11 @@ class PostgresStore:
         rolls back both its DDL and ledger entry; applied SQL is immutable.
         """
         with self.connect() as conn:
+            guard = conn.execute(
+                "SELECT pg_try_advisory_xact_lock_shared(%s) AS ready", (_RESTORE_LOCK_KEY,)
+            ).fetchone()
+            if not guard or not guard["ready"]:
+                raise DomainError("restore_busy", "Database restoration is in progress")
             if conn.info.server_version < 160000:
                 raise DomainError("unsupported_database", "PostgreSQL 16 or later is required")
             conn.execute("SELECT pg_advisory_xact_lock(1734348201)")
@@ -121,6 +138,11 @@ class PostgresStore:
         if policy_revision < 1:
             raise DomainError("invalid_input", "Policy revision must be positive")
         with self.connect() as conn:
+            guard = conn.execute(
+                "SELECT pg_try_advisory_xact_lock_shared(%s) AS ready", (_RESTORE_LOCK_KEY,)
+            ).fetchone()
+            if not guard or not guard["ready"]:
+                raise DomainError("restore_busy", "Database restoration is in progress")
             row = conn.execute(
                 "INSERT INTO ga_groups (id, policy_revision) VALUES (%s, %s) "
                 "ON CONFLICT (id) DO UPDATE SET policy_revision = EXCLUDED.policy_revision "
@@ -141,6 +163,8 @@ class PostgresStore:
                 unit._check_group()
                 yield unit
         except DomainError as error:
+            if error.code in {"restore_busy", "restore_pending"}:
+                raise  # The target schema may not exist yet; never mutate a restore snapshot.
             # Rejection evidence must survive rollback of the rejected mutation.
             with self.connect() as conn:
                 conn.execute(
@@ -159,16 +183,46 @@ class PostgresStore:
 
 
 class UnitOfWork:
-    def __init__(self, conn: Connection, actor: ActorContext, trace_id: str) -> None:
+    def __init__(
+        self,
+        conn: Connection,
+        actor: ActorContext,
+        trace_id: str,
+        *,
+        recovery_maintenance: bool = False,
+    ) -> None:
+        if recovery_maintenance and actor.role not in (Role.OWNER, Role.MAINTAINER):
+            raise DomainError(
+                "permission_denied",
+                "Recovery maintenance requires a trusted administrative identity",
+            )
         self.conn = conn
         self.actor = actor
         self.trace_id = trace_id
+        self.recovery_maintenance = recovery_maintenance
 
     @property
     def group_id(self) -> str:
         return self.actor.group_id
 
     def _check_group(self) -> None:
+        ready = self.conn.execute(
+            "SELECT pg_try_advisory_xact_lock_shared(%s) AS ready", (_RESTORE_LOCK_KEY,)
+        ).fetchone()
+        if not ready or not ready["ready"]:
+            raise DomainError("restore_busy", "Database restoration is in progress")
+        exists = self.conn.execute(
+            "SELECT to_regclass('groupagent_recovery.guard') AS guard"
+        ).fetchone()
+        if exists and exists["guard"] is not None and not self.recovery_maintenance:
+            blocked = self.conn.execute(
+                "SELECT 1 FROM groupagent_recovery.guard WHERE singleton AND blocked"
+            ).fetchone()
+            if blocked:
+                raise DomainError(
+                    "restore_pending",
+                    "Restored data requires privacy and delivery reconciliation before business use",
+                )
         # Hold only for this short transaction: a policy change cannot race an
         # already-authorized write, and takes effect before the next operation.
         row = self.conn.execute(
@@ -178,6 +232,14 @@ class UnitOfWork:
             raise DomainError("permission_denied", "Group is not authorized")
         if row["policy_revision"] != self.actor.policy_revision:
             raise DomainError("policy_changed", "Actor policy revision is stale")
+        member = self.conn.execute(
+            "SELECT membership_state FROM ga_members WHERE group_id=%s AND member_id=%s",
+            (self.group_id, self.actor.member_id),
+        ).fetchone()
+        if member and member["membership_state"] == "left" and self.actor.role != Role.MAINTAINER:
+            raise DomainError(
+                "member_left", "Reliable departure revoked this member's group access"
+            )
 
     def _writer(self) -> None:
         if self.actor.role not in (Role.MEMBER, Role.OWNER):
@@ -190,7 +252,9 @@ class UnitOfWork:
                 "permission_denied", "Only the resource owner or group owner may edit"
             )
 
-    def _audit(self, action: str, resource_ref: str | None, **details: JsonValue) -> None:
+    def _audit(
+        self, action: str, resource_ref: str | None, **details: JsonValue | list[str]
+    ) -> None:
         self.conn.execute(
             "INSERT INTO ga_audit_events "
             "(group_id, trace_id, actor_id, policy_revision, action, resource_ref, details) "
@@ -275,12 +339,241 @@ class UnitOfWork:
 
     def get_event(self, event_id: str) -> GroupEvent:
         row = self.conn.execute(
-            "SELECT body FROM ga_events WHERE group_id = %s AND id = %s",
+            "SELECT body,memory_state FROM ga_events WHERE group_id = %s AND id = %s",
             (self.group_id, event_id),
         ).fetchone()
         if row is None:
             raise DomainError("not_found", "Event was not found in this group")
-        return GroupEvent.model_validate(row["body"])
+        event = GroupEvent.model_validate(row["body"])
+        if row["memory_state"] != "active":
+            return event.model_copy(
+                update={
+                    "text": "",
+                    "attachments": [],
+                    "payload_ref": None,
+                    "content_state": row["memory_state"],
+                }
+            )
+        return self._sanitize_bot_echo(self._sanitize_quote(event))
+
+    def event_fingerprint(self, event_id: str) -> str:
+        import json
+
+        canonical = self.get_event(event_id).model_dump(mode="json")
+        return hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+
+    def _validate_work_sources(
+        self, fingerprints: object, retained: object, input_versions: list[str] | None = None
+    ) -> None:
+        from groupagent.memory.common import source_rows, topic_row
+
+        if (
+            not isinstance(fingerprints, dict)
+            or len(fingerprints) > 500
+            or not isinstance(retained, list)
+            or not all(isinstance(item, str) for item in retained)
+            or not set(retained).issubset(fingerprints)
+        ):
+            raise DomainError("scope_violation", "Work source scope is invalid")
+        for identifier, fingerprint in fingerprints.items():
+            if (
+                not isinstance(identifier, str)
+                or not isinstance(fingerprint, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
+            ):
+                raise DomainError(
+                    "invalid_input",
+                    "Source fingerprints must contain string IDs and SHA-256 digests",
+                )
+            source = self.get_event(identifier)
+            retained_task = False
+            if source.content_state == "expired":
+                if identifier not in retained:
+                    raise DomainError(
+                        "source_unavailable",
+                        "Expired source is not authorized as retained fact evidence",
+                    )
+                candidates = self.conn.execute(
+                    "SELECT * FROM ga_memory_facts WHERE group_id=%s AND state='active' AND source_event_ids ? %s",
+                    (self.group_id, identifier),
+                ).fetchall()
+                supported = False
+                for fact in candidates:
+                    try:
+                        topic_row(self, fact["topic_id"])
+                        source_rows(
+                            self,
+                            fact["source_event_ids"],
+                            allow_expired=True,
+                            require_complete=True,
+                        )
+                        supported = True
+                        break
+                    except DomainError:
+                        continue
+                if not supported:
+                    retained_task = (
+                        self.conn.execute(
+                            "SELECT 1 FROM ga_team_tasks WHERE group_id=%s AND content_state='active' AND (source_event_id=%s OR source_event_ids ? %s) LIMIT 1",
+                            (self.group_id, identifier, identifier),
+                        ).fetchone()
+                        is not None
+                    )
+                    supported = retained_task
+                if not supported and input_versions:
+                    catalog = self.conn.execute(
+                        "SELECT to_regclass('ga_artifact_catalog') AS catalog"
+                    ).fetchone()
+                    if catalog and catalog["catalog"] is not None:
+                        retained_task = (
+                            self.conn.execute(
+                                "SELECT 1 FROM ga_artifact_catalog WHERE group_id=%s AND version_id=ANY(%s) "
+                                "AND %s=ANY(source_event_ids) AND available AND validation->'passed'='true'::jsonb "
+                                "AND (expires_at IS NULL OR expires_at>clock_timestamp()) AND (shared OR created_by=%s OR %s) LIMIT 1",
+                                (
+                                    self.group_id,
+                                    input_versions,
+                                    identifier,
+                                    self.actor.member_id,
+                                    self.actor.role == Role.OWNER,
+                                ),
+                            ).fetchone()
+                            is not None
+                        )
+                        supported = retained_task
+                if not supported:
+                    raise DomainError(
+                        "source_unavailable",
+                        "No retained fact, human task or readable validated input artifact supports this source",
+                    )
+            elif source.content_state != "active":
+                raise DomainError(
+                    "source_unavailable", "Forgotten or recalled source cannot enter a work scope"
+                )
+            if not retained_task:
+                source_rows(self, [identifier], allow_expired=identifier in retained)
+            if self.event_fingerprint(identifier) != fingerprint:
+                raise DomainError(
+                    "version_conflict", "A canonical source changed before work admission"
+                )
+
+    def _sanitize_quote(self, event: GroupEvent) -> GroupEvent:
+        if event.kind != EventKind.QUOTE or not event.reply_to:
+            return event
+        parts = self.conn.execute("SELECT to_regclass('ga_delivery_parts') AS parts").fetchone()
+        part_query = (
+            " UNION ALL SELECT substring(d.reason from 8) FROM ancestry a JOIN ga_delivery_parts p ON p.platform_message_id=a.platform_id JOIN ga_deliveries d ON d.group_id=p.group_id AND d.id=p.intent_id WHERE p.group_id=%s AND p.state='accepted' AND d.reason IN ('source_forgotten','source_recalled','source_expired')"
+            if parts and parts["parts"]
+            else ""
+        )
+        params: tuple[str, ...] = (
+            self.group_id,
+            event.reply_to,
+            self.group_id,
+            self.group_id,
+            event.reply_to,
+            self.group_id,
+        )
+        if part_query:
+            params = (*params, self.group_id)
+        removed = self.conn.execute(
+            "WITH RECURSIVE ancestry AS ("
+            "SELECT id,body->>'reply_to' AS parent_id,memory_state,body->>'platform_message_id' AS platform_id FROM ga_events WHERE group_id=%s AND id=%s "
+            "UNION SELECT e.id,e.body->>'reply_to',e.memory_state,e.body->>'platform_message_id' FROM ga_events e JOIN ancestry a "
+            "ON e.id=a.parent_id WHERE e.group_id=%s), unavailable AS ("
+            "SELECT memory_state AS reason FROM ancestry WHERE memory_state<>'active' "
+            "UNION ALL SELECT reason FROM ga_source_tombstones WHERE group_id=%s "
+            "AND (event_id=%s OR event_id IN (SELECT parent_id FROM ancestry)) "
+            "UNION ALL SELECT substring(d.reason from 8) FROM ancestry a JOIN ga_deliveries d ON d.platform_message_id=a.platform_id WHERE d.group_id=%s AND d.state='accepted' AND d.reason IN ('source_forgotten','source_recalled','source_expired')"
+            + part_query
+            + ") SELECT reason FROM unavailable ORDER BY CASE reason WHEN 'forgotten' THEN 0 WHEN 'recalled' THEN 1 ELSE 2 END LIMIT 1",
+            params,
+        ).fetchone()
+        if removed is None:
+            return event
+        update: dict[str, Any] = {
+            "attachments": [
+                {
+                    "kind": "quote",
+                    "source_event_id": event.reply_to,
+                    "text": None,
+                    "state": "recalled"
+                    if removed["reason"] in {"forgotten", "recalled"}
+                    else "missing",
+                    "media_availability": "unavailable",
+                    "privacy_redacted": True,
+                    "reason": removed["reason"],
+                }
+            ]
+        }
+        if event.trusted_actor_origin == "authenticated_audio_transcription":
+            update.update({"text": "", "payload_ref": None, "content_state": removed["reason"]})
+        return event.model_copy(update=update)
+
+    def _validate_transcription_origin(self, event: GroupEvent) -> None:
+        if event.trusted_actor_origin != "authenticated_audio_transcription":
+            return
+        if event.kind != EventKind.QUOTE or not event.reply_to:
+            raise DomainError(
+                "permission_denied", "Audio transcription needs its original audio event"
+            )
+        parent = self.get_event(event.reply_to)
+        if (
+            parent.kind != EventKind.AUDIO
+            or parent.actor_id != event.actor_id
+            or parent.trusted_actor_origin
+            not in {"verified_channel_metadata", "agentwechat_authenticated_message_metadata"}
+        ):
+            raise DomainError(
+                "permission_denied",
+                "Transcription authority must come from the same sender's verified audio message",
+            )
+        if parent.platform_message_id and self.is_bot_message(parent.platform_message_id):
+            raise DomainError(
+                "permission_denied",
+                "An accepted bot audio echo is not a new human voice instruction",
+            )
+
+    def _sanitize_bot_echo(self, event: GroupEvent) -> GroupEvent:
+        if not event.platform_message_id or event.kind in (
+            EventKind.SYSTEM,
+            EventKind.MEMBERSHIP,
+            EventKind.RECALL,
+        ):
+            return event
+        rows = self.conn.execute(
+            "SELECT id,reason FROM ga_deliveries WHERE group_id=%s AND platform_message_id=%s AND state='accepted'",
+            (self.group_id, event.platform_message_id),
+        ).fetchall()
+        parts = self.conn.execute("SELECT to_regclass('ga_delivery_parts') AS parts").fetchone()
+        if parts and parts["parts"]:
+            rows.extend(
+                self.conn.execute(
+                    "SELECT d.id,d.reason FROM ga_deliveries d JOIN ga_delivery_parts p ON p.group_id=d.group_id AND p.intent_id=d.id WHERE p.group_id=%s AND p.platform_message_id=%s AND p.state='accepted'",
+                    (self.group_id, event.platform_message_id),
+                ).fetchall()
+            )
+        reasons = {row["reason"] for row in rows}
+        reason = next(
+            (
+                state
+                for state in ("forgotten", "recalled", "expired")
+                if "source_" + state in reasons
+            ),
+            None,
+        )
+        if reason is not None:
+            rank = {"active": 0, "expired": 1, "recalled": 2, "forgotten": 3}
+            if rank[event.content_state] > rank[reason]:
+                reason = event.content_state
+            return event.model_copy(
+                update={"text": "", "attachments": [], "payload_ref": None, "content_state": reason}
+            )
+        return event
 
     def get_decision(self, event_id: str) -> dict[str, JsonValue] | None:
         """Lock the source event while its decision and business writes are applied."""
@@ -309,6 +602,8 @@ class UnitOfWork:
         if existing is not None:
             return existing
         event = self.get_event(event_id)
+        if event.content_state != "active" and decision.get("kind") not in {"ignore", "observe"}:
+            raise DomainError("source_unavailable", "Removed source cannot authorize a decision")
         if decision.get("group_id", self.group_id) != self.group_id:
             raise DomainError("scope_violation", "Decision belongs to another group")
         if decision.get("actor_id", event.actor_id) != event.actor_id:
@@ -339,7 +634,7 @@ class UnitOfWork:
 
     def list_pending_events(self, limit: int = 100) -> list[GroupEvent]:
         rows = self.conn.execute(
-            "SELECT e.body FROM ga_events e WHERE e.group_id = %s AND NOT EXISTS "
+            "SELECT e.body FROM ga_events e WHERE e.group_id = %s AND e.memory_state='active' AND NOT EXISTS "
             "(SELECT 1 FROM ga_decisions d WHERE d.group_id = e.group_id AND d.event_id = e.id) "
             "ORDER BY e.sequence LIMIT %s",
             (self.group_id, min(max(limit, 1), 1000)),
@@ -357,6 +652,13 @@ class UnitOfWork:
             raise DomainError("scope_violation", "Event belongs to another group")
         if event.actor_id != self.actor.member_id and self.actor.role != Role.OWNER:
             raise DomainError("permission_denied", "Cannot ingest another member's identity")
+        if event.content_state != "active":
+            raise DomainError("invalid_input", "Only the server may assign content deletion state")
+        self.conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("memory:" + self.group_id,)
+        )
+        self._validate_transcription_origin(event)
+        event = self._sanitize_bot_echo(self._sanitize_quote(event))
         _nonempty(stream_id, "stream_id")
         _nonempty(cursor, "cursor")
         self.conn.execute(
@@ -368,9 +670,88 @@ class UnitOfWork:
             (self.group_id, stream_id),
         ).fetchone()
         assert current is not None
+        tombstone = self.conn.execute(
+            "SELECT reason,event_id FROM ga_source_tombstones WHERE group_id=%s AND "
+            "(source_key=%s OR event_id=%s OR (%s AND platform_message_id IS NOT NULL "
+            "AND platform_message_id=%s AND channel_account_id IS NOT DISTINCT FROM %s)) LIMIT 1",
+            (
+                self.group_id,
+                event.source_key,
+                event.id,
+                event.kind not in (EventKind.RECALL, EventKind.SYSTEM, EventKind.MEMBERSHIP),
+                event.platform_message_id,
+                event.channel_account_id,
+            ),
+        ).fetchone()
+        if tombstone is None and event.content_state != "active":
+            self.conn.execute(
+                "INSERT INTO ga_source_tombstones(group_id,source_key,event_id,platform_message_id,channel_account_id,reason) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (
+                    self.group_id,
+                    event.source_key,
+                    event.id,
+                    event.platform_message_id,
+                    event.channel_account_id,
+                    event.content_state,
+                ),
+            )
+            tombstone = {"reason": event.content_state, "event_id": event.id}
+        if tombstone:
+            redacted = event.model_copy(
+                update={
+                    "text": "",
+                    "attachments": [],
+                    "payload_ref": None,
+                    "content_state": tombstone["reason"],
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO ga_events(id,group_id,source_key,actor_id,kind,body,occurred_at,memory_state) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (
+                    event.id,
+                    self.group_id,
+                    event.source_key,
+                    event.actor_id,
+                    event.kind.value,
+                    Jsonb(redacted.model_dump(mode="json")),
+                    event.occurred_at,
+                    tombstone["reason"],
+                ),
+            )
+            original_row = self.conn.execute(
+                "SELECT id,actor_id,body,memory_state FROM ga_events WHERE group_id=%s AND source_key=%s",
+                (self.group_id, event.source_key),
+            ).fetchone()
+            if original_row is None or original_row["actor_id"] != event.actor_id:
+                raise DomainError(
+                    "idempotency_conflict", "Removed event identity does not match its replay"
+                )
+            if original_row["memory_state"] == "active":
+                stored = GroupEvent.model_validate(original_row["body"]).model_copy(
+                    update={
+                        "text": "",
+                        "attachments": [],
+                        "payload_ref": None,
+                        "content_state": tombstone["reason"],
+                    }
+                )
+                self.conn.execute(
+                    "UPDATE ga_events SET body=%s,memory_state=%s WHERE group_id=%s AND id=%s",
+                    (
+                        Jsonb(stored.model_dump(mode="json")),
+                        tombstone["reason"],
+                        self.group_id,
+                        stored.id,
+                    ),
+                )
+            canonical = self.get_event(original_row["id"])
+            return IngestResult(
+                event=canonical, inserted=False, cursor_revision=current["revision"]
+            )
         inserted = self.conn.execute(
-            "INSERT INTO ga_events (id, group_id, source_key, actor_id, kind, body) "
-            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING id",
+            "INSERT INTO ga_events (id, group_id, source_key, actor_id, kind, body,occurred_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s,%s) ON CONFLICT DO NOTHING RETURNING id",
             (
                 event.id,
                 self.group_id,
@@ -378,6 +759,7 @@ class UnitOfWork:
                 event.actor_id,
                 event.kind.value,
                 Jsonb(event.model_dump(mode="json")),
+                event.occurred_at,
             ),
         ).fetchone()
         if inserted is None:
@@ -388,7 +770,7 @@ class UnitOfWork:
                 raise DomainError("idempotency_conflict", "Event ID belongs to a different source")
             if old["group_id"] != self.group_id:
                 raise DomainError("scope_violation", "Source key is already bound to another group")
-            original = GroupEvent.model_validate(old["body"])
+            original = self._sanitize_quote(GroupEvent.model_validate(old["body"]))
             excluded = {"id", "received_at", "policy_revision"}
             if original.model_dump(exclude=excluded) != event.model_dump(exclude=excluded):
                 raise DomainError(
@@ -404,6 +786,11 @@ class UnitOfWork:
         ).fetchone()
         assert new_cursor is not None
         self._audit("event_ingested", event.id, source_key=event.source_key)
+        if event.kind not in (EventKind.SYSTEM, EventKind.RECALL, EventKind.MEMBERSHIP):
+            self.conn.execute(
+                "INSERT INTO ga_members(group_id,member_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                (self.group_id, event.actor_id),
+            )
         return IngestResult(event=event, inserted=True, cursor_revision=new_cursor["revision"])
 
     def _work_row(self, work_id: str, *, lock: bool = True) -> Row:
@@ -419,6 +806,24 @@ class UnitOfWork:
         assert clock is not None
         row["db_now"] = clock["now"]
         return row
+
+    def _check_work_source(self, row: Row) -> None:
+        self.assert_task_sources(
+            row["scope"].get("source_task_revisions", {}), require_current=False
+        )
+        if row["scope"].get("privacy_redacted"):
+            raise DomainError(
+                "source_unavailable", "Privacy-redacted work requires a new authorized request"
+            )
+        source = self.get_event(row["request_event_id"])
+        if source.content_state in {"forgotten", "recalled"} or any(
+            attachment.get("privacy_redacted")
+            and attachment.get("reason") in {"forgotten", "recalled"}
+            for attachment in source.attachments
+        ):
+            raise DomainError(
+                "source_unavailable", "Removed evidence cannot authorize further execution"
+            )
 
     def get_work(self, work_id: str) -> WorkOrder:
         return _work(self._work_row(work_id, lock=False))
@@ -446,12 +851,28 @@ class UnitOfWork:
         return [_work(row) for row in rows]
 
     def _scope(self, scope: dict[str, JsonValue]) -> None:
+        metadata_versions = scope.get("context_artifact_versions", [])
+        if (
+            not isinstance(metadata_versions, list)
+            or len(metadata_versions) > 100
+            or any(not isinstance(value, str) for value in metadata_versions)
+        ):
+            raise DomainError(
+                "scope_violation", "Context artifact evidence must be a bounded version list"
+            )
         if "allowed_group_ids" in scope and scope["allowed_group_ids"] != [self.group_id]:
             raise DomainError("scope_violation", "Work is restricted to its origin group")
         if scope.get("external_account_changes", False):
             raise DomainError("permission_denied", "External account changes are not supported")
         if scope.get("delivery_target", "origin_group") != "origin_group":
             raise DomainError("scope_violation", "Delivery is restricted to the origin group")
+
+    @staticmethod
+    def _artifact_evidence_versions(scope: dict[str, Any], versions: list[str] | None) -> list[str]:
+        metadata = scope.get("context_artifact_versions", [])
+        if not isinstance(metadata, list) or any(not isinstance(value, str) for value in metadata):
+            raise DomainError("scope_violation", "Invalid context artifact references")
+        return list(versions or []) + [str(value) for value in metadata]
 
     def create_work(
         self,
@@ -468,18 +889,37 @@ class UnitOfWork:
         self._writer()
         _nonempty(goal, "goal")
         self.conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("memory:" + self.group_id,)
+        )
+        self.conn.execute(
             "SELECT id FROM ga_events WHERE group_id = %s AND id = %s FOR UPDATE",
             (self.group_id, request_event_id),
         )
         event = self.get_event(request_event_id)
+        if event.content_state != "active" or any(
+            attachment.get("privacy_redacted")
+            and attachment.get("reason") in {"forgotten", "recalled"}
+            for attachment in event.attachments
+        ):
+            raise DomainError("source_unavailable", "Removed source cannot create work")
         if event.kind == EventKind.UNSUPPORTED_VIDEO:
             raise DomainError("unsupported_video", "Video events cannot create execution work")
         if event.actor_id != self.actor.member_id and self.actor.role != Role.OWNER:
             raise DomainError("permission_denied", "Cannot claim another member's request")
         if state not in (WorkState.QUEUED, WorkState.WAITING_INPUT):
             raise DomainError("invalid_transition", "New work must be queued or waiting for input")
-        scope = scope or {}
+        scope = self._task_source_scope(scope or {}, input_versions or [])
         self._scope(scope)
+        self.assert_task_sources(scope.get("source_task_revisions", {}))
+        if "source_fingerprints" in scope:
+            self._validate_work_sources(
+                scope["source_fingerprints"],
+                scope.get("retained_fact_source_ids", []),
+                self._artifact_evidence_versions(scope, input_versions),
+            )
+            fingerprints = scope["source_fingerprints"]
+            assert isinstance(fingerprints, dict)
+            scope = {**scope, "source_event_ids": list(fingerprints)}
         checks = required_checks if required_checks is not None else ["result"]
         if not checks or any(not isinstance(check, str) or not check.strip() for check in checks):
             raise DomainError("invalid_input", "At least one named validation check is required")
@@ -549,11 +989,89 @@ class UnitOfWork:
         expected_revision: int,
         acceptance_criteria: list[str] | None = None,
         input_versions: list[str] | None = None,
+        source_fingerprints: dict[str, str] | None = None,
+        retained_fact_source_ids: list[str] | None = None,
+        output_requirements: list[dict[str, JsonValue]] | None = None,
+        required_checks: list[str] | None = None,
+        delivery_artifacts: bool | None = None,
+        speech_requested: bool | None = None,
+        source_task_revisions: dict[str, int] | None = None,
+        context_artifact_versions: list[str] | None = None,
     ) -> WorkOrder:
+        if (
+            source_fingerprints is not None
+            or retained_fact_source_ids is not None
+            or source_task_revisions is not None
+        ):
+            self.conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("memory:" + self.group_id,)
+            )
         row = self._work_row(work_id)
         self._controller(row)
         self._revision(row, expected_revision)
         _nonempty(goal, "goal")
+        new_scope = dict(row["scope"])
+        if context_artifact_versions is not None:
+            new_scope["context_artifact_versions"] = context_artifact_versions
+            self._scope(new_scope)
+        if source_task_revisions is not None:
+            self.assert_task_sources(source_task_revisions)
+            new_scope["source_task_revisions"] = source_task_revisions
+            new_scope = self._task_source_scope(
+                new_scope, input_versions if input_versions is not None else row["input_versions"]
+            )
+        if output_requirements is not None:
+            if (
+                not isinstance(output_requirements, list)
+                or len(output_requirements) > 20
+                or any(not isinstance(item, dict) for item in output_requirements)
+            ):
+                raise DomainError(
+                    "invalid_input",
+                    "Output requirements must be a bounded list of validated objects",
+                )
+            new_scope["outputs"] = output_requirements
+        for key, value in (
+            ("delivery_artifacts", delivery_artifacts),
+            ("speech_requested", speech_requested),
+        ):
+            if value is not None:
+                if type(value) is not bool:
+                    raise DomainError("invalid_input", "Execution output flags must be booleans")
+                new_scope[key] = value
+        checks = row["required_checks"] if required_checks is None else required_checks
+        if not checks or any(not isinstance(check, str) or not check.strip() for check in checks):
+            raise DomainError("invalid_input", "At least one named validation check is required")
+        if source_fingerprints is not None or retained_fact_source_ids is not None:
+            fingerprints = (
+                source_fingerprints
+                if source_fingerprints is not None
+                else new_scope.get("source_fingerprints", {})
+            )
+            retained = (
+                retained_fact_source_ids
+                if retained_fact_source_ids is not None
+                else [
+                    identifier
+                    for identifier in new_scope.get("retained_fact_source_ids", [])
+                    if identifier in fingerprints
+                ]
+            )
+            self._validate_work_sources(
+                fingerprints,
+                retained,
+                self._artifact_evidence_versions(
+                    new_scope,
+                    input_versions if input_versions is not None else row["input_versions"],
+                ),
+            )
+            new_scope.update(
+                {
+                    "source_fingerprints": fingerprints,
+                    "source_event_ids": list(fingerprints),
+                    "retained_fact_source_ids": retained,
+                }
+            )
         if row["state"] in (WorkState.COMPLETED, WorkState.CANCELLED, WorkState.FAILED):
             raise DomainError("invalid_transition", "Closed work cannot have its goal rewritten")
         unresolved = self.conn.execute(
@@ -573,7 +1091,7 @@ class UnitOfWork:
         updated = self.conn.execute(
             "UPDATE ga_work_orders SET goal = %s, acceptance_criteria = %s, input_versions = %s, "
             "goal_revision = goal_revision + 1, revision = revision + 1, policy_revision = %s, "
-            "state = %s, pause_reason = %s, updated_at = clock_timestamp() "
+            "state = %s, pause_reason = %s, scope = %s, required_checks = %s, updated_at = clock_timestamp() "
             "WHERE group_id = %s AND id = %s RETURNING *",
             (
                 goal,
@@ -586,6 +1104,8 @@ class UnitOfWork:
                 self.actor.policy_revision,
                 target.value,
                 "delivery_uncertain" if unresolved else row["pause_reason"],
+                Jsonb(new_scope),
+                Jsonb(list(dict.fromkeys(checks))),
                 self.group_id,
                 work_id,
             ),
@@ -644,6 +1164,7 @@ class UnitOfWork:
         _ttl(ttl_seconds)
         row = self._work_row(work_id)
         self._controller(row)
+        self._check_work_source(row)
         if row["policy_revision"] != self.actor.policy_revision:
             raise DomainError("policy_changed", "Work must be reauthorized before execution")
         if row["state"] not in (WorkState.QUEUED, WorkState.RUNNING):
@@ -784,6 +1305,7 @@ class UnitOfWork:
         ):
             raise DomainError("lease_required", "Execution state changes require a valid lease")
         if state == WorkState.QUEUED:
+            self._check_work_source(row)
             needed_reason = {
                 WorkState.FAILED: {"retry"},
                 WorkState.RUNNING: {"recovery", "retry"},
@@ -879,6 +1401,9 @@ class UnitOfWork:
 
     def _reply_source(self, request_event_id: str) -> GroupEvent:
         event = self.get_event(request_event_id)
+        if event.content_state != "active":
+            raise DomainError("source_unavailable", "Removed source cannot authorize a reply")
+        self._validate_transcription_origin(event)
         if event.actor_id != self.actor.member_id:
             raise DomainError("permission_denied", "Reply must match the request event's actor")
         if event.trusted_actor_origin not in _VERIFIED_REPLY_ORIGINS or event.kind in (
@@ -902,6 +1427,10 @@ class UnitOfWork:
             raise DomainError(
                 "permission_denied", "Current policy has not authorized a read-only reply"
             )
+        self.conn.execute(
+            "SELECT id FROM ga_events WHERE group_id=%s AND id=%s FOR SHARE",
+            (self.group_id, request_event_id),
+        )
         event = self._reply_source(request_event_id)
         _nonempty(text, "reply text")
         return self._insert_delivery(
@@ -999,13 +1528,24 @@ class UnitOfWork:
 
     def is_bot_message(self, platform_message_id: str) -> bool:
         """Receipt evidence only; text badges and outgoing direction are not proof."""
-        return (
+        known = (
             self.conn.execute(
                 "SELECT 1 FROM ga_deliveries WHERE group_id = %s AND platform_message_id = %s "
                 "AND state = 'accepted' LIMIT 1",
                 (self.group_id, platform_message_id),
             ).fetchone()
             is not None
+        )
+        if known:
+            return True
+        parts = self.conn.execute("SELECT to_regclass('ga_delivery_parts') AS parts").fetchone()
+        return bool(
+            parts
+            and parts["parts"]
+            and self.conn.execute(
+                "SELECT 1 FROM ga_delivery_parts WHERE group_id=%s AND platform_message_id=%s AND state='accepted' LIMIT 1",
+                (self.group_id, platform_message_id),
+            ).fetchone()
         )
 
     def _delivery_row(self, intent_id: str, *, lock: bool = True) -> Row:
@@ -1151,6 +1691,8 @@ class UnitOfWork:
         evidence_ref: str | None,
         reason: str | None,
     ) -> DeliveryIntent:
+        if row["reason"] in {"source_forgotten", "source_recalled", "source_expired"}:
+            reason = row["reason"]
         if state == DeliveryState.ACCEPTED and not (message_id or job_id):
             raise DomainError("invalid_input", "Accepted delivery requires a platform receipt ID")
         if message_id is not None:
@@ -1244,6 +1786,9 @@ class UnitOfWork:
         source_event_id: str | None = None,
     ) -> TeamTask:
         self._writer()
+        from groupagent.memory.common import memory_lock
+
+        memory_lock(self)
         _nonempty(title, "title")
         owner_id = owner_id or self.actor.member_id
         _nonempty(owner_id, "owner_id")
@@ -1253,13 +1798,23 @@ class UnitOfWork:
             raise DomainError("invalid_input", "Task due time must include a timezone")
         if source_event_id:
             event = self.get_event(source_event_id)
-            if event.actor_id != self.actor.member_id and self.actor.role != Role.OWNER:
+            if event.content_state != "active":
+                raise DomainError("source_unavailable", "Removed source cannot create a human task")
+            if event.actor_id != self.actor.member_id:
                 raise DomainError(
-                    "permission_denied", "Cannot claim another member's task evidence"
+                    "permission_denied", "Task creation source must match the current actor"
                 )
+            from groupagent.memory.common import source_rows
+
+            source_rows(self, [source_event_id], require_complete=True)
+        fields = self._task_fields(
+            {},
+            ("title", "owner_id", "status", "progress", "evidence_refs", "due_at"),
+            source_event_id,
+        )
         row = self.conn.execute(
             "INSERT INTO ga_team_tasks (id, group_id, title, owner_id, assignment_kind, due_at, "
-            "source_event_id) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "source_event_id,created_by,field_sources,source_event_ids,provenance_kind) VALUES (%s, %s, %s, %s, %s, %s, %s,%s,%s,%s,%s) "
             "ON CONFLICT (group_id, source_event_id) DO NOTHING RETURNING *",
             (
                 _id(),
@@ -1269,6 +1824,10 @@ class UnitOfWork:
                 "self_claim" if owner_id == self.actor.member_id else "owner_assigned",
                 due_at,
                 source_event_id,
+                self.actor.member_id,
+                Jsonb(fields),
+                Jsonb([source_event_id] if source_event_id else []),
+                "source_bound" if source_event_id else "independent",
             ),
         ).fetchone()
         if row is None:
@@ -1287,6 +1846,108 @@ class UnitOfWork:
         )
         return TeamTask.model_validate(row)
 
+    @staticmethod
+    def _task_fields(
+        existing: dict[str, list[str]],
+        names,
+        event_id: str | None,
+        append_fields: set[str] | frozenset[str] = frozenset(),
+    ) -> dict[str, list[str]]:
+        result = {field: list(sources) for field, sources in existing.items()}
+        if event_id is not None:
+            for field in names:
+                result[field] = (
+                    sorted(set(result.get(field, [])) | {event_id})
+                    if field in append_fields
+                    else [event_id]
+                )
+        return result
+
+    def _task_update_source(self, event_id: str | None) -> None:
+        if event_id is None:
+            return
+        event = self.get_event(event_id)
+        if event.actor_id != self.actor.member_id:
+            raise DomainError(
+                "permission_denied", "Task update source must belong to the current actor"
+            )
+        if event.content_state != "active":
+            raise DomainError("source_unavailable", "Removed event cannot authorize task changes")
+        from groupagent.memory.common import source_rows
+
+        source_rows(self, [event_id], require_complete=True)
+
+    def assert_task_sources(self, revisions: object, *, require_current: bool = True) -> None:
+        if not isinstance(revisions, dict) or len(revisions) > 100:
+            raise DomainError("scope_violation", "Task source scope must be a bounded revision map")
+        for identifier, revision in revisions.items():
+            if (
+                not isinstance(identifier, str)
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+            ):
+                raise DomainError(
+                    "scope_violation", "Task source revisions must be integer identities"
+                )
+            task = self.get_team_task(identifier)
+            if task.content_state != "active":
+                raise DomainError("source_unavailable", "Forgotten task cannot authorize execution")
+            if require_current and task.revision != revision:
+                raise DomainError("memory_changed", "Task changed since the request snapshot")
+
+    def _task_source_scope(
+        self, scope: dict[str, JsonValue], input_versions: list[str]
+    ) -> dict[str, JsonValue]:
+        revisions = scope.get("source_task_revisions", {})
+        self.assert_task_sources(revisions)
+        if not revisions:
+            return scope
+        # A server-supplied event map is the exact context actually consumed.
+        # In particular historical Work/document text must not acquire newer
+        # private task fields merely because its logical Task ID is unchanged.
+        if "source_fingerprints" in scope:
+            return scope
+        fingerprints = scope.get("source_fingerprints", {})
+        if not isinstance(fingerprints, dict):
+            raise DomainError("scope_violation", "Task source scope requires a fingerprint map")
+        merged = dict(fingerprints)
+        raw_retained = scope.get("retained_fact_source_ids", [])
+        if not isinstance(raw_retained, list) or any(
+            not isinstance(value, str) for value in raw_retained
+        ):
+            raise DomainError("scope_violation", "Retained task sources must be string identities")
+        retained = {value for value in raw_retained if isinstance(value, str)}
+        assert isinstance(revisions, dict)
+        for identifier in revisions:
+            fixed = (
+                self.conn.execute(
+                    "SELECT 1 FROM ga_artifact_catalog a JOIN ga_work_orders w ON w.group_id=a.group_id AND w.id=a.work_id WHERE a.group_id=%s AND a.version_id=ANY(%s) AND a.available AND a.validation->'passed'='true'::jsonb AND (a.expires_at IS NULL OR a.expires_at>clock_timestamp()) AND (a.shared OR a.created_by=%s OR %s) AND w.scope->'source_task_revisions' ? %s AND NOT COALESCE((w.scope->>'privacy_redacted')::boolean,false) LIMIT 1",
+                    (
+                        self.group_id,
+                        input_versions,
+                        self.actor.member_id,
+                        self.actor.role == Role.OWNER,
+                        identifier,
+                    ),
+                ).fetchone()
+                if input_versions
+                else None
+            )
+            if fixed:
+                continue
+            task = self.get_team_task(identifier)
+            for source in task.source_event_ids:
+                merged.setdefault(source, self.event_fingerprint(source))
+                if self.get_event(source).content_state == "expired":
+                    retained.add(source)
+        retained_json: list[JsonValue] = [value for value in sorted(retained)]
+        return {
+            **scope,
+            "source_fingerprints": merged,
+            "source_event_ids": list(merged),
+            "retained_fact_source_ids": retained_json,
+        }
+
     def get_team_task(self, task_id: str) -> TeamTask:
         row = self.conn.execute(
             "SELECT * FROM ga_team_tasks WHERE group_id = %s AND id = %s", (self.group_id, task_id)
@@ -1294,6 +1955,78 @@ class UnitOfWork:
         if row is None:
             raise DomainError("not_found", "Task was not found in this group")
         return TeamTask.model_validate(row)
+
+    def claim_team_task(
+        self, task_id: str, *, expected_revision: int, source_event_id: str | None = None
+    ) -> TeamTask:
+        """Claim an unassigned human task without inventing an owner during migration."""
+        self._writer()
+        from groupagent.memory.common import memory_lock
+
+        memory_lock(self)
+        self._task_update_source(source_event_id)
+        row = self.conn.execute(
+            "SELECT * FROM ga_team_tasks WHERE group_id=%s AND id=%s FOR UPDATE",
+            (self.group_id, task_id),
+        ).fetchone()
+        if row is None:
+            raise DomainError("not_found", "Task was not found in this group")
+        self._revision(row, expected_revision)
+        if row["content_state"] != "active":
+            raise DomainError("source_unavailable", "Forgotten task cannot be reclaimed")
+        if row["owner_id"] not in (None, self.actor.member_id):
+            raise DomainError("permission_denied", "Another member already owns this task")
+        if row["status"] in (TeamTaskState.COMPLETED, TeamTaskState.CANCELLED):
+            raise DomainError("invalid_transition", "Closed tasks cannot be claimed")
+        if row["owner_id"] == self.actor.member_id:
+            return TeamTask.model_validate(row)
+        fields = self._task_fields(row["field_sources"], ("owner_id", "status"), source_event_id)
+        updated = self.conn.execute(
+            "UPDATE ga_team_tasks SET owner_id=%s,assignment_kind='self_claim',status='in_progress',field_sources=%s,source_event_ids=%s,revision=revision+1,updated_at=clock_timestamp() WHERE group_id=%s AND id=%s RETURNING *",
+            (
+                self.actor.member_id,
+                Jsonb(fields),
+                Jsonb(sorted({source for sources in fields.values() for source in sources})),
+                self.group_id,
+                task_id,
+            ),
+        ).fetchone()
+        self.conn.execute(
+            "UPDATE ga_memory_epochs SET epoch=epoch+1 WHERE group_id=%s", (self.group_id,)
+        )
+        self._audit("team_task_claimed", task_id, owner_id=self.actor.member_id)
+        return TeamTask.model_validate(updated)
+
+    def list_team_tasks(
+        self, *, owner_id: str | None = None, status: TeamTaskState | None = None, limit: int = 100
+    ) -> list[TeamTask]:
+        return self.find_team_tasks("", owner_id=owner_id, status=status, limit=limit)
+
+    def find_team_tasks(
+        self,
+        query: str,
+        *,
+        owner_id: str | None = None,
+        status: TeamTaskState | None = None,
+        limit: int = 100,
+    ) -> list[TeamTask]:
+        pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        rows = self.conn.execute(
+            "SELECT * FROM ga_team_tasks WHERE group_id=%s AND content_state='active' AND (%s::text IS NULL OR owner_id=%s) "
+            "AND (%s::text IS NULL OR status=%s) AND (title ILIKE %s OR progress ILIKE %s) "
+            "ORDER BY updated_at DESC,id LIMIT %s",
+            (
+                self.group_id,
+                owner_id,
+                owner_id,
+                status.value if status else None,
+                status.value if status else None,
+                pattern,
+                pattern,
+                min(max(limit, 1), 1000),
+            ),
+        ).fetchall()
+        return [TeamTask.model_validate(row) for row in rows]
 
     def update_team_task(
         self,
@@ -1305,7 +2038,14 @@ class UnitOfWork:
         progress: str | None = None,
         evidence_refs: list[str] | None = None,
         owner_id: str | None = None,
+        due_at: datetime | None | _Unchanged = _UNCHANGED,
+        source_event_id: str | None = None,
+        append_source_fields: set[str] | frozenset[str] = frozenset(),
     ) -> TeamTask:
+        from groupagent.memory.common import memory_lock
+
+        memory_lock(self)
+        self._task_update_source(source_event_id)
         row = self.conn.execute(
             "SELECT * FROM ga_team_tasks WHERE group_id = %s AND id = %s FOR UPDATE",
             (self.group_id, task_id),
@@ -1314,16 +2054,46 @@ class UnitOfWork:
             raise DomainError("not_found", "Task was not found in this group")
         self._controller(row, "owner_id")
         self._revision(row, expected_revision)
-        if owner_id is not None and owner_id != row["owner_id"]:
+        if row["content_state"] != "active":
+            raise DomainError("source_unavailable", "Forgotten task cannot be updated")
+        if owner_id is not None:
             _nonempty(owner_id, "owner_id")
             if self.actor.role != Role.OWNER:
                 raise DomainError("permission_denied", "Only the group owner may reassign tasks")
         if title is not None:
             _nonempty(title, "title")
+        effective_due = row["due_at"] if isinstance(due_at, _Unchanged) else due_at
+        if effective_due is not None and (
+            not isinstance(effective_due, datetime) or effective_due.utcoffset() is None
+        ):
+            raise DomainError("invalid_input", "Task due time must include a timezone")
+        changed_fields = [
+            name
+            for name, value in (
+                ("title", title),
+                ("status", status),
+                ("progress", progress),
+                ("evidence_refs", evidence_refs),
+                ("owner_id", owner_id),
+            )
+            if value is not None
+        ]
+        if not isinstance(due_at, _Unchanged):
+            changed_fields.append("due_at")
+        if not isinstance(
+            append_source_fields, (set, frozenset)
+        ) or not append_source_fields.issubset(changed_fields):
+            raise DomainError(
+                "invalid_input",
+                "Append provenance must name fields explicitly updated by this call",
+            )
+        fields = self._task_fields(
+            row["field_sources"], changed_fields, source_event_id, append_source_fields
+        )
         updated = self.conn.execute(
             "UPDATE ga_team_tasks SET title = %s, status = %s, progress = %s, evidence_refs = %s, "
-            "owner_id = %s, assignment_kind = %s, revision = revision + 1, "
-            "updated_at = clock_timestamp() WHERE group_id = %s AND id = %s RETURNING *",
+            "owner_id = %s, assignment_kind = %s, due_at = %s, revision = revision + 1, "
+            "field_sources=%s,source_event_ids=%s,updated_at = clock_timestamp() WHERE group_id = %s AND id = %s RETURNING *",
             (
                 title if title is not None else row["title"],
                 status.value if status is not None else row["status"],
@@ -1333,11 +2103,17 @@ class UnitOfWork:
                 "owner_assigned"
                 if owner_id and owner_id != row["owner_id"]
                 else row["assignment_kind"],
+                effective_due,
+                Jsonb(fields),
+                Jsonb(sorted({source for sources in fields.values() for source in sources})),
                 self.group_id,
                 task_id,
             ),
         ).fetchone()
         assert updated is not None
+        self.conn.execute(
+            "UPDATE ga_memory_epochs SET epoch=epoch+1 WHERE group_id=%s", (self.group_id,)
+        )
         self._audit(
             "team_task_updated", task_id, owner_id=updated["owner_id"], revision=updated["revision"]
         )

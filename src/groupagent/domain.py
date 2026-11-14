@@ -91,6 +91,7 @@ class GroupEvent(DomainModel):
     platform_message_id: str | None = None
     trusted_actor_origin: str = "verified_channel_metadata"
     policy_revision: int = Field(default=1, ge=1)
+    content_state: Literal["active", "forgotten", "expired", "recalled"] = "active"
 
 
 class EventCursor(DomainModel):
@@ -245,13 +246,18 @@ class TeamTask(DomainModel):
     id: Identifier
     group_id: Identifier
     title: Identifier
-    owner_id: Identifier
+    owner_id: Identifier | None
     assignment_kind: str
     due_at: AwareDatetime | None = None
     status: TeamTaskState = TeamTaskState.OPEN
     progress: str = ""
     evidence_refs: list[str] = Field(default_factory=list)
     source_event_id: str | None = None
+    source_event_ids: list[str] = Field(default_factory=list)
+    field_sources: dict[str, list[str]] = Field(default_factory=dict)
+    created_by: str | None = None
+    content_state: Literal["active", "forgotten"] = "active"
+    provenance_kind: Literal["source_bound", "independent", "legacy_unattributed"] = "independent"
     revision: int = Field(default=1, ge=1)
     created_at: AwareDatetime
     updated_at: AwareDatetime
