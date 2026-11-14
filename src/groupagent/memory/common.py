@@ -106,6 +106,10 @@ def source_rows(
             "SELECT t.* FROM ga_memory_topics t JOIN ga_topic_events e "
             "ON t.group_id=e.group_id AND t.id=e.topic_id WHERE e.group_id=%s AND e.event_id=%s",
             (tx.group_id, row["id"]),
+            # A generic plan badly underestimates large shared groups and may
+            # rescan event membership once per topic. Keep this lookup custom;
+            # the relationship, authorization checks and other queries are unchanged.
+            prepare=False,
         ).fetchall()
         for topic in topics:
             if topic["visibility"] == "participants":
