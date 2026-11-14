@@ -218,10 +218,18 @@ def document_operation(
             # bytes. Never infer a title from filename, host params or prose.
             from pptx import Presentation
 
-            title = Presentation(io.BytesIO(content)).core_properties.title
+            presentation = Presentation(io.BytesIO(content))
+            title = presentation.core_properties.title
             if not isinstance(title, str) or len(title) > 1000:
                 raise ArtifactError("document_limit", "PPTX metadata title exceeds its read limit")
             metadata["title"] = redact_credentials(title)
+            metadata["native_table_count"] = str(
+                sum(shape.has_table for slide in presentation.slides for shape in slide.shapes)
+            )
+        elif format_name == "docx":
+            from docx import Document
+
+            metadata["native_table_count"] = str(len(Document(io.BytesIO(content)).tables))
         return {
             "units": [asdict(unit) for unit in units[start : start + count]],
             "total_units": len(units),

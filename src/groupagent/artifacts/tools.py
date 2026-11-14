@@ -463,7 +463,7 @@ def register_document_tools(
         ),
         (
             "document_read",
-            "Read a bounded range of visible text units plus metadata. PPTX data.metadata.title is read from the actual file core properties in the controlled worker and is separate from visible slide text. Units marked editable=true have exact text-edit locators: DOCX paragraph:N or table:N:row:N:col:N; PPTX slide:N:shape:NAME (all native indexes zero-based). Read units are not page counts. Other units are read-only. Scanned PDF pages use OCR with page numbers. Image descriptions are metadata; extract pixels for visual analysis.",
+            "Read a bounded range of visible text units plus metadata. PPTX data.metadata.title comes from actual file core properties and metadata.native_table_count is the string count of actual native Office tables, parsed in the controlled worker. Unit editable only means this tool supports a text-edit locator; it does not determine Office native editability. An aggregate table unit may have editable=false while native_table_count is positive. Units marked editable=true have exact text-edit locators: DOCX paragraph:N or table:N:row:N:col:N; PPTX slide:N:shape:NAME (all native indexes zero-based). Read units are not page counts. Other units are read-only by this API. Scanned PDF pages use OCR with page numbers. Image descriptions are metadata; extract pixels for visual analysis.",
             DocumentReadInput,
             DocumentDataOutput,
             read,
@@ -471,7 +471,7 @@ def register_document_tools(
         ),
         (
             "document_search",
-            "Search scoped document contents. Editable DOCX/PPTX results return the exact native text-edit locator with editable=true, matching document_read. Other results are read-only. Results report truncation.",
+            "Search scoped document contents. Editable DOCX/PPTX results return the exact native text-edit locator with editable=true, matching document_read. This flag describes this API's text-edit support, not native Office object editability. Use document_read metadata.native_table_count for actual native tables. Other results are read-only by this API. Results report truncation.",
             DocumentSearchInput,
             DocumentDataOutput,
             search,

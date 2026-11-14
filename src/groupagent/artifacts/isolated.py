@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from typing import Any
@@ -187,6 +188,18 @@ class IsolatedDocumentService:
         if not isinstance(metadata, dict) or any(
             not isinstance(key, str) or not isinstance(value, str) or len(value) > 1000
             for key, value in metadata.items()
+        ):
+            raise DomainError("invalid_document", "Document worker returned invalid metadata")
+        allowed_metadata = (
+            {"title", "native_table_count"}
+            if version.format == "pptx"
+            else {"native_table_count"}
+            if version.format == "docx"
+            else set()
+        )
+        if not set(metadata).issubset(allowed_metadata) or (
+            "native_table_count" in metadata
+            and not re.fullmatch(r"0|[1-9][0-9]*", metadata["native_table_count"])
         ):
             raise DomainError("invalid_document", "Document worker returned invalid metadata")
         return DocumentRead(

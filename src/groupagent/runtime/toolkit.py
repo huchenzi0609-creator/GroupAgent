@@ -981,6 +981,23 @@ class WorkToolkit:
                         "validation_failed",
                         "The actual PPTX title metadata does not match required_outputs.metadata_title; regenerate with the requested document title while preserving specified slide text",
                     )
+                native_count = read.metadata.get("native_table_count")
+                needs_native_table = version.format in {"pptx", "docx"} and bool(
+                    re.search(
+                        r"表格(?:必须|需要|要|需|应当|应)?(?:是|为)?可编辑|(?:使用|包含|需要|要求|用).{0,5}(?:原生|可编辑的?)表格",
+                        original_event.text,
+                    )
+                )
+                if needs_native_table and (
+                    not isinstance(native_count, str)
+                    or not native_count.isascii()
+                    or not native_count.isdecimal()
+                    or int(native_count) < 1
+                ):
+                    raise DomainError(
+                        "validation_failed",
+                        "The actual Office file needs a native table; text-edit API flags or a screenshot do not prove native table structure",
+                    )
                 if len(text.strip()) < 10:
                     raise DomainError("validation_failed", "Document has no meaningful content")
                 expected_raw = matching.get("expected_text", [])
@@ -1150,6 +1167,7 @@ class WorkToolkit:
                             "报告中的标识码不因此需要满足程序代码语法。只按用户要求和已有证据核验，不添加用户未要求的标准。"
                             "标题声明用的书名号/引号通常是引用定界标记；除非用户明确要求保留符号，不得仅因实际标题省略这些定界符而拒绝。"
                             "PPT的metadata.title是从实际文件读回的主题元数据；当原文逐页指定了不同标题且未要求可见展示主题时，不要求把主题重复塞进页内文字、增加封面或改变指定标题。"
+                            "document_read中unit.editable仅表示当前机器人文本编辑接口是否支持该unit，不表示Office对象本身不可编辑。metadata.native_table_count来自实际Office结构；正数证明含原生可编辑表格，不能因聚合unit的editable:false把它误判成图片。零或缺失不能证明原生表格，不得把纯文本画格或截图当作原生表格。"
                             "音频ASR文本的标点不是声学证据，不得据此推断实际停顿、声线或自然度。"
                             "仍须依据真实音频解码、非静音和内容核验结果判断；不得把缺少相关证据自动当作通过。"
                             + (
