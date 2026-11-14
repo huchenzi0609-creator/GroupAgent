@@ -14,6 +14,7 @@ import re
 import shlex
 import unicodedata
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -48,6 +49,130 @@ def _url(value: str) -> str:
 
 def _valid_hash(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+
+
+def _canonical_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _independent_ocr_texts(case_id: str, evidence: dict[str, Any]) -> tuple[list[str], bool]:
+    """Extra OCR needs actual source/response/settled-budget bindings, never a review."""
+    observations = evidence.get("independent_ocr_observations", [])
+    references = evidence.get("independent_ocr_observation_sources", [])
+    texts = []
+    if not isinstance(observations, list) or not isinstance(references, list):
+        return [], False
+    if len(observations) != len(references):
+        return [], False
+    scope = evidence.get("scope", {})
+    try:
+        for item, reference in zip(observations, references, strict=True):
+            source, response, receipt = (
+                item["source"],
+                item["provider_response"],
+                item["budget_receipt"],
+            )
+            artifacts = [
+                artifact
+                for artifact in evidence.get("artifacts", [])
+                if all(artifact.get(key) == source.get(key) for key in ("file_id", "version_id"))
+            ]
+            if len(artifacts) != 1:
+                return [], False
+            artifact = artifacts[0]
+            image = artifact.get("decoded", {}).get("image", {})
+            page = response["pages"][0]
+            expected_key = (
+                f"acceptance-ocr:{item['case_id']}:{source['file_id']}:"
+                f"{source['version_id']}:{source['sha256']}"
+            )
+            if not (
+                item.get("kind") == "independent_machine_ocr"
+                and item.get("case_id") == case_id
+                and item.get("observer") == "scripts/runtime_png_ocr.py"
+                and item.get("status") == "completed"
+                and item.get("method") == "deepseek_ocr"
+                and item.get("provider") == "deepseek"
+                and item.get("model") == "tools/ocr"
+                and item.get("transport") == "live_http"
+                and item.get("request_contains_gold_or_prompt") is False
+                and item.get("input_filename") == "image.png"
+                and item.get("business_writes_applied") is False
+                and item.get("budget_receipt_read_from_database") is True
+                and all(
+                    scope.get(key) for key in ("group_id", "work_id", "event_id", "requester_id")
+                )
+                and item.get("scope") == scope
+                and all(artifact.get(key) == scope[key] for key in ("group_id", "work_id"))
+                and _date(evidence.get("delivery", {}).get("work_completed_at")) is not None
+                and artifact.get("format") == "png"
+                and _valid_hash(source.get("sha256"))
+                and source["sha256"] == artifact.get("sha256")
+                and source["sha256"] == artifact.get("decoded", {}).get("source_sha256")
+                and type(source.get("size_bytes")) is int
+                and source["size_bytes"] > 0
+                and source["size_bytes"] == artifact.get("size_bytes")
+                and artifact.get("validation", {}).get("passed") is True
+                and source["sha256"] == artifact["validation"].get("sha256")
+                and source.get("validation_id") == artifact["validation"].get("validation_id")
+                and bool(source.get("validation_id"))
+                and image.get("decoded") is True
+                and _valid_hash(image.get("pixel_sha256"))
+                and item.get("input_pixel_sha256")
+                == source.get("pixel_sha256")
+                == image["pixel_sha256"]
+                and _valid_hash(item.get("input_sha256"))
+                and item.get("original_local_ocr_text") == image.get("ocr_text")
+                and all(
+                    _valid_hash(item.get(key, {}).get("sha256")) and item[key].get("path")
+                    for key in (
+                        "source_evidence",
+                        "source_progress",
+                        "source_manifest",
+                        "immutable_version_record",
+                    )
+                )
+                and _valid_hash(reference.get("sha256"))
+                and reference.get("path")
+                and reference.get("payload_sha256") == _canonical_hash(item)
+                and item.get("provider_response_sha256") == _canonical_hash(response)
+                and isinstance(response.get("request_id"), str)
+                and response["request_id"]
+                and len(response["pages"]) == 1
+                and page.get("page_number") == 1
+                and page.get("method") == "deepseek_ocr"
+                and page.get("complete") is True
+                and isinstance(page.get("text"), str)
+                and item.get("text") == page["text"]
+                and response.get("usage") == item.get("usage") == {"pages": 1.0}
+                and item.get("usage_method") == "complete_page_count_from_provider_response"
+                and receipt.get("id") == item.get("reservation_id")
+                and receipt["id"]
+                and receipt.get("group_id") == scope["group_id"]
+                and receipt.get("actor_id") == scope["requester_id"]
+                and receipt.get("source_event_id") == scope["event_id"]
+                and receipt.get("work_id") is None
+                and receipt.get("key") == expected_key
+                and receipt.get("operation") == "media.ocr"
+                and receipt.get("price_id") == "deepseek-20261114-media.ocr"
+                and receipt.get("currency") == "CNY"
+                and receipt.get("state") == "settled"
+                and receipt.get("overrun") is False
+                and receipt.get("evidence_ref")
+                == item.get("budget_evidence_ref")
+                == "deepseek:" + response["request_id"]
+                and Decimal(str(receipt["estimated_units"]["pages"])) == 1
+                and Decimal(str(receipt["actual_units"]["pages"])) == 1
+                and Decimal(str(receipt["reserved_amount"])) == Decimal("0.0015")
+                and Decimal(str(receipt["actual_amount"])) == Decimal("0.0015")
+            ):
+                return [], False
+            texts.append(page["text"])
+    except (AttributeError, TypeError, KeyError, ValueError, IndexError, InvalidOperation):
+        return [], False
+    return texts, True
 
 
 def _markdown_edges(markdown: str) -> set[tuple[str, str]]:
@@ -134,6 +259,7 @@ def _evaluate_case(case: dict[str, Any], evidence: dict[str, Any]) -> dict[str, 
         table for item in decoded for table in item.get("tables", []) if isinstance(table, list)
     ]
     result: dict[str, dict[str, Any]] = {}
+    independent_ocr, independent_ocr_valid = _independent_ocr_texts(case["id"], evidence)
 
     def record(key: str, passed: bool | None, detail: str = "", *, review: bool = False) -> None:
         result[key] = {
@@ -163,6 +289,13 @@ def _evaluate_case(case: dict[str, Any], evidence: dict[str, Any]) -> dict[str, 
                 "Independent review required: " + json.dumps(expected_value, ensure_ascii=False),
                 review=True,
             )
+
+    if "independent_ocr_observations" in evidence:
+        record(
+            "_independent_ocr_observation",
+            independent_ocr_valid,
+            "Additional machine OCR requires matching pixels, scope, provider response and settled ledger receipt",
+        )
 
     # Integrity checks are additional evidence gates, never substitutions for gold.
     if outputs:
@@ -505,16 +638,28 @@ def _evaluate_case(case: dict[str, Any], evidence: dict[str, Any]) -> dict[str, 
                 "Actual raster pixel contrast",
             )
         elif key == "image_ocr_required_text":
+            local_texts = [item.get("ocr_text", "") for item in images]
+            observed_texts = local_texts + independent_ocr
             record(
                 key,
                 all(
-                    any(_normal(part) in _normal(item.get("ocr_text", "")) for item in images)
+                    any(_normal(part) in _normal(observed) for observed in observed_texts)
                     for part in value
                 )
                 if images and all("ocr_text" in item for item in images)
                 else None,
-                "OCR of actual output pixels",
+                "OCR of actual output pixels; original local extraction is retained",
             )
+            if independent_ocr:
+                result[key]["original_local_observation"] = {
+                    "status": "PASS"
+                    if all(
+                        any(_normal(part) in _normal(observed) for observed in local_texts)
+                        for part in value
+                    )
+                    else "FAIL",
+                    "detail": "Original local OCR remains unchanged; additional OCR is independently receipted",
+                }
         elif key == "chart_data_equals":
             charts = [
                 item["arguments"].get("chart")

@@ -845,6 +845,9 @@ class MatrixRun:
         return evidence
 
     def _review_evidence(self, case, evidence):
+        from runtime_png_ocr import attach_observations
+
+        evidence = attach_observations(self.root, case["id"], evidence)
         path = self.root / "reviews" / (case["id"] + ".json")
         if not path.exists():
             return evidence
