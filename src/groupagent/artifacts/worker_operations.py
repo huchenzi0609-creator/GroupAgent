@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+
+from groupagent.security import redact_credentials
 
 from .advanced import (
     annotate_pdf,
@@ -205,13 +208,26 @@ def document_operation(
                 "ocr_pages": [
                     page.page_number for page in result.pages if page.method == "tesseract"
                 ],
+                "metadata": {},
             }
-        units = extract(read_input(request), format_name, native_targets=True)
+        content = read_input(request)
+        units = extract(content, format_name, native_targets=True)
+        metadata = {}
+        if format_name == "pptx":
+            # Only the controlled document worker parses the actual Office
+            # bytes. Never infer a title from filename, host params or prose.
+            from pptx import Presentation
+
+            title = Presentation(io.BytesIO(content)).core_properties.title
+            if not isinstance(title, str) or len(title) > 1000:
+                raise ArtifactError("document_limit", "PPTX metadata title exceeds its read limit")
+            metadata["title"] = redact_credentials(title)
         return {
             "units": [asdict(unit) for unit in units[start : start + count]],
             "total_units": len(units),
             "complete": start == 0 and count >= len(units),
             "ocr_pages": [],
+            "metadata": metadata,
         }
     elif operation == "document_edit_section":
         content = edit_report_section(

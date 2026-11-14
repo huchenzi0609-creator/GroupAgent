@@ -79,6 +79,43 @@ def _original_request_context(event: GroupEvent) -> dict[str, JsonValue]:
     }
 
 
+def _output_requirements(work: WorkOrder, event: GroupEvent) -> list[dict[str, Any]]:
+    """Keep an explicitly named deck topic distinct from specified slide text.
+
+    Only a fresh, input-free deck with multiple explicitly titled slides can use
+    this narrow projection. Repeated/visible topic requests and later edits keep
+    their original visible-text requirements. Stored router output is unchanged.
+    """
+    raw = work.scope.get("outputs", [])
+    outputs = (
+        [dict(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+    )
+    if work.goal_revision != 1 or work.input_versions or work.scope.get("attachment_event_ids"):
+        return outputs
+    text = redact_credentials(event.text)
+    topic = re.search(r"主题(?:为|是)?\s*《([^《》\n]{1,180})》", text)
+    titles = re.findall(
+        r'第\s*[0-9一二三四五六七八九十]+\s*页\s*标题(?:为|是)?\s*[“"「『]([^”"」』\n]+)[”"」』]',
+        text,
+    )
+    if (
+        topic is None
+        or len(titles) < 2
+        or not topic[1].strip()
+        or text.count(topic[1]) != 1
+        or topic[1] in titles
+        or re.search(r"显示|展示|呈现|可见|封面", text)
+    ):
+        return outputs
+    for output in outputs:
+        if output.get("format") == "pptx":
+            expected = output.get("expected_text", [])
+            if isinstance(expected, list):
+                output["expected_text"] = [value for value in expected if value != topic[1]]
+            output["metadata_title"] = topic[1]
+    return outputs
+
+
 _REQUEST_CONTEXT_INSTRUCTION = (
     "Use original_request to preserve meaning omitted by an abbreviated goal. Current goal and criteria "
     "still control authorized changes; the original request does not expand tool permissions. Interpret "
@@ -755,7 +792,7 @@ class WorkToolkit:
                     "current_time": datetime.now(ZoneInfo(self.config.group.time_zone)).isoformat(),
                     "group_time_zone": self.config.group.time_zone,
                     "acceptance_criteria": work.acceptance_criteria,
-                    "required_outputs": work.scope.get("outputs", []),
+                    "required_outputs": _output_requirements(work, original_event),
                     "required_tools": sorted(required_tools),
                     "input_files": input_refs,
                     "media_routes": [
@@ -767,6 +804,7 @@ class WorkToolkit:
                         if execution_intent == "reminder"
                         else "Use actual scoped tools to complete this goal; do not just offer a plan.",
                         _REQUEST_CONTEXT_INSTRUCTION,
+                        "PPT若逐页明确指定了不同标题，required_outputs.metadata_title表示文件主题元数据，不是额外页内文字。用document_read.metadata.title核对真实主题，expected_text仅核对要求的可见文字；不要为让主题出现在可见文本里添加页脚、封面或改写指定页标题。",
                         "表格默认使用layout=records：名称=数值的一组观测按名称/数值两列、一条记录一行。工具会把默认records模式的一行横向纯数值向量规范化为行记录；只有用户明确要求横向或转置表格时才设置layout=columns，不要自行选择columns绕过默认记录布局。",
                         "Before returning an answer, successfully call every tool listed in required_tools; if a required tool is unavailable or denied, report the concrete blocker without re-enabling or bypassing it.",
                         "Installed Python libraries include Pillow, python-docx, python-pptx, pypdf and reportlab plus the standard library. numpy/matplotlib/cairo/svgwrite are not installed; use chart_render for supported charts and Pillow for custom drawings. Do not attempt network package installation.",
@@ -873,8 +911,9 @@ class WorkToolkit:
             for row in self.registry.outputs(actor, work.id, lease.goal_revision)
             if row["purpose"] == "result"
         ]
-        requirements = work.scope.get("outputs", [])
-        requirements = requirements if isinstance(requirements, list) else []
+        with self.store.transaction(actor) as tx:
+            original_event = tx.get_event(work.request_event_id)
+        requirements = _output_requirements(work, original_event)
         required_formats = {
             row.get("format")
             for row in requirements
@@ -915,6 +954,12 @@ class WorkToolkit:
             if version.format in {"md", "docx", "pdf", "pptx"}:
                 read = await documents.read(context, version.file_id, version.version_id)
                 text = read.text
+                metadata_title = matching.get("metadata_title")
+                if isinstance(metadata_title, str) and read.metadata.get("title") != metadata_title:
+                    raise DomainError(
+                        "validation_failed",
+                        "The actual PPTX title metadata does not match required_outputs.metadata_title; regenerate with the requested document title while preserving specified slide text",
+                    )
                 if len(text.strip()) < 10:
                     raise DomainError("validation_failed", "Document has no meaningful content")
                 expected_raw = matching.get("expected_text", [])
@@ -955,6 +1000,7 @@ class WorkToolkit:
                         "excerpt_truncated": not read.complete or len(text) > 16000,
                         "total_units": read.total_units,
                         "page_count": record.page_count,
+                        "metadata": read.metadata,
                     }
                 )
             else:
@@ -1081,6 +1127,7 @@ class WorkToolkit:
                             "不得把尚未发送、等待审核、尚无发送回执当作内容缺陷，也不得要求执行模型提前发送来通过审核；实际派送及回执由后续控制服务独立检查。"
                             + "结合original_request和真实提取证据理解用户词义；当前goal和criteria仍决定后续授权变更。"
                             "报告中的标识码不因此需要满足程序代码语法。只按用户要求和已有证据核验，不添加用户未要求的标准。"
+                            "PPT的metadata.title是从实际文件读回的主题元数据；当原文逐页指定了不同标题且未要求可见展示主题时，不要求把主题重复塞进页内文字、增加封面或改变指定标题。"
                             "音频ASR文本的标点不是声学证据，不得据此推断实际停顿、声线或自然度。"
                             "仍须依据真实音频解码、非静音和内容核验结果判断；不得把缺少相关证据自动当作通过。"
                             + (

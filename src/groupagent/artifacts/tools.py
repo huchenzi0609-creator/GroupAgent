@@ -463,7 +463,7 @@ def register_document_tools(
         ),
         (
             "document_read",
-            "Read a bounded range of text units. Units marked editable=true have exact text-edit locators: DOCX paragraph:N or table:N:row:N:col:N; PPTX slide:N:shape:NAME (all native indexes zero-based). Read units are not page counts. Other units are read-only. Scanned PDF pages use OCR with page numbers. Image descriptions are metadata; extract pixels for visual analysis.",
+            "Read a bounded range of visible text units plus metadata. PPTX data.metadata.title is read from the actual file core properties in the controlled worker and is separate from visible slide text. Units marked editable=true have exact text-edit locators: DOCX paragraph:N or table:N:row:N:col:N; PPTX slide:N:shape:NAME (all native indexes zero-based). Read units are not page counts. Other units are read-only. Scanned PDF pages use OCR with page numbers. Image descriptions are metadata; extract pixels for visual analysis.",
             DocumentReadInput,
             DocumentDataOutput,
             read,

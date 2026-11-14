@@ -7,6 +7,7 @@ from dataclasses import asdict
 from typing import Any
 
 from groupagent.domain import DomainError
+from groupagent.security import redact_credentials
 from groupagent.tools import ToolContext
 from groupagent.tools.models import ToolFailure
 
@@ -182,6 +183,12 @@ class IsolatedDocumentService:
             parameters={"format": version.format, "start_unit": start_unit, "max_units": max_units},
         )
         await self._scope(context)
+        metadata = result.get("metadata", {})
+        if not isinstance(metadata, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str) or len(value) > 1000
+            for key, value in metadata.items()
+        ):
+            raise DomainError("invalid_document", "Document worker returned invalid metadata")
         return DocumentRead(
             file_id,
             version.version_id,
@@ -193,6 +200,7 @@ class IsolatedDocumentService:
             total_units=result.get("total_units"),
             complete=result.get("complete", True),
             ocr_pages=tuple(result.get("ocr_pages", ())),
+            metadata={key: redact_credentials(value) for key, value in metadata.items()},
         )
 
     async def _edit(

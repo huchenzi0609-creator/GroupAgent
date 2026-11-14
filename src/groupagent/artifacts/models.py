@@ -222,6 +222,7 @@ class DocumentRead:
     total_units: int | None = None
     complete: bool = True
     ocr_pages: tuple[int, ...] = ()
+    metadata: dict[str, str] = field(default_factory=dict)
 
     @property
     def text(self) -> str:
