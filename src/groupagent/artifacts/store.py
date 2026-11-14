@@ -319,6 +319,51 @@ class ArtifactStore:
         with self._file(file_id) as fd:
             return self._version(fd, self._scoped(fd, scope), version_id)
 
+    def has_version_files(self, scope: ArtifactScope, file_id: str, version_id: str) -> bool:
+        """Deny-only presence probe; True grants no scope or integrity claim.
+
+        No manifest or payload content is read. Present entries must still pass
+        the normal scoped metadata, provenance and byte/hash checks.
+        """
+        if not isinstance(scope, ArtifactScope):
+            raise ArtifactError("invalid_scope", "ArtifactScope is required")
+        if self._closed:
+            raise ArtifactError("store_closed", "Artifact store is closed")
+        try:
+            if not stat.S_ISDIR(os.fstat(self._root_fd).st_mode):
+                raise OSError("Root descriptor is not a directory")
+        except OSError as exc:
+            raise ArtifactError("store_unavailable", "Artifact root is unavailable") from exc
+        _reference(file_id)
+        _reference(version_id)
+
+        def present(fd: int, name: str) -> bool:
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise ArtifactError(
+                    "unsafe_path", "Artifact entry cannot be safely inspected"
+                ) from exc
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ArtifactError(
+                    "unsafe_path", "Artifact entry must be a single-link regular file"
+                )
+            return True
+
+        try:
+            with self._file(file_id) as fd:
+                if not present(fd, "file.json"):
+                    return False
+                with self._directory(fd, "versions") as versions:
+                    with self._directory(versions, version_id) as version:
+                        return present(version, "version.json") and present(version, "content")
+        except ArtifactError as error:
+            if error.code == "artifact_not_found":
+                return False
+            raise
+
     def read(self, scope: ArtifactScope, file_id: str, version_id: str | None = None) -> bytes:
         with self._file(file_id) as fd:
             version = self._version(fd, self._scoped(fd, scope), version_id)

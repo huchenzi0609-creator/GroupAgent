@@ -251,7 +251,7 @@ class ArtifactRegistry:
     ) -> builtins.list[dict[str, Any]]:
         with self.store.transaction(actor) as tx:
             rows = tx.conn.execute(
-                "SELECT version_id FROM ga_artifact_catalog WHERE group_id=%s AND available AND (shared OR created_by=%s OR %s) AND name ILIKE %s AND (%s::text IS NULL OR work_id=%s) ORDER BY created_at DESC LIMIT %s",
+                "SELECT version_id,file_id,work_id,created_by FROM ga_artifact_catalog WHERE group_id=%s AND available AND (shared OR created_by=%s OR %s) AND name ILIKE %s AND (%s::text IS NULL OR work_id=%s) ORDER BY created_at DESC LIMIT %s",
                 (
                     actor.group_id,
                     actor.member_id,
@@ -265,6 +265,13 @@ class ArtifactRegistry:
             results = []
             for candidate in rows:
                 try:
+                    scope = ArtifactScope(
+                        actor.group_id, candidate["work_id"], candidate["created_by"]
+                    )
+                    if not self.artifacts.has_version_files(
+                        scope, candidate["file_id"], candidate["version_id"]
+                    ):
+                        continue
                     row = self._row(tx, candidate["version_id"])
                     if public_context:
                         self.public_sources_in_tx(tx, row)

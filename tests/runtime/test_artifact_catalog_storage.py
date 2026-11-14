@@ -128,3 +128,36 @@ def test_closed_store_is_reported_instead_of_hidden_as_an_empty_catalog(runtime_
     with pytest.raises(DomainError) as error:
         env.registry.list(env.actor, public_context=True)
     assert error.value.code == "store_closed"
+
+
+def test_missing_current_root_skips_expensive_source_checks_without_changing_catalog(
+    runtime_env, monkeypatch
+):
+    env = runtime_env
+    version, _, _ = publish(env, env.artifacts, env.registry)
+    with ArtifactStore(env.root / "empty-probe-root") as empty:
+        registry = ArtifactRegistry(env.store, empty)
+
+        def never_validate_missing(*args, **kwargs):
+            raise AssertionError("A missing local version needs no source traversal")
+
+        monkeypatch.setattr(registry, "_row", never_validate_missing)
+        assert registry.list(env.actor, public_context=True) == []
+    with env.store.transaction(env.actor) as tx:
+        assert tx.conn.execute(
+            "SELECT available FROM ga_artifact_catalog WHERE group_id=%s AND version_id=%s",
+            (env.actor.group_id, version.version_id),
+        ).fetchone()["available"]
+
+
+def test_presence_probe_never_hides_configuration_failures(runtime_env, monkeypatch):
+    env = runtime_env
+    publish(env, env.artifacts, env.registry)
+
+    def broken_configuration(*args, **kwargs):
+        raise DomainError("store_unavailable", "Synthetic root configuration failure")
+
+    monkeypatch.setattr(env.artifacts, "has_version_files", broken_configuration)
+    with pytest.raises(DomainError) as caught:
+        env.registry.list(env.actor, public_context=True)
+    assert caught.value.code == "store_unavailable"
