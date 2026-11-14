@@ -146,7 +146,7 @@ jobs:
           echo "GROUPAGENT_HARNESS_IMAGE=$(cat runtime/ci/harness.iid)" >> "$GITHUB_ENV"
       - name: Verify genuine SDK, process isolation and artifact pipelines
         # Provider/model/channel fixtures remain synthetic; Docker/SDK/file bytes are real.
-        run: uv run --no-sync pytest --strict-markers --strict-config tests/sandbox tests/execution/test_harness_real.py tests/artifacts/test_isolated_matrix.py tests/media/test_sandbox_media.py tests/media/test_browser_worker.py tests/runtime/test_inputs.py -q --junitxml=runtime/ci/isolated-worker.xml
+        run: uv run --no-sync pytest --strict-markers --strict-config tests/sandbox tests/execution/test_harness_real.py tests/artifacts/test_isolated_matrix.py tests/artifacts/test_chart_labels.py tests/media/test_sandbox_media.py tests/media/test_browser_worker.py tests/runtime/test_inputs.py -q --junitxml=runtime/ci/isolated-worker.xml
       - name: Require executed isolated-worker checks without skips
         run: |
           uv run --no-sync python - <<'PY'

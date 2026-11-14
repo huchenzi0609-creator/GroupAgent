@@ -99,6 +99,50 @@ def test_resume_validation_preserves_original_bytes(matrix, tmp_path):
     assert {p.name: p.read_bytes() for p in root.iterdir()} == original
 
 
+def test_focused_selection_closes_dependencies_and_keeps_frozen_order_and_data(matrix):
+    data = {
+        "cases": [
+            {"id": "create"},
+            {"id": "other"},
+            {"id": "update", "inputs": [{"source_case": "create"}]},
+            {"id": "fire", "inputs": [{"source_case": "update"}]},
+        ]
+    }
+    before = deepcopy(data)
+    assert [c["id"] for c in matrix.select_cases(data, "fire")] == ["create", "update", "fire"]
+    assert data == before
+    assert matrix.select_cases(data) == data["cases"]
+
+
+@pytest.mark.parametrize("selection", ["unknown", ",,,"])
+def test_unknown_or_empty_case_selection_cannot_start_a_run(matrix, selection):
+    with pytest.raises(RuntimeError):
+        matrix.select_cases({"cases": [{"id": "known"}]}, selection)
+
+
+def test_selection_rejects_cyclic_or_out_of_order_dependencies(matrix):
+    with pytest.raises(RuntimeError, match="precede"):
+        matrix.select_cases(
+            {
+                "cases": [
+                    {"id": "a", "inputs": [{"source_case": "b"}]},
+                    {"id": "b", "inputs": [{"source_case": "a"}]},
+                ]
+            },
+            "a",
+        )
+
+
+def test_resume_cannot_change_declared_case_selection_before_bootstrap(matrix, tmp_path):
+    root, data, args = run_inputs(matrix, tmp_path)
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["selected_case_ids"] = []
+    matrix.save(root / "manifest.json", manifest)
+    args.case_ids = "CASE-01"
+    with pytest.raises(RuntimeError, match="selection"):
+        matrix.validate_resume(root, data, args)
+
+
 def recovered_runner(
     module, tmp_path, *, state=WorkState.COMPLETED, prior_state="error", started=True
 ):

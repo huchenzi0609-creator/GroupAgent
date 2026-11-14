@@ -71,11 +71,31 @@ def _font(size: int):
 def chart_png(chart: ChartData) -> bytes:
     """A deterministic data chart, never represented as an image-generation model."""
     check_chart(chart)
-    image = Image.new("RGB", (1200, 720), "white")
+    label_font = _font(28)
+    canvas_width, chart_left = 1200, 95
+    if chart.kind != "pie":
+        values = [value for series in chart.series for value in series.values]
+        low, high = min(0.0, min(values)), max(0.0, max(values))
+        if low == high:
+            high = low + 1
+        span = high - low
+        tick_text = [f"{low + span * tick / 5:g}" for tick in range(6)]
+        tick_boxes = [label_font.getbbox(text) for text in tick_text]
+        chart_left = max(95, max(box[2] - box[0] for box in tick_boxes) + 20)
+        category_boxes = [label_font.getbbox(text) for text in chart.categories]
+        category_width = max(box[2] - box[0] for box in category_boxes)
+        canvas_width = max(
+            1200, math.ceil(chart_left + 60 + len(chart.categories) * (category_width + 12))
+        )
+        if canvas_width > 3200:
+            raise ArtifactError(
+                "unsupported_layout",
+                "Category labels exceed the readable canvas limit; split the chart rather than clip or shrink text",
+            )
+    image = Image.new("RGB", (canvas_width, 720), "white")
     draw = ImageDraw.Draw(image)
     colors = ("#245D8C", "#E39A35", "#3D9470", "#A36599")
     draw.text((70, 25), chart.title, fill="#132536", font=_font(32))
-    label_font = _font(18)
     if chart.kind == "pie":
         total = sum(chart.series[0].values)
         angle = -90.0
@@ -95,16 +115,11 @@ def chart_png(chart: ChartData) -> bytes:
                 (720, 140 + index * 25),
                 f"{category}: {value:g}",
                 fill=colors[index % len(colors)],
-                font=label_font,
+                font=_font(22),
             )
             angle = end
     else:
-        x0, y0, x1, y1 = 95, 120, 1140, 590
-        values = [value for series in chart.series for value in series.values]
-        low, high = min(0.0, min(values)), max(0.0, max(values))
-        if low == high:
-            high = low + 1
-        span = high - low
+        x0, y0, x1, y1 = chart_left, 120, canvas_width - 60, 590
 
         def y(value: float) -> float:
             return y1 - (value - low) / span * (y1 - y0)
@@ -113,11 +128,19 @@ def chart_png(chart: ChartData) -> bytes:
             value = low + span * tick / 5
             position = y(value)
             draw.line((x0, position, x1, position), fill="#DAE0E5", width=1)
-            draw.text((5, position - 10), f"{value:g}", fill="#394A59", font=label_font)
+            draw.text(
+                (x0 - 12, position), tick_text[tick], fill="#111111", font=label_font, anchor="rm"
+            )
         group_width = (x1 - x0) / len(chart.categories)
         for index, category in enumerate(chart.categories):
             middle = x0 + group_width * (index + 0.5)
-            draw.text((middle - 22, y1 + 20), category, fill="#132536", font=label_font)
+            bounds = draw.textbbox((middle, y1 + 20), category, font=label_font, anchor="mt")
+            if bounds[2] - bounds[0] > group_width - 12:
+                raise ArtifactError(
+                    "unsupported_layout",
+                    "Category labels need more horizontal space; split the chart rather than clip or shrink text",
+                )
+            draw.text((middle, y1 + 20), category, fill="#111111", font=label_font, anchor="mt")
         line_labels = []
         for series_index, series in enumerate(chart.series):
             color = colors[series_index]
@@ -133,10 +156,11 @@ def chart_png(chart: ChartData) -> bytes:
                         fill=color,
                     )
                     draw.text(
-                        (left, position - 23 if value >= 0 else position + 3),
+                        (left + (width - 3) / 2, position - 10 if value >= 0 else position + 10),
                         f"{value:g}",
-                        fill=color,
+                        fill="#111111",
                         font=label_font,
+                        anchor="mb" if value >= 0 else "mt",
                     )
                 else:
                     points.append((middle, position))
@@ -146,11 +170,11 @@ def chart_png(chart: ChartData) -> bytes:
                 draw.ellipse((middle - 5, position - 5, middle + 5, position + 5), fill=color)
             if points:
                 line_labels.append((color, points, series.values))
-            draw.text((110 + series_index * 260, 670), series.name, fill=color, font=label_font)
+            draw.text((110 + series_index * 260, 670), series.name, fill=color, font=_font(22))
         # Paint values after every line, outside the point marker. At a valley
         # use the lower side so an ascending segment cannot cross the glyphs.
-        value_font = _font(20)
-        for color, points, series_values in line_labels:
+        value_font = _font(28)
+        for _color, points, series_values in line_labels:
             for index, ((middle, position), value) in enumerate(
                 zip(points, series_values, strict=True)
             ):
@@ -165,7 +189,7 @@ def chart_png(chart: ChartData) -> bytes:
                 draw.rectangle(
                     (bounds[0] - 3, bounds[1] - 3, bounds[2] + 3, bounds[3] + 3), fill="white"
                 )
-                draw.text(location, text, fill=color, font=value_font, anchor=anchor)
+                draw.text(location, text, fill="#111111", font=value_font, anchor=anchor)
     output = io.BytesIO()
     image.save(output, "PNG")
     return output.getvalue()

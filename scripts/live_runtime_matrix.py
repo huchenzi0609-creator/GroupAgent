@@ -78,6 +78,39 @@ def read_json(path: Path) -> dict:
     return value
 
 
+def select_cases(dataset: dict, case_ids: str | None = None) -> list[dict]:
+    """A focused smoke run includes declared input dependencies, never new gold."""
+    cases = dataset["cases"]
+    if not case_ids:
+        return list(cases)
+    wanted = {value.strip() for value in case_ids.split(",") if value.strip()}
+    known = {case["id"]: case for case in cases}
+    if not wanted or not wanted <= known.keys():
+        raise RuntimeError("Requested acceptance case IDs are empty or unknown")
+    while True:
+        dependencies = {
+            item["source_case"]
+            for identity in wanted
+            for item in known[identity].get("inputs", [])
+            if item.get("source_case")
+        }
+        if not dependencies <= known.keys():
+            raise RuntimeError("An acceptance input dependency is unknown")
+        if dependencies <= wanted:
+            break
+        wanted.update(dependencies)
+    selected = [case for case in cases if case["id"] in wanted]
+    prior: set[str] = set()
+    for case in selected:
+        if any(
+            item.get("source_case") and item["source_case"] not in prior
+            for item in case.get("inputs", [])
+        ):
+            raise RuntimeError("Acceptance input dependencies must precede their consumers")
+        prior.add(case["id"])
+    return selected
+
+
 def validate_resume(root: Path, dataset: dict, args) -> tuple[dict, dict, dict]:
     manifest = read_json(root / "manifest.json")
     original = read_json(root / "dataset.json")
@@ -111,6 +144,19 @@ def validate_resume(root: Path, dataset: dict, args) -> tuple[dict, dict, dict]:
     ids = [row.get("id") for row in results.get("cases", [])]
     if len(ids) != len(set(ids)) or not set(ids) <= {case["id"] for case in dataset["cases"]}:
         raise RuntimeError("Resume results contain duplicated or foreign cases")
+    selected = manifest.get("selected_case_ids", [case["id"] for case in dataset["cases"]])
+    if (
+        not isinstance(selected, list)
+        or len(selected) != len(set(selected))
+        or not set(selected) <= {case["id"] for case in dataset["cases"]}
+    ):
+        raise RuntimeError("Resume case selection is invalid")
+    if getattr(args, "case_ids", None) and selected != [
+        case["id"] for case in select_cases(dataset, args.case_ids)
+    ]:
+        raise RuntimeError("Resume cannot change the original case selection")
+    if not set(ids) <= set(selected):
+        raise RuntimeError("Resume results contain cases outside their declared selection")
     return manifest, config, results
 
 
@@ -122,6 +168,7 @@ class MatrixRun:
         self.dataset = read_json(ROOT / "tests/fixtures/runtime_acceptance_cases.json")
         if canonical_hash(self.dataset["cases"]) != self.dataset["cases_sha256"]:
             raise RuntimeError("Frozen case checksum mismatch")
+        selection = select_cases(self.dataset, getattr(args, "case_ids", None))
         self.root = ROOT / "runtime/live" / args.run_id
         self.resuming = bool(getattr(args, "resume", False))
         self.recheck_only = bool(getattr(args, "recheck_only", False))
@@ -147,6 +194,12 @@ class MatrixRun:
             if self.resuming
             else ({}, {}, {"cases": []})
         )
+        if self.resuming:
+            selected_ids = original_manifest.get(
+                "selected_case_ids", [case["id"] for case in self.dataset["cases"]]
+            )
+            selection = [case for case in self.dataset["cases"] if case["id"] in selected_ids]
+        self.selected_cases = selection
         self.records = {row["id"]: row for row in prior["cases"]}
         self.events: dict[str, GroupEvent] = {}
         self.rules: dict[str, dict] = {}
@@ -245,6 +298,7 @@ class MatrixRun:
                 "channel": "local_only",
                 "paid_budget_group": self.actor.group_id,
                 "total_cny_limit": 50,
+                "selected_case_ids": [case["id"] for case in selection],
                 "stop_on_failure": bool(getattr(args, "stop_on_failure", False)),
                 "started_at": datetime.now(UTC),
             }
@@ -1111,7 +1165,9 @@ class MatrixRun:
     async def run(self):
         started = False
         try:
-            for case in self.dataset["cases"][: self.args.limit or None]:
+            for case in getattr(self, "selected_cases", self.dataset["cases"])[
+                : self.args.limit or None
+            ]:
                 try:
                     if self.resuming and await self.resume_case(case):
                         continue
@@ -1170,6 +1226,10 @@ if __name__ == "__main__":
     parser.add_argument("--docker-host", required=True)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--case-ids",
+        help="Comma-separated focused smoke cases; includes their declared input dependencies",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--stop-on-failure",
