@@ -317,6 +317,50 @@ async def test_real_toolkit_catalog_contains_file_research_media_compute_and_con
     assert not any("video" in name for name in run.prepared.request.allowed_tools)
     objective = json.loads(run.prepared.request.objective)
     assert objective["goal"] == run.work.goal and objective["input_files"] == []
+
+
+@pytest.mark.parametrize("required", [[], ["python_compute"]])
+async def test_trusted_required_tools_are_explicit_in_native_objective_without_changing_goal(
+    toolkit_setup, required
+):
+    setup = toolkit_setup
+    goal = "请计算17*23。"
+    run = await prepare(setup, goal=goal, scope={"required_tools": required})
+    objective = json.loads(run.prepared.request.objective)
+    assert objective["goal"] == objective["original_request"]["text"] == goal
+    assert objective["required_tools"] == sorted(run.prepared.request.required_tools) == required
+    assert all(name in run.prepared.request.allowed_tools for name in required)
+    assert any(
+        "successfully call every tool listed in required_tools" in item
+        for item in objective["instructions"]
+    )
+    assert any("without re-enabling or bypassing it" in item for item in objective["instructions"])
+    assert "391" not in run.prepared.request.objective
+    assert not setup.model.requests and not setup.http_calls
+
+
+async def test_required_but_disabled_tool_is_rejected_without_reactivating_or_calling_provider(
+    toolkit_setup,
+):
+    setup = toolkit_setup
+    setup.toolkit.config = setup.toolkit.config.model_copy(
+        update={
+            "features": setup.toolkit.config.features.model_copy(update={"web_research": False})
+        }
+    )
+    with pytest.raises(DomainError) as caught:
+        await prepare(
+            setup, goal="Read a synthetic official page", scope={"required_tools": ["web_fetch"]}
+        )
+    assert caught.value.code == "tool_not_registered"
+    assert setup.toolkit.config.features.web_research is False
+    assert not setup.model.requests and not setup.http_calls
+    with setup.env.store.connect() as conn:
+        row = conn.execute(
+            "SELECT count(*) AS n FROM ga_budget_reservations WHERE group_id=%s",
+            (setup.env.actor.group_id,),
+        ).fetchone()
+    assert row["n"] == 0
     assert not toolkit_setup.model.requests and not toolkit_setup.http_calls
 
 
