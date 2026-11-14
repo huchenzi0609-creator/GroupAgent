@@ -156,10 +156,10 @@ async def test_unknown_events_nonmonotonic_cursors_and_expiry_do_not_ack(adapter
         ({"senderId": None}, "invalid_channel_response"),
         ({"serverId": 18446744073709551000}, "invalid_channel_response"),
         ({"createdAt": "2026-11-13T08:00:00"}, "timestamp_unavailable"),
-        ({"type": 999}, "unsupported_message"),
+        ({"type": 999, "senderId": None}, "invalid_channel_response"),
     ],
 )
-async def test_invalid_inbound_identity_and_unknown_kinds_fail(adapter, daemon, changes, code):
+async def test_invalid_inbound_identity_and_protocol_fields_fail(adapter, daemon, changes, code):
     daemon.messages["local-1"].update(changes)
     with pytest.raises(DomainError) as error:
         await adapter.read_message("local-1")

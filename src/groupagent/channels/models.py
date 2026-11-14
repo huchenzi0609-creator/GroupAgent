@@ -115,11 +115,15 @@ class ChannelCapabilities(ChannelModel):
         "audio",
         "file",
         "quote",
+        "system",
         "unsupported_video",
     )
     send_kinds: tuple[str, ...] = ("text", "file")
     media_upload_max_bytes: int
     file_send_max_bytes: int
+    image_send_max_bytes: int | None = None
+    voice_send_max_bytes: int | None = None
+    native_voice_reported: bool = False
     metadata_media_kinds: tuple[str, ...]
     upstream_features: tuple[str, ...]
     quoted_text_send_reported: bool
@@ -230,6 +234,9 @@ class ChannelReceipt(ChannelModel):
     reason: str | None = None
     observed_at: datetime
     recipient_read: None = None
+    requested_kind: Literal["image", "voice"] | None = None
+    wire_kind: Literal["image", "voice", "file"] | None = None
+    fallback_reason: str | None = None
 
     @property
     def accepted(self) -> bool:

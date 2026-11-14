@@ -26,6 +26,12 @@ class NativeQuote(WireModel):
     appMessageType: int | None = None
 
 
+class NativeLinkCard(WireModel):
+    # Reviewed LinkCard subset; description/sourceName are deliberately not kept.
+    title: str | None = Field(max_length=1024)
+    url: str | None = Field(max_length=8192)
+
+
 class NativeMessage(WireModel):
     id: str
     accountId: str
@@ -35,6 +41,9 @@ class NativeMessage(WireModel):
     type: int
     appMessageType: int | None = None
     quote: NativeQuote | None = None
+    # Parse supported link content separately from the authenticated envelope.
+    # Malformed/unsupported card content becomes a metadata-only event.
+    link: Any = None
     recall: dict[str, Any] | None = None
     direction: str | None
     body: str | None

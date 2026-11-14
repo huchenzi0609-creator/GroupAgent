@@ -23,6 +23,7 @@ def test_spec_example_and_constraints():
     [
         ("features", "video_analysis", True),
         ("features", "video_generation", True),
+        ("features", "image_generation", True),
         ("conversation", "hard_reply_character_limit", 200),
         ("execution", "max_tool_calls", -1),
         ("execution", "heartbeat_seconds", 31),

@@ -65,11 +65,39 @@ class Scheduler:
         self.min_interval = min_interval_seconds
         self.default_validity = timedelta(days=default_valid_days)
         self.one_shot_grace = timedelta(seconds=one_shot_grace_seconds)
+        self._bound_transaction: UnitOfWork | None = None
+
+    def in_tx(self, tx: UnitOfWork) -> Scheduler:
+        """Compose an interaction atomically without opening a nested connection."""
+        bound = Scheduler(
+            self.store,
+            max_active_per_group=self.max_active,
+            min_interval_seconds=self.min_interval,
+            default_valid_days=self.default_validity.days,
+            one_shot_grace_seconds=int(self.one_shot_grace.total_seconds()),
+        )
+        bound._bound_transaction = tx
+        return bound
+
+    @contextmanager
+    def _transaction(self, actor: ActorContext) -> Iterator[UnitOfWork]:
+        if self._bound_transaction is not None:
+            if actor != self._bound_transaction.actor:
+                raise DomainError(
+                    "scope_violation", "Bound scheduling cannot replace transaction authority"
+                )
+            yield self._bound_transaction
+        else:
+            with self.store.transaction(actor) as tx:
+                yield tx
 
     @contextmanager
     def _mutation(self, actor: ActorContext) -> Iterator[UnitOfWork]:
-        with self.store.transaction(actor) as tx:
+        with self._transaction(actor) as tx:
             tx._writer()
+            from groupagent.memory.common import memory_lock
+
+            memory_lock(tx)
             # Serializes admission/quota/coalescing per group. Do not upgrade the
             # policy row's shared lock: concurrent lock upgrades can deadlock.
             tx.conn.execute(
@@ -95,9 +123,9 @@ class Scheduler:
 
     def _quota(self, tx: UnitOfWork, *, excluding: str | None = None) -> None:
         count = tx.conn.execute(
-            "SELECT count(*) AS n FROM ga_schedules WHERE group_id = %s AND state = 'active' "
-            "AND (%s::text IS NULL OR id <> %s)",
-            (tx.group_id, excluding, excluding),
+            "SELECT (SELECT count(*) FROM ga_schedules WHERE group_id = %s AND state = 'active' "
+            "AND (%s::text IS NULL OR id <> %s)) + (SELECT count(*) FROM ga_trigger_rules WHERE group_id=%s AND state='active') AS n",
+            (tx.group_id, excluding, excluding, tx.group_id),
         ).fetchone()
         assert count is not None
         if count["n"] >= self.max_active:
@@ -215,11 +243,11 @@ class Scheduler:
             return Schedule.model_validate(row)
 
     def get(self, actor: ActorContext, schedule_id: str) -> Schedule:
-        with self.store.transaction(actor) as tx:
+        with self._transaction(actor) as tx:
             return Schedule.model_validate(self._row(tx, schedule_id))
 
     def list(self, actor: ActorContext, *, state: ScheduleState | None = None) -> list[Schedule]:
-        with self.store.transaction(actor) as tx:
+        with self._transaction(actor) as tx:
             state_value = state.value if state is not None else None
             rows = tx.conn.execute(
                 "SELECT * FROM ga_schedules WHERE group_id = %s "
@@ -231,7 +259,7 @@ class Scheduler:
     def occurrences(
         self, actor: ActorContext, schedule_id: str, *, limit: int = 100
     ) -> builtins.list[ScheduleOccurrence]:
-        with self.store.transaction(actor) as tx:
+        with self._transaction(actor) as tx:
             self._row(tx, schedule_id)
             rows = tx.conn.execute(
                 "SELECT * FROM ga_schedule_occurrences WHERE group_id = %s AND schedule_id = %s "
@@ -533,7 +561,13 @@ class Scheduler:
         work = origin_tx.create_work(
             schedule["goal"],
             ingested.event.id,
-            scope=schedule["scope"],
+            scope={
+                **schedule["scope"],
+                "origin_schedule_id": schedule["id"],
+                "origin_occurrence_id": occurrence["id"],
+                "derived_depth": 1,
+                "schedule_creation_allowed": False,
+            },
             budget=schedule["budget"],
             acceptance_criteria=schedule["acceptance_criteria"],
         )

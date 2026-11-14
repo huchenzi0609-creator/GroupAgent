@@ -35,6 +35,8 @@ class GroupConfig(StrictModel):
     quiet_hours: list[str] = Field(default_factory=list)
     roster_sync: Literal["on_startup"] = "on_startup"
     periodic_roster_refresh: Literal[False] = False
+    bot_member_id: str | None = None
+    shared_account: bool = True
 
     @field_validator("time_zone")
     @classmethod
@@ -44,6 +46,13 @@ class GroupConfig(StrictModel):
         except ZoneInfoNotFoundError as exc:
             raise ValueError("Unknown IANA timezone") from exc
         return value
+
+    @field_validator("quiet_hours")
+    @classmethod
+    def valid_quiet_hours(cls, value: list[str]) -> list[str]:
+        from groupagent.conversation.quiet import validate_windows
+
+        return validate_windows(value)
 
     @field_validator("internal_id", "external_group_id")
     @classmethod
@@ -73,7 +82,7 @@ class FeatureConfig(StrictModel):
     image_understanding: bool = True
     audio_transcription: bool = True
     speech_reply_on_request: bool = True
-    image_generation: bool = True
+    image_generation: Literal[False] = False
     document_editing: bool = True
     web_research: bool = True
     durable_schedules: bool = True
@@ -159,6 +168,7 @@ class RetentionConfig(StrictModel):
 class SpendConfig(StrictModel):
     currency: Literal["CNY", "USD"] = "CNY"
     group_daily_limit: Annotated[Decimal | None, Field(gt=0, allow_inf_nan=False)] = None
+    session_total_limit: Annotated[Decimal | None, Field(gt=0, allow_inf_nan=False)] = None
     pricing_snapshot_id: str | None = None
     production_requires_explicit_limit: Literal[True] = True
 
@@ -177,7 +187,7 @@ class ModelRoutes(StrictModel):
     vision: str = Field(default="CONFIGURE_AND_VALIDATE", min_length=1)
     speech_to_text: str = Field(default="CONFIGURE_AND_VALIDATE", min_length=1)
     text_to_speech: str = Field(default="CONFIGURE_AND_VALIDATE", min_length=1)
-    image_generation: str = Field(default="CONFIGURE_AND_VALIDATE", min_length=1)
+    image_generation: str = Field(default="NOT_IN_CURRENT_SCOPE", min_length=1)
 
     @field_validator("text_agent", "vision", "speech_to_text", "text_to_speech", "image_generation")
     @classmethod
@@ -193,6 +203,37 @@ class EngineConfig(StrictModel):
     extra_session_log_upload: Literal[False] = False
 
 
+class RuntimeConfig(StrictModel):
+    channel: Literal["local", "agentwechat"] = "local"
+    channel_base_url: str = "http://127.0.0.1:8788"
+    channel_account_id: str = "local-account"
+    source_epoch: str = "local-v1"
+    allow_live_send: bool = False
+    engine: Literal["harness", "scoped"] = "harness"
+    worker_image: str | None = None
+    harness_image: str | None = None
+    docker_host: str | None = None
+    poll_seconds: float = Field(default=0.25, gt=0, le=30)
+    message_chunk_characters: int = Field(default=1800, ge=100, le=4000)
+    bot_badge: str = "【机器人组长】"
+    browser_hosts: list[str] = Field(default_factory=list, max_length=30)
+    image_generation_price_id: str | None = None
+    semantic_validation: bool = True
+    local_member_names: dict[str, str] = Field(default_factory=dict)
+    pg_bin_dir: str | None = None
+
+    @field_validator("worker_image", "harness_image")
+    @classmethod
+    def immutable_image(cls, value: str | None) -> str | None:
+        import re
+
+        if value is not None and not re.fullmatch(
+            r"(?:sha256:[a-f0-9]{64}|[A-Za-z0-9./:_-]+@sha256:[a-f0-9]{64})", value
+        ):
+            raise ValueError("A worker image ID or digest is required")
+        return value
+
+
 class AppConfig(StrictModel):
     schema_version: Literal["groupagent.config.v0.1"] = "groupagent.config.v0.1"
     deployment_mode: Literal["development", "test", "production"] = "development"
@@ -206,6 +247,7 @@ class AppConfig(StrictModel):
     spend: SpendConfig = Field(default_factory=SpendConfig)
     model_routes: ModelRoutes = Field(default_factory=ModelRoutes)
     engine: EngineConfig = Field(default_factory=EngineConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
 
     def production_blockers(self) -> list[str]:
         blockers = []

@@ -11,7 +11,15 @@ import json
 from typing import Any, Literal, Protocol
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SecretStr,
+    ValidationError,
+    model_validator,
+)
 
 from groupagent.config import AppConfig
 from groupagent.domain import ActorContext, DomainError, EventKind, GroupEvent, Role, WorkState
@@ -29,10 +37,22 @@ class Decision(BaseModel):
     acceptance_criteria: list[str] = Field(default_factory=list, max_length=20)
     target_work_id: str | None = None
     expected_revision: int | None = Field(default=None, ge=1)
-    control: Literal["pause", "cancel"] | None = None
+    control: Literal["pause", "cancel", "resume", "retry"] | None = None
+    directness: Literal["direct", "open", "proactive", "other", "none", "unknown"] = "unknown"
+    confidence: float = Field(default=0, ge=0, le=1)
+    action: dict[str, JsonValue] | None = None
+    topic_id: str | None = None
+    topic_title: str | None = Field(default=None, max_length=200)
+    input_versions: list[str] = Field(default_factory=list, max_length=20)
+    input_event_ids: list[str] = Field(default_factory=list, max_length=20)
+    outputs: list[dict[str, JsonValue]] = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="after")
     def coherent(self) -> Decision:
+        if self.action is not None and self.kind != "reply":
+            raise ValueError(
+                "Immediate human-task/schedule/memory actions use kind=reply; agent work decisions require action=null"
+            )
         if self.kind in {"reply", "clarify"} and not (self.response and self.response.strip()):
             raise ValueError("A reply needs text")
         if self.kind in {"start_work", "update_work"} and not (self.goal and self.goal.strip()):
@@ -52,6 +72,7 @@ class CoordinationResult(BaseModel):
     work_id: str | None = None
     delivery_id: str | None = None
     duplicate: bool = False
+    action_result: dict[str, JsonValue] | None = None
 
 
 class DecisionProvider(Protocol):
@@ -160,6 +181,9 @@ class Coordinator:
     def __init__(self, config: AppConfig, store: PostgresStore, provider: DecisionProvider) -> None:
         self.config, self.store, self.provider = config, store, provider
 
+    def accepts_event(self, event: GroupEvent) -> bool:
+        return True
+
     def actor(self, event: GroupEvent) -> ActorContext:
         group = self.config.group
         if event.group_id != group.internal_id or not group.enabled:
@@ -205,6 +229,12 @@ class Coordinator:
         actor = self.actor(event)
         with self.store.transaction(actor, trace_id=event.id) as tx:
             event = tx.get_event(event.id)
+            if getattr(event, "content_state", "active") != "active":
+                return CoordinationResult(
+                    event_id=event.id,
+                    decision=Decision(kind="ignore", reason_code="source_unavailable"),
+                    duplicate=True,
+                )
             if event.actor_id != actor.member_id:
                 raise DomainError(
                     "permission_denied", "Event identity does not match its durable source"
@@ -282,11 +312,17 @@ class Coordinator:
                 )
                 work_id = work.id
             elif decision.kind == "control_work":
+                target = {
+                    "cancel": WorkState.CANCELLED,
+                    "pause": WorkState.PAUSED,
+                    "resume": WorkState.QUEUED,
+                    "retry": WorkState.QUEUED,
+                }[decision.control or "pause"]
                 work = tx.transition_work(
                     decision.target_work_id or "",
-                    WorkState.CANCELLED if decision.control == "cancel" else WorkState.PAUSED,
+                    target,
                     expected_revision=decision.expected_revision or 0,
-                    reason="user_request",
+                    reason="retry" if decision.control == "retry" else "user_request",
                 )
                 work_id = work.id
             if decision.kind in {"reply", "clarify"}:

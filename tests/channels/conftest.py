@@ -217,7 +217,7 @@ class FakeDaemon:
             if key in self.send_bodies and self.send_bodies[key] != body:
                 return httpx.Response(409, json={"error": {"code": "idempotency_conflict"}})
             self.send_bodies[key] = body
-            if body["kind"] == "file":
+            if body["kind"] in {"file", "image", "voice"}:
                 result = {
                     "id": "job-1",
                     "accountId": ACCOUNT,
