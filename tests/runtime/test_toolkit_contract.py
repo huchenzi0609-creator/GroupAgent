@@ -529,6 +529,44 @@ async def test_execution_retry_policy_cannot_exceed_original_work_grant(
     assert run.prepared.request.budget.additional_retry_limit == effective
 
 
+@pytest.mark.parametrize("columns", [False, True])
+async def test_actual_generation_normalizes_default_numeric_vector_but_keeps_explicit_columns(
+    toolkit_setup, columns
+):
+    setup = toolkit_setup
+    run = await prepare(setup, scope={"outputs": [{"format": "md"}]})
+    table = {"headers": ["Theta", "Sigma", "Kappa"], "rows": [["1.20", "-0.25", "+2.00"]]}
+    if columns:
+        table["layout"] = "columns"
+    generated = await call(
+        run,
+        "document_generate",
+        {
+            "name": "records.md",
+            "kind": "report",
+            "title": "Synthetic measurements",
+            "sections": [{"title": "Data", "paragraphs": [], "tables": [table]}],
+        },
+    )
+    assert generated.success
+    content = setup.env.artifacts.read(
+        ArtifactScope(setup.env.actor.group_id, run.work.id, setup.env.actor.member_id),
+        generated.output["file_id"],
+        generated.output["version_id"],
+    ).decode()
+    rows = [
+        tuple(cell.strip() for cell in line.strip().strip("|").split("|"))
+        for line in content.splitlines()
+        if line.lstrip().startswith("|")
+    ]
+    if columns:
+        assert rows[0] == ("Theta", "Sigma", "Kappa")
+        assert rows[2] == ("1.20", "-0.25", "+2.00")
+    else:
+        assert rows[2:] == [("Theta", "1.20"), ("Sigma", "-0.25"), ("Kappa", "+2.00")]
+    assert not setup.http_calls and not setup.model.requests
+
+
 async def test_real_media_decode_evidence_is_required_even_when_reviewer_would_approve(
     toolkit_setup,
 ):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from typing import Any, ClassVar, Literal
@@ -30,11 +31,15 @@ class TableInput(ToolData):
     headers: tuple[str, ...] = Field(
         min_length=1,
         max_length=6,
-        description="Column names, not observation names. For key=value observations use two columns (name/value) unless the user explicitly requests horizontal orientation.",
+        description="Column names for row records. For key=value observations prefer name/value columns; records layout also canonicalizes a nonnumeric observation-name vector with exactly one numeric data row. Use columns layout only for an explicitly requested horizontal orientation.",
     )
     rows: tuple[tuple[str, ...], ...] = Field(
         max_length=50,
         description="Editable native table data, one record per row. Put each named scalar observation and its unchanged value in the same row; do not transpose observation names into column headers unless explicitly requested.",
+    )
+    layout: Literal["records", "columns"] = Field(
+        default="records",
+        description="Default records: named scalar observations are rows. A nonempty nonnumeric header vector with one entirely numeric data row is normalized to 项目/数值 records, preserving original strings and order. Use columns only when the user explicitly requests a horizontal/transposed table; it preserves the supplied layout.",
     )
 
     @model_validator(mode="after")
@@ -256,6 +261,19 @@ def register_document_tools(
         )
 
     def table(value: TableInput) -> TableData:
+        numeric = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+        if (
+            value.layout == "records"
+            and len(value.headers) > 1
+            and len(value.rows) == 1
+            and all(
+                header.strip() and not numeric.fullmatch(header.strip()) for header in value.headers
+            )
+            and all(numeric.fullmatch(cell.strip()) for cell in value.rows[0])
+        ):
+            return TableData(
+                ("项目", "数值"), tuple(zip(value.headers, value.rows[0], strict=True))
+            )
         return TableData(value.headers, value.rows)
 
     def output(version) -> ArtifactOutput:
