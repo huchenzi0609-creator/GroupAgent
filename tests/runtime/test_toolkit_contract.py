@@ -335,7 +335,17 @@ async def test_trusted_required_tools_are_explicit_in_native_objective_without_c
         for item in objective["instructions"]
     )
     assert any("without re-enabling or bypassing it" in item for item in objective["instructions"])
-    assert "391" not in run.prepared.request.objective
+    # UUIDs and clock microseconds may contain these digits by chance. Check
+    # request/constraint content, where a leaked expected answer would matter.
+    assert objective["input_files"] == []
+    semantic_content = {
+        "goal": objective["goal"],
+        "original_request_text": objective["original_request"]["text"],
+        "acceptance_criteria": objective["acceptance_criteria"],
+        "required_outputs": objective["required_outputs"],
+        "instructions": objective["instructions"],
+    }
+    assert "391" not in json.dumps(semantic_content, ensure_ascii=False)
     assert not setup.model.requests and not setup.http_calls
 
 
