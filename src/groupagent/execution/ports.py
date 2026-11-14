@@ -14,6 +14,7 @@ from .models import (
     ModelReply,
     ModelRequest,
     RunSnapshot,
+    TokenUsage,
 )
 
 
@@ -32,6 +33,21 @@ class ModelPort(Protocol):
     name: str
 
     async def complete(self, request: ModelRequest) -> ModelReply: ...
+
+
+class ModelBudgetPort(Protocol):
+    async def reserve(
+        self,
+        request: ExecutionRequest,
+        *,
+        round_number: int,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> str: ...
+
+    async def settle(self, reservation_id: str, usage: TokenUsage | None) -> None:
+        """None is uncertain usage, never an instruction to refund the reservation."""
+        ...
 
 
 class EnginePort(Protocol):

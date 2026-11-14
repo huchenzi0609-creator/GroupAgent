@@ -141,6 +141,45 @@ class EchoOutput(ToolData):
     text: str
 
 
+async def test_quiescence_requires_handler_exit_not_just_cancel_request(scope):
+    release, stopped = asyncio.Event(), asyncio.Event()
+
+    async def ignores_cancel(args, _context):
+        while not release.is_set():
+            try:
+                await asyncio.sleep(0.005)
+            except asyncio.CancelledError:
+                continue
+        stopped.set()
+        return EchoOutput(text=args.text)
+
+    gateway = ToolGateway()
+    gateway.register(
+        ToolDefinition(
+            name="noncooperative",
+            description="Explicit synthetic fault",
+            input_model=EchoInput,
+            output_model=EchoOutput,
+            handler=ignores_cancel,
+            timeout_seconds=0.01,
+        )
+    )
+    grant = replace(scope, allowed_tools=frozenset({"noncooperative"}))
+    gateway.bind_scope(grant)
+    try:
+        result = await gateway.invoke("noncooperative", {"text": "synthetic"}, context(grant))
+        assert result.effect_state.value == "unknown" and not gateway.is_quiescent(grant)
+        with pytest.raises(DomainError) as error:
+            await gateway.quiesce(grant, timeout_seconds=0.02)
+        assert error.value.code == "work_busy" and not stopped.is_set()
+        release.set()
+        await asyncio.wait_for(stopped.wait(), 1)
+        await gateway.quiesce(grant, timeout_seconds=0.1)
+        assert gateway.is_quiescent(grant)
+    finally:
+        release.set()
+
+
 async def test_tool_timeout_cancels_handler_and_marks_effect_unknown(scope) -> None:
     stopped = asyncio.Event()
 

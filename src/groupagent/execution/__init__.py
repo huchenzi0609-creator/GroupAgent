@@ -1,5 +1,6 @@
 from .engine import ScopedToolEngine
 from .fake import ScriptedFakeModel
+from .harness import HarnessEngine
 from .models import (
     EngineCheckpoint,
     EngineEvent,
@@ -21,6 +22,7 @@ __all__ = [
     "EnginePort",
     "ExecutionBudget",
     "ExecutionRequest",
+    "HarnessEngine",
     "ModelMessage",
     "ModelPort",
     "ModelReply",

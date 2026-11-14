@@ -15,6 +15,7 @@ from groupagent.execution import (
     TokenUsage,
 )
 from groupagent.tools import EffectState, ToolContext, ToolData, ToolDefinition, ToolGateway
+from groupagent.tools.models import ToolFailure
 
 
 def answer(text: str = "Candidate draft ready.", **overrides) -> ModelReply:
@@ -303,7 +304,7 @@ async def test_persistence_failure_before_tool_prevents_effect(execution_request
     assert not (execution_request.workspace / "never.txt").exists()
 
 
-async def test_unresolved_tool_error_cannot_be_covered_by_model_success_text(
+async def test_required_tool_error_cannot_be_covered_by_model_success_text(
     execution_request, gateway
 ):
     model = ScriptedFakeModel(
@@ -313,7 +314,10 @@ async def test_unresolved_tool_error_cannot_be_covered_by_model_success_text(
         ]
     )
     engine = ScopedToolEngine(model, gateway)
-    result = await engine.wait(await engine.start(execution_request))
+    request = execution_request.model_copy(
+        update={"required_tools": frozenset({"workspace_read_text"})}
+    )
+    result = await engine.wait(await engine.start(request))
     assert result.state == RunState.FAILED and result.error_code == "validation_required"
 
 
@@ -329,6 +333,88 @@ async def test_failed_read_can_be_repaired_within_budget(execution_request, gate
     engine = ScopedToolEngine(model, gateway)
     result = await engine.wait(await engine.start(execution_request))
     assert result.state == RunState.CANDIDATE and result.usage.rounds == 3
+
+
+@pytest.mark.parametrize("failure", ["no_effect", "not_started"])
+async def test_successful_alternative_tool_path_is_not_blocked_by_definite_failure(
+    execution_request, gateway, failure
+):
+    async def unsupported(_args, _context):
+        raise ToolFailure("unsupported_feature", "Synthetic unsupported generator", no_effect=True)
+
+    gateway.register(
+        ToolDefinition(
+            name="document_generate",
+            description="Synthetic rejected generator",
+            input_model=EmptyInput,
+            output_model=EmptyOutput,
+            handler=unsupported,
+        )
+    )
+    request = execution_request.model_copy(
+        update={
+            "allowed_tools": gateway.registered_names,
+            "required_tools": frozenset({"workspace_write_text", "workspace_read_text"}),
+        }
+    )
+    bad = call("document_generate", **({"not_in_schema": True} if failure == "not_started" else {}))
+    model = ScriptedFakeModel(
+        [
+            bad,
+            call(call_id="alternate-write", path="alternate.md", text="Verified fallback bytes"),
+            call("workspace_read_text", call_id="alternate-read", path="alternate.md"),
+            answer(),
+        ]
+    )
+    engine = ScopedToolEngine(model, gateway)
+    result = await engine.wait(await engine.start(request))
+    assert result.state == RunState.CANDIDATE
+    assert not result.receipts[0].success
+    assert result.receipts[0].effect_state == (
+        EffectState.NOT_STARTED if failure == "not_started" else EffectState.NO_EFFECT
+    )
+    assert result.checkpoint.unresolved_tools == frozenset()
+    assert result.receipts[-1].output["text"] == "Verified fallback bytes"
+
+
+async def test_safe_legacy_checkpoint_drops_only_spurious_no_effect_unresolved_names(
+    execution_request, gateway
+):
+    async def unsupported(_args, _context):
+        raise ToolFailure("unsupported_feature", "Synthetic no-effect failure", no_effect=True)
+
+    gateway.register(
+        ToolDefinition(
+            name="old_generator",
+            description="Legacy diagnostic",
+            input_model=EmptyInput,
+            output_model=EmptyOutput,
+            handler=unsupported,
+        )
+    )
+    request = execution_request.model_copy(
+        update={"allowed_tools": gateway.registered_names, "budget": ExecutionBudget(max_rounds=1)}
+    )
+    first = ScopedToolEngine(ScriptedFakeModel([call("old_generator")]), gateway)
+    paused = await first.wait(await first.start(request))
+    assert paused.state == RunState.PAUSED and paused.checkpoint.safe_to_resume
+    legacy = paused.checkpoint.model_copy(update={"unresolved_tools": frozenset({"old_generator"})})
+    resumed = ScopedToolEngine(
+        ScriptedFakeModel(
+            [call(call_id="new-writer", path="new.md", text="Alternative"), answer()]
+        ),
+        gateway,
+    )
+    result = await resumed.wait(
+        await resumed.resume(
+            legacy,
+            request.actor.model_copy(update={"role": Role.OWNER}),
+            attempt_id="legacy-alternative",
+            budget=ExecutionBudget(max_rounds=3),
+        )
+    )
+    assert result.state == RunState.CANDIDATE and result.usage.rounds == 3
+    assert not result.receipts[0].success and result.checkpoint.unresolved_tools == frozenset()
 
 
 async def test_append_at_pretool_persistence_checkpoint_prevents_stale_action(

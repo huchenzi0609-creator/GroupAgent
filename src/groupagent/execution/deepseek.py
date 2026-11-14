@@ -18,6 +18,7 @@ from pydantic import SecretStr, ValidationError
 
 from groupagent.domain import DomainError
 
+from .errors import ModelRejected, retry_after_seconds
 from .models import ModelReply, ModelRequest, ModelToolCall, TokenUsage
 
 
@@ -110,7 +111,7 @@ class DeepSeekHTTPModel:
                 if status in {401, 403}:
                     raise DomainError("auth_required", "The model provider rejected authentication")
                 if status == 429:
-                    raise DomainError("rate_limited", "The model provider is rate limited")
+                    raise ModelRejected(retry_after_seconds(response.headers.get("Retry-After")))
                 if 300 <= status < 400:
                     raise DomainError("provider_redirect_rejected", "Provider redirect was refused")
                 if status >= 500 or status == 408:
