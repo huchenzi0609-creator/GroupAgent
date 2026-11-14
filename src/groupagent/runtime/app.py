@@ -23,6 +23,7 @@ from groupagent.billing.prices import deepseek_20261114
 from groupagent.channels import AgentWechatAdapter, AgentWechatConfig, MemberRecord
 from groupagent.channels.local import LocalChannel
 from groupagent.config import AppConfig, ConfigError
+from groupagent.conversation.intent import new_work_intent
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import CoordinationResult, Decision
@@ -333,6 +334,12 @@ class RuntimeApp:
         now = time.monotonic()
         if (
             batched
+            and not (
+                events[0].kind == EventKind.TEXT
+                and not events[0].reply_to
+                and not events[0].attachments
+                and new_work_intent(events[0].text) is not None
+            )
             and self._first_arrival
             and (
                 now - self._last_arrival < self.config.conversation.idle_batch_seconds

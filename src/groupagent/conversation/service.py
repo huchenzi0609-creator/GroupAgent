@@ -59,6 +59,7 @@ from .actions import (
 from .intent import (
     explicitly_requires_execution,
     main_request,
+    new_work_intent,
     requires_research,
     task_write_request,
 )
@@ -736,6 +737,49 @@ class ConversationCoordinator(Coordinator):
                 payload["context_incomplete"] = True
         return payload
 
+    def _fast_new_work(self, event: GroupEvent, context: dict) -> Decision | None:
+        if (
+            event.kind != EventKind.TEXT
+            or event.reply_to
+            or event.attachments
+            or context.get("quoted_work_id")
+            or context.get("_quoted_work_id")
+            or context.get("role") not in {"owner", "member"}
+            or context.get("read_only")
+            or fast_observe(event, context) is not None
+            or policy_intent(event, context) is not None
+        ):
+            return None
+        intent = new_work_intent(event.text)
+        if intent is None:
+            return None
+        # Only self-contained requests qualify. Missing unrelated history grants
+        # no input references; the shared final transaction still asserts the
+        # original complete snapshot, role and source below.
+        aliases = context.get("agent_aliases", [])
+        addressed = isinstance(aliases, list) and any(
+            isinstance(alias, str)
+            and alias
+            and re.match(
+                r"^\s*(?:请|麻烦|拜托)?\s*@?"
+                + re.escape(alias)
+                + r"[，,:：\s]*(?:请|帮|制作|生成|用|计算)",
+                event.text,
+            )
+            for alias in aliases
+        )
+        return Decision(
+            kind="start_work",
+            reason_code="explicit_new_work_admission",
+            goal=event.text,
+            acceptance_criteria=[
+                "完成原始请求中的全部内容与约束，以真实执行、产物验证和必需投递回执结案。"
+            ],
+            outputs=list(intent.outputs),
+            directness="direct" if addressed else "open",
+            confidence=1,
+        )
+
     def _fast_control(self, event: GroupEvent, context: dict) -> Decision | None:
         if event.kind not in {EventKind.TEXT, EventKind.QUOTE}:
             return None
@@ -1371,6 +1415,7 @@ class ConversationCoordinator(Coordinator):
         if event.kind == EventKind.RECALL:
             self.memory.recall(self.service_actor, event.id, now=self.clock())
         context = self._context(actor, event)
+        fast_admitted = False
         if self.config.group.bot_member_id == event.actor_id and not echo:
             if not self.config.group.shared_account:
                 echo = True
@@ -1435,9 +1480,13 @@ class ConversationCoordinator(Coordinator):
                     kind="observe", reason_code="group_paused"
                 )
             else:
-                decision = self._fast_control(event, context) or await self.provider_factory(
-                    actor, event
-                ).decide(event, context)
+                immediate = self._fast_control(event, context)
+                if immediate is None:
+                    immediate = self._fast_new_work(event, context)
+                    fast_admitted = immediate is not None
+                decision = immediate or await self.provider_factory(actor, event).decide(
+                    event, context
+                )
         with self.store.transaction(actor, trace_id=event.id) as tx:
             self.memory.prepare_in_tx(tx)
             self.execution_guard(tx)
@@ -1558,6 +1607,13 @@ class ConversationCoordinator(Coordinator):
                             main,
                         ):
                             required_tools.append("process_run")
+                        admitted_intent = new_work_intent(event.text) if fast_admitted else None
+                        if (
+                            admitted_intent
+                            and admitted_intent.required_tool
+                            and admitted_intent.required_tool not in required_tools
+                        ):
+                            required_tools.append(admitted_intent.required_tool)
                         if speech_requested:
                             required_tools.append("speech_synthesize")
                         if direct_fetch:
@@ -1605,6 +1661,9 @@ class ConversationCoordinator(Coordinator):
                                 "attachment_event_ids": [str(value) for value in attachment_ids],
                                 "retained_fact_source_ids": retained,
                                 "outputs": [item.model_dump(mode="json") for item in outputs],
+                                "admission_path": "deterministic_current_request"
+                                if fast_admitted
+                                else "provider_candidate",
                                 "topic_id": topic_id,
                                 "speech_requested": speech_requested,
                                 "delivery_artifacts": delivery_artifacts,

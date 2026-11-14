@@ -391,6 +391,70 @@ async def cancel_sample(app, actor, root, index, timeout, poll_seconds):
     return record
 
 
+def deterministic_admission_proof(
+    conn,
+    actor,
+    event,
+    work_id,
+    delivery_id,
+    decision,
+    *,
+    expected_format,
+    expected_units=None,
+    expected_text=(),
+):
+    """Prove the real product path without inventing a paid router call."""
+    row = conn.execute(
+        "SELECT w.goal,w.request_event_id,w.requester_id,w.scope,w.required_checks,"
+        "d.request_event_id AS ack_event_id,d.id AS ack_id,"
+        "(SELECT count(*) FROM ga_work_orders x WHERE x.group_id=w.group_id "
+        "AND x.request_event_id=w.request_event_id) AS work_count,"
+        "(SELECT count(*) FROM ga_deliveries x WHERE x.group_id=w.group_id "
+        "AND x.request_event_id=w.request_event_id) AS ack_count "
+        "FROM ga_work_orders w LEFT JOIN ga_deliveries d ON d.group_id=w.group_id AND d.id=%s "
+        "WHERE w.group_id=%s AND w.id=%s",
+        (delivery_id, actor.group_id, work_id),
+    ).fetchone()
+    if not row or row["scope"].get("admission_path") != "deterministic_current_request":
+        return None
+    checks = {
+        "original_goal": row["goal"] == event.text,
+        "original_source": row["request_event_id"] == event.id,
+        "requester": row["requester_id"] == event.actor_id == actor.member_id,
+        "one_work": row["work_count"] == 1,
+        "one_ack": row["ack_count"] == 1
+        and row["ack_event_id"] == event.id
+        and bool(row["ack_id"]),
+        "source_bound": event.id in row["scope"].get("source_fingerprints", {}),
+        "origin_scope": row["scope"].get("allowed_group_ids") == [actor.group_id]
+        and row["scope"].get("delivery_target") == "origin_group",
+        "declared_format": any(
+            output.get("format") == expected_format for output in row["scope"].get("outputs", [])
+        ),
+        "declared_units": all(
+            output.get("exact_units") == expected_units
+            for output in row["scope"].get("outputs", [])
+            if output.get("format") == expected_format
+        ),
+        "declared_literals": all(
+            output.get("expected_text", []) == list(expected_text)
+            for output in row["scope"].get("outputs", [])
+            if output.get("format") == expected_format
+        ),
+        "format_validation": "artifact:" + expected_format in row["required_checks"],
+        "candidate": decision.get("kind") == "start_work"
+        and decision.get("reason_code") == "explicit_new_work_admission"
+        and decision.get("goal") == event.text,
+    }
+    return {
+        "kind": "real_app_deterministic_admission",
+        "checks": checks,
+        "valid": all(checks.values()),
+        "outputs": row["scope"].get("outputs", []),
+        "execution": "NOT_RUN in held executor lane; separate representative execution required",
+    }
+
+
 async def sample_app(
     app, actor, root, *, mode, short_count, long_count, cancel_count, timeout, poll_seconds
 ):
@@ -427,6 +491,19 @@ async def sample_app(
                         "SELECT b.id,b.state,b.actual_amount,b.evidence_ref FROM ga_budget_reservations b JOIN ga_price_snapshots p ON p.group_id=b.group_id AND p.id=b.price_id WHERE b.group_id=%s AND b.source_event_id=%s AND b.state='settled' AND NOT COALESCE((p.body->>'test_only')::boolean,false)",
                         (actor.group_id, event.id),
                     ).fetchall()
+                    admission = (
+                        deterministic_admission_proof(
+                            conn,
+                            actor,
+                            event,
+                            work_id,
+                            record.get("delivery_id"),
+                            decision,
+                            expected_format="md",
+                        )
+                        if kind == "long_admission" and work_id
+                        else None
+                    )
                 success = (
                     (
                         decision.get("kind") == "reply"
@@ -438,7 +515,7 @@ async def sample_app(
                 )
                 success = (
                     success
-                    and bool(proof)
+                    and (admission["valid"] if admission is not None else bool(proof))
                     and decision.get("reason_code")
                     not in {
                         "budget_exhausted",
@@ -453,9 +530,12 @@ async def sample_app(
                     kind=kind,
                     index=index,
                     status="PASS" if success else record.get("status", "FAIL"),
-                    provider="real_app_shared_ledger",
+                    provider="real_app_deterministic_admission"
+                    if admission is not None
+                    else "real_app_shared_ledger",
                     work_id=work_id,
                     provider_receipts=[dict(row) for row in proof],
+                    admission_proof=admission,
                 )
                 records.append(record)
                 save(root / "samples.json", {"records": records})
