@@ -45,6 +45,7 @@ CATALOG = frozenset(
         "document_search",
         "document_edit",
         "document_validate",
+        "document_extract_image",
         "chart_render",
         "pdf_combine",
         "memory_search",
@@ -116,6 +117,62 @@ def test_plain_public_web_answer_has_bounded_research_catalog():
 
 
 @pytest.mark.parametrize(
+    "goal",
+    [
+        "请联网检索Python官方文档，说明sorted()与list.sort()的区别，提供实际查到的链接和访问时间，不要凭记忆编引用。",
+        "使用Python官方文档核对sorted()的行为，不得只凭记忆编造来源。",
+        "检索Python官方文档，不要仅凭记忆回答。",
+        "不凭记忆编造，查阅Python官方文档回答问题。",
+        "联网查看Shell官方文档，不要凭记忆编引用。",
+        "Use Python documentation and cite the official page.",
+    ],
+)
+def test_programming_documentation_and_memory_prohibition_keep_pure_web_catalog(goal):
+    current = work(goal, research_required=True, required_tools=["web_search"])
+    assert select_tools(current, [], CATALOG) == WEB_TOOLS
+    assert select_tools(current, [], CATALOG - {"browser_open"}) == WEB_TOOLS - {"browser_open"}
+
+
+@pytest.mark.parametrize(
+    "criterion,needed",
+    [
+        ("实际运行Python验证两个排序函数的结果", "python_compute"),
+        ("查完后用Python实际计算合计", "python_compute"),
+        ("Python实际计算这些数字", "python_compute"),
+        ("Run Python to verify the result", "python_compute"),
+        ("执行Shell命令校验输出", "shell_command"),
+        ("并对照昨天聊天的决定", "memory_search"),
+        ("与上次讨论核对", "memory_search"),
+        ("同时检索历史记录", "memory_search"),
+        ("不要忘记昨天聊天里确认的方案", "memory_search"),
+    ],
+)
+def test_actual_execution_and_history_needs_survive_a_separate_memory_prohibition(
+    criterion, needed
+):
+    current = work(
+        "联网检索Python官方文档，不要凭记忆编引用。",
+        research_required=True,
+        required_tools=["web_search"],
+    ).model_copy(update={"acceptance_criteria": [criterion]})
+    selected = select_tools(current, [], CATALOG)
+    assert needed in selected and {"web_search", "web_fetch"} <= selected
+    assert needed not in select_tools(current, [], CATALOG - {needed})
+
+
+def test_web_profile_still_requires_registered_explicit_tools():
+    current = work(
+        "联网检索Python官方文档，不得凭记忆编引用。",
+        research_required=True,
+        required_tools=["web_search", "python_compute"],
+    )
+    assert "python_compute" in select_tools(current, [], CATALOG)
+    with pytest.raises(DomainError) as caught:
+        select_tools(current, [], CATALOG - {"python_compute"})
+    assert caught.value.code == "tool_not_registered"
+
+
+@pytest.mark.parametrize(
     "goal,extra",
     [
         ("读图后用Python实际计算合计", {}),
@@ -181,6 +238,76 @@ def test_reminder_acceptance_criteria_can_require_actual_agent_work():
     selected = select_tools(current, [], CATALOG)
     assert "python_compute" in selected
     assert not selected & {"schedule_create", "trigger_create", "team_task_create"}
+
+
+@pytest.mark.parametrize("output_format", ["md", "docx", "pdf", "pptx"])
+@pytest.mark.parametrize("refs", [[], [{"format": "docx"}, {"format": "pdf"}]])
+def test_pure_document_profile_keeps_full_file_compute_and_chart_routes(output_format, refs):
+    current = work("按给定内容生成文档", outputs=[{"format": output_format}])
+    selected = select_tools(current, refs, CATALOG)
+    assert {
+        "document_generate",
+        "document_read",
+        "document_search",
+        "document_edit",
+        "document_validate",
+        "document_extract_image",
+        "pdf_combine",
+        "chart_render",
+        "artifact_search",
+        "artifact_import",
+        "artifact_export",
+        "artifact_from_workspace",
+        "artifact_deliver",
+        "workspace_read_text",
+        "workspace_write_text",
+        "python_compute",
+        "process_run",
+        "shell_command",
+        "request_input",
+    } == selected
+    assert selected <= CATALOG
+
+
+@pytest.mark.parametrize(
+    "goal,criteria,scope,refs",
+    [
+        ("读图后生成文档", [], {}, [{"format": "png"}]),
+        ("生成文档", ["分析附件图片的内容"], {}, []),
+        ("生成文档", [], {"research_required": True}, []),
+        ("生成文档", ["检索公开网页核对结论"], {}, []),
+        ("生成文档", ["对照历史记忆"], {}, []),
+        ("生成文档", [], {"team_task_write_allowed": True}, []),
+        ("生成文档并创建提醒", [], {}, []),
+        ("任务完成后生成文档", [], {}, []),
+        ("生成文档", [], {"required_tools": ["web_fetch"]}, []),
+        ("生成文档", [], {"attachment_event_ids": ["pending-synthetic-input"]}, []),
+        ("生成文档", [], {}, [{"format": "unknown"}]),
+    ],
+)
+def test_document_profile_keeps_general_catalog_for_extra_or_unresolved_needs(
+    goal, criteria, scope, refs
+):
+    current = work(goal, outputs=[{"format": "docx"}], **scope).model_copy(
+        update={"acceptance_criteria": criteria}
+    )
+    assert "web_fetch" in select_tools(current, refs, CATALOG)
+
+
+def test_document_profile_keeps_explicit_compute_and_never_enables_absent_features():
+    current = work(
+        "用Python绘制图表并放入PDF文档",
+        outputs=[{"format": "pdf"}],
+        required_tools=["python_compute", "chart_render"],
+    )
+    eligible = CATALOG - {"shell_command", "document_extract_image"}
+    selected = select_tools(current, [], eligible)
+    assert {"python_compute", "chart_render", "artifact_deliver"} <= selected
+    assert selected <= eligible
+    assert not selected & {"web_fetch", "schedule_create", "trigger_create", "team_task_create"}
+    with pytest.raises(DomainError) as caught:
+        select_tools(current, [], eligible - {"python_compute"})
+    assert caught.value.code == "tool_not_registered"
 
 
 @pytest.mark.parametrize(

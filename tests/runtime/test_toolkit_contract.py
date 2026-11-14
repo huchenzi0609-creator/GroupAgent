@@ -7,11 +7,12 @@ worker suites establish decoding, rendering and OS isolation.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import tempfile
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,7 @@ from groupagent.research import DeepSeekResearchClient
 from groupagent.runtime.inputs import InputProcessor
 from groupagent.runtime.state import source_fingerprint
 from groupagent.runtime.toolkit import WorkToolkit
+from groupagent.scheduling import EveryTiming, Scheduler
 from groupagent.tools import ToolContext, ToolScope
 
 from .conftest import source
@@ -515,6 +517,136 @@ async def test_semantic_rejection_and_no_send_policy_are_not_overridden_by_forma
     )
     assert len(result.deliveries) == 1 and result.deliveries[0].payload_ref.startswith("text:")
     assert "暂不发送" in result.deliveries[0].payload_ref
+
+
+async def test_semantic_review_evidence_is_version_bound_redacted_and_privacy_removable(
+    toolkit_setup,
+):
+    setup = toolkit_setup
+    run = await prepare(setup, scope={"outputs": [{"format": "md"}], "delivery_artifacts": False})
+    generated = await create_document(run)
+    selected = await call(
+        run, "artifact_deliver", {"version_ids": [generated.output["version_id"]]}
+    )
+    secret = "sk-" + "synthetic_only_" * 3
+    reply = ModelReply(
+        text=json.dumps({"passed": False, "reason": "Missing footer; " + secret}),
+        usage=TokenUsage(input_tokens=10, output_tokens=5),
+    )
+
+    async def reviewer(request):
+        return reply
+
+    setup.model.complete = reviewer
+    with pytest.raises(DomainError, match="Missing footer") as caught:
+        await setup.toolkit.validate(
+            run.work,
+            run.lease,
+            setup.env.actor,
+            candidate(run, receipts=(generated, selected)),
+            run.workspace,
+        )
+    assert secret not in caught.value.message
+    with setup.env.store.transaction(setup.env.actor) as tx:
+        evidence = tx.get_work(run.work.id).scope["_runtime_semantic_reviews"][-1]
+        audits = tx.conn.execute(
+            "SELECT details FROM ga_audit_events WHERE group_id=%s AND resource_ref=%s AND action='semantic_review_completed'",
+            (setup.env.actor.group_id, run.work.id),
+        ).fetchall()
+    assert evidence["passed"] is False and evidence["accepted"] is False
+    assert evidence["finish_reason"] == "stop"
+    assert evidence["goal_revision"] == run.work.goal_revision
+    assert evidence["version_ids"] == [generated.output["version_id"]]
+    assert evidence["attempt_id"] == run.lease.attempt_id
+    assert (
+        evidence["response_sha256"] == hashlib.sha256(reply.model_dump_json().encode()).hexdigest()
+    )
+    assert secret not in json.dumps(evidence)
+    assert len(audits) == 1 and "reason" not in audits[0]["details"]
+    reply = ModelReply(
+        text=json.dumps({"passed": True, "reason": "Corrected final candidate"}),
+        usage=TokenUsage(input_tokens=10, output_tokens=5),
+    )
+    await setup.toolkit.validate(
+        run.work,
+        run.lease,
+        setup.env.actor,
+        candidate(run, receipts=(generated, selected)),
+        run.workspace,
+    )
+    with setup.env.store.transaction(setup.env.actor) as tx:
+        evidence = tx.get_work(run.work.id).scope["_runtime_semantic_reviews"]
+    assert [item["passed"] for item in evidence] == [False, True]
+    setup.toolkit.memory.forget(setup.env.actor, event_ids=[run.event.id])
+    with setup.env.store.transaction(setup.env.actor) as tx:
+        assert "_runtime_semantic_reviews" not in tx.get_work(run.work.id).scope
+
+
+async def test_trusted_scheduled_reminder_names_recipient_work_not_agent_work(toolkit_setup):
+    setup, env = toolkit_setup, toolkit_setup.env
+    authorization = source(env, "一小时后只提醒我检查作业，不需要代我检查")
+    now = datetime.now(UTC)
+    scheduler = Scheduler(env.store)
+    with env.store.transaction(env.actor) as tx:
+        fingerprints = {authorization.id: tx.event_fingerprint(authorization.id)}
+    scheduler.create(
+        env.actor,
+        "Synthetic reminder",
+        "检查作业",
+        EveryTiming(interval_seconds=3600),
+        now=now,
+        scope={"reminder_only": True, "source_fingerprints": fingerprints},
+    )
+    occurrence = scheduler.due(env.actor, now + timedelta(hours=1))[0]
+    with env.store.transaction(env.actor) as tx:
+        work = tx.get_work(occurrence.work_id)
+        lease = tx.claim_work(work.id, "reminder-fixture", ttl_seconds=300)
+        work = tx.get_work(work.id)
+    workspace = env.root / work.id
+    workspace.mkdir()
+    prepared = await setup.toolkit.prepare(work, lease, env.actor, workspace)
+    objective = json.loads(prepared.request.objective)
+    assert objective["execution_intent"] == "reminder" and objective["goal"] == "检查作业"
+    assert "发送提醒本身不需要" in objective["instructions"][0]
+    assert "不要为了被提醒的事项调用 request_input" in objective["instructions"][0]
+    assert not objective["input_files"] and prepared.request.allowed_tools == {"request_input"}
+    run = SimpleNamespace(work=work, lease=lease, workspace=workspace, prepared=prepared)
+    result = await setup.toolkit.validate(
+        work, lease, env.actor, candidate(run, text="提醒：该检查作业了。"), workspace
+    )
+    review_request = setup.model.requests[-1]
+    assert json.loads(review_request.messages[1].content)["execution_intent"] == "reminder"
+    assert "不要求机器人完成它或取得文件" in review_request.messages[0].content
+    assert (
+        len(result.deliveries) == 1
+        and result.deliveries[0].payload_ref == "text:提醒：该检查作业了。"
+    )
+    assert not setup.http_calls
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {},
+        {"reminder_only": True},
+        {"reminder_only": False, "origin_schedule_id": "synthetic", "derived_depth": 1},
+        {"reminder_only": "true", "origin_schedule_id": "synthetic", "derived_depth": 1},
+        {"reminder_only": True, "origin_schedule_id": "", "derived_depth": 1},
+        {"reminder_only": True, "origin_schedule_id": "synthetic", "derived_depth": 0},
+    ],
+)
+async def test_ordinary_or_unmarked_work_keeps_actual_execution_intent(toolkit_setup, scope):
+    setup = toolkit_setup
+    run = await prepare(setup, scope=scope, goal="检查作业")
+    objective = json.loads(run.prepared.request.objective)
+    assert objective["execution_intent"] == "perform_work"
+    assert "发送提醒本身不需要" not in objective["instructions"][0]
+    await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, candidate(run), run.workspace
+    )
+    review_request = setup.model.requests[-1]
+    assert json.loads(review_request.messages[1].content)["execution_intent"] == "perform_work"
+    assert "不要求机器人完成它或取得文件" not in review_request.messages[0].content
 
 
 async def test_missing_input_processor_does_not_silently_drop_explicit_versions(toolkit_setup):

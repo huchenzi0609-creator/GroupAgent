@@ -20,13 +20,47 @@ _IMAGE_TOOLS = frozenset({"request_input", "image_analyze", "media_ocr", "provid
 _AUDIO_TOOLS = frozenset({"request_input", "audio_transcribe"})
 _WEB_TOOLS = frozenset({"request_input", "web_search", "web_fetch", "browser_open"})
 _REMINDER_TOOLS = frozenset({"request_input"})
+_DOCUMENT_FORMATS = frozenset({"md", "docx", "pdf", "pptx"})
+_DOCUMENT_TOOLS = frozenset(
+    {
+        "request_input",
+        "document_generate",
+        "document_read",
+        "document_search",
+        "document_edit",
+        "document_validate",
+        "document_extract_image",
+        "pdf_combine",
+        "chart_render",
+        "artifact_search",
+        "artifact_import",
+        "artifact_export",
+        "artifact_from_workspace",
+        "artifact_deliver",
+        "workspace_read_text",
+        "workspace_write_text",
+        "python_compute",
+        "process_run",
+        "shell_command",
+    }
+)
+_MEDIA_REQUIREMENT = re.compile(
+    r"图片|图像|照片|插图|插画|语音|音频|转写|转录|视频|浏览器|image|photo|illustrat|audio|speech|transcrib|ocr|video|browser",
+    re.I,
+)
 _TEAM_WRITES = frozenset({"team_task_create", "team_task_claim", "team_task_update"})
 _SCHEDULE_WRITES = frozenset(
     {"schedule_create", "schedule_update", "schedule_control", "trigger_create", "trigger_control"}
 )
 
 _COMPUTE = re.compile(
-    r"python|shell|运行.{0,12}(?:代码|进程|程序)|执行.{0,12}(?:代码|命令|进程)|用.{0,8}程序", re.I
+    r"(?:运行|执行|调用|启动|使用|采用|通过|用)\s*(?:受控的?\s*)?(?:python|shell)"
+    r"(?!\s*(?:官方|文档|教程|手册|语法|docs|documentation|manual))"
+    r"|(?:python|shell)\s*(?:实际)?(?:代码|脚本|程序|计算|算|检查|核验|验证|运行|执行|处理|绘制|绘图)"
+    r"|(?:run|execute|invoke|use)\s+(?:the\s+)?(?:python|shell)\b"
+    r"(?!\s*(?:official|docs|documentation|manual))"
+    r"|运行.{0,12}(?:代码|进程|程序)|执行.{0,12}(?:代码|命令|进程)|用.{0,8}程序",
+    re.I,
 )
 _FILE_OUTPUT = re.compile(
     r"(?:生成|制作|保存|导出|写成|整理成|转换成|转换为|做成|发来|发给我|给我一份).{0,30}"
@@ -35,8 +69,12 @@ _FILE_OUTPUT = re.compile(
     re.I,
 )
 _MEMORY = re.compile(
-    r"记忆|记住|记下|忘记|更正记录|历史记录|聊天记录|群聊|上次|刚才|之前|以前|remember|memory|previous|earlier",
+    r"记忆|记住|记下|忘记|更正记录|历史记录|聊天记录|群聊|(?:昨天|昨日|前天|昨晚).{0,6}(?:聊天|讨论)"
+    r"|上次|刚才|之前|以前|remember|memory|previous|earlier",
     re.I,
+)
+_MEMORY_SOURCE_PROHIBITION = re.compile(
+    r"(?:不要|不得|不能|不许|禁止|不)\s*(?:仅|只)?\s*(?:凭|依赖)\s*(?:仅|只)?\s*记忆"
 )
 _BUSINESS = re.compile(
     r"登记|认领|分配|分工|落库|负责人|群成员|群昵称|团队|查(?:询|看).{0,12}(?:任务|成员|名单|日程|提醒)"
@@ -89,6 +127,12 @@ def _text_only(work: WorkOrder) -> bool:
     )
 
 
+def _requires_memory(text: str) -> bool:
+    # Only suppress this narrow ban on an unsupported knowledge source. Other
+    # mentions of remembered facts or actual conversation history remain needs.
+    return bool(_MEMORY.search(_MEMORY_SOURCE_PROHIBITION.sub("", text)))
+
+
 def select_tools(
     work: WorkOrder,
     input_refs: Sequence[Mapping[str, Any]],
@@ -109,7 +153,7 @@ def select_tools(
     derived = bool(work.scope.get("origin_schedule_id") or work.scope.get("origin_trigger_rule_id"))
     team_write = work.scope.get("team_task_write_allowed") is True
     research = work.scope.get("research_required") is True
-    business = team_write or bool(_BUSINESS.search(requirements) or _MEMORY.search(requirements))
+    business = team_write or bool(_BUSINESS.search(requirements)) or _requires_memory(requirements)
     text_only = _text_only(work)
     raw_formats = [ref.get("format") if isinstance(ref, Mapping) else None for ref in input_refs]
     formats = [value.casefold() if isinstance(value, str) else None for value in raw_formats]
@@ -126,6 +170,7 @@ def select_tools(
         and not research
         and not team_write
         and not _ADDITIONAL_DELEGATION.search(goal)
+        and not _requires_memory(criteria)
         # Criteria describe work the agent must actually satisfy, even when
         # the short goal only asks it to remind the requester.
         and not any(
@@ -133,7 +178,6 @@ def select_tools(
             for pattern in (
                 _COMPUTE,
                 _FILE_OUTPUT,
-                _MEMORY,
                 _BUSINESS,
                 _SCHEDULING,
                 _RESEARCH,
@@ -172,6 +216,29 @@ def select_tools(
             and not work.scope.get("attachment_event_ids")
         ):
             profile = _WEB_TOOLS
+
+    outputs = work.scope.get("outputs", [])
+    if (
+        profile is None
+        and isinstance(outputs, list)
+        and bool(outputs)
+        and all(
+            isinstance(item, dict) and item.get("format") in _DOCUMENT_FORMATS for item in outputs
+        )
+        and all(format in _DOCUMENT_FORMATS for format in formats)
+        and not (not input_refs and (work.input_versions or work.scope.get("attachment_event_ids")))
+        and not business
+        and not research
+        and not work.scope.get("speech_requested")
+        and not _MEDIA_REQUIREMENT.search(requirements)
+        and not _RESEARCH.search(requirements)
+        and not _SCHEDULING.search(requirements)
+        and required.issubset(_DOCUMENT_TOOLS)
+    ):
+        # This retains all native editing/version routes, scoped workspace access,
+        # Python/process/shell, charts and PDF composition. It only removes
+        # unrelated catalogs; an extra required capability keeps the general set.
+        profile = _DOCUMENT_TOOLS
 
     if profile is not None and required.issubset(profile):
         return (available & profile) | required

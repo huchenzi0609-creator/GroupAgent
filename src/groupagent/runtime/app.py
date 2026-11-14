@@ -540,7 +540,10 @@ def build_app(
     model = DeepSeekHTTPModel(key, model=config.model_routes.text_agent)
     provider = MediaHTTPProvider("deepseek", key.get_secret_value())
     research = DeepSeekResearchClient(
-        key, max_search_content_bytes=8_000, max_fetch_content_bytes=12_000
+        key,
+        max_search_content_bytes=8_000,
+        max_search_text_bytes=16_000,
+        max_fetch_content_bytes=12_000,
     )
     route_models = [
         ("vision", Capability.VISION, config.model_routes.vision, "vision"),

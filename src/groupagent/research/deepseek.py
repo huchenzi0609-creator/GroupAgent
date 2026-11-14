@@ -67,6 +67,7 @@ class DeepSeekResearchClient:
         max_response_bytes: int = 2_000_000,
         max_output_bytes: int = 256_000,
         max_search_content_bytes: int = 16_000,
+        max_search_text_bytes: int = 16_000,
         max_fetch_content_bytes: int = 100_000,
     ) -> None:
         if (
@@ -75,6 +76,7 @@ class DeepSeekResearchClient:
                 max_response_bytes,
                 max_output_bytes,
                 max_search_content_bytes,
+                max_search_text_bytes,
                 max_fetch_content_bytes,
             )
             <= 0
@@ -97,6 +99,7 @@ class DeepSeekResearchClient:
         self.max_output_bytes = max_output_bytes
         self._max_response_bytes = max_response_bytes
         self._search_content_bytes = max_search_content_bytes
+        self._search_text_bytes = max_search_text_bytes
         self._fetch_content_bytes = max_fetch_content_bytes
 
     async def aclose(self) -> None:
@@ -185,6 +188,8 @@ class DeepSeekResearchClient:
         snippet: str = "",
         summary: str = "",
         published_at: datetime | None = None,
+        text_budget_bytes: int | None = None,
+        include_content: bool = True,
     ) -> ResearchSource:
         limits = {
             "title": 2048,
@@ -194,16 +199,26 @@ class DeepSeekResearchClient:
             if operation == "search"
             else self._fetch_content_bytes,
         }
+        if not include_content:
+            limits["content"] = 0
         original = {"title": title, "snippet": snippet, "summary": summary, "content": content}
         values: dict[str, str] = {}
         truncated = []
         for field, value in original.items():
+            # Retain provider prefixes, never synthesize a summary. Search text
+            # shares this budget in title/snippet/summary/content order; URL and
+            # provenance remain intact and subject to the final output bound.
+            limit = limits[field]
+            if text_budget_bytes is not None:
+                limit = min(limit, text_budget_bytes)
             try:
-                values[field], clipped = _truncate(value, limits[field])
+                values[field], clipped = _truncate(value, limit)
             except UnicodeError:
                 raise DomainError(
                     "invalid_research_response", "The provider returned invalid Unicode text"
                 ) from None
+            if text_budget_bytes is not None:
+                text_budget_bytes -= len(values[field].encode("utf-8"))
             if clipped:
                 truncated.append(field)
         returned_content = values["content"].encode("utf-8")
@@ -251,6 +266,8 @@ class DeepSeekResearchClient:
             *(self.url_policy.validate(result.url) for result in response.results),
             return_exceptions=True,
         )
+        returned_count = sum(not isinstance(url, BaseException) for url in admitted)
+        source_text_bytes = self._search_text_bytes // max(1, returned_count)
         sources = []
         filtered = 0
         for result, url in zip(response.results, admitted, strict=True):
@@ -263,10 +280,12 @@ class DeepSeekResearchClient:
                     title=result.title,
                     snippet=result.snippet,
                     summary=result.summary,
-                    content=result.content if arguments.need_content else "",
+                    content=result.content,
                     operation="search",
                     retrieved_at=retrieved,
                     published_at=result.date,
+                    text_budget_bytes=source_text_bytes,
+                    include_content=arguments.need_content,
                 )
             )
         return self._bounded(
