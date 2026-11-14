@@ -17,7 +17,7 @@
     "image_understanding": true,
     "audio_transcription": true,
     "speech_reply_on_request": true,
-    "image_generation": true,
+    "image_generation": false,
     "document_editing": true,
     "web_research": true,
     "durable_schedules": true,
@@ -91,7 +91,7 @@
     "vision": "CONFIGURE_AND_VALIDATE",
     "speech_to_text": "CONFIGURE_AND_VALIDATE",
     "text_to_speech": "CONFIGURE_AND_VALIDATE",
-    "image_generation": "CONFIGURE_AND_VALIDATE"
+    "image_generation": "NOT_IN_CURRENT_SCOPE"
   },
   "engine": {
     "candidate": "deepseek_harness",
