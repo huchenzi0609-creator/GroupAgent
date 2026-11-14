@@ -161,9 +161,11 @@ async def test_real_worker_chart_labels_are_read_by_unchanged_ocr(document_runti
         version.file_id,
         version.version_id,
     )
-    recognized, _ = await service.worker.run(
+    response, _ = await service.worker.run(
         context, "ocr_image", (raw,), parameters={"languages": "eng+chi_sim"}
     )
+    assert len(response["pages"]) == 1
+    recognized = response["pages"][0]
     assert recognized["method"] == "tesseract" and recognized["segmentation_mode"] == 6
     assert all(label.casefold() in recognized["text"].casefold() for label in chart.categories), (
         recognized["text"]
