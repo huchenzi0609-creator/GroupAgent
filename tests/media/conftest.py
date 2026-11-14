@@ -22,18 +22,27 @@ def png_fixture(
 ) -> bytes:
     raster = Image.new("RGB", size, "white")
     configured = os.environ.get("GROUPAGENT_TEST_CJK_FONT") or os.environ.get("GROUPAGENT_PDF_FONT")
-    candidates = ([Path(configured)] if configured else []) + [
+    candidates = [
         Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
         Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
         Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
     ]
-    font_path = next((path for path in candidates if path.is_file()), None)
-    if configured and font_path is None:
-        pytest.fail("The configured synthetic CJK fixture font is not available")
+    if configured:
+        font_path = Path(configured)
+        if not font_path.is_file():
+            pytest.fail("The configured synthetic CJK fixture font is not available")
+    else:
+        font_path = next((path for path in candidates if path.is_file()), None)
+    try:
+        font_index = int(os.environ.get("GROUPAGENT_TEST_CJK_FONT_INDEX", "0"))
+    except ValueError:
+        pytest.fail("The configured synthetic CJK fixture font index must be an integer")
+    if not 0 <= font_index <= 15:
+        pytest.fail("The configured synthetic CJK fixture font index must be between 0 and 15")
     if font_path is None and any("\u4e00" <= character <= "\u9fff" for character in text):
         pytest.skip("A CJK font is required to create an actual Chinese OCR fixture")
     font = (
-        ImageFont.truetype(str(font_path), 54)
+        ImageFont.truetype(str(font_path), 54, index=font_index)
         if font_path is not None
         else ImageFont.load_default(size=54)
     )
@@ -93,6 +102,8 @@ def isolated_worker():
         DockerSandbox(
             image,
             docker_host=os.environ.get("GROUPAGENT_DOCKER_HOST"),
-            limits=SandboxLimits(memory_mb=1024, workspace_mb=256, temp_mb=256, pids=128),
+            # Match the production media/browser budget. Real Chromium fixtures
+            # reached 129 PIDs; the former 128 cap was below measured demand.
+            limits=SandboxLimits(memory_mb=1024, workspace_mb=256, temp_mb=256, pids=256),
         )
     )

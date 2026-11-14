@@ -119,6 +119,8 @@ jobs:
       UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
       GROUPAGENT_TEST_DSN: postgresql://groupagent_worker_ci:synthetic_worker_fixture_only@localhost:5432/groupagent_worker_test
       GROUPAGENT_PDF_FONT: /usr/share/fonts/truetype/wqy/wqy-zenhei.ttc
+      GROUPAGENT_TEST_CJK_FONT: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+      GROUPAGENT_TEST_CJK_FONT_INDEX: "2"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
@@ -127,7 +129,8 @@ jobs:
           python-version: "3.13"
           enable-cache: true
       - name: Install a CJK font for synthetic host-side OCR fixtures
-        run: sudo apt-get update && sudo apt-get install -y fonts-wqy-zenhei
+        # TTC face 2 is Noto Sans CJK SC; keep PDF's WQY font independent.
+        run: sudo apt-get update && sudo apt-get install -y fonts-wqy-zenhei fonts-noto-cjk
       - run: uv sync --locked
       - name: Build immutable workers from the reviewed lock and SDK hashes
         run: |
