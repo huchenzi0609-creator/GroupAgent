@@ -9,5 +9,5 @@
 **/.env*
 **/*.pem
 **/*.key
-**/*local*
+**/config.local.*
 **/secrets/**

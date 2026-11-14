@@ -135,8 +135,10 @@ jobs:
           mkdir -p runtime/ci
           uv export --frozen --no-dev --no-emit-project --format requirements.txt --output-file runtime/ci/requirements.txt
           diff -u <(tail -n +3 deploy/worker/requirements.txt) <(tail -n +3 runtime/ci/requirements.txt)
-          docker build --build-arg BASE_IMAGE=python@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72 -f deploy/worker/Dockerfile --iidfile runtime/ci/worker.iid .
-          docker build --build-arg WORKER_IMAGE="$(cat runtime/ci/worker.iid)" -f deploy/worker/Dockerfile.harness --iidfile runtime/ci/harness.iid .
+          worker_build_tag="groupagent-worker:ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build --build-arg BASE_IMAGE=python@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72 -f deploy/worker/Dockerfile --iidfile runtime/ci/worker.iid --tag "$worker_build_tag" .
+          test "$(docker image inspect --format '{{.Id}}' "$worker_build_tag")" = "$(cat runtime/ci/worker.iid)"
+          docker build --build-arg WORKER_IMAGE="$worker_build_tag" -f deploy/worker/Dockerfile.harness --iidfile runtime/ci/harness.iid .
           echo "GROUPAGENT_WORKER_IMAGE=$(cat runtime/ci/worker.iid)" >> "$GITHUB_ENV"
           echo "GROUPAGENT_HARNESS_IMAGE=$(cat runtime/ci/harness.iid)" >> "$GITHUB_ENV"
       - name: Verify genuine SDK, process isolation and artifact pipelines

@@ -3,13 +3,18 @@
 应用运行只接受不可变镜像 ID/digest。`groupagent-worker:local-readiness` 是本地构建句柄，不能作为生产唯一标识。基础镜像固定为 `python@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72`；Python 依赖来自根 uv.lock 的 hash export，Harness 包另有 `harness-requirements.txt`。apt 安装的实际版本写入镜像内清单；apt 仓库未做日期快照，重新构建可能不同，因此应发布并测试同一最终镜像，而不是宣称位级可重复构建。
 
 ```sh
+mkdir -p runtime/build
 docker -H "$GROUPAGENT_DOCKER_HOST" build \
   --build-arg BASE_IMAGE=python@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72 \
-  -f deploy/worker/Dockerfile -t groupagent-worker:local-readiness .
-docker -H "$GROUPAGENT_DOCKER_HOST" image inspect groupagent-worker:local-readiness --format '{{.Id}}'
-docker -H "$GROUPAGENT_DOCKER_HOST" build --build-arg WORKER_IMAGE="$GROUPAGENT_WORKER_IMAGE" \
-  -f deploy/worker/Dockerfile.harness -t groupagent-harness:local-readiness .
+  -f deploy/worker/Dockerfile -t groupagent-worker:local-readiness --iidfile runtime/build/worker.iid .
+test "$(docker -H "$GROUPAGENT_DOCKER_HOST" image inspect groupagent-worker:local-readiness --format '{{.Id}}')" = "$(cat runtime/build/worker.iid)"
+docker -H "$GROUPAGENT_DOCKER_HOST" build --build-arg WORKER_IMAGE=groupagent-worker:local-readiness \
+  -f deploy/worker/Dockerfile.harness -t groupagent-harness:local-readiness --iidfile runtime/build/harness.iid .
+export GROUPAGENT_WORKER_IMAGE="$(cat runtime/build/worker.iid)"
+export GROUPAGENT_HARNESS_IMAGE="$(cat runtime/build/harness.iid)"
 ```
+
+BuildKit 的 `FROM` 不按本机 image ID 查找 `sha256:...`；构建 Harness 时使用已核对 ID 的本地标签，应用启动仍读取生成的不可变 IID。标签只承担同次构建阶段的衔接，不能代替运行标识。
 
 构建上下文默认拒绝全部，仅允许公开源码／依赖锁／部署文件；不得加入 `.env*`、运行数据库、会话或真实群数据。运行 worker 不挂载本机目录。媒体镜像包含中文／英文字体、Tesseract、Poppler、LibreOffice、Chromium、Playwright、用于音频容器检查的 ffmpeg 和 arm64 Playwright Node 所需 libatomic1；安装 ffmpeg 不授予视频处理能力。
 
