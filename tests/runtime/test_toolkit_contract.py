@@ -862,3 +862,6 @@ async def test_canonical_original_request_is_bounded_redacted_and_shared_with_re
     assert "不因此需要满足程序代码语法" in review.messages[0].content
     assert "不得据此推断实际停顿、声线或自然度" in review.messages[0].content
     assert "真实音频解码、非静音和内容核验" in review.messages[0].content
+    assert "不得把尚未发送" in review.messages[0].content
+    assert json.loads(review.messages[1].content)["validation_phase"] == "pre_delivery"
+    assert json.loads(review.messages[1].content)["delivery_status"] == "not_started_by_design"

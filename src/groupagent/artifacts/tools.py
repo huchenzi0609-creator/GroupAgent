@@ -27,8 +27,15 @@ class ArtifactReference(ToolData):
 
 
 class TableInput(ToolData):
-    headers: tuple[str, ...] = Field(min_length=1, max_length=6)
-    rows: tuple[tuple[str, ...], ...] = Field(max_length=50)
+    headers: tuple[str, ...] = Field(
+        min_length=1,
+        max_length=6,
+        description="Column names, not observation names. For key=value observations use two columns (name/value) unless the user explicitly requests horizontal orientation.",
+    )
+    rows: tuple[tuple[str, ...], ...] = Field(
+        max_length=50,
+        description="Editable native table data, one record per row. Put each named scalar observation and its unchanged value in the same row; do not transpose observation names into column headers unless explicitly requested.",
+    )
 
     @model_validator(mode="after")
     def rectangular(self):
@@ -430,7 +437,7 @@ def register_document_tools(
         ),
         (
             "document_generate",
-            'Create a real scoped document; name MUST include its extension. Use kind=report for native DOCX/PDF reports, comparison tables, score sheets, rubrics and checklists. Sections support tables, blank cells and empty paragraphs for writing space; PDF uses managed CJK fonts and verified page layout. Prefer this to custom Python drawing for these supported layouts. Minimal report: {"name":"report.md","kind":"report","title":"Summary","sections":[{"title":"Findings","paragraphs":["Result 87."]}]}. For PPTX use {"name":"slides.pptx","kind":"deck","title":"Summary","slides":[{"title":"Findings","bullets":["Result 87."]}]}. Use document_validate before delivery.',
+            'Create a real scoped document; name MUST include its extension. Use kind=report for native DOCX/PDF reports, comparison tables, score sheets, rubrics and checklists. Sections support tables, blank cells and empty paragraphs for writing space; PDF uses managed CJK fonts and verified page layout. Prefer this to custom Python drawing for these supported layouts. For key=value observations, use name/value columns and one editable data row per observation unless the user explicitly requests a horizontal table. Minimal report: {"name":"report.md","kind":"report","title":"Summary","sections":[{"title":"Findings","paragraphs":["Result 87."]}]}. For PPTX use {"name":"slides.pptx","kind":"deck","title":"Summary","slides":[{"title":"Findings","bullets":["Result 87."]}]}. The deck title is document metadata; visible slide text comes only from supplied slide content, with no automatic title/page-number footer. Use document_validate before delivery.',
             DocumentCreateInput,
             ArtifactOutput,
             generate,

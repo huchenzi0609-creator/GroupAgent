@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -255,3 +256,40 @@ def test_resume_archives_prior_results_manifest_and_raw_evidence_before_bootstra
     assert (archive / "evidence" / "CASE-01.json").read_bytes() == (
         root / "evidence" / "CASE-01.json"
     ).read_bytes()
+
+
+@pytest.mark.parametrize(
+    "first_status,stop,expected", [("FAIL", True, 1), ("NEEDS_REVIEW", True, 2), ("FAIL", False, 2)]
+)
+async def test_fail_fast_retains_failed_record_without_starting_another_paid_case(
+    matrix, tmp_path, first_status, stop, expected
+):
+    run = matrix.MatrixRun.__new__(matrix.MatrixRun)
+    run.args = SimpleNamespace(limit=0, stop_on_failure=stop)
+    run.resuming = False
+    run.recheck_only = False
+    run.dataset = {"cases": [{"id": "one"}, {"id": "two"}]}
+    run.records = {}
+    run.actor = object()
+    run.ledger = SimpleNamespace(report=lambda actor: {"synthetic": True})
+    run._lock = os.open(tmp_path / "runner.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    calls = []
+
+    async def start():
+        calls.append("start")
+
+    async def close():
+        calls.append("close")
+
+    async def case(value):
+        calls.append(value["id"])
+        run.records[value["id"]] = {
+            "evaluation": {"status": first_status if value["id"] == "one" else "PASS"}
+        }
+
+    run.app = SimpleNamespace(start=start, close=close)
+    run.case = case
+    await run.run()
+    assert len(run.records) == expected
+    assert run.records["one"]["evaluation"]["status"] == first_status
+    assert calls == ["start", "one", *(["two"] if expected == 2 else []), "close"]

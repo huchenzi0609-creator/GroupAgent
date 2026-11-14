@@ -423,7 +423,7 @@ def build_pptx(deck: Deck, *, font_family: str = "Arial") -> bytes:
     presentation.core_properties.title = deck.title
     presentation.core_properties.author = "GroupAgent"
     presentation.core_properties.keywords = DECK_MARKER
-    for index, data in enumerate(deck.slides):
+    for data in deck.slides:
         slide = presentation.slides.add_slide(presentation.slide_layouts[6])
         title = slide.shapes.add_textbox(Inches(0.7), Inches(0.5), Inches(11.9), Inches(1.0))
         title.name = "groupagent.title"
@@ -459,9 +459,6 @@ def build_pptx(deck: Deck, *, font_family: str = "Arial") -> bytes:
                         paragraph.font.size = Pt(16)
                         paragraph.font.bold = row_index == 0
                         paragraph.font.color.rgb = RGBColor(20, 33, 46)
-        footer = slide.shapes.add_textbox(Inches(0.7), Inches(7.0), Inches(11.9), Inches(0.3))
-        footer.name = "groupagent.footer"
-        _slide_text(footer, (f"{deck.title}   |   {index + 1}",), 10, font_family=font_family)
     output = io.BytesIO()
     presentation.save(output)
     return output.getvalue()

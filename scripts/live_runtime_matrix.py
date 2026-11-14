@@ -245,6 +245,7 @@ class MatrixRun:
                 "channel": "local_only",
                 "paid_budget_group": self.actor.group_id,
                 "total_cny_limit": 50,
+                "stop_on_failure": bool(getattr(args, "stop_on_failure", False)),
                 "started_at": datetime.now(UTC),
             }
             save(self.root / "manifest.json", self.original_manifest)
@@ -1122,6 +1123,13 @@ class MatrixRun:
                         await self.app.start()
                         started = True
                     await self.case(case)
+                    if (
+                        getattr(self.args, "stop_on_failure", False)
+                        and self.records[case["id"]]["evaluation"]["status"] == "FAIL"
+                    ):
+                        # Retain the failed case and leave later cases NOT_RUN;
+                        # do not spend more once a new repair is already needed.
+                        break
                 except Exception as error:
                     record = {
                         "id": case["id"],
@@ -1163,6 +1171,11 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--stop-on-failure",
+        action="store_true",
+        help="Retain the first checked FAIL and stop before paying for a later case",
+    )
     parser.add_argument(
         "--recheck-only",
         action="store_true",
