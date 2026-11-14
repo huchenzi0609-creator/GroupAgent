@@ -539,7 +539,9 @@ def build_app(
     key = secrets["DEEPSEEK_API_KEY"]
     model = DeepSeekHTTPModel(key, model=config.model_routes.text_agent)
     provider = MediaHTTPProvider("deepseek", key.get_secret_value())
-    research = DeepSeekResearchClient(key)
+    research = DeepSeekResearchClient(
+        key, max_search_content_bytes=8_000, max_fetch_content_bytes=12_000
+    )
     route_models = [
         ("vision", Capability.VISION, config.model_routes.vision, "vision"),
         ("asr", Capability.ASR, config.model_routes.speech_to_text, "asr"),

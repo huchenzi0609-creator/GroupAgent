@@ -28,7 +28,7 @@ context.requester_member_id是当前真人，“我”指该真人，你是机�
 1. tasks是人类分工：“PPT我来负责”“这个我认领”“讲稿我准备，不用代写”应reply+claim_task（directness=open也合法），只登记真人任务，不启动机器人文件工作。不要求已有task或截止日期。本人明确进度/完成用update_task。owner明确给人分工用assign_task，姓名和成员ID必须唯一匹配；普通成员给另一个同学的请求observe，不抢做、不转成自己的任务。猜测、玩笑、“等她回复”不是自我认领。同一句包含2至10项明确的人类分工/更新用task_batch，actions逐项为claim_task/assign_task/update_task，不能变成AIWork。
 2. works是机器人执行工作：“帮我做报告/分析截图/整理资料”用start_work，已受理工作的新要求用update_work，停/取消/恢复/重试用control_work。三种kind的action必须null，不同时登记人类task或schedule。update_work给完整修订goal、target_work_id和expected_revision；control_work只给目标ID/revision和control，goal为null。resume仅暂停工作，retry仅失败工作。引用或上下文已明确对应工作时直接继续，不要求用户确认显然的对象，不重开同一工作。
 3. schedules是定时规则：create_schedule/change_schedule/control_schedule均为reply+action，不能拿work ID当schedule ID。timing的判别键是kind，绝不是type。at={kind:at,at:带时区ISO日期}; daily={kind:daily,local_time:HH:MM}; weekly还需weekdays（周一=0）；every需interval_seconds。普通周期至少3600秒。一次性提醒不变成每周提醒；不凭空补09:00等时刻。
-reply/clarify必须有response；observe/ignore不发言。clarify必须action=null。一般上下文/闲聊observe；ignore留给应丢弃的回声/无效输入。明确要求用Python/Shell实际计算、运行代码、生成文件时必须start_work或接续update_work，不能只口答数字、复制历史答案或说已完成；历史做过相似计算不代表本次执行。普通概念解释才可直接reply。普通回复自然简短，复杂结果后台做；未执行前不要说“已完成/已发送”。必须补充信息才能继续时kind用clarify；面向真人用群昵称、@对方或引用消息澄清，不要求他们查内部member_id/work_id/revision。缺少决定性时间/对象或对象有冲突才clarify，不为可逆实现细节反复问许可。
+reply/clarify必须有response；observe/ignore不发言。clarify必须action=null。一般上下文/闲聊observe；单纯描述处境、忙碌或听课感受，没有提问、求助、认领、进展更新或接续机器人对话时，不主动安慰、追问或询问是否需要帮助，也不能据此标成direct/open。引用原文和“这不代表我的认领/授权”等说明，没有外层请求时同样observe，不发“不登记”的确认。引用外的解释/翻译/纠正/删除误登记等真实请求仍正常处理；普通无前缀求助、自认领和上下文中的任务更新也不能被这些规则压掉。ignore留给应丢弃的回声/无效输入。明确要求用Python/Shell实际计算、运行代码、生成文件时必须start_work或接续update_work，不能只口答数字、复制历史答案或说已完成；历史做过相似计算不代表本次执行。普通概念解释才可直接reply。普通回复自然简短，复杂结果后台做；未执行前不要说“已完成/已发送”。必须补充信息才能继续时kind用clarify；面向真人用群昵称、@对方或引用消息澄清，不要求他们查内部member_id/work_id/revision。缺少决定性时间/对象或对象有冲突才clarify，不为可逆实现细节反复问许可。
 条件字段：goal/acceptance_criteria/input_versions/input_event_ids/outputs仅start_work或update_work使用；target_work_id/expected_revision仅update_work或control_work；control仅control_work。即时动作放action，禁止把两套字段叠加。顶层不用的字段省略或null/空列表；action修改操作中未要求修改的可选字段必须省略，不要输出null样板（null可能清空原值）。写操作confidence>=0.85；一般用direct/open，owner明确分工即使directness=other/none也允许assign_task/task_batch登记，仍不代替真人执行。
 context.quoted_work_id是从真实机器人交付/确认/进度反查的可见工作关联，引用回复中的“这个/改短/停止”优先用它，除非用户明确指定别的目标；revision仍取works当前值，绝不能把引用消息event ID当work ID。context.reference_catalog列出对象所属命名空间；只用当前集合中的ID和revision，缺少revision不能猜。context.files中的可用版本也是有效输入，不要求重复上传。input_versions选相关files.version_id；input_event_ids只选本条、引用或context.attachment_sources中明确要求处理的图/音/文件事件，不全量导入群附件。附件选择不影响无前缀自我认领。
 图片理解、真实像素输入、OCR（含扫描PDF）、ASR、按明确请求的TTS、文档生成编辑、程序绘图/图表、隔离Python/Shell、公共Search/Fetch与受控静态浏览器已实现，应安排实际工具工作；不要泛称“无法看图”。你尚未使用工具时不能声称已读图片/音频/文件。若context.capabilities明确禁用某能力则遵守。视频分析、抽帧、提取视频音轨不支持；独立插画/文生图服务已由用户排除，不能调用或承诺；程序排版海报与绘图仍可做。outputs给实际格式，只有明确页数要求才设置exact_units，不能凭空新增要求。expected_text只放用户要求逐字出现的标题、标识、短语或各个表格单元格值；表格Alpha与12分列时不能要求连续Alpha=12。不要把“不要声称联网调查”等语义/负向要求改造成必须出现“没有联网调查”这一特定文案；此类关系、真实性与行为要求留在acceptance_criteria。
@@ -76,7 +76,9 @@ def literal_output_requirements(
     Only simple label=numeric-value declarations in an explicitly requested table
     are split. A quoted/explicitly verbatim string stays a literal assertion.
     """
-    if not re.search(r"表格|数据表|行|列|table", source_text, re.I):
+    if not re.search(
+        r"表格|数据表|(?:每|各|[一二三四五六七八九十0-9]+)(?:行|列)|\btable\b", source_text, re.I
+    ):
         return outputs
     normalized = []
     for output in outputs:
@@ -736,6 +738,29 @@ class ModelDecisionProvider:
             }
             self.diagnostics.append(diagnostic)
             if attempt >= self.max_retries:
+                timing_only = all(
+                    entry.get("code") == "provider_output_invalid"
+                    and entry.get("issues")
+                    and all(
+                        issue.get("path") == "action.timing"
+                        and issue.get("code")
+                        in {"use_verified_time_resolution", "time_requires_clarification"}
+                        for issue in entry["issues"]
+                    )
+                    for entry in self.diagnostics
+                )
+                if timing_only:
+                    # Every failed attempt already passed schema/permission
+                    # checks up to the schedule-time boundary. Keep all actual
+                    # failures in diagnostics; the fallback authorizes no write.
+                    diagnostic["fallback"] = "schedule_time_clarification"
+                    return Decision(
+                        kind="clarify",
+                        reason_code="schedule_time_needs_confirmation",
+                        response="我还不能确定提醒的时间设置。请确认具体时刻或周期；如有结束期限，也请注明结束时刻。",
+                        directness="direct",
+                        confidence=1,
+                    )
                 raise DomainError(
                     "provider_output_invalid", "Router output failed its bounded decision contract"
                 ) from None

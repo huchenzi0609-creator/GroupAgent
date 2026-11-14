@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
 from groupagent.conversation.participation import fast_observe, policy_intent
 from groupagent.conversation.provider import ModelDecisionProvider
+from groupagent.conversation.service import ConversationCoordinator
+from groupagent.coordinator import Decision
 from groupagent.domain import EventKind, GroupEvent
 
 
@@ -115,6 +119,152 @@ async def test_reference_only_or_explicit_one_off_decline_is_observed(text):
     assert (
         await ModelDecisionProvider(NeverCalledFixtureModel()).decide(event(text), context())
     ).kind == "observe"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "引用原文：『我负责PPT』，这不是我在认领。",
+        "引述原话：“周三交初稿”，不代表我的承诺。",
+        "转述内容：「把资料发出去」，上述内容并非本人的授权。",
+        "引用：『今天由我来讲』。",
+        "转发原文：『能替我写一下吗？』",
+    ],
+)
+async def test_complete_source_wrapper_without_outer_request_is_silent(text):
+    result = await ModelDecisionProvider(NeverCalledFixtureModel()).decide(
+        event(text, kind=EventKind.QUOTE), context()
+    )
+    assert result.kind == "observe" and result.response is None and result.action is None
+    assert result.reason_code == "reference_data_without_outer_request"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "引用原文：『我负责讲稿』，请翻译成英语。",
+        "引用原文：『我负责讲稿』，这不是我在认领，请删除刚才误登记的任务。",
+        "引述原话：“周三交初稿”，不代表我的承诺，帮我改到周五。",
+        "引用原文：『我负责PPT』，这个我来做。",
+        "引用原文：『我负责PPT』，这是我的正式认领。",
+        "引用原文：『我负责PPT』，这句话是否表示认领？",
+        "引用原文：我负责讲稿。",  # No delimited reference: do not guess the boundary.
+    ],
+)
+def test_source_wrapper_does_not_swallow_outer_commands_or_claims(text):
+    assert fast_observe(event(text, kind=EventKind.QUOTE), context()) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "刚才老师讲得有点快。",
+        "这周事情有点多。",
+        "最近节奏比较紧。",
+        "今天实验室有些冷啊。",
+        "我现在有点累了。",
+    ],
+)
+async def test_standalone_observation_does_not_invite_unsolicited_help(text):
+    result = await ModelDecisionProvider(NeverCalledFixtureModel()).decide(event(text), context())
+    assert result.kind == "observe" and result.response is None and result.action is None
+    assert result.reason_code == "standalone_state_without_request"
+
+
+@pytest.mark.parametrize(
+    "text,kind",
+    [
+        ("刚才老师讲得有点快。", EventKind.TEXT),
+        ("这周事情有点多。", EventKind.TEXT),
+        ("引用原文：『我负责PPT』，这不是我在认领。", EventKind.QUOTE),
+    ],
+)
+def test_service_gate_silences_an_incorrect_direct_reply_without_database_access(text, kind):
+    class NoDatabaseAccess:
+        def __getattr__(self, name):
+            raise AssertionError("Participation preflight must precede database access")
+
+    coordinator = ConversationCoordinator.__new__(ConversationCoordinator)
+    candidate = Decision(
+        kind="reply",
+        reason_code="fixture_unsolicited_reply",
+        response="需要帮忙吗？",
+        directness="direct",
+        confidence=0.95,
+    )
+    result = coordinator._gate(NoDatabaseAccess(), event(text, kind=kind), candidate, context())
+    assert result.kind == "observe" and result.response is None and result.action is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "老师讲得有点快，帮我梳理要点。",
+        "这周事情有点多，能帮我安排一下吗？",
+        "我需要你帮忙，因为事情有点多。",
+        "小伴这周事情有点多。",
+        "@小伴 这周事情有点多。",
+        "我负责讲稿，这部分有点难。",
+        "讲稿我来准备，其他事情有点多。",
+        "我的任务进度有点慢。",
+        "你做的报告有点长。",
+        "这次报告有点难。",
+        "最近讲得是不是有点快呢。",
+        "我最近活着有点累。",
+        "这周事情有点多，明天九点提醒我整理。",
+    ],
+)
+def test_requests_claims_feedback_and_distress_are_not_plain_observations(text):
+    assert fast_observe(event(text), context()) is None
+
+
+def test_observation_rule_defers_when_message_can_continue_a_request():
+    text = "最近节奏比较紧。"
+    assert fast_observe(event(text, reply_to="previous"), context()) is None
+    assert fast_observe(event(text, attachments=[{"kind": "image"}]), context()) is None
+    assert fast_observe(event(text, kind=EventKind.QUOTE), context()) is None
+    assert fast_observe(event(text), {**context(), "quoted_work_id": "work"}) is None
+    assert fast_observe(event(text), {**context(), "context_incomplete": True}) is None
+    assert (
+        fast_observe(
+            event(text),
+            {
+                **context(),
+                "recent_messages": [{"id": "previous", "text": "这周的节奏如何？"}],
+            },
+        )
+        is None
+    )
+    assert (
+        fast_observe(event("阅读笔记有点难。"), {**context(), "tasks": [{"title": "阅读笔记"}]})
+        is None
+    )
+
+
+def test_frozen_explicit_requests_are_not_silenced_by_preflight():
+    fixture = Path(__file__).parents[1] / "fixtures" / "interaction_cases.json"
+    cases = json.loads(fixture.read_text())["cases"]
+    requests = [case for case in cases if not {"observe", "ignore"} & set(case["expected_kind"])]
+    assert len(requests) == 219
+    suppressed = []
+    for case in requests:
+        stamp = datetime.fromisoformat(case["occurred_at"])
+        model_event = case["context"]["model_event"]
+        source = GroupEvent(
+            id=model_event["id"],
+            source_key="fixture:" + case["id"],
+            group_id=case["context"]["group_id"],
+            actor_id=model_event["actor_id"],
+            kind=EventKind(case["event_kind"]),
+            text=case["text"],
+            occurred_at=stamp,
+            received_at=stamp,
+            reply_to=model_event.get("reply_to"),
+            attachments=model_event.get("attachments", []),
+        )
+        if fast_observe(source, case["context"]) is not None:
+            suppressed.append(case["id"])
+    assert suppressed == []
 
 
 @pytest.mark.parametrize(

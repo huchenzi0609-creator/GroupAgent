@@ -24,6 +24,27 @@ _GROUP = re.compile(r"全群|本群|整个群|这个群|当前群|群内|群里�
 _PARTICIPATION = re.compile(
     r"安静|静默|插话|打扰|参与|回应|回复|处理|助手|机器人|主动.{0,12}(?:回应|回复|发言|补充|提醒|交流|建议)|(?:恢复|正常|自然).{0,5}(?:交流|参与)|(?:处理|启用|停用).{0,12}(?:群|消息)"
 )
+_SOURCE_LABEL = re.compile(r"^(?:引用|引述|转述|转发)(?:的)?(?:原文|原话|内容|消息)?\s*[：:]")
+_SOURCE_DISCLAIMER = re.compile(
+    r"(?:(?:这|以上|上述)(?:句话|段话|内容)?(?:并|都|也)?)?"
+    r"(?:不是|不代表|不表示|并非)(?:我|本人|我们)(?:的)?(?:在|要|已经)?"
+    r"(?:认领|接单|承诺|授权|分工|安排|请求|指令)(?:任务|工作)?"
+)
+_PLAIN_STATE = re.compile(
+    r"[^，,。.!！?？:：;；@/\n\"“”『』「」`]{0,60}"
+    r"(?:有点|有些|有一点|挺|比较|很|太|真)"
+    r"(?:冷|热|忙|累|困|难|快|慢|多|少|紧|赶|乱|吵|复杂|辛苦|吃力|疲惫|紧张|费劲)"
+    r"(?:了|的|啊|呀|呢)?[。！!\s]*"
+)
+_NON_CASUAL_STATE = re.compile(
+    r"请|麻烦|拜托|帮|求|建议|推荐|解释|翻译|分析|总结|整理|计算|生成|制作|画|写|改|换|调整|撤|删|"
+    r"停止|取消|暂停|继续|恢复|重试|记住|记下|忘记|分配|安排|分工|认领|负责|承担|接手|来做|准备|"
+    r"我来|我接|我做|由我|算我|进度|完成|提交|汇报|"
+    r"截止|延期|推迟|提醒|需要|希望|想要|能否|可以|能不能|是不是|是否|难道|吗|么|谁|什么|哪|为何|你|您|"
+    r"任务|报告|文档|幻灯|表格|摘要|图表|稿|PPT|PDF|Word|"
+    r"活着|活下去|自杀|想死|伤害|救命|自残|受伤|疼|痛|报警|急救|危险|绝望",
+    re.I,
+)
 
 
 def _outside(text: str) -> str:
@@ -48,6 +69,61 @@ def _agent_request(text: str, context: dict[str, Any]) -> bool:
     return False
 
 
+def _source_quote_only(text: str, outside: str) -> bool:
+    """Match the entire source wrapper, never an instruction after the quote."""
+    if not _QUOTED.search(text):
+        return False
+    label = _SOURCE_LABEL.match(outside)
+    if label is None:
+        return False
+    rest = outside[label.end() :].strip(" \t\n，,。.!！;；")
+    return not rest or _SOURCE_DISCLAIMER.fullmatch(rest) is not None
+
+
+def _standalone_state(event: GroupEvent, text: str, context: dict[str, Any]) -> bool:
+    """A bounded everyday observation does not itself ask for help or a check-in.
+
+    Replies, artifacts, work feedback, questions and uncertain context remain for
+    interpretation. This is deliberately narrower than a general intent parser.
+    """
+    if (
+        event.kind != EventKind.TEXT
+        or event.reply_to
+        or event.attachments
+        or context.get("quoted_work_id")
+        or context.get("context_incomplete")
+        or not _PLAIN_STATE.fullmatch(text)
+        or _NON_CASUAL_STATE.search(text)
+    ):
+        return False
+    aliases = context.get("agent_aliases", ["机器人", "机器人组长", "组长", "小伴"])
+    if isinstance(aliases, list) and any(
+        isinstance(alias, str) and alias and alias in text for alias in aliases
+    ):
+        return False
+    # An unthreaded answer to a recent question can still continue a request.
+    recent = context.get("recent_messages", [])
+    if isinstance(recent, list) and any(
+        isinstance(row, dict)
+        and row.get("id") != event.id
+        and isinstance(row.get("text"), str)
+        and _OUTER_ASK.search(row["text"])
+        for row in recent[-2:]
+    ):
+        return False
+    for name in ("works", "tasks", "schedules"):
+        rows = context.get(name, [])
+        if isinstance(rows, list) and any(
+            isinstance(row, dict)
+            and isinstance(row.get("title"), str)
+            and len(row["title"]) >= 2
+            and row["title"] in text
+            for row in rows
+        ):
+            return False
+    return True
+
+
 def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
     """Recognize only high-certainty no-intervention windows, without a model call."""
     if (
@@ -64,7 +140,7 @@ def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
         )
     )
     if (
-        (event.kind == EventKind.FORWARDED or explicit_data)
+        (event.kind == EventKind.FORWARDED or explicit_data or _source_quote_only(text, outside))
         and not _OUTER_ASK.search(outside)
         and not _agent_request(outside, context)
     ):
@@ -76,6 +152,13 @@ def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
         )
     if _EXPLANATION.search(outside) or _agent_request(outside, context):
         return None
+    if _standalone_state(event, text, context):
+        return Decision(
+            kind="observe",
+            reason_code="standalone_state_without_request",
+            directness="none",
+            confidence=1,
+        )
     # One-off refusal to involve the bot is not a persistent quiet policy and is
     # not a cancellation of a quoted, already accepted work.
     if (

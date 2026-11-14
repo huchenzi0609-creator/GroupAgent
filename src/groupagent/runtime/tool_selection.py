@@ -1,0 +1,174 @@
+"""Small conservative catalogs for already imported inputs; not an authority layer.
+
+Call after input import and feature filtering, immediately before ExecutionRequest.
+Only controller Work fields and validated input formats are inspected. Input text,
+filenames and provider output never choose tools. Ambiguous/complex work keeps the
+general catalog; required tools must already exist in the supplied eligible set.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
+
+from groupagent.domain import DomainError, WorkOrder
+
+_IMAGE = frozenset({"png", "jpg", "jpeg", "webp", "gif"})
+_AUDIO = frozenset({"wav", "mp3", "ogg", "flac", "m4a", "aac"})
+_IMAGE_TOOLS = frozenset({"request_input", "image_analyze", "media_ocr", "provider_ocr"})
+_AUDIO_TOOLS = frozenset({"request_input", "audio_transcribe"})
+_WEB_TOOLS = frozenset({"request_input", "web_search", "web_fetch", "browser_open"})
+_REMINDER_TOOLS = frozenset({"request_input"})
+_TEAM_WRITES = frozenset({"team_task_create", "team_task_claim", "team_task_update"})
+_SCHEDULE_WRITES = frozenset(
+    {"schedule_create", "schedule_update", "schedule_control", "trigger_create", "trigger_control"}
+)
+
+_COMPUTE = re.compile(
+    r"python|shell|运行.{0,12}(?:代码|进程|程序)|执行.{0,12}(?:代码|命令|进程)|用.{0,8}程序", re.I
+)
+_FILE_OUTPUT = re.compile(
+    r"(?:生成|制作|保存|导出|写成|整理成|转换成|转换为|做成|发来|发给我|给我一份).{0,30}"
+    r"(?:文件|文档|报告|表格|图表|流程图|图片|语音|音频|pdf|word|docx|pptx|ppt|markdown|\.md|\.txt|\.csv|\.png|\.wav)"
+    r"|(?:create|generate|save|export|write).{0,30}(?:file|document|report|chart|diagram|audio|pdf|docx|pptx|markdown)",
+    re.I,
+)
+_MEMORY = re.compile(
+    r"记忆|记住|记下|忘记|更正记录|历史记录|聊天记录|群聊|上次|刚才|之前|以前|remember|memory|previous|earlier",
+    re.I,
+)
+_BUSINESS = re.compile(
+    r"登记|认领|分配|分工|落库|负责人|群成员|群昵称|团队|查(?:询|看).{0,12}(?:任务|成员|名单|日程|提醒)"
+    r"|更新.{0,12}(?:任务|进度)|标记.{0,12}完成|team\s*task|assign|claim\s*(?:a\s*)?task|roster",
+    re.I,
+)
+_SCHEDULING = re.compile(
+    r"提醒|通知|日程|定时|到期|安排.{0,12}(?:时间|任务)|(?:每天|每周|每月|每小时).{0,20}(?:执行|运行|搜索|生成|发来)|schedule|remind|recurr|follow.up",
+    re.I,
+)
+_RESEARCH = re.compile(
+    r"联网|上网|搜索|检索|查阅.{0,12}(?:网页|官网|文献)|https?://|search|web\s*(?:page|research)|fetch",
+    re.I,
+)
+_TRANSCRIPTION = re.compile(r"转写|转录|逐字|语音识别|听写|transcrib|speech.to.text|\basr\b", re.I)
+_REMINDER_GOAL = re.compile(
+    r"^(?:(?:请|到时|届时|到点后|按时|定时|定期)[，,:：\s]*)*(?:提醒(?:我|我们|大家|成员)?|通知(?:我|我们|大家)|remind\b|notify\b)",
+    re.I,
+)
+_ADDITIONAL_DELEGATION = re.compile(
+    r"(?:并|另外|同时|顺便).{0,5}(?:帮我|替我|由你|你来|机器人|组长)|(?:and|also)\s+(?:you|create|generate|search|fetch)",
+    re.I,
+)
+
+
+def _required(work: WorkOrder, available: frozenset[str]) -> frozenset[str]:
+    raw = work.scope.get("required_tools", [])
+    if (
+        not isinstance(raw, list)
+        or len(raw) > 100
+        or any(not isinstance(name, str) or not name.strip() for name in raw)
+    ):
+        raise DomainError("invalid_input", "Required tools must be a bounded list of names")
+    required = frozenset(str(name) for name in raw)
+    if not required.issubset(available):
+        raise DomainError(
+            "tool_not_registered", "A required tool is absent from the eligible catalog"
+        )
+    return required
+
+
+def _text_only(work: WorkOrder) -> bool:
+    outputs = work.scope.get("outputs", [])
+    return (
+        isinstance(outputs, list)
+        and all(isinstance(item, dict) and item.get("format") == "text" for item in outputs)
+        and not any(check.startswith("artifact:") for check in work.required_checks)
+        and not work.scope.get("speech_requested")
+    )
+
+
+def select_tools(
+    work: WorkOrder,
+    input_refs: Sequence[Mapping[str, Any]],
+    registered_names: Iterable[str],
+) -> frozenset[str]:
+    """Return only existing eligible names; never alter grants or budgets.
+
+    reminder_only is a controller hint for a currently authorized reminder goal.
+    Rule updates must recompute it. It must not come from file/OCR content.
+    """
+    available = frozenset(registered_names)
+    if any(not isinstance(name, str) or not name for name in available):
+        raise DomainError("invalid_input", "Eligible tool names must be nonempty strings")
+    required = _required(work, available)
+    goal = work.goal.strip()
+    derived = bool(work.scope.get("origin_schedule_id") or work.scope.get("origin_trigger_rule_id"))
+    team_write = work.scope.get("team_task_write_allowed") is True
+    research = work.scope.get("research_required") is True
+    business = team_write or bool(_BUSINESS.search(goal) or _MEMORY.search(goal))
+    text_only = _text_only(work)
+    raw_formats = [ref.get("format") if isinstance(ref, Mapping) else None for ref in input_refs]
+    formats = [value.casefold() if isinstance(value, str) else None for value in raw_formats]
+    profile: frozenset[str] | None = None
+
+    # A reminder tells the requester to act. Its quoted/action text is not an
+    # instruction for the agent to execute Python, inspect files or do that job.
+    reminder = derived and (
+        work.scope.get("reminder_only") is True or bool(_REMINDER_GOAL.search(goal))
+    )
+    if (
+        reminder
+        and text_only
+        and not research
+        and not team_write
+        and not _ADDITIONAL_DELEGATION.search(goal)
+        and required.issubset(_REMINDER_TOOLS)
+    ):
+        profile = _REMINDER_TOOLS
+    elif (
+        text_only
+        and not business
+        and not _COMPUTE.search(goal)
+        and not _FILE_OUTPUT.search(goal)
+        and not _SCHEDULING.search(goal)
+    ):
+        if (
+            formats
+            and all(format in _IMAGE for format in formats)
+            and not research
+            and not _RESEARCH.search(goal)
+        ):
+            profile = _IMAGE_TOOLS
+        elif (
+            formats
+            and all(format in _AUDIO for format in formats)
+            and _TRANSCRIPTION.search(goal)
+            and not research
+            and not _RESEARCH.search(goal)
+        ):
+            profile = _AUDIO_TOOLS
+        elif (
+            research
+            and not input_refs
+            and not work.input_versions
+            and not work.scope.get("attachment_event_ids")
+        ):
+            profile = _WEB_TOOLS
+
+    if profile is not None and required.issubset(profile):
+        return (available & profile) | required
+
+    # Complex workflows retain media/file/computation/retrieval routes. These
+    # exclusions only reduce irrelevant writes; actual invocation still fences
+    # scope, identity and lease in the existing gateway/backend.
+    selected = set(available)
+    if not team_write or derived:
+        selected.difference_update(_TEAM_WRITES)
+    if (
+        derived
+        or work.scope.get("schedule_creation_allowed") is not True
+        or not _SCHEDULING.search(goal)
+    ):
+        selected.difference_update(_SCHEDULE_WRITES)
+    return frozenset(selected | required)

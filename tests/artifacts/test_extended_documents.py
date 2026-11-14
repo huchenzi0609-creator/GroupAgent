@@ -109,7 +109,9 @@ def test_ten_representative_structural_cases_per_format(service, scope, extensio
     assert "87" in read.text
     assert version.size_bytes > 0
     if extension == "pptx" and case == 9:
-        assert len(read.units) == 10
+        # Read units identify individual native shapes; slide count remains a
+        # structural/rendered property, not the number of editable text units.
+        assert len({unit.locator.split(":")[1] for unit in read.units}) == 10
 
 
 def test_docx_section_edit_preserves_inline_images_and_table(service, store, scope):

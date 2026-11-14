@@ -5,13 +5,14 @@ import os
 
 import pytest
 
-from groupagent.artifacts import ArtifactStore, IsolatedDocumentService
+from groupagent.artifacts import ArtifactScope, ArtifactStore, IsolatedDocumentService
 from groupagent.domain import ActorContext, Role
 from groupagent.media import IsolatedMediaWorker
 from groupagent.sandbox import DockerSandbox, SandboxLimits
 from groupagent.tools import ToolContext, ToolScope
 
 from .test_extended_documents import matrix_document
+from .test_native_locators import budget_report
 
 
 @pytest.fixture
@@ -60,6 +61,39 @@ async def test_real_isolated_ten_case_matrix(document_runtime, extension, case):
         assert validation.rendered and validation.preview_sha256
     if extension == "pptx" and case == 9:
         assert validation.page_count == 10
+
+
+async def test_real_native_docx_read_search_edit_uses_returned_locator(document_runtime):
+    service, context = document_runtime
+    scope = ArtifactScope(context.group_id, context.work_id, context.actor.member_id)
+    original = await service.generate(context, "native-budget.docx", budget_report())
+    before = service.store.read(scope, original.file_id, original.version_id)
+    read = await service.read(context, original.file_id)
+    found = await service.search(context, original.file_id, "预算100元")
+    assert found["match_count"] == 1
+    target = found["units"][0]
+    assert target["editable"] and target["locator"].startswith("paragraph:")
+    assert target["locator"] in {unit.locator for unit in read.units if unit.editable}
+    revised = await service.edit_target(
+        context,
+        original.file_id,
+        expected_version_id=original.version_id,
+        target=target["locator"],
+        expected_text="预算100元",
+        replacement="预算150元",
+    )
+    after = await service.read(context, revised.file_id, revised.version_id)
+    assert [(unit.locator, unit.text) for unit in after.units] == [
+        (
+            unit.locator,
+            unit.text.replace("预算100元", "预算150元")
+            if unit.locator == target["locator"]
+            else unit.text,
+        )
+        for unit in read.units
+    ]
+    assert revised.version_id != original.version_id
+    assert service.store.read(scope, original.file_id, original.version_id) == before
 
 
 @pytest.mark.parametrize("extension", ["docx", "pptx"])

@@ -11,9 +11,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import warnings
 import wave
 from pathlib import Path
+from typing import Literal
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -286,28 +288,20 @@ def split_pcm_wav(content: bytes, *, seconds: int = 110) -> tuple[bytes, ...]:
     return tuple(chunks)
 
 
-def ocr_image(content: bytes, *, languages: str = "eng+chi_sim", page_number: int = 1) -> OCRPage:
-    if not re.fullmatch(r"(?:eng|chi_sim)(?:\+(?:eng|chi_sim))?", languages):
-        raise DomainError(
-            "unsupported_ocr_language",
-            "Only configured English and simplified Chinese OCR are enabled",
-        )
-    info, raster = inspect_image(content)
-    executable = shutil.which("tesseract")
-    if not executable:
-        raise DomainError("media_dependency_missing", "Tesseract is not installed in the worker")
-    with tempfile.TemporaryDirectory(prefix="ga-ocr-") as directory:
-        source = Path(directory) / "page.png"
-        source.write_bytes(raster)
-        output = _run(
-            [executable, str(source), "stdout", "-l", languages, "--psm", "6", "tsv"], timeout=60
-        )
+def _tesseract_text(output: bytes) -> tuple[str, tuple[OCRWord, ...]]:
     words = []
     lines: dict[tuple[str, ...], list[str]] = {}
     try:
-        for row in csv.DictReader(io.StringIO(output.decode("utf-8")), delimiter="\t"):
+        reader = csv.DictReader(io.StringIO(output.decode("utf-8")), delimiter="\t")
+        required = {"text", "conf", "left", "top", "width", "height"}
+        required.update(("page_num", "block_num", "par_num", "line_num"))
+        if not required <= set(reader.fieldnames or ()):
+            raise ValueError("Missing TSV columns")
+        for row in reader:
             text = (row.get("text") or "").strip()
             confidence = float(row["conf"])
+            if not math.isfinite(confidence):
+                raise ValueError("Invalid confidence")
             if not text or confidence < 0:
                 continue
             x, y, width, height = (int(row[key]) for key in ("left", "top", "width", "height"))
@@ -320,15 +314,61 @@ def ocr_image(content: bytes, *, languages: str = "eng+chi_sim", page_number: in
             )
             key = tuple(row[field] for field in ("page_num", "block_num", "par_num", "line_num"))
             lines.setdefault(key, []).append(text)
-    except (KeyError, ValueError, UnicodeError):
+    except (KeyError, TypeError, ValueError, UnicodeError):
         raise DomainError("invalid_ocr_response", "Tesseract output is malformed") from None
     text = "\n".join(" ".join(line) for line in lines.values())
+    return text, tuple(words)
+
+
+def ocr_image(content: bytes, *, languages: str = "eng+chi_sim", page_number: int = 1) -> OCRPage:
+    if not re.fullmatch(r"(?:eng|chi_sim)(?:\+(?:eng|chi_sim))?", languages):
+        raise DomainError(
+            "unsupported_ocr_language",
+            "Only configured English and simplified Chinese OCR are enabled",
+        )
+    info, raster = inspect_image(content)
+    executable = shutil.which("tesseract")
+    if not executable:
+        raise DomainError("media_dependency_missing", "Tesseract is not installed in the worker")
+    attempts: list[Literal[4, 6, 11]] = []
+    modes: tuple[Literal[4, 6, 11], ...] = (6, 11, 11)
+    preprocessing: Literal["none", "dark_ink_threshold_32"] = "none"
+    with tempfile.TemporaryDirectory(prefix="ga-ocr-") as directory:
+        source = Path(directory) / "page.png"
+        source.write_bytes(raster)
+        deadline = time.monotonic() + 60
+        # PSM 6: uniform block; 11: sparse text. Only an entirely empty result
+        # permits another attempt; never replace nonempty text with a preferred
+        # transcript or manufacture word confidence. A final dark-ink view can
+        # separate black glyphs from colored diagram borders. It is reported,
+        # has the same dimensions/coordinates, and is not a new source artifact.
+        # https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html#page-segmentation-method
+        for index, mode in enumerate(modes):
+            if index == 2:
+                source = Path(directory) / "dark-ink.png"
+                with Image.open(io.BytesIO(raster)) as image:
+                    ImageOps.grayscale(image).point([0] * 32 + [255] * 224).save(source, "PNG")
+                preprocessing = "dark_ink_threshold_32"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DomainError("media_timeout", "Media operation timed out")
+            output = _run(
+                [executable, str(source), "stdout", "-l", languages, "--psm", str(mode), "tsv"],
+                timeout=remaining,
+            )
+            attempts.append(mode)
+            text, words = _tesseract_text(output)
+            if text:
+                break
     return OCRPage(
         page_number=page_number,
         text=text,
         method="tesseract",
-        words=tuple(words),
+        words=words,
         confidence=sum(word.confidence for word in words) / len(words) if words else None,
+        segmentation_mode=mode,
+        attempted_segmentation_modes=tuple(attempts),
+        preprocessing=preprocessing,
         width_pixels=info.width,
         height_pixels=info.height,
     )

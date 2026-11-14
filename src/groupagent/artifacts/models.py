@@ -209,6 +209,7 @@ class Deck:
 class DocumentUnit:
     locator: str
     text: str
+    editable: bool = False
 
 
 @dataclass(frozen=True)

@@ -71,7 +71,9 @@ class DocumentService:
         self, scope: ArtifactScope, file_id: str, version_id: str | None = None
     ) -> DocumentRead:
         version = self.store.get(scope, file_id, version_id)
-        units = extract(self.store.read(scope, file_id, version.version_id), version.format)
+        units = extract(
+            self.store.read(scope, file_id, version.version_id), version.format, native_targets=True
+        )
         warnings: tuple[str, ...] = ()
         if version.format == "pdf" and any(not unit.text.strip() for unit in units):
             warnings = ("PDF pages without extractable text require OCR; OCR is not implemented",)

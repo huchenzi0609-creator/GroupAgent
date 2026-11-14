@@ -631,7 +631,9 @@ def open_pdf(content: bytes) -> PdfReader:
         raise ArtifactError("invalid_document", "PDF cannot be opened") from exc
 
 
-def extract(content: bytes, format_name: str) -> tuple[DocumentUnit, ...]:
+def extract(
+    content: bytes, format_name: str, *, native_targets: bool = False
+) -> tuple[DocumentUnit, ...]:
     try:
         if format_name == "md":
             text = content.decode("utf-8")
@@ -655,7 +657,30 @@ def extract(content: bytes, format_name: str) -> tuple[DocumentUnit, ...]:
         if format_name == "docx":
             document = Document(io.BytesIO(content))
             units = []
+            paragraph_index, table_index = 0, 0
             for index, block in enumerate(document.iter_inner_content()):
+                if native_targets:
+                    if isinstance(block, WordParagraph):
+                        units.append(
+                            DocumentUnit(f"paragraph:{paragraph_index}", block.text, editable=True)
+                        )
+                        paragraph_index += 1
+                    else:
+                        seen_cells = set()
+                        for row_index, row in enumerate(block.rows):
+                            for column_index, cell in enumerate(row.cells):
+                                if cell._tc in seen_cells:
+                                    continue  # A merged cell has one canonical native target.
+                                seen_cells.add(cell._tc)
+                                units.append(
+                                    DocumentUnit(
+                                        f"table:{table_index}:row:{row_index}:col:{column_index}",
+                                        cell.text,
+                                        editable=True,
+                                    )
+                                )
+                        table_index += 1
+                    continue
                 text = (
                     block.text
                     if isinstance(block, WordParagraph)
@@ -708,6 +733,22 @@ def extract(content: bytes, format_name: str) -> tuple[DocumentUnit, ...]:
                     else ""
                 )
 
+            if native_targets:
+                native_units = []
+                for index, slide in enumerate(presentation.slides):
+                    names = [shape.name for shape in slide.shapes]
+                    for shape_index, shape in enumerate(slide.shapes):
+                        unique = names.count(shape.name) == 1
+                        native_units.append(
+                            DocumentUnit(
+                                f"slide:{index}:shape:{shape.name}"
+                                if unique
+                                else f"slide:{index}:shape_index:{shape_index}",
+                                shape_text(shape),
+                                editable=unique and bool(shape.has_text_frame),
+                            )
+                        )
+                return tuple(native_units)
             return tuple(
                 DocumentUnit(
                     f"slide:{index + 1}",

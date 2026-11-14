@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from docx import Document
+from docx.text.paragraph import Paragraph as WordParagraph
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
@@ -213,12 +214,30 @@ def edit_text_target(
         document = Document(io.BytesIO(content))
         paragraph_target = re.fullmatch(r"paragraph:(\d+)", target)
         cell_target = re.fullmatch(r"table:(\d+):row:(\d+):col:(\d+)", target)
+        block_target = re.fullmatch(r"block:([1-9]\d*)", target)
         try:
             if paragraph_target:
                 paragraphs = [document.paragraphs[int(paragraph_target[1])]]
             elif cell_target:
                 table, row, column = map(int, cell_target.groups())
-                paragraphs = list(document.tables[table].cell(row, column).paragraphs)
+                native_table = document.tables[table]
+                if row >= len(native_table.rows) or column >= len(native_table.columns):
+                    raise IndexError
+                paragraphs = list(native_table.cell(row, column).paragraphs)
+            elif block_target:
+                # Legacy read locators were one-based body blocks, not paragraph
+                # indices: tables occupy a block too. Resolve the actual OOXML
+                # order and retain the exactly-one expected-text match below.
+                block = list(document.iter_inner_content())[int(block_target[1]) - 1]
+                if isinstance(block, WordParagraph):
+                    paragraphs = [block]
+                else:
+                    seen_cells = set()
+                    for native_row in block.rows:
+                        for cell in native_row.cells:
+                            if cell._tc not in seen_cells:
+                                seen_cells.add(cell._tc)
+                                paragraphs.extend(cell.paragraphs)
             else:
                 raise ArtifactError("invalid_target", "Unknown DOCX edit locator")
         except IndexError:

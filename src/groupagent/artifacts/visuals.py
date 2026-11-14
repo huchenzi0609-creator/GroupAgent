@@ -118,6 +118,7 @@ def chart_png(chart: ChartData) -> bytes:
         for index, category in enumerate(chart.categories):
             middle = x0 + group_width * (index + 0.5)
             draw.text((middle - 22, y1 + 20), category, fill="#132536", font=label_font)
+        line_labels = []
         for series_index, series in enumerate(chart.series):
             color = colors[series_index]
             points = []
@@ -139,13 +140,32 @@ def chart_png(chart: ChartData) -> bytes:
                     )
                 else:
                     points.append((middle, position))
-                    draw.ellipse((middle - 5, position - 5, middle + 5, position + 5), fill=color)
-                    draw.text(
-                        (middle + 8, position - 22), f"{value:g}", fill=color, font=label_font
-                    )
             if len(points) > 1:
                 draw.line(points, fill=color, width=4)
+            for middle, position in points:
+                draw.ellipse((middle - 5, position - 5, middle + 5, position + 5), fill=color)
+            if points:
+                line_labels.append((color, points, series.values))
             draw.text((110 + series_index * 260, 670), series.name, fill=color, font=label_font)
+        # Paint values after every line, outside the point marker. At a valley
+        # use the lower side so an ascending segment cannot cross the glyphs.
+        value_font = _font(20)
+        for color, points, series_values in line_labels:
+            for index, ((middle, position), value) in enumerate(
+                zip(points, series_values, strict=True)
+            ):
+                neighbors = points[max(0, index - 1) : index] + points[index + 1 : index + 2]
+                below = bool(neighbors) and position > sum(p[1] for p in neighbors) / len(neighbors)
+                if position > y1 - 50:
+                    below = False  # Keep labels clear of the category axis.
+                location = (middle, position + 14 if below else position - 14)
+                anchor = "mt" if below else "mb"
+                text = f"{value:g}"
+                bounds = draw.textbbox(location, text, font=value_font, anchor=anchor)
+                draw.rectangle(
+                    (bounds[0] - 3, bounds[1] - 3, bounds[2] + 3, bounds[3] + 3), fill="white"
+                )
+                draw.text(location, text, fill=color, font=value_font, anchor=anchor)
     output = io.BytesIO()
     image.save(output, "PNG")
     return output.getvalue()

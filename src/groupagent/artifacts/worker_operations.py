@@ -176,7 +176,10 @@ def document_operation(
                 for page in recognized.pages
             ]
         else:
-            search_units = [asdict(unit) for unit in extract(read_input(request), format_name)]
+            search_units = [
+                asdict(unit)
+                for unit in extract(read_input(request), format_name, native_targets=True)
+            ]
         matches = [unit for unit in search_units if query.casefold() in unit["text"].casefold()]
         return {"units": matches[:20], "match_count": len(matches), "complete": len(matches) <= 20}
     elif operation == "document_read":
@@ -203,7 +206,7 @@ def document_operation(
                     page.page_number for page in result.pages if page.method == "tesseract"
                 ],
             }
-        units = extract(read_input(request), format_name)
+        units = extract(read_input(request), format_name, native_targets=True)
         return {
             "units": [asdict(unit) for unit in units[start : start + count]],
             "total_units": len(units),

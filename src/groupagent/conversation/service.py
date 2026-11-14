@@ -865,11 +865,11 @@ class ConversationCoordinator(Coordinator):
             )
         now = self.clock()
         if decision.kind == "control_work" and decision.control in {"resume", "retry"}:
-            mode = tx.conn.execute(
+            mode_row = tx.conn.execute(
                 "SELECT mode FROM ga_conversation_policy WHERE group_id=%s AND subject_id='*'",
                 (tx.group_id,),
             ).fetchone()
-            if mode and mode["mode"] in {"paused", "disabled"}:
+            if mode_row and mode_row["mode"] in {"paused", "disabled"}:
                 return Decision(
                     kind="reply",
                     reason_code="group_paused",
@@ -1133,6 +1133,15 @@ class ConversationCoordinator(Coordinator):
                     "source_event_ids": list(context["_snapshot"]["source_fingerprints"]),
                     "source_fingerprints": context["_snapshot"]["source_fingerprints"],
                     "topic_id": context["_topic_id"],
+                    "reminder_only": bool(
+                        re.search(r"(?:提醒|通知)(?:我|我们|大家|一下|：|:)", event.text)
+                    )
+                    and not bool(
+                        re.search(
+                            r"(?:你|帮我|替我|机器人).{0,8}(?:实际|执行|生成|制作|搜索|整理成)",
+                            event.text,
+                        )
+                    ),
                 },
             )
             time = (
@@ -1531,6 +1540,8 @@ class ConversationCoordinator(Coordinator):
                             required_tools.append("speech_synthesize")
                         if direct_fetch:
                             required_tools.append("web_fetch")
+                        if re.match(r"(?:联网)?(?:检索|搜索|上网.{0,3}查)", main):
+                            required_tools.append("web_search")
                         team_write = task_write_request(request_text)
                         team_targets = [
                             row["id"]

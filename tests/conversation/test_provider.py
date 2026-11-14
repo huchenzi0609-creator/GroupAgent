@@ -170,6 +170,144 @@ async def test_schema_failure_stops_after_total_three_calls(environment):
     assert len(model.requests) == len(provider.diagnostics) == 3
 
 
+def schedule_candidate(timing, **changes):
+    return decision(
+        action={
+            "op": "create_schedule",
+            "title": "合成提醒",
+            "goal": "提醒我休息",
+            "timing": timing,
+        },
+        **changes,
+    )
+
+
+@pytest.mark.parametrize("max_retries", [0, 1, 2])
+@pytest.mark.parametrize(
+    "text,timing,error_code",
+    [
+        (
+            "每隔四小时提醒我休息，持续到今天晚上。",
+            {
+                "kind": "every",
+                "interval_seconds": 14400,
+                "start_at": "2026-11-14T13:00:00+08:00",
+            },
+            "use_verified_time_resolution",
+        ),
+        (
+            "明天下午提醒我复核。",
+            {"kind": "at", "at": "2026-11-15T18:00:00+08:00"},
+            "time_requires_clarification",
+        ),
+    ],
+)
+async def test_only_exhausted_time_mismatches_become_safe_clarification(
+    environment, max_retries, text, timing, error_code
+):
+    candidate = schedule_candidate(timing)
+    model = FixtureModel(*([candidate] * (max_retries + 1)), schedule_candidate(timing))
+    provider = ModelDecisionProvider(model, max_retries=max_retries)
+    result = await provider.decide(
+        environment.event.model_copy(update={"text": text}), environment.context
+    )
+    assert result.kind == "clarify" and result.reason_code == "schedule_time_needs_confirmation"
+    assert result.action is None and result.goal is None and result.target_work_id is None
+    assert "时间" in result.response and "确认" in result.response
+    assert "18:00" not in result.response and "13:00" not in result.response
+    assert len(model.requests) == len(provider.diagnostics) == max_retries + 1
+    assert all(not request.tools for request in model.requests)
+    assert all(
+        record["issues"] == [{"path": "action.timing", "code": error_code}]
+        for record in provider.diagnostics
+    )
+    assert provider.diagnostics[-1]["fallback"] == "schedule_time_clarification"
+
+
+async def test_valid_time_repair_finishes_before_clarification_fallback(environment):
+    bad = schedule_candidate(
+        {"kind": "every", "interval_seconds": 14400, "start_at": "2026-11-14T13:00:00+08:00"}
+    )
+    good = schedule_candidate({"kind": "every", "interval_seconds": 14400})
+    model = FixtureModel(bad, bad, good)
+    provider = ModelDecisionProvider(model)
+    result = await provider.decide(
+        environment.event.model_copy(update={"text": "每隔四小时提醒我休息。"}),
+        environment.context,
+    )
+    assert result.kind == "reply" and result.action["timing"]["interval_seconds"] == 14400
+    assert len(model.requests) == 3 and len(provider.diagnostics) == 2
+    assert all("fallback" not in record for record in provider.diagnostics)
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        "{}",
+        schedule_candidate({"kind": "every", "interval_seconds": 14400}, confidence=0.1),
+        schedule_candidate({"type": "every", "interval_seconds": 14400}),
+        schedule_candidate({"kind": "every", "interval_seconds": 60}),
+        decision(action={"op": "forget", "task_ids": ["another-persons-task"]}),
+    ],
+)
+async def test_mixed_schema_or_permission_failures_cannot_use_time_fallback(environment, first):
+    bad_time = schedule_candidate(
+        {"kind": "every", "interval_seconds": 14400, "start_at": "2026-11-14T13:00:00+08:00"}
+    )
+    model = FixtureModel(first, bad_time, bad_time)
+    provider = ModelDecisionProvider(model)
+    with pytest.raises(DomainError) as error:
+        await provider.decide(
+            environment.event.model_copy(update={"text": "每隔四小时提醒我休息。"}),
+            environment.context,
+        )
+    assert error.value.code == "provider_output_invalid" and len(model.requests) == 3
+    assert all("fallback" not in record for record in provider.diagnostics)
+
+
+async def test_transport_failure_cannot_be_hidden_by_time_clarification(environment, monkeypatch):
+    async def no_delay(seconds):
+        return None
+
+    monkeypatch.setattr("groupagent.conversation.provider.asyncio.sleep", no_delay)
+    bad_time = schedule_candidate(
+        {"kind": "every", "interval_seconds": 14400, "start_at": "2026-11-14T13:00:00+08:00"}
+    )
+    model = FixtureModel(
+        DomainError("provider_timeout", "fixture", retryable=True), bad_time, bad_time
+    )
+    provider = ModelDecisionProvider(model)
+    with pytest.raises(DomainError) as error:
+        await provider.decide(
+            environment.event.model_copy(update={"text": "每隔四小时提醒我休息。"}),
+            environment.context,
+        )
+    assert error.value.code == "provider_output_invalid" and len(model.requests) == 3
+    assert provider.diagnostics[0]["provider_error"]
+    assert all("fallback" not in record for record in provider.diagnostics)
+
+
+async def test_unresolved_quiet_until_is_not_the_schedule_timing_fallback(environment):
+    candidate = decision(
+        action={
+            "op": "quiet",
+            "scope": "self",
+            "enabled": True,
+            "until": "2026-11-15T18:00:00+08:00",
+        }
+    )
+    provider = ModelDecisionProvider(FixtureModel(candidate, candidate, candidate))
+    with pytest.raises(DomainError) as error:
+        await provider.decide(
+            environment.event.model_copy(update={"text": "安静到明天下午。"}), environment.context
+        )
+    assert error.value.code == "provider_output_invalid"
+    assert all(
+        record["issues"] == [{"path": "action.until", "code": "time_requires_clarification"}]
+        for record in provider.diagnostics
+    )
+
+
 @pytest.mark.parametrize("limit", [-1, 3, True, 2.5])
 def test_attempt_budget_cannot_be_unbounded(limit):
     with pytest.raises(ValueError):
@@ -724,3 +862,39 @@ async def test_unaddressed_invalid_human_assignment_does_not_become_an_intrusive
     model = FixtureModel(candidate)
     result = await ModelDecisionProvider(model).decide(environment.event, environment.context)
     assert result.kind == "observe" and result.action is None and len(model.requests) == 1
+
+
+async def test_table_relations_become_cell_literals_without_changing_goal(environment):
+    text = "制作PPT原生表格，数据为Alpha=12、Beta=24、Gamma=36。"
+    proposal = decision(
+        "start_work",
+        goal=text,
+        outputs=[{"format": "pptx", "expected_text": ["Alpha=12", "Beta=24", "Gamma=36"]}],
+    )
+    result = await ModelDecisionProvider(FixtureModel(proposal)).decide(
+        environment.event.model_copy(update={"text": text}), environment.context
+    )
+    assert result.goal == text
+    assert result.outputs[0]["expected_text"] == ["Alpha", "12", "Beta", "24", "Gamma", "36"]
+
+
+async def test_explicitly_verbatim_table_adjacent_literal_is_not_weakened(environment):
+    text = "请做一个PPT表格，旁边必须原样写字符串‘Alpha=12’。"
+    proposal = decision(
+        "start_work", goal=text, outputs=[{"format": "pptx", "expected_text": ["Alpha=12"]}]
+    )
+    result = await ModelDecisionProvider(FixtureModel(proposal)).decide(
+        environment.event.model_copy(update={"text": text}), environment.context
+    )
+    assert result.outputs[0]["expected_text"] == ["Alpha=12"]
+
+
+async def test_running_code_is_not_misclassified_as_table_rows(environment):
+    text = "做一个PPT说明运行代码 Alpha=12 的过程。"
+    proposal = decision(
+        "start_work", goal=text, outputs=[{"format": "pptx", "expected_text": ["Alpha=12"]}]
+    )
+    result = await ModelDecisionProvider(FixtureModel(proposal)).decide(
+        environment.event.model_copy(update={"text": text}), environment.context
+    )
+    assert result.outputs[0]["expected_text"] == ["Alpha=12"]

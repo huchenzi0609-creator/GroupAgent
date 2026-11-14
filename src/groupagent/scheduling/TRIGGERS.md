@@ -4,8 +4,14 @@
 
 ```python
 rules = EventTriggerService(store, resolve_actor)
-rule = rules.create(actor, "task_completed", task_id, "完成后整理跟进说明",
-                    source_event_id=request.id, request_key="stable-action-key")
+rule = rules.create(
+    actor,
+    "task_completed",
+    task_id,
+    "完成后整理跟进说明",
+    source_event_id=request.id,
+    request_key="stable-action-key",
+)
 occurrences = rules.poll(control_actor)
 ```
 

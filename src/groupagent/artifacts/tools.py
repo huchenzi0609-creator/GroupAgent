@@ -130,7 +130,10 @@ class DocumentEditInput(ToolData):
     slide_index: int | None = Field(default=None, ge=0)
     title: str | None = None
     bullets: tuple[str, ...] | None = None
-    target: str | None = None
+    target: str | None = Field(
+        default=None,
+        description="Copy an editable=true unit's locator from document_read/search. Native DOCX paragraph/table/row/col and PPTX slide indexes are zero-based; PPTX also needs the exact unique shape name. Do not use a heading as a locator.",
+    )
     expected_text: str | None = None
     replacement: str | None = None
     replacements: dict[str, str] = Field(default_factory=dict, max_length=100)
@@ -435,7 +438,7 @@ def register_document_tools(
         ),
         (
             "document_read",
-            "Read a bounded range. Scanned PDF pages use OCR with page numbers. Image descriptions are metadata; extract pixels for visual analysis.",
+            "Read a bounded range of text units. Units marked editable=true have exact text-edit locators: DOCX paragraph:N or table:N:row:N:col:N; PPTX slide:N:shape:NAME (all native indexes zero-based). Read units are not page counts. Other units are read-only. Scanned PDF pages use OCR with page numbers. Image descriptions are metadata; extract pixels for visual analysis.",
             DocumentReadInput,
             DocumentDataOutput,
             read,
@@ -443,7 +446,7 @@ def register_document_tools(
         ),
         (
             "document_search",
-            "Search the scoped document contents; results identify blocks/pages and report any result truncation.",
+            "Search scoped document contents. Editable DOCX/PPTX results return the exact native text-edit locator with editable=true, matching document_read. Other results are read-only. Results report truncation.",
             DocumentSearchInput,
             DocumentDataOutput,
             search,
@@ -451,7 +454,7 @@ def register_document_tools(
         ),
         (
             "document_edit",
-            "Create an immutable new version using an exact expected version and declared section/slide/template/chart/PDF operation.",
+            "Create an immutable new version using an exact expected version and declared section/slide/template/chart/PDF operation. For operation=text copy an editable=true locator from read/search and provide the exact existing substring as expected_text; only one occurrence may match. Native paragraph/table/row/col/slide indexes are zero-based.",
             DocumentEditInput,
             ArtifactOutput,
             edit,

@@ -558,6 +558,13 @@ class Scheduler:
         )
         cursor = origin_tx.get_cursor(stream_id)
         ingested = origin_tx.ingest_event(event, stream_id, slot, cursor.revision if cursor else 0)
+        previous_fingerprints = schedule["scope"].get("source_fingerprints", {})
+        if not isinstance(previous_fingerprints, dict):
+            raise DomainError("scope_violation", "Schedule evidence is not a fingerprint map")
+        fingerprints = {
+            **previous_fingerprints,
+            ingested.event.id: origin_tx.event_fingerprint(ingested.event.id),
+        }
         work = origin_tx.create_work(
             schedule["goal"],
             ingested.event.id,
@@ -567,6 +574,7 @@ class Scheduler:
                 "origin_occurrence_id": occurrence["id"],
                 "derived_depth": 1,
                 "schedule_creation_allowed": False,
+                "source_fingerprints": fingerprints,
             },
             budget=schedule["budget"],
             acceptance_criteria=schedule["acceptance_criteria"],

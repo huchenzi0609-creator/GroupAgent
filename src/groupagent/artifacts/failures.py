@@ -22,7 +22,7 @@ _HINTS = {
     "invalid_input": "Document fields are inconsistent. Follow the tool schema and its minimal example.",
     "document_limit": "Fields sections/slides/paragraphs exceed the bounded document profile. Reduce the content or split it into documents.",
     "invalid_edit": "Fields operation/target/content must describe a supported bounded edit.",
-    "invalid_target": "Field target must be an exact locator from document_read, not a filename or guessed path.",
+    "invalid_target": "Field target must be copied from an editable=true unit in document_read/search. DOCX paragraph:N or table:N:row:N:col:N; PPTX slide:N:shape:NAME. Native indexes are zero-based; a filename or heading is not a locator.",
     "edit_target_missing": "Field target was not found. Read the document locators before editing.",
     "ambiguous_target": "Field target matches more than one location. Supply an exact block/shape locator.",
     "section_not_found": "Field section_index is outside the document. Read the current sections first.",
