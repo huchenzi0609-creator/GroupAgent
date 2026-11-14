@@ -200,6 +200,8 @@ class UnitOfWork:
         self.actor = actor
         self.trace_id = trace_id
         self.recovery_maintenance = recovery_maintenance
+        self._context_event_rows: dict[str, Any] | None = None
+        self._context_event_actor: ActorContext | None = None
 
     @property
     def group_id(self) -> str:
@@ -337,11 +339,53 @@ class UnitOfWork:
         )
         return EventCursor.model_validate(updated)
 
+    @contextmanager
+    def context_event_reads(self) -> Iterator[None]:
+        """Deduplicate raw rows only inside a memory-locked context read phase.
+
+        Call after memory preparation. Never use for the later decision/write
+        transaction. A bulk exit check rejects same-transaction source changes;
+        cached rows and actor bindings are discarded before context can escape.
+        Quote/echo sanitization and fingerprints are deliberately not cached.
+        """
+        if self._context_event_rows is not None:
+            raise DomainError("invalid_transition", "Context event reads cannot be nested")
+        self.conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("memory:" + self.group_id,)
+        )
+        self._context_event_rows = {}
+        self._context_event_actor = self.actor
+        try:
+            yield
+            if self.actor != self._context_event_actor:
+                raise DomainError("scope_violation", "Context event actor changed")
+            if self._context_event_rows:
+                rows = self.conn.execute(
+                    "SELECT id,body,memory_state FROM ga_events WHERE group_id=%s AND id=ANY(%s)",
+                    (self.group_id, list(self._context_event_rows)),
+                ).fetchall()
+                current = {
+                    row["id"]: {"body": row["body"], "memory_state": row["memory_state"]}
+                    for row in rows
+                }
+                if current != self._context_event_rows:
+                    raise DomainError("memory_changed", "A source changed during context reads")
+        finally:
+            self._context_event_rows = None
+            self._context_event_actor = None
+
     def get_event(self, event_id: str) -> GroupEvent:
-        row = self.conn.execute(
-            "SELECT body,memory_state FROM ga_events WHERE group_id = %s AND id = %s",
-            (self.group_id, event_id),
-        ).fetchone()
+        cache = self._context_event_rows
+        if cache is not None and self.actor != self._context_event_actor:
+            raise DomainError("scope_violation", "Context event actor changed")
+        row = cache.get(event_id) if cache is not None else None
+        if row is None:
+            row = self.conn.execute(
+                "SELECT body,memory_state FROM ga_events WHERE group_id = %s AND id = %s",
+                (self.group_id, event_id),
+            ).fetchone()
+            if row is not None and cache is not None and len(cache) < 1024:
+                cache[event_id] = row
         if row is None:
             raise DomainError("not_found", "Event was not found in this group")
         event = GroupEvent.model_validate(row["body"])

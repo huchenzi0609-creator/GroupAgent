@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
+from contextlib import ExitStack
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
@@ -220,8 +221,9 @@ class ConversationCoordinator(Coordinator):
             except DomainError as error:
                 if error.code == "permission_denied":
                     raise
-        with self.store.transaction(actor) as tx:
+        with self.store.transaction(actor) as tx, ExitStack() as reads:
             self.memory.prepare_in_tx(tx)
+            reads.enter_context(tx.context_event_reads())
             if tx.get_event(event.id) != event:
                 raise DomainError(
                     "memory_changed",
@@ -688,8 +690,9 @@ class ConversationCoordinator(Coordinator):
                 by_version = {row["version_id"]: row for row in bound_files + candidates}
                 candidates = list(by_version.values())
             files = []
-            with self.store.transaction(actor) as tx:
+            with self.store.transaction(actor) as tx, ExitStack() as reads:
                 self.memory.prepare_in_tx(tx)
+                reads.enter_context(tx.context_event_reads())
                 self.memory.assert_snapshot_in_tx(tx, snapshot)
                 retained = set(snapshot.get("artifact_retained_source_ids", []))
                 metadata_versions = []
