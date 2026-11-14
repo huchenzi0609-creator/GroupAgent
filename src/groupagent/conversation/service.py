@@ -56,7 +56,12 @@ from .actions import (
     TaskBatch,
     UpdateTask,
 )
-from .intent import explicitly_requires_execution, main_request, task_write_request
+from .intent import (
+    explicitly_requires_execution,
+    main_request,
+    requires_research,
+    task_write_request,
+)
 from .participation import fast_observe, policy_intent
 from .quiet import is_quiet
 
@@ -1532,16 +1537,7 @@ class ConversationCoordinator(Coordinator):
                                 request_text,
                             )
                         )
-                        research_required = bool(
-                            re.search(
-                                r"联网|上网|搜索|检索|找.{0,12}(?:文献|来源|资料|报道)|最新.{0,10}(?:资料|新闻|政策)",
-                                request_text,
-                            )
-                        ) and not bool(
-                            re.search(
-                                r"(?:不要|不用|别).{0,4}(?:联网|搜索|上网|检索)", request_text
-                            )
-                        )
+                        research_required = requires_research(request_text)
                         direct_fetch = bool(
                             re.match(
                                 r"(?:真正|实际|现在|直接)?(?:读取|打开|查看|访问).{0,20}https?://",

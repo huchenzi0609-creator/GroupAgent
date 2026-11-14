@@ -458,12 +458,15 @@ async def test_default_worker_concurrency_is_bounded(execution_request, gateway,
     await engine.wait(run_id)
 
 
-async def test_time_limit_during_tool_is_unknown_and_never_completed(execution_request):
-    stopped = asyncio.Event()
+async def test_time_limit_during_tool_is_unknown_and_never_completed(
+    execution_request, monkeypatch
+):
+    entered, stopped = asyncio.Event(), asyncio.Event()
 
     async def slow(args: EmptyInput, context: ToolContext) -> EmptyOutput:
+        entered.set()
         try:
-            await asyncio.sleep(100)
+            await asyncio.Event().wait()
             return EmptyOutput()
         finally:
             stopped.set()
@@ -476,18 +479,31 @@ async def test_time_limit_during_tool_is_unknown_and_never_completed(execution_r
             input_model=EmptyInput,
             output_model=EmptyOutput,
             handler=slow,
+            timeout_seconds=120,
         )
     )
     request = execution_request.model_copy(
         update={
             "allowed_tools": frozenset({"slow_tool"}),
-            "budget": ExecutionBudget(max_active_seconds=0.05),
+            "budget": ExecutionBudget(max_active_seconds=60),
         }
     )
     engine = ScopedToolEngine(ScriptedFakeModel([call("slow_tool"), answer()]), gateway)
-    result = await asyncio.wait_for(engine.wait(await engine.start(request)), 0.5)
-    assert result.state == RunState.PAUSED and result.error_code == "effect_unknown"
-    assert stopped.is_set() and result.receipts[-1].effect_state == EffectState.UNKNOWN
+    run_id = await engine.start(request)
+    try:
+        # Establish that the effectful handler actually started. Advancing only
+        # this test loop's clock then expires the work deadline, not setup time.
+        await asyncio.wait_for(entered.wait(), 5)
+        loop = asyncio.get_running_loop()
+        real_time = loop.time
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: real_time() + 61)
+            result = await asyncio.wait_for(engine.wait(run_id), 2)
+        assert result.state == RunState.PAUSED and result.error_code == "effect_unknown"
+        assert stopped.is_set() and result.receipts[-1].effect_state == EffectState.UNKNOWN
+    finally:
+        await engine.cancel(run_id, request.actor)
+        await engine.wait(run_id)
 
 
 async def test_waiting_input_continues_without_losing_budget(execution_request, gateway):

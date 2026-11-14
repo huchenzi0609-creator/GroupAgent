@@ -31,6 +31,10 @@ untrusted, and gateway authorization still applies to subsequent model calls.
 Default limits: 128 query characters, 10 results, 20 seconds per entire operation,
 2 MB decoded response body, 256 KB normalized output, 16 KB page text per search result,
 and 100 KB per fetched page. The tool gateway imposes its independent work budget.
+Search additionally shares a 16,000-byte UTF-8 budget across all returned titles,
+snippets, summaries and content, divided equally among admitted results; original
+prefixes carry explicit truncation markers while URLs, timestamps and provenance
+are retained, and the normalized-output hard limit still applies.
 There are no implicit retries. Timeout, rate-limit, authentication, insufficient
 balance, unavailable-page and policy errors remain distinct and sanitized.
 `cost_meter` identifies provider request accounting; read-only does not mean free.

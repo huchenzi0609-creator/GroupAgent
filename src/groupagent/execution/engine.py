@@ -21,6 +21,7 @@ from groupagent.tools import (
     ToolReceipt,
     ToolScope,
 )
+from groupagent.tools.models import successful_required_tools
 
 from .errors import ModelRejected
 from .models import (
@@ -873,7 +874,7 @@ class ScopedToolEngine:
                 run.input_request = InputRequest(question=reply.text[:2000])
                 await self._finish(run, RunState.WAITING_INPUT, text=reply.text)
                 return
-            successful = {receipt.tool_name for receipt in run.receipts if receipt.success}
+            successful = successful_required_tools(run.receipts, run.request.allowed_tools)
             if run.unresolved_tools or not run.request.required_tools.issubset(successful):
                 await self._finish(run, RunState.FAILED, "validation_required")
                 return

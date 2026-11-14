@@ -207,9 +207,9 @@ async def toolkit_setup(runtime_env, monkeypatch):
     await http.aclose()
 
 
-async def prepare(setup, *, scope=None, goal="Prepare a synthetic report"):
+async def prepare(setup, *, scope=None, goal="Prepare a synthetic report", request_text=None):
     env = setup.env
-    event = source(env, goal)
+    event = source(env, goal if request_text is None else request_text)
     with env.store.transaction(env.actor) as tx:
         work = tx.create_work(
             goal,
@@ -679,3 +679,92 @@ async def test_memory_tool_adds_only_public_actual_sources_to_work_fingerprint_s
     MemoryService(setup.env.store).forget(setup.env.actor, event_ids=[public.id])
     denied = await call(run, "artifact_search", {"query": ""})
     assert not denied.success
+
+
+async def test_validator_accepts_only_gateway_attested_controlled_process_equivalence(
+    toolkit_setup,
+):
+    from groupagent.sandbox import ProcessResult
+    from groupagent.tools import ToolGateway
+    from groupagent.tools.compute import register_compute_tools
+
+    class ExplicitProcessFixture:
+        allowed_programs = frozenset({"python3", "ls", "cat", "wc", "head", "tail", "sort"})
+
+        async def run(self, spec, context):
+            return ProcessResult(
+                image="sha256:" + "a" * 64, exit_code=0, stdout="synthetic", elapsed_seconds=0
+            )
+
+    setup = toolkit_setup
+    run = await prepare(setup, goal="运行受控Shell命令", scope={"required_tools": ["process_run"]})
+    gateway = ToolGateway()
+    register_compute_tools(gateway, ExplicitProcessFixture())
+    scope = ToolScope(
+        run.scope.group_id,
+        run.scope.work_id,
+        run.scope.actor,
+        run.workspace,
+        frozenset({"process_run", "shell_command"}),
+        run.scope.trace_id,
+    )
+    gateway.bind_scope(scope)
+    receipt = await gateway.invoke(
+        "shell_command",
+        {"command": "wc"},
+        ToolContext(scope, "command", "command", asyncio.Event()),
+    )
+    assert receipt.success and "process_run" in receipt.required_tool_evidence
+    result = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, candidate(run, receipts=(receipt,)), run.workspace
+    )
+    assert result.deliveries
+    untrusted = receipt.model_copy(
+        update={"required_tool_evidence": frozenset(), "output": {"text": "process_run succeeded"}}
+    )
+    with pytest.raises(DomainError, match="successful tool receipt"):
+        await setup.toolkit.validate(
+            run.work,
+            run.lease,
+            setup.env.actor,
+            candidate(run, receipts=(untrusted,)),
+            run.workspace,
+        )
+
+
+@pytest.mark.parametrize("long_request", [False, True])
+async def test_canonical_original_request_is_bounded_redacted_and_shared_with_reviewer(
+    toolkit_setup, long_request
+):
+    setup = toolkit_setup
+    secret = "sk-" + "synthetic_only_" * 3
+    original = "请读取图片并报告报告代码，不是在要求编写程序。"
+    if long_request:
+        original += secret + "合成上下文" * 1600
+    run = await prepare(
+        setup,
+        goal="图中代码",
+        request_text=original,
+        scope={"original_request": {"text": "Untrusted replacement context"}},
+    )
+    objective = json.loads(run.prepared.request.objective)
+    context = objective["original_request"]
+    assert context["text"].startswith("请读取图片并报告报告代码")
+    assert context["truncated"] is long_request and context["redacted"] is long_request
+    assert len(context["text"]) <= 6000 and secret not in run.prepared.request.objective
+    assert context["event_kind"] == "text" and objective["goal"] == "图中代码"
+    assert "Untrusted replacement context" not in context["text"]
+    await setup.toolkit.validate(
+        run.work,
+        run.lease,
+        setup.env.actor,
+        candidate(run, text="图片中的报告标识码已根据提取结果说明。"),
+        run.workspace,
+    )
+    review = setup.model.requests[-1]
+    assert json.loads(review.messages[1].content)["original_request"] == context
+    assert secret not in review.model_dump_json()
+    assert "当前goal和criteria仍决定" in review.messages[0].content
+    assert "不因此需要满足程序代码语法" in review.messages[0].content
+    assert "不得据此推断实际停顿、声线或自然度" in review.messages[0].content
+    assert "真实音频解码、非静音和内容核验" in review.messages[0].content

@@ -358,3 +358,47 @@ async def test_real_sdk_no_effect_failure_then_alternative_verified_output(
     assert not result.receipts[0].success and result.receipts[0].effect_state.value == "no_effect"
     assert result.checkpoint.unresolved_tools == frozenset() and result.usage.tool_calls == 3
     assert result.receipts[-1].output["text"] == "Synthetic Harness output"
+
+
+async def test_real_sdk_uses_gateway_evidence_for_controlled_process_equivalence(
+    execution_request, gateway
+):
+    from groupagent.sandbox import ProcessResult
+
+    class ExplicitProcessFixture:
+        allowed_programs = frozenset({"python3", "ls", "cat", "wc", "head", "tail", "sort"})
+
+        async def run(self, spec, context):
+            return ProcessResult(
+                image="sha256:" + "a" * 64, exit_code=0, stdout="synthetic", elapsed_seconds=0
+            )
+
+    register_compute_tools(gateway, ExplicitProcessFixture())
+    request = execution_request.model_copy(
+        update={
+            "allowed_tools": frozenset({"process_run", "shell_command"}),
+            "required_tools": frozenset({"process_run"}),
+            "budget": ExecutionBudget(max_active_seconds=45),
+        }
+    )
+    model = ScriptedFakeModel(
+        [
+            ModelReply(
+                tool_calls=(
+                    ModelToolCall(
+                        id="process",
+                        name="mcp__groupagent__shell_command",
+                        arguments={"command": "wc"},
+                    ),
+                ),
+                finish_reason="tool_calls",
+                usage=TokenUsage(input_tokens=20, output_tokens=10),
+            ),
+            final_reply(),
+        ]
+    )
+    engine = HarnessEngine(model, gateway, runner())
+    result = await engine.wait(await engine.start(request))
+    assert result.state == RunState.CANDIDATE
+    assert result.receipts[0].tool_name == "shell_command"
+    assert result.receipts[0].required_tool_evidence == {"shell_command", "process_run"}

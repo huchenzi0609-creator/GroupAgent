@@ -12,6 +12,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from groupagent.conversation.intent import requires_research
 from groupagent.domain import DomainError, WorkOrder
 
 _IMAGE = frozenset({"png", "jpg", "jpeg", "webp", "gif"})
@@ -84,10 +85,6 @@ _BUSINESS = re.compile(
 _SCHEDULING = re.compile(
     r"提醒|通知|日程|定时|到期|安排.{0,12}(?:时间|任务)|(?:每天|每周|每月|每小时).{0,20}(?:执行|运行|搜索|生成|发来)"
     r"|(?:完成|失败|收到|上传).{0,20}(?:后|时|触发)|schedule|remind|recurr|follow.up",
-    re.I,
-)
-_RESEARCH = re.compile(
-    r"联网|上网|搜索|检索|查阅.{0,12}(?:网页|官网|文献)|https?://|search|web\s*(?:page|research)|fetch",
     re.I,
 )
 _TRANSCRIPTION = re.compile(r"转写|转录|逐字|语音识别|听写|transcrib|speech.to.text|\basr\b", re.I)
@@ -171,6 +168,7 @@ def select_tools(
         and not team_write
         and not _ADDITIONAL_DELEGATION.search(goal)
         and not _requires_memory(criteria)
+        and not requires_research(criteria)
         # Criteria describe work the agent must actually satisfy, even when
         # the short goal only asks it to remind the requester.
         and not any(
@@ -180,7 +178,6 @@ def select_tools(
                 _FILE_OUTPUT,
                 _BUSINESS,
                 _SCHEDULING,
-                _RESEARCH,
                 _TRANSCRIPTION,
             )
         )
@@ -198,7 +195,7 @@ def select_tools(
             formats
             and all(format in _IMAGE for format in formats)
             and not research
-            and not _RESEARCH.search(requirements)
+            and not requires_research(requirements)
         ):
             profile = _IMAGE_TOOLS
         elif (
@@ -206,7 +203,7 @@ def select_tools(
             and all(format in _AUDIO for format in formats)
             and _TRANSCRIPTION.search(requirements)
             and not research
-            and not _RESEARCH.search(requirements)
+            and not requires_research(requirements)
         ):
             profile = _AUDIO_TOOLS
         elif (
@@ -231,7 +228,7 @@ def select_tools(
         and not research
         and not work.scope.get("speech_requested")
         and not _MEDIA_REQUIREMENT.search(requirements)
-        and not _RESEARCH.search(requirements)
+        and not requires_research(requirements)
         and not _SCHEDULING.search(requirements)
         and required.issubset(_DOCUMENT_TOOLS)
     ):

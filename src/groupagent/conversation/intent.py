@@ -58,3 +58,30 @@ def task_write_request(text: str) -> bool:
             outside,
         )
     )
+
+
+_RESEARCH_ACTION = r"(?:(?:联网|上网)(?:调查|研究|搜索|检索|查询)?|搜索|检索)(?:过|了)?"
+_NEGATIVE_RESEARCH = re.compile(
+    r"(?:不要|不得|禁止|不用|不必|无需|不准|别)\s*(?:再|去|进行)?\s*"
+    + _RESEARCH_ACTION
+    + r"|(?:不要|不得|禁止|别)\s*(?:声称|宣称|谎称|假装|说)"
+    r"(?:(?:自己|已经|曾经|做过|做了|进行过|进行|实际|真正|你|我|已|曾|过|了)\s*){0,6}"
+    + _RESEARCH_ACTION
+    + r"|(?:没有|未曾|尚未|未)(?:(?:做过|做了|进行过|进行|任何)\s*){0,3}"
+    + _RESEARCH_ACTION
+    + r"|(?:不要|不得|禁止|不用|别)\s*(?:读取|打开|查看|访问)\s*https?://[^\s，。；;!?！？]+"
+)
+_POSITIVE_RESEARCH = re.compile(
+    r"联网|上网|搜索|检索|找.{0,12}(?:文献|来源|资料|报道)|最新.{0,10}(?:资料|新闻|政策)"
+    r"|查阅.{0,12}(?:网页|官网|文献)|https?://|search|web\s*(?:page|research)|fetch",
+    re.I,
+)
+
+
+def requires_research(text: str) -> bool:
+    """Ignore only explicit no-network/no-research-claim spans, not other clauses.
+
+    This is a narrow completion-requirement guard, not a new authority source.
+    A separate positive request or actual URL still requires real tool evidence.
+    """
+    return bool(_POSITIVE_RESEARCH.search(_NEGATIVE_RESEARCH.sub(" ", text)))

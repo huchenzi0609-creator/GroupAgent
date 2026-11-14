@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -80,6 +80,34 @@ class ToolReceipt(ToolData):
     # Set by a trusted ToolDefinition capability, never parsed from tool output.
     control: ToolControl | None = None
     input_issues: tuple[ToolInputIssue, ...] = ()
+    # Added only by the host Gateway from reviewed registration + fresh policy.
+    # Model arguments and output dictionaries cannot populate receipt metadata.
+    required_tool_evidence: frozenset[Literal["process_run", "shell_command"]] = frozenset()
+
+
+ISOLATED_PROCESS_TOOLS = frozenset({"process_run", "shell_command"})
+
+
+def successful_required_tools(
+    receipts: Iterable[ToolReceipt], allowed_tools: frozenset[str]
+) -> frozenset[str]:
+    successful = set()
+    for receipt in receipts:
+        if (
+            not receipt.success
+            or receipt.effect_state not in {EffectState.SUCCEEDED, EffectState.NO_EFFECT}
+            or receipt.tool_name not in allowed_tools
+        ):
+            continue
+        successful.add(receipt.tool_name)
+        if (
+            receipt.tool_name in ISOLATED_PROCESS_TOOLS
+            and receipt.effect_state == EffectState.SUCCEEDED
+        ):
+            successful.update(
+                receipt.required_tool_evidence & allowed_tools & ISOLATED_PROCESS_TOOLS
+            )
+    return frozenset(successful)
 
 
 class ToolLedgerEntry(ToolData):
@@ -168,6 +196,7 @@ class ToolDefinition(Generic[InputT, OutputT]):
     output_path_fields: tuple[str, ...] = ()
     control_kind: Literal["request_input"] | None = None
     may_request_input: bool = False
+    required_tool_family: Literal["isolated_process"] | None = None
 
     def describe(self) -> dict[str, Any]:
         return {

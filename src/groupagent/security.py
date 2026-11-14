@@ -42,7 +42,8 @@ def load_secret_file(path: Path, allowed: frozenset[str]) -> dict[str, SecretStr
 
 _CREDENTIALS = re.compile(
     r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----"
-    r"|\b(?:sk|ghp|github_pat|xoxb|xoxp)[-_][A-Za-z0-9_-]{16,}\b"
+    r"|(?<![A-Za-z0-9_-])(?:sk|ghp|github_pat|xoxb|xoxp)[-_][A-Za-z0-9_-]{16,}"
+    r"(?![A-Za-z0-9_-])"
     r"|(?<=://)[^\s/:@]+:[^\s/@]+@",
     re.DOTALL,
 )

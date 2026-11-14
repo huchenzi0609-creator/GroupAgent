@@ -225,6 +225,21 @@ class ArtifactRegistry:
             raise DomainError("validation_failed", "Artifact was modified after cataloging")
         return version, payload
 
+    def _check_stored_version(self, row: dict[str, Any]) -> None:
+        """Catalog authority does not establish that this storage root has bytes."""
+        scope = ArtifactScope(row["group_id"], row["work_id"], row["created_by"])
+        stored = self.artifacts.get(scope, row["file_id"], row["version_id"])
+        if stored.to_dict() != row["body"]:
+            raise DomainError(
+                "validation_failed", "Stored version metadata differs from its catalog"
+            )
+        payload = self.artifacts.read(scope, row["file_id"], row["version_id"])
+        if (
+            len(payload) != row["byte_length"]
+            or hashlib.sha256(payload).hexdigest() != row["sha256"]
+        ):
+            raise DomainError("validation_failed", "Stored bytes differ from their catalog")
+
     def list(
         self,
         actor: ActorContext,
@@ -253,6 +268,10 @@ class ArtifactRegistry:
                     row = self._row(tx, candidate["version_id"])
                     if public_context:
                         self.public_sources_in_tx(tx, row)
+                    # Check only the configured store and the original immutable
+                    # identity, after authorization. Never redirect an absent
+                    # version to another root or a same-named replacement.
+                    self._check_stored_version(row)
                     results.append(
                         {
                             key: row[key]
@@ -270,7 +289,18 @@ class ArtifactRegistry:
                         }
                     )
                 except DomainError as error:
-                    if error.code not in {"source_unavailable", "permission_denied"}:
+                    if error.code not in {
+                        "source_unavailable",
+                        "permission_denied",
+                        "artifact_not_found",
+                        "artifact_deleted",
+                        "corrupt_metadata",
+                        "integrity_mismatch",
+                        "scope_denied",
+                        "unsafe_path",
+                        "file_too_large",
+                        "validation_failed",
+                    }:
                         raise
             return results
 

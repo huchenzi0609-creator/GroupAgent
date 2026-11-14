@@ -214,5 +214,8 @@ def register_compute_tools(
                 max_input_bytes=512_000,
                 max_output_bytes=2_000_000,
                 idempotency_mode=IdempotencyMode.RECONCILE_BEFORE_RETRY,
+                required_tool_family="isolated_process"
+                if name in {"process_run", "shell_command"}
+                else None,
             )
         )

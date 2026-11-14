@@ -580,3 +580,65 @@ def test_derived_request_fingerprint_is_complete_for_registry_registration(runti
         env.actor, lease, version, source_event_ids=tuple(current.scope["source_fingerprints"])
     )
     assert select_tools(current, [], CATALOG) == {"request_input"}
+
+
+@pytest.mark.parametrize(
+    "constraint", ["不要联网", "禁止联网调查", "不要声称做过联网调查", "没有联网调查"]
+)
+def test_negative_research_constraint_keeps_pure_document_profile(constraint):
+    current = work("生成Markdown数据说明，" + constraint, outputs=[{"format": "md"}])
+    selected = select_tools(current, [], CATALOG)
+    assert {
+        "document_generate",
+        "document_validate",
+        "artifact_deliver",
+        "python_compute",
+    } <= selected
+    assert not selected & {"web_search", "web_fetch", "browser_open"}
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("生成Markdown数据说明，明确全部数字来自本条合成请求，没有联网调查。", False),
+        ("制作带代码块的Markdown，不要声称做过联网调查。", False),
+        ("生成Markdown，不要凭记忆，请联网查官方来源。", True),
+        ("请联网检索官方文档，不要声称做过无关联网调查。", True),
+        ("读取https://example.org并整理成Markdown。", True),
+    ],
+)
+async def test_work_research_scope_and_selector_share_positive_request_rule(
+    runtime_env, text, expected
+):
+    env = runtime_env
+    request = event(env, text)
+    app, models = app_for(
+        env,
+        {
+            request.id: Decision(
+                kind="start_work",
+                reason_code="synthetic_research_requirement",
+                goal=text,
+                directness="direct",
+                confidence=1,
+                outputs=[{"format": "md"}],
+            )
+        },
+    )
+    try:
+        await app.start()
+        result = await app.coordinator.receive(
+            request, stream_id="synthetic-research-scope", cursor="1", verified_channel=True
+        )
+        assert result.work_id
+        with env.store.transaction(env.actor) as tx:
+            current = tx.get_work(result.work_id)
+        assert current.scope["research_required"] is expected
+        selected = select_tools(current, [], CATALOG)
+        assert ("web_search" in selected) is expected
+        if not expected:
+            assert not set(current.scope["required_tools"]) & {"web_search", "web_fetch"}
+        assert not models
+    finally:
+        await app.close()

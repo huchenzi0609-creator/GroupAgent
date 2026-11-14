@@ -19,6 +19,7 @@ from typing import Any
 from groupagent.domain import ActorContext, DomainError
 from groupagent.sandbox import DockerSandbox
 from groupagent.tools import EffectState, ToolContext, ToolGateway, ToolReceipt
+from groupagent.tools.models import successful_required_tools
 
 from .engine import SYSTEM_PROMPT, ScopedToolEngine, _Run
 from .errors import ModelRejected
@@ -328,7 +329,7 @@ class HarnessEngine(ScopedToolEngine):
                         elif run.pending or reply_revision != run.revision:
                             await self._finish(run, RunState.PAUSED, "superseded_model_response")
                         elif run.unresolved_tools or not request.required_tools.issubset(
-                            {r.tool_name for r in run.receipts if r.success}
+                            successful_required_tools(run.receipts, request.allowed_tools)
                         ):
                             await self._finish(run, RunState.FAILED, "validation_required")
                         else:

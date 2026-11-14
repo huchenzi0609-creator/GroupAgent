@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from groupagent.domain import DomainError, Role
 
 from .models import (
+    ISOLATED_PROCESS_TOOLS,
     EffectState,
     IdempotencyMode,
     InputRequest,
@@ -144,6 +145,12 @@ class ToolGateway:
         return definition.input_model.model_validate(arguments).model_dump(mode="json")
 
     def register(self, definition: ToolDefinition[Any, Any]) -> None:
+        if definition.required_tool_family is not None and (
+            definition.name not in ISOLATED_PROCESS_TOOLS
+            or definition.risk_class != "local_draft"
+            or definition.idempotency_mode != IdempotencyMode.RECONCILE_BEFORE_RETRY
+        ):
+            raise ValueError("Only reviewed isolated process registrations can share requirements")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", definition.name):
             raise ValueError("Tool names must be compatible with function-calling APIs")
         if definition.name in self._tools:
@@ -231,6 +238,29 @@ class ToolGateway:
             raise DomainError("cancelled", "This execution was cancelled")
         return replace(context, scope=replace(context.scope, actor=actor))
 
+    async def _required_evidence(self, result: ToolReceipt, context: ToolContext) -> ToolReceipt:
+        definition = self._tools.get(result.tool_name)
+        evidence = set()
+        if (
+            result.success
+            and result.effect_state == EffectState.SUCCEEDED
+            and definition is not None
+            and definition.required_tool_family == "isolated_process"
+        ):
+            evidence.add(result.tool_name)
+            for name in ISOLATED_PROCESS_TOOLS - {result.tool_name}:
+                alternate = self._tools.get(name)
+                if alternate is None or alternate.required_tool_family != "isolated_process":
+                    continue
+                try:
+                    # Recheck the alternative on replay too: old receipts cannot
+                    # revive an unregistered or newly forbidden tool requirement.
+                    await self.authorize(name, context)
+                except Exception:
+                    continue
+                evidence.add(name)
+        return result.model_copy(update={"required_tool_evidence": frozenset(evidence)})
+
     async def invoke(
         self, name: str, arguments: dict[str, Any], context: ToolContext
     ) -> ToolReceipt:
@@ -292,7 +322,8 @@ class ToolGateway:
         if previous:
             if previous[0] != fingerprint:
                 return receipt("idempotency_conflict")
-            return previous[1].model_copy(update={"call_id": context.call_id, "replayed": True})
+            replay = previous[1].model_copy(update={"call_id": context.call_id, "replayed": True})
+            return await self._required_evidence(replay, context)
         if context.cancelled.is_set():
             return receipt("cancelled")
         if context.deadline_monotonic is not None and (
@@ -406,6 +437,7 @@ class ToolGateway:
                 task.add_done_callback(
                     lambda finished: finished.exception() if not finished.cancelled() else None
                 )
+        result = await self._required_evidence(result, context)
         if (
             result.control is not None
             and not result.success
