@@ -1,5 +1,9 @@
 # Engineering working agreement
 
+## Subagent model preference
+
+- User preference confirmed on 2026-11-15: use GPT-6.1 Sol with Max reasoning for all subagents on this project, unless the user changes it.
+
 ## Current stage
 
 - The user has authorized implementation from Spec v0.1 and explicit subagent collaboration. Read `docs/SPEC_V0.1.zh-CN.md` and `docs/development/FOUNDATION_CONTRACT.md` for current scope. Keep production unchanged until the applicable release gates are satisfied.
