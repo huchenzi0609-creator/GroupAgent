@@ -71,7 +71,10 @@ async def test_unknown_outcome_does_not_auto_retry(execution_request, gateway):
         [DomainError("provider_unavailable", "Lost response", retryable=True)]
     )
     engine = ScopedToolEngine(model, gateway)
-    result = await engine.wait(await engine.start(execution_request))
+    request = execution_request.model_copy(
+        update={"budget": ExecutionBudget(additional_retry_limit=0)}
+    )
+    result = await engine.wait(await engine.start(request))
     assert model.calls == 1 and result.state == RunState.PAUSED
     assert result.usage.tokens > 0 and not result.checkpoint.safe_to_resume
 

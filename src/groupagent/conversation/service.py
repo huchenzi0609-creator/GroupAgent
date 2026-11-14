@@ -39,6 +39,7 @@ from groupagent.memory.retrieval import visible_events
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
 from groupagent.scheduling import Scheduler
+from groupagent.scheduling.reminders import extract_reminder_body, is_time_only_reminder_change
 
 from .actions import (
     ACTION_ADAPTER,
@@ -1171,30 +1172,33 @@ class ConversationCoordinator(Coordinator):
         if isinstance(action, CreateSchedule):
             if not self.config.features.durable_schedules:
                 raise DomainError("feature_disabled", "Scheduling is disabled")
+            reminder_only = bool(
+                re.search(r"(?:提醒|通知)(?:我|我们|大家|一下|：|:)", event.text)
+            ) and not bool(
+                re.search(
+                    r"(?:你|帮我|替我|机器人).{0,8}(?:实际|执行|生成|制作|搜索|整理成)", event.text
+                )
+            )
+            body = extract_reminder_body(event.text) if reminder_only else None
+            scope = {
+                "source_event_ids": list(context["_snapshot"]["source_fingerprints"]),
+                "source_fingerprints": context["_snapshot"]["source_fingerprints"],
+                "topic_id": context["_topic_id"],
+                "reminder_only": reminder_only,
+            }
+            if body is not None:
+                scope.update(reminder_body_literal=True, reminder_body_source_event_id=event.id)
             rule = self.scheduler.in_tx(tx).create(
                 tx.actor,
                 action.title,
-                action.goal,
+                body if body is not None else action.goal,
                 action.timing,
                 now=self.clock(),
                 time_zone=self.config.group.time_zone,
                 valid_until=action.valid_until,
                 request_key="chat:" + event.id,
                 budget=self.config.execution.model_dump(mode="json"),
-                scope={
-                    "source_event_ids": list(context["_snapshot"]["source_fingerprints"]),
-                    "source_fingerprints": context["_snapshot"]["source_fingerprints"],
-                    "topic_id": context["_topic_id"],
-                    "reminder_only": bool(
-                        re.search(r"(?:提醒|通知)(?:我|我们|大家|一下|：|:)", event.text)
-                    )
-                    and not bool(
-                        re.search(
-                            r"(?:你|帮我|替我|机器人).{0,8}(?:实际|执行|生成|制作|搜索|整理成)",
-                            event.text,
-                        )
-                    ),
-                },
+                scope=scope,
             )
             time = (
                 rule.next_due_at.astimezone(ZoneInfo(rule.time_zone)).strftime("%Y-%m-%d %H:%M")
@@ -1213,6 +1217,15 @@ class ConversationCoordinator(Coordinator):
                 for key in ("timing", "goal", "valid_until")
                 if key in action.model_fields_set
             }
+            replacement_body = extract_reminder_body(event.text, replacement=True)
+            if replacement_body is not None:
+                values["goal"] = replacement_body
+            elif previous_schedule.scope.get(
+                "reminder_body_literal"
+            ) is True and is_time_only_reminder_change(event.text):
+                # A timing-only request cannot replace its original literal
+                # body with a paraphrased goal supplied by the router.
+                values.pop("goal", None)
             rule = scheduler.update(
                 tx.actor,
                 action.schedule_id,
@@ -1225,7 +1238,27 @@ class ConversationCoordinator(Coordinator):
                 "source_event_ids": list(context["_snapshot"]["source_fingerprints"]),
                 "source_fingerprints": context["_snapshot"]["source_fingerprints"],
             }
-            if rule.goal != previous_schedule.goal:
+            if replacement_body is not None:
+                scope.update(
+                    reminder_only=True,
+                    reminder_body_literal=True,
+                    reminder_body_source_event_id=event.id,
+                )
+            elif scope.get("reminder_body_literal") is True:
+                body_source = scope.get("reminder_body_source_event_id")
+                previous_sources = previous_schedule.scope.get("source_fingerprints", {})
+                if (
+                    not isinstance(body_source, str)
+                    or not isinstance(previous_sources, dict)
+                    or body_source not in previous_sources
+                ):
+                    raise DomainError("scope_violation", "Literal reminder source is unavailable")
+                scope["source_fingerprints"] = {
+                    **context["_snapshot"]["source_fingerprints"],
+                    body_source: previous_sources[body_source],
+                }
+                scope["source_event_ids"] = list(scope["source_fingerprints"])
+            if rule.goal != previous_schedule.goal and replacement_body is None:
                 # A goal replacement cannot inherit the old reminder hint.
                 # Only the current authorized request/goal may re-establish it.
                 current_request = re.sub(

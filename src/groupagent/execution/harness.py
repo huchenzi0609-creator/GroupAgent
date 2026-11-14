@@ -305,7 +305,13 @@ class HarnessEngine(ScopedToolEngine):
                             "uncertain_model_usage": uncertain_usage,
                             "resource_usage": message.get("resource_usage", {}),
                         }
-                        run.safe_to_resume = not uncertain_usage and not any(
+                        # A successful live retry establishes a new execution
+                        # boundary without resolving/refunding old unknown
+                        # billing. Legacy unsafe checkpoints retain the guard.
+                        recovery_pending = run.backend_state.get(
+                            "model_recovery_pending", uncertain_usage
+                        )
+                        run.safe_to_resume = not recovery_pending and not any(
                             r.effect_state == EffectState.UNKNOWN for r in run.receipts
                         )
                         if stop_reason == "input_requested" and run.input_request is not None:
@@ -409,6 +415,8 @@ class HarnessEngine(ScopedToolEngine):
             raise DomainError("input_budget_exhausted", "Harness input exceeds the work limit")
         if run.usage.rounds >= budget.max_rounds:
             raise DomainError("round_budget_exhausted", "Model round budget exhausted")
+        if self._usage(run).active_seconds >= budget.max_active_seconds:
+            raise DomainError("time_budget_exhausted", "Execution active time budget exhausted")
         estimate = estimate_input_tokens(request)
         allowance = min(budget.max_output_tokens, budget.max_tokens - run.usage.tokens - estimate)
         if allowance < 1:
@@ -453,9 +461,10 @@ class HarnessEngine(ScopedToolEngine):
         except BaseException as exc:
             if not isinstance(exc, ModelRejected):
                 run.backend_state["uncertain_model_usage"] = True
+                run.backend_state["model_recovery_pending"] = True
             if self._model_budget and reservation_id is not None:
                 await self._model_budget.settle(reservation_id, None)
-            if isinstance(exc, ModelRejected) and retry_number < budget.additional_retry_limit:
+            if retry_number < budget.additional_retry_limit and self._can_retry_model(run, exc):
                 await self._wait_retry(run, exc, retry_number + 1)
                 return await self._relay_model(run, payload, retry_number + 1)
             raise
@@ -464,6 +473,7 @@ class HarnessEngine(ScopedToolEngine):
                 await self._model_budget.settle(reservation_id, reply.usage)
             except BaseException:
                 run.backend_state["uncertain_model_usage"] = True
+                run.backend_state["model_recovery_pending"] = True
                 raise
         run.usage = run.usage.model_copy(
             update={"tokens": run.usage.tokens - reserved + reply.usage.total}
@@ -482,6 +492,7 @@ class HarnessEngine(ScopedToolEngine):
             raise DomainError("model_output_truncated", "Model response was truncated")
         if reply.finish_reason == "content_filter":
             raise DomainError("model_response_filtered", "Model response was filtered")
+        run.backend_state["model_recovery_pending"] = False
         await self._emit(
             run,
             "progress",

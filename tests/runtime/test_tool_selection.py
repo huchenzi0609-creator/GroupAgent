@@ -240,6 +240,40 @@ def test_reminder_acceptance_criteria_can_require_actual_agent_work():
     assert not selected & {"schedule_create", "trigger_create", "team_task_create"}
 
 
+def literal_reminder_work():
+    return work(
+        "写完报告并帮我核对资料",
+        origin_schedule_id="synthetic-rule",
+        derived_depth=1,
+        reminder_only=True,
+        reminder_body_literal=True,
+        reminder_body="写完报告并帮我核对资料",
+        reminder_body_source_event_id="synthetic-source",
+        source_fingerprints={"synthetic-source": "0" * 64},
+    )
+
+
+def test_bound_literal_reminder_body_is_recipient_data_not_additional_delegation():
+    assert select_tools(literal_reminder_work(), [], CATALOG) == {"request_input"}
+
+
+def test_literal_reminder_does_not_hide_separate_agent_execution_criteria():
+    current = literal_reminder_work().model_copy(
+        update={"acceptance_criteria": ["必须用Python实际计算总和"]}
+    )
+    assert "python_compute" in select_tools(current, [], CATALOG)
+
+
+@pytest.mark.parametrize("changed", ["depth", "goal"])
+def test_literal_reminder_hint_requires_same_goal_and_first_derived_depth(changed):
+    current = literal_reminder_work()
+    if changed == "depth":
+        current.scope["derived_depth"] = 0
+    else:
+        current = current.model_copy(update={"goal": current.goal + "并帮我搜索来源"})
+    assert "python_compute" in select_tools(current, [], CATALOG)
+
+
 @pytest.mark.parametrize("output_format", ["md", "docx", "pdf", "pptx"])
 @pytest.mark.parametrize("refs", [[], [{"format": "docx"}, {"format": "pdf"}]])
 def test_pure_document_profile_keeps_full_file_compute_and_chart_routes(output_format, refs):

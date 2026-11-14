@@ -430,7 +430,7 @@ def register_document_tools(
         ),
         (
             "document_generate",
-            'Create a real scoped document; name MUST include its extension. Minimal report: {"name":"report.md","kind":"report","title":"Summary","sections":[{"title":"Findings","paragraphs":["Result 87."]}]}. For PPTX use {"name":"slides.pptx","kind":"deck","title":"Summary","slides":[{"title":"Findings","bullets":["Result 87."]}]}. Use document_validate before delivery.',
+            'Create a real scoped document; name MUST include its extension. Use kind=report for native DOCX/PDF reports, comparison tables, score sheets, rubrics and checklists. Sections support tables, blank cells and empty paragraphs for writing space; PDF uses managed CJK fonts and verified page layout. Prefer this to custom Python drawing for these supported layouts. Minimal report: {"name":"report.md","kind":"report","title":"Summary","sections":[{"title":"Findings","paragraphs":["Result 87."]}]}. For PPTX use {"name":"slides.pptx","kind":"deck","title":"Summary","slides":[{"title":"Findings","bullets":["Result 87."]}]}. Use document_validate before delivery.',
             DocumentCreateInput,
             ArtifactOutput,
             generate,

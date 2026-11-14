@@ -22,6 +22,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, Val
 
 from groupagent.domain import DomainError
 
+from .citations import source_citation
 from .models import FetchInput, FetchOutput, ResearchSource, SearchInput, SearchOutput
 from .urls import PublicURLPolicy, Resolver, system_resolver
 
@@ -222,7 +223,7 @@ class DeepSeekResearchClient:
             if clipped:
                 truncated.append(field)
         returned_content = values["content"].encode("utf-8")
-        return ResearchSource(
+        source = ResearchSource(
             source_id=hashlib.sha256(url.encode("utf-8")).hexdigest(),
             url=url,
             operation=operation,
@@ -238,6 +239,7 @@ class DeepSeekResearchClient:
             summary=values["summary"],
             content=values["content"],
         )
+        return source.model_copy(update={"citation": source_citation(source)})
 
     async def search(self, arguments: SearchInput) -> SearchOutput:
         try:

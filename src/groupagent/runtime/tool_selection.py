@@ -14,6 +14,7 @@ from typing import Any
 
 from groupagent.conversation.intent import requires_research
 from groupagent.domain import DomainError, WorkOrder
+from groupagent.scheduling.reminders import get_reminder_body
 
 _IMAGE = frozenset({"png", "jpg", "jpeg", "webp", "gif"})
 _AUDIO = frozenset({"wav", "mp3", "ogg", "flac", "m4a", "aac"})
@@ -161,12 +162,19 @@ def select_tools(
     reminder = derived and (
         work.scope.get("reminder_only") is True or bool(_REMINDER_GOAL.search(goal))
     )
+    literal_reminder = (
+        reminder
+        and type(work.scope.get("derived_depth")) is int
+        and work.scope["derived_depth"] == 1
+        and work.scope.get("reminder_body_literal") is True
+        and get_reminder_body(work.scope) == goal
+    )
     if (
         reminder
         and text_only
         and not research
         and not team_write
-        and not _ADDITIONAL_DELEGATION.search(goal)
+        and (literal_reminder or not _ADDITIONAL_DELEGATION.search(goal))
         and not _requires_memory(criteria)
         and not requires_research(criteria)
         # Criteria describe work the agent must actually satisfy, even when

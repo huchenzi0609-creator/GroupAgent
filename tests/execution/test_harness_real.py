@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from groupagent.domain import Role
+from groupagent.domain import DomainError, Role
 from groupagent.execution import (
     ExecutionBudget,
     HarnessEngine,
@@ -69,6 +69,107 @@ async def test_real_sdk_mcp_tool_loop_scoped_gateway_and_log_upload_disabled(
             "mcp__groupagent__workspace_write_text",
             "mcp__groupagent__workspace_read_text",
         }
+
+
+async def test_real_sdk_live_model_retry_after_tool_preserves_unknown_budget(
+    execution_request, gateway, monkeypatch
+):
+    """Real pinned SDK/MCP; all inference and billing are explicit offline fixtures."""
+    writes = 0
+    original_invoke = gateway.invoke
+
+    async def invoke(name, arguments, context):
+        nonlocal writes
+        if name == "workspace_write_text":
+            writes += 1
+        return await original_invoke(name, arguments, context)
+
+    monkeypatch.setattr(gateway, "invoke", invoke)
+
+    class OnceUnavailableAfterToolModel(ScriptedFakeModel):
+        def __init__(self):
+            super().__init__([write_reply(), final_reply("Recovered SDK candidate")])
+            self.failed = False
+
+        async def complete(self, request):
+            if len(self.requests) == 1 and not self.failed:
+                # The provider fault happens after the prior MCP effect really
+                # completed, rather than before the SDK received its proposal.
+                assert writes == 1
+                assert (execution_request.workspace / "harness.txt").read_text() == (
+                    "Synthetic Harness output"
+                )
+                self.requests.append(request)
+                self.failed = True
+                raise DomainError("provider_unavailable", "Synthetic provider response lost")
+            return await super().complete(request)
+
+    class RecordingModelBudget:
+        def __init__(self):
+            self.reservations = {}
+            self.settlements = {}
+
+        async def reserve(self, request, *, round_number, input_tokens, output_tokens):
+            identifier = f"synthetic-sdk-model-round-{round_number}"
+            assert identifier not in self.reservations
+            self.reservations[identifier] = input_tokens + output_tokens
+            return identifier
+
+        async def settle(self, identifier, usage):
+            # A later success cannot overwrite/refund the failed call's unknown.
+            assert identifier not in self.settlements
+            self.settlements[identifier] = usage
+
+    checkpoints = []
+
+    async def save(checkpoint):
+        checkpoints.append(checkpoint)
+
+    budget = RecordingModelBudget()
+    model = OnceUnavailableAfterToolModel()
+    engine = HarnessEngine(
+        model,
+        gateway,
+        runner(),
+        model_budget=budget,
+        checkpoint_sink=save,
+        synthetic_diagnostics=True,
+    )
+    request = execution_request.model_copy(
+        update={
+            "budget": ExecutionBudget(
+                max_rounds=4,
+                max_active_seconds=60,
+                additional_retry_limit=1,
+                max_retry_after_seconds=0,
+            )
+        }
+    )
+    result = await engine.wait(await engine.start(request))
+    assert result.state == RunState.CANDIDATE, (result.error_code, engine.last_diagnostic)
+    assert result.candidate_text == "Recovered SDK candidate" and model.failed
+    assert len(model.requests) == result.usage.rounds == 3
+    assert model.requests[1] == model.requests[2]
+    assert writes == result.usage.tool_calls == len(result.receipts) == 1
+    receipt = result.receipts[0]
+    assert receipt.success and receipt.effect_state.value == "succeeded" and not receipt.replayed
+    assert (request.workspace / "harness.txt").read_text() == "Synthetic Harness output"
+    first, failed, retried = [f"synthetic-sdk-model-round-{number}" for number in (1, 2, 3)]
+    assert set(budget.reservations) == set(budget.settlements) == {first, failed, retried}
+    assert budget.settlements[first] == write_reply().usage
+    assert budget.settlements[failed] is None
+    assert budget.settlements[retried] == final_reply().usage
+    assert result.usage.tokens == 100 + budget.reservations[failed]
+    persisted = checkpoints[-1]
+    assert persisted.state == RunState.CANDIDATE and persisted.safe_to_resume
+    assert result.checkpoint.safe_to_resume and persisted.backend_state["sessions"]
+    assert persisted.backend_state["uncertain_model_usage"] is True
+    assert persisted.backend_state["model_recovery_pending"] is False
+    assert any(
+        not checkpoint.safe_to_resume
+        and checkpoint.backend_state.get("model_recovery_pending") is True
+        for checkpoint in checkpoints[:-1]
+    )
 
 
 async def test_real_sdk_round_pause_and_native_session_resume(execution_request, gateway):

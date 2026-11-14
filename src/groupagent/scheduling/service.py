@@ -30,6 +30,7 @@ from groupagent.scheduling.models import (
     parse_timing,
 )
 from groupagent.scheduling.recurrence import latest_due, next_due, utc, zone
+from groupagent.scheduling.reminders import occurrence_reminder_contract
 
 Row = dict[str, Any]
 TERMINAL_WORK = {WorkState.COMPLETED, WorkState.FAILED, WorkState.CANCELLED}
@@ -316,6 +317,9 @@ class Scheduler:
                 # This hint belongs to the old goal. All callers, including
                 # work tools, must reauthorize it for a replacement goal.
                 scope.pop("reminder_only", None)
+                scope.pop("reminder_body", None)
+                scope.pop("reminder_body_literal", None)
+                scope.pop("reminder_body_source_event_id", None)
             rule = self._timing(timing if timing is not None else row["timing"], now)
             time_zone = time_zone if time_zone is not None else row["time_zone"]
             zone(time_zone)
@@ -571,11 +575,14 @@ class Scheduler:
             **previous_fingerprints,
             ingested.event.id: origin_tx.event_fingerprint(ingested.event.id),
         }
+        reminder_scope, criteria = occurrence_reminder_contract(
+            schedule["goal"], schedule["scope"], schedule["acceptance_criteria"]
+        )
         work = origin_tx.create_work(
             schedule["goal"],
             ingested.event.id,
             scope={
-                **schedule["scope"],
+                **reminder_scope,
                 "origin_schedule_id": schedule["id"],
                 "origin_occurrence_id": occurrence["id"],
                 "derived_depth": 1,
@@ -583,7 +590,7 @@ class Scheduler:
                 "source_fingerprints": fingerprints,
             },
             budget=schedule["budget"],
-            acceptance_criteria=schedule["acceptance_criteria"],
+            acceptance_criteria=criteria,
         )
         # Compatible with coordinator replay results, and already decided so a
         # channel recovery scan cannot classify the scheduler's system event.
@@ -599,7 +606,7 @@ class Scheduler:
                         "kind": "start_work",
                         "reason_code": "schedule_occurrence",
                         "goal": schedule["goal"],
-                        "acceptance_criteria": schedule["acceptance_criteria"],
+                        "acceptance_criteria": [value for value in criteria],
                     },
                     "work_id": work.id,
                     "delivery_id": None,

@@ -463,11 +463,13 @@ class ScopedToolEngine:
     async def _model_call(self, run: _Run, request: ModelRequest) -> ModelReply:
         if run.cancelled.is_set():
             raise DomainError("cancelled", "Execution cancelled before the model request")
+        remaining = run.request.budget.max_active_seconds - self._usage(run).active_seconds
+        if remaining <= 0:
+            raise DomainError("time_budget_exhausted", "Execution deadline passed before inference")
         task = asyncio.create_task(self.model.complete(request))
         run.model_tasks.add(task)
         task.add_done_callback(run.model_tasks.discard)
         cancellation = asyncio.create_task(run.cancelled.wait())
-        remaining = run.request.budget.max_active_seconds - self._usage(run).active_seconds
         try:
             done, _ = await asyncio.wait(
                 {task, cancellation},
@@ -635,7 +637,7 @@ class ScopedToolEngine:
                         "tokens": run.usage.tokens - reserved,
                     }
                 )
-                run.safe_to_resume = True
+                run.safe_to_resume = not run.backend_state.get("model_recovery_pending", False)
                 continue
             response_revision = run.revision
             reservation_id = None
@@ -654,30 +656,37 @@ class ScopedToolEngine:
                             "tokens": run.usage.tokens - reserved,
                         }
                     )
-                    run.safe_to_resume = True
+                    run.safe_to_resume = not run.backend_state.get("model_recovery_pending", False)
                     raise
             try:
                 reply = await self._model_call(run, request)
             except BaseException as exc:
+                if not isinstance(exc, ModelRejected):
+                    run.backend_state["uncertain_model_usage"] = True
+                    run.backend_state["model_recovery_pending"] = True
                 if self._model_budget and reservation_id is not None:
                     await self._model_budget.settle(reservation_id, None)
                 if isinstance(exc, ModelRejected):
-                    # Unknown billing remains fully reserved. A confirmed 429 has
-                    # no model/tool execution to replay, unlike a lost response.
-                    run.safe_to_resume = True
-                    if retries < budget.additional_retry_limit:
-                        retries += 1
-                        await self._wait_retry(run, exc, retries)
-                        continue
+                    run.safe_to_resume = not run.backend_state.get("model_recovery_pending", False)
+                if retries < budget.additional_retry_limit and self._can_retry_model(run, exc):
+                    retries += 1
+                    await self._wait_retry(run, exc, retries)
+                    continue
                 raise
             retries = 0
             if self._model_budget and reservation_id is not None:
-                await self._model_budget.settle(reservation_id, reply.usage)
+                try:
+                    await self._model_budget.settle(reservation_id, reply.usage)
+                except BaseException:
+                    run.backend_state["uncertain_model_usage"] = True
+                    run.backend_state["model_recovery_pending"] = True
+                    raise
             run.usage = run.usage.model_copy(
                 update={
                     "tokens": run.usage.tokens - reserved + reply.usage.total,
                 }
             )
+            run.backend_state["model_recovery_pending"] = False
             run.safe_to_resume = True
             await self._emit(
                 run,
@@ -881,10 +890,23 @@ class ScopedToolEngine:
             await self._finish(run, RunState.CANDIDATE, text=reply.text)
             return
 
-    async def _wait_retry(self, run: _Run, error: ModelRejected, number: int) -> None:
+    def _can_retry_model(self, run: _Run, error: BaseException) -> bool:
+        # ModelPort only returns client-side tool proposals. A failed pure
+        # inference has not invoked the gateway; retry just this request while
+        # the live controller still owns its history. Never recover a stopped
+        # unsafe checkpoint or overlap an inference task whose outcome is late.
+        return (
+            isinstance(error, DomainError)
+            and (isinstance(error, ModelRejected) or error.code == "provider_unavailable")
+            and not run.cancelled.is_set()
+            and not any(not task.done() for task in run.model_tasks)
+            and not any(receipt.effect_state == EffectState.UNKNOWN for receipt in run.receipts)
+        )
+
+    async def _wait_retry(self, run: _Run, error: BaseException, number: int) -> None:
         delay = (
             error.retry_after_seconds
-            if error.retry_after_seconds is not None
+            if isinstance(error, ModelRejected) and error.retry_after_seconds is not None
             else 2 ** (number - 1)
         )
         delay = min(

@@ -480,12 +480,23 @@ async def test_research_claim_without_actual_receipt_cannot_pass(toolkit_setup):
     assert not setup.model.requests
     fetched = await call(run, "web_fetch", {"url": "https://example.com/source"})
     assert fetched.success and len(setup.http_calls) == 1
+    with pytest.raises(DomainError, match="actual retrieval time in UTC"):
+        await setup.toolkit.validate(
+            run.work,
+            run.lease,
+            setup.env.actor,
+            candidate(run, "The source is https://example.com/source", (fetched,)),
+            run.workspace,
+        )
+    assert not setup.model.requests
     accepted = await setup.toolkit.validate(
         run.work,
         run.lease,
         setup.env.actor,
         candidate(
-            run, "The synthetic observation is documented at https://example.com/source", (fetched,)
+            run,
+            "The synthetic observation is documented at " + fetched.output["source"]["citation"],
+            (fetched,),
         ),
         run.workspace,
     )
@@ -498,6 +509,24 @@ async def test_research_claim_without_actual_receipt_cannot_pass(toolkit_setup):
             candidate(run, "Unrelated source https://example.com/invented", (fetched,)),
             run.workspace,
         )
+
+
+@pytest.mark.parametrize("configured,effective", [(0, 0), (1, 1), (5, 2)])
+async def test_execution_retry_policy_cannot_exceed_original_work_grant(
+    toolkit_setup, configured, effective
+):
+    setup = toolkit_setup
+    setup.toolkit.config = setup.toolkit.config.model_copy(
+        update={
+            "execution": setup.toolkit.config.execution.model_copy(
+                update={"additional_retry_limit": configured}
+            )
+        }
+    )
+    # The work's original default grant allows two additional attempts. A later
+    # service setting can reduce it (including zero), never enlarge that grant.
+    run = await prepare(setup)
+    assert run.prepared.request.budget.additional_retry_limit == effective
 
 
 async def test_real_media_decode_evidence_is_required_even_when_reviewer_would_approve(
@@ -649,7 +678,12 @@ async def test_trusted_scheduled_reminder_names_recipient_work_not_agent_work(to
         "检查作业",
         EveryTiming(interval_seconds=3600),
         now=now,
-        scope={"reminder_only": True, "source_fingerprints": fingerprints},
+        scope={
+            "reminder_only": True,
+            "reminder_body_literal": True,
+            "reminder_body_source_event_id": authorization.id,
+            "source_fingerprints": fingerprints,
+        },
     )
     occurrence = scheduler.due(env.actor, now + timedelta(hours=1))[0]
     with env.store.transaction(env.actor) as tx:
@@ -661,10 +695,16 @@ async def test_trusted_scheduled_reminder_names_recipient_work_not_agent_work(to
     prepared = await setup.toolkit.prepare(work, lease, env.actor, workspace)
     objective = json.loads(prepared.request.objective)
     assert objective["execution_intent"] == "reminder" and objective["goal"] == "检查作业"
+    assert objective["reminder_body"] == "检查作业"
     assert "发送提醒本身不需要" in objective["instructions"][0]
     assert "不要为了被提醒的事项调用 request_input" in objective["instructions"][0]
     assert not objective["input_files"] and prepared.request.allowed_tools == {"request_input"}
     run = SimpleNamespace(work=work, lease=lease, workspace=workspace, prepared=prepared)
+    with pytest.raises(DomainError, match="preserve reminder_body verbatim"):
+        await setup.toolkit.validate(
+            work, lease, env.actor, candidate(run, text="提醒：该检查一下作业了。"), workspace
+        )
+    assert not setup.model.requests
     result = await setup.toolkit.validate(
         work, lease, env.actor, candidate(run, text="提醒：该检查作业了。"), workspace
     )

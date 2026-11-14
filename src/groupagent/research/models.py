@@ -35,6 +35,10 @@ class ResearchSource(ToolData):
     url: str
     title: str
     retrieved_at: AwareDatetime
+    citation: str = Field(
+        default="",
+        description="Client-built URL and actual retrieval time in UTC; copy this citation, optionally adding local time",
+    )
     provider: Literal["deepseek"] = "deepseek"
     operation: Literal["search", "fetch"]
     evidence_kind: Literal["search_result", "provider_fetched_page"]
