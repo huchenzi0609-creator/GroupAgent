@@ -23,13 +23,17 @@ from uuid import uuid4
 from .models import ArtifactError, ArtifactScope, ArtifactVersion, ValidationRecord
 
 FORMATS = {".md": "md", ".docx": "docx", ".pdf": "pdf", ".pptx": "pptx"}
+MEDIA_FORMATS = {
+    "." + name: name
+    for name in ("png", "jpg", "jpeg", "webp", "gif", "wav", "ogg", "mp3", "flac", "m4a", "aac")
+}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"}
 MAX_FILE_BYTES = 30 * 1024 * 1024
 _REF = re.compile(r"^[a-f0-9]{32}$")
 _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
-def document_format(name: str) -> str:
+def document_format(name: str, *, media: bool = False) -> str:
     if (
         not isinstance(name, str)
         or not name.strip()
@@ -42,9 +46,10 @@ def document_format(name: str) -> str:
     suffix = Path(name).suffix.lower()
     if suffix in VIDEO_SUFFIXES:
         raise ArtifactError("unsupported_video", "Video processing is outside this worker")
-    if suffix not in FORMATS:
+    supported = {**FORMATS, **MEDIA_FORMATS} if media else FORMATS
+    if suffix not in supported:
         raise ArtifactError("unsupported_format", "Supported formats are md, docx, pdf and pptx")
-    return FORMATS[suffix]
+    return supported[suffix]
 
 
 def _reference(value: str) -> str:
@@ -182,12 +187,18 @@ class ArtifactStore:
     def _write_json(self, fd: int, name: str, value: dict[str, Any]) -> None:
         self._write(fd, name, json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8"))
 
-    def _scoped(self, fd: int, scope: ArtifactScope) -> dict[str, Any]:
+    def _scoped(
+        self, fd: int, scope: ArtifactScope, *, allow_deleted: bool = False
+    ) -> dict[str, Any]:
         if not isinstance(scope, ArtifactScope):
             raise ArtifactError("invalid_scope", "ArtifactScope is required")
         record = self._json(fd, "file.json")
         if record.get("group_id") != scope.group_id or record.get("work_id") != scope.work_id:
             raise ArtifactError("scope_denied", "Artifact belongs to another group or work")
+        if "tombstone.json" in os.listdir(fd) and not allow_deleted:
+            raise ArtifactError(
+                "artifact_deleted", "Artifact was deleted and cannot be resurrected"
+            )
         return record
 
     def _version(self, fd: int, record: dict[str, Any], version_id: str | None) -> ArtifactVersion:
@@ -228,6 +239,7 @@ class ArtifactStore:
             parent_version_id=parent_version_id,
             created_by=scope.actor_id,
             created_at=datetime.now(UTC).isoformat(),
+            provenance=record.get("provenance", {}),
         )
         with self._directory(fd, "versions", create=True) as versions:
             staging_name = f".pending-{version_id}"
@@ -243,11 +255,27 @@ class ArtifactStore:
         os.fsync(fd)
         return version
 
-    def create(self, scope: ArtifactScope, name: str, content: bytes) -> ArtifactVersion:
+    def create(
+        self,
+        scope: ArtifactScope,
+        name: str,
+        content: bytes,
+        *,
+        provenance: dict[str, Any] | None = None,
+    ) -> ArtifactVersion:
         if not isinstance(scope, ArtifactScope):
             raise ArtifactError("invalid_scope", "ArtifactScope is required")
-        format_name = document_format(name)
+        format_name = document_format(name, media=True)
         self._bytes(content)
+        try:
+            encoded_provenance = json.dumps(provenance or {}, ensure_ascii=False, allow_nan=False)
+            if len(encoded_provenance.encode()) > 65536:
+                raise ValueError("provenance limit")
+            provenance = json.loads(encoded_provenance)
+        except (ValueError, TypeError) as exc:
+            raise ArtifactError(
+                "invalid_provenance", "Artifact provenance must be bounded JSON"
+            ) from exc
         file_id = uuid4().hex
         record = {
             "file_id": file_id,
@@ -255,10 +283,13 @@ class ArtifactStore:
             "work_id": scope.work_id,
             "name": name,
             "format": format_name,
+            "provenance": provenance,
         }
-        with self._file(file_id, create=True) as fd, self._locked(fd, create=True):
-            self._write_json(fd, "file.json", record)
-            return self._publish(fd, record, scope, content, None)
+        with self._locked(self._root_fd, create=True):
+            self._check_revocation(scope, provenance or {})
+            with self._file(file_id, create=True) as fd, self._locked(fd, create=True):
+                self._write_json(fd, "file.json", record)
+                return self._publish(fd, record, scope, content, None)
 
     def revise(
         self,
@@ -269,8 +300,9 @@ class ArtifactStore:
         expected_version_id: str,
     ) -> ArtifactVersion:
         _reference(expected_version_id)
-        with self._file(file_id) as fd:
+        with self._locked(self._root_fd, create=True), self._file(file_id) as fd:
             record = self._scoped(fd, scope)
+            self._check_revocation(scope, record.get("provenance", {}))
             with self._locked(fd):
                 current = self._version(fd, record, None)
                 if current.version_id != expected_version_id:
@@ -308,12 +340,249 @@ class ArtifactStore:
             try:
                 version = self.get(scope, file_id)
             except ArtifactError as exc:
-                if exc.code in {"scope_denied", "artifact_not_found"}:
+                if exc.code in {"scope_denied", "artifact_not_found", "artifact_deleted"}:
                     continue
                 raise
             if name_contains.casefold() in version.name.casefold():
                 result.append(version)
         return tuple(sorted(result, key=lambda v: (v.created_at, v.file_id)))
+
+    @staticmethod
+    def _revocation_key(group_id: str, kind: str, source_id: str) -> str:
+        return (
+            hashlib.sha256(json.dumps([group_id, kind, source_id]).encode()).hexdigest() + ".json"
+        )
+
+    @staticmethod
+    def _source_events(provenance: dict[str, Any]) -> tuple[str, ...]:
+        sources = provenance.get("source_event_ids", ())
+        if not isinstance(sources, (list, tuple)) or any(
+            not isinstance(value, str) or not value for value in sources
+        ):
+            raise ArtifactError("invalid_provenance", "Source event references must be identifiers")
+        primary = provenance.get("source_event_id")
+        if primary is not None and (not isinstance(primary, str) or not primary):
+            raise ArtifactError(
+                "invalid_provenance", "Source event reference must be an identifier"
+            )
+        return tuple(sorted(set(sources) | ({primary} if primary else set())))
+
+    def _check_revocation(self, scope: ArtifactScope, provenance: dict[str, Any]) -> None:
+        sources = self._source_events(provenance)
+        try:
+            with self._directory(self._root_fd, "revocations") as revoked:
+                names = set(os.listdir(revoked))
+        except ArtifactError as exc:
+            if exc.code == "artifact_not_found":
+                return
+            raise
+        keys = [self._revocation_key(scope.group_id, "work", scope.work_id)]
+        keys.extend(
+            self._revocation_key(scope.group_id, "event", identifier) for identifier in sources
+        )
+        if any(key in names for key in keys):
+            raise ArtifactError("source_deleted", "A deleted source cannot create new artifacts")
+
+    def _revoke_source(self, group_id: str, kind: str, source_id: str) -> None:
+        with self._directory(self._root_fd, "revocations", create=True) as revoked:
+            name = self._revocation_key(group_id, kind, source_id)
+            if name not in os.listdir(revoked):
+                self._write_json(
+                    revoked,
+                    name,
+                    {
+                        "group_id": group_id,
+                        "kind": kind,
+                        "source_id": source_id,
+                        "deleted_at": datetime.now(UTC).isoformat(),
+                    },
+                )
+                os.fsync(revoked)
+
+    def _remove_tree(self, parent: int, name: str) -> None:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
+            # Remove only the link itself, never traverse its target.
+            os.unlink(name, dir_fd=parent)
+        elif stat.S_ISDIR(info.st_mode):
+            with self._directory(parent, name) as directory:
+                for entry in os.listdir(directory):
+                    self._remove_tree(directory, entry)
+            os.rmdir(name, dir_fd=parent)
+        else:
+            os.unlink(name, dir_fd=parent)
+
+    def purge(self, scope: ArtifactScope, file_id: str, *, reason: str) -> str:
+        """Trusted retention/forget handler; not exposed as a model tool."""
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason):
+            raise ArtifactError("invalid_reason", "Deletion reason must be a short machine code")
+        with self._file(file_id) as fd, self._locked(fd):
+            self._scoped(fd, scope, allow_deleted=True)
+            if "tombstone.json" not in os.listdir(fd):
+                self._write_json(
+                    fd,
+                    "tombstone.json",
+                    {
+                        "file_id": file_id,
+                        "group_id": scope.group_id,
+                        "work_id": scope.work_id,
+                        "deleted_by": scope.actor_id,
+                        "deleted_at": datetime.now(UTC).isoformat(),
+                        "reason": reason,
+                    },
+                )
+                os.fsync(fd)
+            # A crash can leave payloads after the tombstone; repeating purge completes deletion.
+            for name in os.listdir(fd):
+                if name not in {"file.json", "lock", "tombstone.json"}:
+                    self._remove_tree(fd, name)
+            temporary = ".redacted-" + uuid4().hex
+            self._write_json(
+                fd,
+                temporary,
+                {
+                    "file_id": file_id,
+                    "group_id": scope.group_id,
+                    "work_id": scope.work_id,
+                    "name": "deleted",
+                    "format": "deleted",
+                },
+            )
+            os.replace(temporary, "file.json", src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+        return "artifact-tombstone:" + file_id
+
+    def purge_work(self, scope: ArtifactScope, *, reason: str = "retention") -> tuple[str, ...]:
+        with self._locked(self._root_fd, create=True):
+            self._revoke_source(scope.group_id, "work", scope.work_id)
+            files = []
+            for file_id in os.listdir(self._root_fd):
+                if not _REF.fullmatch(file_id):
+                    continue
+                with self._file(file_id) as fd:
+                    row = self._json(fd, "file.json")
+                    if (
+                        row.get("group_id") == scope.group_id
+                        and row.get("work_id") == scope.work_id
+                    ):
+                        files.append(file_id)
+            return tuple(self.purge(scope, file_id, reason=reason) for file_id in files)
+
+    def purge_event(
+        self,
+        group_id: str,
+        event_id: str,
+        actor_id: str,
+        *,
+        reason: str = "forgotten",
+        preserve_file_ids: set[str] | frozenset[str] = frozenset(),
+        preserve_version_ids: set[str] | frozenset[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Trusted expiry exception for catalog-authorized retained files.
+
+        Without a version allowlist a file exception includes its history.
+        With preserve_version_ids, unlisted versions/validations/previews are
+        physically removed. Explicit forget/recall can never preserve a file.
+        """
+        if (preserve_file_ids or preserve_version_ids) and reason != "expired":
+            raise ArtifactError("invalid_reason", "Only raw-source expiry may preserve files")
+        for file_id in preserve_file_ids:
+            _reference(file_id)
+        for version_id in preserve_version_ids or ():
+            _reference(version_id)
+        with self._locked(self._root_fd, create=True):
+            # Raw expiry and explicit withdrawal have different retention rules.
+            # DB source guards reject expired raw attachments; the virtual raw
+            # input scope is revoked here. Validated retained files may be copied.
+            self._revoke_source(
+                group_id,
+                "work" if reason == "expired" else "event",
+                "input:" + event_id if reason == "expired" else event_id,
+            )
+            targets = []
+            for file_id in os.listdir(self._root_fd):
+                if not _REF.fullmatch(file_id):
+                    continue
+                with self._file(file_id) as fd, self._locked(fd):
+                    row = self._json(fd, "file.json")
+                    if row.get("group_id") == group_id and event_id in self._source_events(
+                        row.get("provenance", {})
+                    ):
+                        if preserve_version_ids is not None:
+                            if self._retain_versions(fd, row, preserve_version_ids):
+                                continue
+                        elif file_id in preserve_file_ids:
+                            continue
+                        targets.append((ArtifactScope(group_id, row["work_id"], actor_id), file_id))
+            return tuple(self.purge(scope, file_id, reason=reason) for scope, file_id in targets)
+
+    def _retain_versions(
+        self, fd: int, row: dict[str, Any], keep: set[str] | frozenset[str]
+    ) -> bool:
+        """Caller holds root then file lock and supplied trusted catalog IDs."""
+        with self._directory(fd, "versions") as versions:
+            names = os.listdir(versions)
+            selected = [
+                self._version(fd, row, name)
+                for name in names
+                if name in keep and _REF.fullmatch(name)
+            ]
+            if not selected:
+                return False
+            chosen = max(selected, key=lambda value: (value.created_at, value.version_id))
+            pointer = ".retained-current-" + uuid4().hex
+            self._write_json(fd, pointer, {"version_id": chosen.version_id})
+            os.replace(pointer, "current.json", src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+            for name in names:
+                if name not in keep:
+                    self._remove_tree(versions, name)
+        remove_previews = []
+        try:
+            with self._directory(fd, "validations") as validations:
+                for name in os.listdir(validations):
+                    if (
+                        name.endswith(".json")
+                        and self._json(validations, name).get("version_id") not in keep
+                    ):
+                        remove_previews.append(name.removesuffix(".json"))
+                        self._remove_tree(validations, name)
+        except ArtifactError as error:
+            if error.code != "artifact_not_found":
+                raise
+        try:
+            with self._directory(fd, "previews") as previews:
+                for identifier in remove_previews:
+                    if identifier in os.listdir(previews):
+                        self._remove_tree(previews, identifier)
+        except ArtifactError as error:
+            if error.code != "artifact_not_found":
+                raise
+        return True
+
+    def retain_versions(
+        self,
+        scope: ArtifactScope,
+        file_id: str,
+        keep: set[str] | frozenset[str],
+        *,
+        reason: str = "expired",
+    ) -> str:
+        """Trusted TTL cleanup; never registered as a model capability."""
+        for version_id in keep:
+            _reference(version_id)
+        if keep and reason != "expired":
+            raise ArtifactError("invalid_reason", "Only expiry cleanup may retain versions")
+        with self._locked(self._root_fd, create=True):
+            with self._file(file_id) as fd, self._locked(fd):
+                row = self._scoped(fd, scope, allow_deleted=True)
+                if keep and "tombstone.json" not in os.listdir(fd):
+                    if not self._retain_versions(fd, row, keep):
+                        raise ArtifactError(
+                            "artifact_not_found", "Retained versions are not in this file"
+                        )
+                    return "artifact-retained:" + file_id
+            return self.purge(scope, file_id, reason=reason)
 
     def record_validation(
         self,

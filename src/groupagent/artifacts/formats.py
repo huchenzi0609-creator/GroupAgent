@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import re
@@ -24,6 +25,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.util import Inches, Pt
 from pypdf import PdfReader
+from pypdf.generic import ArrayObject, FloatObject, NullObject, NumberObject
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4
@@ -31,11 +33,13 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, TableStyle
+from reportlab.platypus import Image as PDFImage
+from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, TableStyle
 from reportlab.platypus import Table as PDFTable
 
 from .models import ArtifactError, Deck, DocumentUnit, Report, TableData
 from .store import VIDEO_SUFFIXES
+from .visuals import add_slide_visuals, chart_png, chart_summary, check_chart, validated_image
 
 REPORT_MARKER = "groupagent-report-v1"
 DECK_MARKER = "groupagent-deck-v1"
@@ -76,9 +80,20 @@ def check_report(report: Report) -> None:
         if len(section.paragraphs) > 50 or len(section.tables) > 5:
             raise ArtifactError("unsupported_layout", "Section exceeds the supported layout limits")
         for paragraph in section.paragraphs:
-            _text(paragraph)
+            # Explicit empty paragraphs are form-writing space, not missing data.
+            _text(paragraph, allow_empty=True)
         for table in section.tables:
             _table(table)
+        if len(section.images) > 3 or len(section.charts) > 3:
+            raise ArtifactError(
+                "document_limit", "A section supports at most three images and charts"
+            )
+        for image in section.images:
+            validated_image(image)
+        for chart in section.charts:
+            check_chart(chart)
+    if sum(len(section.images) for section in report.sections) > 10:
+        raise ArtifactError("document_limit", "Report supports at most ten source images")
     character_count = (
         len(report.title)
         + len(report.subtitle)
@@ -104,12 +119,16 @@ def check_deck(deck: Deck) -> None:
         raise ArtifactError("invalid_document", "A deck needs 1-100 slides")
     for slide in deck.slides:
         _text(slide.title, maximum=90)
-        if len(slide.bullets) > (3 if slide.table else 6):
+        if len(slide.bullets) > (2 if slide.image or slide.chart else 3 if slide.table else 6):
             raise ArtifactError(
                 "unsupported_layout", "Slide has too many paragraphs for this layout"
             )
         for bullet in slide.bullets:
             _text(bullet, maximum=180)
+        if slide.image:
+            validated_image(slide.image)
+        if slide.chart:
+            check_chart(slide.chart)
         if slide.table:
             _table(slide.table)
             if len(slide.table.rows) > 5 or len(slide.table.headers) > 4:
@@ -132,7 +151,7 @@ def build_markdown(report: Report) -> bytes:
         for paragraph in section.paragraphs:
             if re.search(r"^(?:#{1,6} |```|~~~|>|[-*] |\d+\. |\|)|!\[|<", paragraph, re.MULTILINE):
                 raise ArtifactError(
-                    "unsupported_feature", "Report Markdown paragraphs must be plain text"
+                    "unsupported_markdown_block", "Report Markdown paragraphs must be plain text"
                 )
     parts = [f"# {report.title}", report.subtitle] if report.subtitle else [f"# {report.title}"]
     for section in report.sections:
@@ -144,6 +163,17 @@ def build_markdown(report: Report) -> bytes:
             ]
             rows.insert(1, "| " + " | ".join("---" for _ in table.headers) + " |")
             parts.append("\n".join(rows))
+        for image in section.images:
+            content, _, _ = validated_image(image)
+            alt = (
+                image.alt_text.replace("\\", "\\\\")
+                .replace("[", "\\[")
+                .replace("]", "\\]")
+                .replace("\n", " ")
+            )
+            parts.append(f"![{alt}](data:image/png;base64,{base64.b64encode(content).decode()})")
+        for chart in section.charts:
+            parts.append(chart_summary(chart))
     return ("\n\n".join(parts) + "\n").encode("utf-8")
 
 
@@ -214,6 +244,20 @@ def build_docx(report: Report, *, font_family: str = "Arial") -> bytes:
                     for paragraph in cell.paragraphs:
                         paragraph.paragraph_format.space_after = WordPt(0)
             document.add_paragraph()
+        for image in section.images:
+            content, _, _ = validated_image(image)
+            paragraph = document.add_paragraph()
+            paragraph.paragraph_format.keep_with_next = True
+            picture = paragraph.add_run().add_picture(
+                io.BytesIO(content), width=WordInches(image.width_inches)
+            )
+            picture._inline.docPr.set("descr", image.alt_text)
+            document.add_paragraph(image.alt_text, style="Caption")
+        for chart in section.charts:
+            paragraph = document.add_paragraph()
+            paragraph.paragraph_format.keep_with_next = True
+            paragraph.add_run().add_picture(io.BytesIO(chart_png(chart)), width=WordInches(5.8))
+            document.add_paragraph(chart_summary(chart), style="Caption")
     output = io.BytesIO()
     document.save(output)
     return output.getvalue()
@@ -285,9 +329,11 @@ def build_pdf(report: Report, *, font_path: Path | None = None) -> bytes:
         story.append(Paragraph(escape(report.subtitle), body))
     for section in report.sections:
         story.append(Paragraph(escape(section.title), heading))
-        story.extend(
-            Paragraph(escape(text).replace("\n", "<br/>"), body) for text in section.paragraphs
-        )
+        for text in section.paragraphs:
+            if text.strip():
+                story.append(Paragraph(escape(text).replace("\n", "<br/>"), body))
+            else:
+                story.append(Spacer(1, body.leading))
         for data in section.tables:
             rows = [
                 [Paragraph(escape(text), cell_style) for text in row]
@@ -313,6 +359,32 @@ def build_pdf(report: Report, *, font_path: Path | None = None) -> bytes:
                 )
             )
             story.extend((table, Spacer(1, 10)))
+        for image in section.images:
+            content, width, height = validated_image(image)
+            scaled_width = min(image.width_inches * 72, 400 * width / height)
+            story.append(
+                KeepTogether(
+                    [
+                        PDFImage(
+                            io.BytesIO(content),
+                            width=scaled_width,
+                            height=scaled_width * height / width,
+                        ),
+                        Paragraph(escape(image.alt_text), body),
+                        Spacer(1, 10),
+                    ]
+                )
+            )
+        for chart in section.charts:
+            story.append(
+                KeepTogether(
+                    [
+                        PDFImage(io.BytesIO(chart_png(chart)), width=480, height=288),
+                        Paragraph(escape(chart_summary(chart)), body),
+                        Spacer(1, 10),
+                    ]
+                )
+            )
     document.build(story)
     return output.getvalue()
 
@@ -357,11 +429,16 @@ def build_pptx(deck: Deck, *, font_family: str = "Arial") -> bytes:
         title.name = "groupagent.title"
         _slide_text(title, (data.title,), 30, bold=True, font_family=font_family)
         body = slide.shapes.add_textbox(
-            Inches(0.7), Inches(1.75), Inches(11.9), Inches(1.8 if data.table else 4.7)
+            Inches(0.7),
+            Inches(1.75),
+            Inches(11.9),
+            Inches(1.4 if data.image or data.chart else 1.8 if data.table else 4.7),
         )
         body.name = "groupagent.body"
         _slide_text(body, data.bullets, 22, font_family=font_family)
-        if data.table:
+        if data.image or data.chart:
+            add_slide_visuals(slide, data, font_family)
+        elif data.table:
             rows = (data.table.headers, *data.table.rows)
             shape = slide.shapes.add_table(
                 len(rows), len(rows[0]), Inches(0.8), Inches(3.8), Inches(11.7), Inches(2.6)
@@ -429,9 +506,37 @@ def inspect_office(
                 benign_printer_settings = re.fullmatch(
                     r"(?:word|ppt)/printersettings/printersettings\d+\.bin", lower
                 )
+                chart_workbook = format_name == "pptx" and re.fullmatch(
+                    r"ppt/embeddings/[^/]+\.xlsx", lower
+                )
+                if chart_workbook:
+                    with zipfile.ZipFile(io.BytesIO(archive.read(info))) as workbook:
+                        if (
+                            "xl/workbook.xml" not in workbook.namelist()
+                            or sum(item.file_size for item in workbook.infolist()) > 5 * 1024 * 1024
+                        ):
+                            raise ArtifactError(
+                                "unsafe_archive", "Chart workbook is invalid or too large"
+                            )
+                        for entry in workbook.namelist():
+                            if (
+                                "vbaproject" in entry.lower()
+                                or entry.endswith(".bin")
+                                or ".." in PurePosixPath(entry).parts
+                            ):
+                                raise ArtifactError(
+                                    "unsupported_feature",
+                                    "Chart workbook contains active or unsafe content",
+                                )
+                            if entry.endswith(
+                                ".rels"
+                            ) and b'TargetMode="External"' in workbook.read(entry):
+                                raise ArtifactError(
+                                    "external_reference", "External chart workbooks are unsupported"
+                                )
                 if (
                     "vbaproject" in lower
-                    or "/embeddings/" in lower
+                    or ("/embeddings/" in lower and not chart_workbook)
                     or (lower.endswith(".bin") and not benign_printer_settings)
                 ):
                     raise ArtifactError(
@@ -461,6 +566,22 @@ def inspect_office(
         raise ArtifactError("invalid_document", "Office package cannot be opened") from exc
 
 
+def _passive_open_destination(value: Any) -> bool:
+    if value is None:
+        return True
+    if hasattr(value, "get_object"):
+        value = value.get_object()
+    if not isinstance(value, ArrayObject) or not 2 <= len(value) <= 6:
+        return False
+    page = value[0].get_object() if hasattr(value[0], "get_object") else value[0]
+    return (
+        isinstance(page, dict)
+        and page.get("/Type") == "/Page"
+        and value[1] in {"/XYZ", "/Fit", "/FitH", "/FitV", "/FitR", "/FitB", "/FitBH", "/FitBV"}
+        and all(isinstance(part, (NumberObject, FloatObject, NullObject)) for part in value[2:])
+    )
+
+
 def open_pdf(content: bytes) -> PdfReader:
     if not content.startswith(b"%PDF-"):
         raise ArtifactError("format_mismatch", "PDF signature is missing")
@@ -468,8 +589,41 @@ def open_pdf(content: bytes) -> PdfReader:
         reader = PdfReader(io.BytesIO(content), strict=True)
         if reader.is_encrypted:
             raise ArtifactError("encrypted_document", "Encrypted PDF is unsupported")
+        root: Any = reader.trailer["/Root"]
+        names: Any = root.get("/Names", {})
+        if hasattr(names, "get_object"):
+            names = names.get_object()
+        if (
+            root.get("/AA")
+            or not _passive_open_destination(root.get("/OpenAction"))
+            or names.get("/JavaScript")
+            or names.get("/EmbeddedFiles")
+        ):
+            raise ArtifactError(
+                "unsupported_feature", "Active PDF actions and embedded files are unsupported"
+            )
         if not 1 <= len(reader.pages) <= MAX_PAGES:
             raise ArtifactError("page_limit", "PDF must contain 1-200 pages")
+        for page in reader.pages:
+            for reference in page.get("/Annots", ()):
+                annotation: Any = reference.get_object()
+                if annotation.get("/Subtype") in {"/Movie", "/RichMedia", "/Screen"}:
+                    raise ArtifactError("unsupported_video", "Embedded PDF video is unsupported")
+                action: Any = annotation.get("/A", {})
+                if hasattr(action, "get_object"):
+                    action = action.get_object()
+                if (
+                    annotation.get("/AA")
+                    or action.get("/Next")
+                    or action.get("/S")
+                    in {
+                        "/JavaScript",
+                        "/Launch",
+                    }
+                ):
+                    raise ArtifactError(
+                        "unsupported_feature", "Active PDF annotations are unsupported"
+                    )
         return reader
     except ArtifactError:
         raise
@@ -483,6 +637,9 @@ def extract(content: bytes, format_name: str) -> tuple[DocumentUnit, ...]:
             text = content.decode("utf-8")
             if "\x00" in text:
                 raise ArtifactError("invalid_document", "Markdown contains binary data")
+            text = re.sub(
+                r"data:image/[a-z]+;base64,[A-Za-z0-9+/=]+", "[embedded image bytes]", text
+            )
             return tuple(
                 DocumentUnit(f"block:{index + 1}", block)
                 for index, block in enumerate(re.split(r"\n\s*\n", text))
@@ -494,7 +651,7 @@ def extract(content: bytes, format_name: str) -> tuple[DocumentUnit, ...]:
                 DocumentUnit(f"page:{index + 1}", page.extract_text() or "")
                 for index, page in enumerate(reader.pages)
             )
-        inspect_office(content, format_name)
+        inspect_office(content, format_name, for_edit=True)
         if format_name == "docx":
             document = Document(io.BytesIO(content))
             units = []
@@ -507,23 +664,54 @@ def extract(content: bytes, format_name: str) -> tuple[DocumentUnit, ...]:
                     )
                 )
                 units.append(DocumentUnit(f"block:{index + 1}", text))
+            for section_index, section in enumerate(document.sections):
+                for label, story in (("header", section.header), ("footer", section.footer)):
+                    text = "\n".join(
+                        paragraph.text for paragraph in story.paragraphs if paragraph.text
+                    )
+                    if text:
+                        units.append(DocumentUnit(f"section:{section_index + 1}:{label}", text))
             return tuple(units)
         if format_name == "pptx":
             presentation = Presentation(io.BytesIO(content))
             if not 1 <= len(presentation.slides) <= MAX_SLIDES:
                 raise ArtifactError("page_limit", "PPTX must contain 1-100 slides")
+
+            def shape_text(shape: Any) -> str:
+                if shape.has_text_frame:
+                    return str(shape.text)
+                if shape.has_table:
+                    return "\n".join(
+                        " | ".join(cell.text for cell in row.cells) for row in shape.table.rows
+                    )
+                if shape.has_chart:
+                    chart = shape.chart
+                    categories = tuple(category.label for category in chart.plots[0].categories)
+                    title = chart.chart_title.text_frame.text if chart.has_title else "Chart"
+                    return (
+                        title
+                        + "\n"
+                        + "\n".join(
+                            series.name
+                            + ": "
+                            + ", ".join(
+                                f"{label}={value:g}"
+                                for label, value in zip(categories, series.values, strict=True)
+                            )
+                            for series in chart.series
+                        )
+                    )
+                nodes = shape._element.xpath(".//p:cNvPr")
+                return (
+                    "Image description: " + nodes[0].get("descr", "")
+                    if nodes and nodes[0].get("descr")
+                    else ""
+                )
+
             return tuple(
                 DocumentUnit(
                     f"slide:{index + 1}",
-                    "\n".join(
-                        shape.text
-                        if shape.has_text_frame
-                        else "\n".join(
-                            " | ".join(cell.text for cell in row.cells) for row in shape.table.rows
-                        )
-                        for shape in slide.shapes
-                        if shape.has_text_frame or shape.has_table
-                    ),
+                    "\n".join(shape_text(shape) for shape in slide.shapes),
                 )
                 for index, slide in enumerate(presentation.slides)
             )
@@ -542,7 +730,7 @@ def edit_report_section(
             "invalid_edit", "A nonnegative section index and replacement text are required"
         )
     for text in paragraphs:
-        _text(text)
+        _text(text, allow_empty=True)
     if format_name == "md":
         text = content.decode("utf-8")
         markdown_headings = list(re.finditer(r"^## [^\n]+$", text, re.MULTILINE))
@@ -559,7 +747,9 @@ def edit_report_section(
         # Only simple paragraphs plus pipe tables are a declared editing capability.
         preserved = []
         for block in markdown_blocks:
-            if block.lstrip().startswith("|"):
+            if block.lstrip().startswith("|") or re.fullmatch(
+                r"!\[[^\n]*\]\(data:image/png;base64,[A-Za-z0-9+/=]+\)", block.strip()
+            ):
                 preserved.append(block)
             elif re.search(r"^(?:#{1,6} |```|~~~|>|[-*] |\d+\. )|!\[|<", block, re.MULTILINE):
                 raise ArtifactError(
@@ -591,6 +781,10 @@ def edit_report_section(
     for block in blocks[start + 1 : end]:
         if isinstance(block, Table):
             continue
+        if block._p.xpath(".//w:drawing") and not block.text.strip():
+            continue
+        if block.style is not None and block.style.name == "Caption":
+            continue
         if block._p.xpath(".//w:drawing|.//w:pict|.//w:fldChar|.//w:hyperlink"):
             raise ArtifactError("unsupported_feature", "Edited paragraphs contain nontext content")
         if block.style is not None and block.style.name.startswith("Heading"):
@@ -598,7 +792,11 @@ def edit_report_section(
                 "unsupported_feature", "Nested headings require a more precise edit"
             )
     for block in blocks[start + 1 : end]:
-        if isinstance(block, WordParagraph):
+        if (
+            isinstance(block, WordParagraph)
+            and not block._p.xpath(".//w:drawing")
+            and not (block.style is not None and block.style.name == "Caption")
+        ):
             block._p.getparent().remove(block._p)
     heading = blocks[start]
     assert isinstance(heading, WordParagraph)

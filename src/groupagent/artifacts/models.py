@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
+from groupagent.domain import DomainError
 
-class ArtifactError(ValueError):
+
+class ArtifactError(DomainError, ValueError):
     def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
+        super().__init__(code, message)
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class ArtifactVersion:
     parent_version_id: str | None
     created_by: str
     created_at: str
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     @property
     def artifact_version_id(self) -> str:
@@ -59,12 +62,14 @@ class ValidationRecord:
     format: str
     structural_passed: bool
     content_passed: bool
+    media_decoded: bool = False
     rendered: bool = False
     layout_passed: bool = False
     visual_reviewed: bool = False
     page_count: int | None = None
     checks: tuple[str, ...] = ()
     issues: tuple[str, ...] = ()
+    failed_expectations: tuple[dict[str, Any], ...] = ()
     renderer: str | None = None
     preview_sha256: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
@@ -78,6 +83,20 @@ class ValidationRecord:
     def passed(self) -> bool:
         if not self.structural_passed or not self.content_passed or self.issues:
             return False
+        if self.format in {
+            "png",
+            "jpg",
+            "jpeg",
+            "webp",
+            "gif",
+            "wav",
+            "ogg",
+            "mp3",
+            "flac",
+            "m4a",
+            "aac",
+        }:
+            return self.media_decoded
         return self.format == "md" or (self.rendered and self.layout_passed)
 
     @property
@@ -91,12 +110,39 @@ class ValidationRecord:
         return "structural_only"
 
     def to_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "passed": self.passed, "status": self.status}
+        return {
+            **asdict(self),
+            "passed": self.passed,
+            "status": self.status,
+            "failure_summary": self.failure_summary,
+        }
+
+    @property
+    def failure_summary(self) -> str:
+        if self.passed:
+            return ""
+        parts = ["Document validation failed: " + ", ".join(self.issues[:12])]
+        for item in self.failed_expectations[:8]:
+            parts.append(
+                f"expected_text[{item['index']}] missing in {item['stage']}: "
+                + json.dumps(item["expected"], ensure_ascii=False)
+            )
+        if self.failed_expectations:
+            parts.append(
+                "expected_text is a literal check (whitespace ignored), not a semantic claim or a table-row equality. Required user literals must be present; do not invent phrasing for semantic criteria."
+            )
+        if "layout_policy_unsupported" in self.issues:
+            parts.append(
+                "This layout is outside the verified profile; use document_generate for the supported report/deck layout. Do not spoof document metadata to bypass layout checks."
+            )
+        return "\n".join(parts)[:2400]
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ValidationRecord:
-        fields = {k: v for k, v in value.items() if k not in {"passed", "status"}}
-        for key in ("checks", "issues", "preview_sha256", "limitations"):
+        fields = {
+            k: v for k, v in value.items() if k not in {"passed", "status", "failure_summary"}
+        }
+        for key in ("checks", "issues", "preview_sha256", "limitations", "failed_expectations"):
             fields[key] = tuple(fields.get(key, ()))
         return cls(**fields)
 
@@ -108,10 +154,33 @@ class TableData:
 
 
 @dataclass(frozen=True)
+class ImageData:
+    content: bytes
+    alt_text: str
+    width_inches: float = 5.5
+
+
+@dataclass(frozen=True)
+class ChartSeries:
+    name: str
+    values: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class ChartData:
+    kind: Literal["bar", "line", "pie"]
+    title: str
+    categories: tuple[str, ...]
+    series: tuple[ChartSeries, ...]
+
+
+@dataclass(frozen=True)
 class Section:
     title: str
     paragraphs: tuple[str, ...]
     tables: tuple[TableData, ...] = ()
+    images: tuple[ImageData, ...] = ()
+    charts: tuple[ChartData, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +195,8 @@ class Slide:
     title: str
     bullets: tuple[str, ...]
     table: TableData | None = None
+    image: ImageData | None = None
+    chart: ChartData | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +218,9 @@ class DocumentRead:
     format: str
     units: tuple[DocumentUnit, ...]
     warnings: tuple[str, ...] = ()
+    total_units: int | None = None
+    complete: bool = True
+    ocr_pages: tuple[int, ...] = ()
 
     @property
     def text(self) -> str:

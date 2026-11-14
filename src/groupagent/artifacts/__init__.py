@@ -1,13 +1,17 @@
 """Scoped immutable artifacts and the bounded document foundation."""
 
 from .documents import DocumentService
+from .isolated import IsolatedDocumentService
 from .models import (
     ArtifactError,
     ArtifactScope,
     ArtifactVersion,
+    ChartData,
+    ChartSeries,
     Deck,
     DocumentRead,
     DocumentUnit,
+    ImageData,
     Report,
     Section,
     Slide,
@@ -23,6 +27,10 @@ __all__ = [
     "ArtifactStore",
     "ArtifactVersion",
     "Deck",
+    "ChartData",
+    "ChartSeries",
+    "ImageData",
+    "IsolatedDocumentService",
     "DocumentRead",
     "DocumentRenderer",
     "DocumentService",

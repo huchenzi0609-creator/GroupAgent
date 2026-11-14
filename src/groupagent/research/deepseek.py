@@ -89,6 +89,9 @@ class DeepSeekResearchClient:
             follow_redirects=False,
             trust_env=False,
         )
+        self.fixture_transport = client is not None and isinstance(
+            client._transport, httpx.MockTransport
+        )
         self.url_policy = PublicURLPolicy(resolver, timeout_seconds=min(3, timeout_seconds))
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max_output_bytes

@@ -58,9 +58,11 @@ class SearchOutput(ToolData):
     provider_result_count: int = Field(ge=0)
     filtered_result_count: int = Field(ge=0)
     untrusted_content: Literal[True] = True
+    budget_receipt: str | None = None
 
 
 class FetchOutput(ToolData):
     requested_url: str
     source: ResearchSource
     untrusted_content: Literal[True] = True
+    budget_receipt: str | None = None

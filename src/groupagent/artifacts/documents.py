@@ -7,6 +7,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from groupagent.domain import DomainError
+from groupagent.security import redact_credentials
+
 from .formats import (
     build_docx,
     build_markdown,
@@ -147,21 +150,38 @@ class DocumentService:
         *,
         expected_text: tuple[str, ...] = (),
         render: bool = False,
+        ocr_fallback: bool = False,
     ) -> ValidationRecord:
         version = self.store.get(scope, file_id, version_id)
-        if any(not isinstance(text, str) or not text.strip() for text in expected_text):
+        if len(expected_text) > 100 or any(
+            not isinstance(text, str) or not text.strip() or len(text) > 1000
+            for text in expected_text
+        ):
             raise ArtifactError(
                 "invalid_assertion", "Expected text assertions must be nonempty strings"
             )
         content = self.store.read(scope, file_id, version.version_id)
         checks = ["sha256_integrity"]
         issues: list[str] = []
+        failed_expectations: list[dict] = []
         structural = False
         content_passed = False
         previews: tuple[bytes, ...] = ()
         render_fields: dict = {}
+        ocr_text: str | None = None
         try:
             units = extract(content, version.format)
+            if version.format == "pdf" and ocr_fallback:
+                from groupagent.media.validation import ocr_pdf
+
+                recognized = ocr_pdf(content)
+                if any(page.method == "tesseract" for page in recognized.pages):
+                    units = tuple(
+                        DocumentUnit(f"page:{page.page_number}", page.text)
+                        for page in recognized.pages
+                    )
+                    ocr_text = "\n".join(page.text for page in recognized.pages)
+                    checks.append("scanned_pdf_ocr")
             structural = bool(units)
             checks.append("structure_open")
             if not structural:
@@ -175,11 +195,31 @@ class DocumentService:
                 ]
                 checks.append("expected_text_assertions")
                 issues.extend(f"missing_content:{index}" for index in missing)
+                failed_expectations.extend(
+                    {
+                        "index": int(index),
+                        "expected": redact_credentials(expected_text[int(index)]),
+                        "stage": "extracted_text",
+                    }
+                    for index in missing
+                )
                 content_passed = not missing
             if render and version.format != "md":
-                result = self.renderer.render(content, version.format, expected_text=expected_text)
+                result = self.renderer.render(
+                    content, version.format, expected_text=expected_text, ocr_text=ocr_text
+                )
                 checks.extend(result.checks)
                 issues.extend(result.issues)
+                for issue in result.issues:
+                    if issue.startswith("rendered_missing_content:"):
+                        index = int(issue.rsplit(":", 1)[1])
+                        failed_expectations.append(
+                            {
+                                "index": index,
+                                "expected": redact_credentials(expected_text[index]),
+                                "stage": "rendered_text",
+                            }
+                        )
                 previews = result.previews
                 render_fields = {
                     "rendered": True,
@@ -188,7 +228,7 @@ class DocumentService:
                     "renderer": result.renderer,
                     "preview_sha256": result.preview_sha256,
                 }
-        except ArtifactError as exc:
+        except (ArtifactError, DomainError) as exc:
             issues.append(exc.code)
         record = ValidationRecord(
             file_id=file_id,
@@ -199,12 +239,13 @@ class DocumentService:
             content_passed=content_passed,
             checks=tuple(checks),
             issues=tuple(issues),
+            failed_expectations=tuple(failed_expectations),
             **render_fields,
             limitations=(
                 "Expected-text assertions establish only the caller-supplied completion criteria",
-                "Automatic layout checks cover the generated report/deck layout; no arbitrary fidelity",
-                "No OCR, semantic image review, font-glyph equivalence or accessibility certification",
-                "Rendering runs locally with time limits and an isolated profile, not an OS sandbox",
+                "Automatic layout checks cover the bounded report/template profile; no arbitrary fidelity",
+                "OCR is an extraction aid; no semantic image review, font-glyph equivalence or accessibility certification",
+                "Renderer time/profile bounds are not themselves evidence of OS isolation; deployment supplies the sandbox",
             ),
         )
         return self.store.record_validation(
