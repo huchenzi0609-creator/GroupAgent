@@ -783,13 +783,30 @@ async def test_expired_inputs_and_auth_require_explicit_action(env, code, state)
         await service.close()
 
 
-async def test_attachment_wait_deadline_expires_without_another_request(env):
+async def test_attachment_wait_deadline_expires_without_another_request(env, monkeypatch):
+    from datetime import timedelta
+
     work = new_work(env)
+    clock = {"now": datetime.now(UTC)}
+
+    class ControlledDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (
+                clock["now"].astimezone(tz) if tz is not None else clock["now"].replace(tzinfo=None)
+            )
+
+    monkeypatch.setattr("groupagent.runtime.executor.datetime", ControlledDateTime)
     factory = PreparationFailureFactory()
     service = supervisor(env, factory, attachment_retry_seconds=0.03, attachment_wait_seconds=0.03)
     try:
-        assert (await service.run_once()).state == WorkState.WAITING_EXTERNAL
-        await asyncio.sleep(0.04)
+        waiting = await service.run_once()
+        assert waiting.state == WorkState.WAITING_EXTERNAL
+        metadata = waiting.scope["_runtime_preparation"]
+        deadline = datetime.fromisoformat(metadata["deadline_at"])
+        assert clock["now"] < deadline and factory.calls == 1
+        clock["now"] = deadline + timedelta(microseconds=1)
+        assert clock["now"] >= datetime.fromisoformat(metadata["next_retry_at"])
         assert await service.run_once() is None
         result = work_state(env, work.id)
         assert result.state == WorkState.WAITING_INPUT
