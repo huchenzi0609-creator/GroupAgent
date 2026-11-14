@@ -1,19 +1,121 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any
+from hashlib import sha256
+from typing import Any, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from groupagent.domain import ActorContext, DomainError, Role
 from groupagent.memory.common import memory_lock
 from groupagent.persistence import PostgresStore
 
 from .models import QUANTUM, PriceSnapshot, Reservation
+
+_RECONCILIATION_ACTION = "budget_billing_reconciled"
+
+
+def _money(value: Decimal) -> Decimal:
+    if (
+        not value.is_finite()
+        or value < 0
+        or value >= Decimal("1e18")
+        or value.quantize(QUANTUM) != value
+    ):
+        raise ValueError("Amounts require finite nonnegative six-decimal monetary values")
+    return value.quantize(QUANTUM)
+
+
+class _BillingReconciliation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    key: str = Field(min_length=1, max_length=200, strict=True)
+    source: Literal["user_reported_provider_console"] = "user_reported_provider_console"
+    operator_role: Literal["owner"] = "owner"
+    as_of: AwareDatetime
+    recorded_at: AwareDatetime
+    currency: Literal["CNY", "USD"]
+    reported_total: Decimal
+    prefix_count: int = Field(ge=1, strict=True)
+    prefix_gross: Decimal
+    prefix_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    prefix_by_day: dict[date, Decimal] = Field(min_length=1)
+    evidence_ref: str = Field(min_length=1, max_length=2000, strict=True)
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    previous_id: str | None = Field(default=None, pattern=r"^[1-9][0-9]*$")
+    previous_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    integrity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("reported_total", "prefix_gross")
+    @classmethod
+    def money(cls, value: Decimal) -> Decimal:
+        return _money(value)
+
+    @field_validator("prefix_by_day")
+    @classmethod
+    def daily_money(cls, value: dict[date, Decimal]) -> dict[date, Decimal]:
+        return {day: _money(amount) for day, amount in value.items()}
+
+    @field_validator("as_of", "recorded_at")
+    @classmethod
+    def utc(cls, value: datetime) -> datetime:
+        return value.astimezone(UTC)
+
+    @field_validator("key", "evidence_ref")
+    @classmethod
+    def nonblank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("A nonblank reconciliation key and evidence reference are required")
+        return value
+
+    @model_validator(mode="after")
+    def consistent(self) -> _BillingReconciliation:
+        if (
+            self.as_of > self.recorded_at
+            or sum(self.prefix_by_day.values(), Decimal(0)) != self.prefix_gross
+            or (self.previous_id is None) != (self.previous_digest is None)
+        ):
+            raise ValueError("Invalid reconciliation time, daily totals or predecessor")
+        return self
+
+
+def _digest(value: Any) -> str:
+    def canonical(item: Any) -> str:
+        if isinstance(item, datetime):
+            return item.astimezone(UTC).isoformat(timespec="microseconds")
+        return str(item)
+
+    return sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=canonical).encode()
+    ).hexdigest()
+
+
+def _reconciliation_digest(
+    group_id: str, actor_id: str, policy_revision: int, body: _BillingReconciliation
+) -> str:
+    return _digest(
+        {
+            "group_id": group_id,
+            "actor_id": actor_id,
+            "policy_revision": policy_revision,
+            "resource_ref": body.key,
+            "details": body.model_dump(mode="json", exclude={"integrity_sha256"}),
+        }
+    )
 
 
 def _units(value: dict[str, Decimal]) -> Jsonb:
@@ -103,6 +205,261 @@ class BudgetLedger:
             if existing is None or existing["body"] != body:
                 raise DomainError("version_conflict", "Price snapshots are immutable; use a new ID")
 
+    @staticmethod
+    def _billing_prefix(tx: Any, as_of: datetime, currency: str) -> dict[str, Any]:
+        summary = tx.conn.execute(
+            "SELECT count(*) AS count, "
+            "count(*) FILTER (WHERE state NOT IN ('settled','released') "
+            "OR (state='settled' AND actual_amount IS NULL) OR currency<>%s) AS invalid, "
+            "COALESCE(sum(actual_amount) FILTER (WHERE state='settled'),0) AS gross, "
+            "max(updated_at) AS last_update FROM ga_budget_reservations "
+            "WHERE group_id=%s AND created_at<=%s",
+            (currency, tx.group_id, as_of),
+        ).fetchone()
+        assert summary is not None
+        if not summary["count"] or summary["invalid"] or summary["last_update"] > as_of:
+            raise DomainError(
+                "reconciliation_required",
+                "Billing prefix must be nonempty and terminal before the reported cutoff",
+            )
+        rows = tx.conn.execute(
+            "SELECT * FROM ga_budget_reservations WHERE group_id=%s AND created_at<=%s "
+            "ORDER BY id FOR SHARE",
+            (tx.group_id, as_of),
+        ).fetchall()
+        by_day = tx.conn.execute(
+            "SELECT budget_day,COALESCE(sum(actual_amount) FILTER (WHERE state='settled'),0) "
+            "AS gross FROM ga_budget_reservations WHERE group_id=%s AND created_at<=%s "
+            "GROUP BY budget_day ORDER BY budget_day",
+            (tx.group_id, as_of),
+        ).fetchall()
+        return {
+            "count": int(summary["count"]),
+            "gross": summary["gross"],
+            "sha256": _digest(rows),
+            "by_day": {row["budget_day"]: row["gross"] for row in by_day},
+        }
+
+    @staticmethod
+    def _billing_reconciliations(
+        tx: Any, currency: str
+    ) -> list[tuple[str, _BillingReconciliation]]:
+        rows = tx.conn.execute(
+            "SELECT * FROM ga_audit_events WHERE group_id=%s AND action=%s ORDER BY id",
+            (tx.group_id, _RECONCILIATION_ACTION),
+        ).fetchall()
+        records: list[tuple[str, _BillingReconciliation]] = []
+        keys: set[str] = set()
+        try:
+            for row in rows:
+                body = _BillingReconciliation.model_validate(row["details"])
+                prior_id, prior = records[-1] if records else (None, None)
+                if (
+                    body.model_dump(mode="json") != row["details"]
+                    or body.currency != currency
+                    or body.key != row["resource_ref"]
+                    or body.key in keys
+                    or body.recorded_at != row["created_at"]
+                    or body.previous_id != prior_id
+                    or body.previous_digest != (prior.integrity_sha256 if prior else None)
+                    or body.integrity_sha256
+                    != _reconciliation_digest(
+                        tx.group_id, row["actor_id"], row["policy_revision"], body
+                    )
+                    or (
+                        prior is not None
+                        and (
+                            body.as_of <= prior.as_of
+                            or body.reported_total < prior.reported_total
+                            or body.prefix_count < prior.prefix_count
+                            or body.prefix_gross < prior.prefix_gross
+                        )
+                    )
+                ):
+                    raise ValueError("Billing reconciliation chain does not match its audit")
+                records.append((str(row["id"]), body))
+                keys.add(body.key)
+        except (ValidationError, ValueError, TypeError, KeyError) as error:
+            raise DomainError(
+                "reconciliation_required", "Billing reconciliation audit failed integrity checks"
+            ) from error
+        return records
+
+    def _budget_usage(
+        self, tx: Any, policy: dict[str, Any], day: date, *, exclude_daily_id: str | None = None
+    ) -> dict[str, Any]:
+        # Callers hold the policy lock, shared with reserve/begin/settle/reconciliation.
+        sums = tx.conn.execute(
+            "SELECT COALESCE(sum(amount),0) AS total, "
+            "COALESCE(sum(amount) FILTER (WHERE budget_day=%s AND id IS DISTINCT FROM %s),0) "
+            "AS daily, COALESCE(sum(reserved_amount) FILTER "
+            "(WHERE state IN ('reserved','inflight','unknown')),0) AS held "
+            "FROM (SELECT *,CASE WHEN state='settled' THEN actual_amount "
+            "WHEN state IN ('reserved','inflight','unknown') THEN reserved_amount ELSE 0 END "
+            "AS amount FROM ga_budget_reservations WHERE group_id=%s) AS usage",
+            (day, exclude_daily_id, tx.group_id),
+        ).fetchone()
+        assert sums is not None
+        result: dict[str, Any] = {
+            "gross_total": sums["total"],
+            "gross_settled_estimate": sums["total"] - sums["held"],
+            "gross_daily": sums["daily"],
+            "held": sums["held"],
+            "total": sums["total"],
+            "daily": sums["daily"],
+            "reconciliation": None,
+        }
+        records = self._billing_reconciliations(tx, policy["currency"])
+        if records:
+            identifier, latest = records[-1]
+            prefix = self._billing_prefix(tx, latest.as_of, latest.currency)
+            if (
+                prefix["count"] != latest.prefix_count
+                or prefix["gross"] != latest.prefix_gross
+                or prefix["sha256"] != latest.prefix_sha256
+                or prefix["by_day"] != latest.prefix_by_day
+            ):
+                raise DomainError(
+                    "reconciliation_required", "Reconciled billing prefix no longer matches"
+                )
+            result["total"] += latest.reported_total - latest.prefix_gross
+            if day in latest.prefix_by_day:
+                # The cumulative bill has no trusted per-day allocation. Charging it
+                # entirely to each covered day is a conservative upper bound.
+                result["daily"] += latest.reported_total - latest.prefix_by_day[day]
+            result["reconciliation"] = {"id": identifier, **latest.model_dump(mode="json")}
+        return result
+
+    def reconcile_billing(
+        self,
+        actor: ActorContext,
+        *,
+        key: str,
+        as_of: datetime,
+        currency: str,
+        reported_total: Decimal,
+        expected_prefix_count: int,
+        expected_prefix_gross: Decimal,
+        evidence_ref: str,
+        evidence_sha256: str,
+        expected_previous_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Trusted local Owner operator API; never register as a model/channel tool.
+
+        Preserve policy, prices and reservations. The existing audit is application-
+        append-only, not a database-enforced or independently attested billing log.
+        """
+        if actor.role != Role.OWNER:
+            raise DomainError("permission_denied", "Only a trusted Owner may reconcile billing")
+        if (
+            not isinstance(as_of, datetime)
+            or as_of.utcoffset() is None
+            or not isinstance(reported_total, Decimal)
+            or not isinstance(expected_prefix_gross, Decimal)
+        ):
+            raise DomainError(
+                "invalid_input", "Reconciliation needs aware time and Decimal amounts"
+            )
+        with self.store.transaction(actor) as tx:
+            memory_lock(tx)
+            policy = tx.conn.execute(
+                "SELECT * FROM ga_budget_policy WHERE group_id=%s FOR UPDATE", (actor.group_id,)
+            ).fetchone()
+            if policy is None:
+                raise DomainError("budget_unconfigured", "A monetary policy is required")
+            if currency != policy["currency"]:
+                raise DomainError("currency_mismatch", "Billing evidence currency does not match")
+            clock = tx.conn.execute("SELECT clock_timestamp() AS now").fetchone()
+            assert clock is not None
+            stamp = clock["now"]
+            try:
+                request = _BillingReconciliation(
+                    key=key,
+                    as_of=as_of,
+                    recorded_at=stamp,
+                    currency=policy["currency"],
+                    reported_total=reported_total,
+                    prefix_count=expected_prefix_count,
+                    prefix_gross=expected_prefix_gross,
+                    prefix_sha256="0" * 64,
+                    prefix_by_day={as_of.date(): expected_prefix_gross},
+                    evidence_ref=evidence_ref,
+                    evidence_sha256=evidence_sha256,
+                    previous_id=expected_previous_id,
+                    previous_digest="0" * 64 if expected_previous_id is not None else None,
+                    integrity_sha256="0" * 64,
+                )
+            except (ValidationError, ValueError) as error:
+                raise DomainError(
+                    "invalid_input", "Invalid billing reconciliation evidence"
+                ) from error
+            records = self._billing_reconciliations(tx, currency)
+            # Revalidate any current prefix even on an idempotent retry.
+            self._budget_usage(tx, policy, stamp.astimezone(ZoneInfo(policy["time_zone"])).date())
+            fields = {
+                "key",
+                "as_of",
+                "currency",
+                "reported_total",
+                "prefix_count",
+                "prefix_gross",
+                "evidence_ref",
+                "evidence_sha256",
+                "previous_id",
+            }
+            for identifier, old in records:
+                if old.key == key:
+                    if old.model_dump(include=fields) != request.model_dump(include=fields):
+                        raise DomainError(
+                            "idempotency_conflict", "Reconciliation key has other evidence"
+                        )
+                    return {"id": identifier, **old.model_dump(mode="json")}
+            previous_id, previous = records[-1] if records else (None, None)
+            if expected_previous_id != previous_id:
+                raise DomainError("version_conflict", "Billing reconciliation predecessor changed")
+            if previous and (
+                request.as_of <= previous.as_of or request.reported_total < previous.reported_total
+            ):
+                raise DomainError(
+                    "version_conflict", "Cumulative billing must advance without refunds"
+                )
+            prefix = self._billing_prefix(tx, request.as_of, currency)
+            if prefix["count"] != expected_prefix_count or prefix["gross"] != expected_prefix_gross:
+                raise DomainError(
+                    "version_conflict", "Billing prefix count or gross estimate differs"
+                )
+            body = _BillingReconciliation.model_validate(
+                {
+                    **request.model_dump(),
+                    "prefix_sha256": prefix["sha256"],
+                    "prefix_by_day": prefix["by_day"],
+                    "previous_digest": previous.integrity_sha256 if previous else None,
+                }
+            )
+            body = body.model_copy(
+                update={
+                    "integrity_sha256": _reconciliation_digest(
+                        actor.group_id, actor.member_id, actor.policy_revision, body
+                    )
+                }
+            )
+            row = tx.conn.execute(
+                "INSERT INTO ga_audit_events(group_id,trace_id,actor_id,policy_revision,action,"
+                "resource_ref,details,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (
+                    actor.group_id,
+                    tx.trace_id,
+                    actor.member_id,
+                    actor.policy_revision,
+                    _RECONCILIATION_ACTION,
+                    key,
+                    Jsonb(body.model_dump(mode="json")),
+                    stamp,
+                ),
+            ).fetchone()
+            assert row is not None
+            return {"id": str(row["id"]), **body.model_dump(mode="json")}
+
     def reserve(
         self,
         actor: ActorContext,
@@ -179,11 +536,7 @@ class BudgetLedger:
                 )
             amount = price.cost(estimated_units)
             day = now.astimezone(ZoneInfo(policy["time_zone"])).date()
-            sums = tx.conn.execute(
-                "SELECT COALESCE(sum(CASE WHEN state='settled' THEN actual_amount WHEN state IN ('reserved','inflight','unknown') THEN reserved_amount ELSE 0 END),0) AS total, COALESCE(sum(CASE WHEN budget_day=%s THEN CASE WHEN state='settled' THEN actual_amount WHEN state IN ('reserved','inflight','unknown') THEN reserved_amount ELSE 0 END ELSE 0 END),0) AS daily FROM ga_budget_reservations WHERE group_id=%s",
-                (day, actor.group_id),
-            ).fetchone()
-            assert sums is not None
+            sums = self._budget_usage(tx, policy, day)
             if (
                 policy["blocked"]
                 or sums["daily"] + amount > policy["daily_limit"]
@@ -304,13 +657,7 @@ class BudgetLedger:
             if stamp.utcoffset() is None:
                 raise DomainError("invalid_input", "Budget clock must be timezone aware")
             day = stamp.astimezone(ZoneInfo(policy["time_zone"])).date()
-            sums = tx.conn.execute(
-                "SELECT COALESCE(sum(CASE WHEN state='settled' THEN actual_amount WHEN state IN ('reserved','inflight','unknown') THEN reserved_amount ELSE 0 END),0) AS total, "
-                "COALESCE(sum(CASE WHEN budget_day=%s AND id<>%s THEN CASE WHEN state='settled' THEN actual_amount WHEN state IN ('reserved','inflight','unknown') THEN reserved_amount ELSE 0 END ELSE 0 END),0) AS daily "
-                "FROM ga_budget_reservations WHERE group_id=%s",
-                (day, identifier, actor.group_id),
-            ).fetchone()
-            assert sums is not None
+            sums = self._budget_usage(tx, policy, day, exclude_daily_id=identifier)
             if (
                 policy["blocked"]
                 or sums["daily"] + row["reserved_amount"] > policy["daily_limit"]
@@ -405,8 +752,26 @@ class BudgetLedger:
 
     def report(self, actor: ActorContext) -> dict[str, Any]:
         with self.store.transaction(actor) as tx:
+            memory_lock(tx)
+            policy = tx.conn.execute(
+                "SELECT *,clock_timestamp() AS now FROM ga_budget_policy WHERE group_id=%s "
+                "FOR UPDATE",
+                (actor.group_id,),
+            ).fetchone()
+            usage = None
+            if policy is not None:
+                usage = self._budget_usage(
+                    tx, policy, policy["now"].astimezone(ZoneInfo(policy["time_zone"])).date()
+                )
             rows = tx.conn.execute(
                 "SELECT state,count(*) AS calls,COALESCE(sum(reserved_amount),0) AS reserved,COALESCE(sum(actual_amount),0) AS actual FROM ga_budget_reservations WHERE group_id=%s GROUP BY state ORDER BY state",
                 (actor.group_id,),
             ).fetchall()
-            return {"group_id": actor.group_id, "states": json.loads(json.dumps(rows, default=str))}
+            return {
+                "group_id": actor.group_id,
+                "states": json.loads(json.dumps(rows, default=str)),
+                "accounting": json.loads(json.dumps(usage, default=str)),
+                "accounting_basis": "owner_reported_prefix_plus_conservative_suffix"
+                if usage and usage["reconciliation"]
+                else "conservative_estimate",
+            }
