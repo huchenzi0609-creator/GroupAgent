@@ -612,7 +612,13 @@ def build_app(
     memory = MemoryService(
         store,
         ModelPortSummarizer(
-            MeteredModel(model, ledger, owner, price_id=config.spend.pricing_snapshot_id)
+            MeteredModel(
+                model,
+                ledger,
+                owner,
+                price_id=config.spend.pricing_snapshot_id,
+                additional_retry_limit=config.execution.additional_retry_limit,
+            )
         ),
         deletion_sink=journal,
     )
@@ -638,6 +644,7 @@ def build_app(
                 price_id=config.spend.pricing_snapshot_id or "deepseek-20261114-text",
                 source_event_id=event.id,
                 read_only_authorized=actor.role.value in config.group.read_only_qa_roles,
+                additional_retry_limit=config.execution.additional_retry_limit,
             )
         )
 

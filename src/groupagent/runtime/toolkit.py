@@ -22,7 +22,7 @@ from groupagent.artifacts.isolated import IsolatedDocumentService
 from groupagent.artifacts.tools import register_document_tools
 from groupagent.billing import BudgetLedger
 from groupagent.billing.metering import LedgerModelBudget, MeteredModel
-from groupagent.config import AppConfig
+from groupagent.config import AppConfig, ExecutionConfig
 from groupagent.domain import ActorContext, DomainError, ExecutionLease, GroupEvent, WorkOrder
 from groupagent.execution import ExecutionRequest, RunSnapshot, ScopedToolEngine
 from groupagent.execution.harness import HarnessEngine
@@ -847,8 +847,6 @@ class WorkToolkit:
                 ensure_ascii=False,
             )
         )
-        from groupagent.config import ExecutionConfig
-
         original_limits = ExecutionConfig.model_validate(
             {
                 key: value
@@ -1165,12 +1163,22 @@ class WorkToolkit:
             with self.store.transaction(actor) as tx:
                 tx.assert_lease(lease)
                 original_request = _original_request_context(tx.get_event(work.request_event_id))
+            original_retry_limit = ExecutionConfig.model_validate(
+                {
+                    key: value
+                    for key, value in work.budget.items()
+                    if key in ExecutionConfig.model_fields
+                }
+            ).additional_retry_limit
             review = MeteredModel(
                 self.model,
                 self.ledger,
                 actor,
                 price_id=self.config.spend.pricing_snapshot_id or "deepseek-20261114-text",
                 work_id=work.id,
+                additional_retry_limit=min(
+                    self.config.execution.additional_retry_limit, original_retry_limit
+                ),
             )
             result = await review.complete(
                 ModelRequest(

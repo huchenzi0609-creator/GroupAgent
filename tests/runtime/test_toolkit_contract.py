@@ -562,6 +562,51 @@ async def test_execution_retry_policy_cannot_exceed_original_work_grant(
     assert run.prepared.request.budget.additional_retry_limit == effective
 
 
+@pytest.mark.parametrize("configured,failures,expected_calls", [(0, 1, 1), (5, 2, 3)])
+async def test_semantic_model_retries_respect_original_grant_and_keep_unknown_charges(
+    toolkit_setup, configured, failures, expected_calls
+):
+    setup = toolkit_setup
+    setup.toolkit.config = setup.toolkit.config.model_copy(
+        update={
+            "execution": setup.toolkit.config.execution.model_copy(
+                update={"additional_retry_limit": configured}
+            )
+        }
+    )
+    run = await prepare(setup, goal="给出一项简短的合成解释")
+    calls = []
+
+    async def transient(request):
+        calls.append(request)
+        if len(calls) <= failures:
+            raise DomainError("provider_unavailable", "Synthetic model transport failure")
+        return ModelReply(
+            text='{"passed":true,"reason":"Synthetic content verified"}',
+            usage=TokenUsage(input_tokens=10, output_tokens=5),
+        )
+
+    setup.model.complete = transient
+    if configured == 0:
+        with pytest.raises(DomainError, match="Synthetic model transport failure"):
+            await setup.toolkit.validate(
+                run.work, run.lease, setup.env.actor, candidate(run), run.workspace
+            )
+    else:
+        result = await setup.toolkit.validate(
+            run.work, run.lease, setup.env.actor, candidate(run), run.workspace
+        )
+        assert result.checks["result"]
+    assert len(calls) == expected_calls
+    with setup.env.store.transaction(setup.env.actor) as tx:
+        states = tx.conn.execute(
+            "SELECT state FROM ga_budget_reservations WHERE group_id=%s AND work_id=%s",
+            (setup.env.actor.group_id, run.work.id),
+        ).fetchall()
+    assert sum(row["state"] == "unknown" for row in states) == failures
+    assert sum(row["state"] == "settled" for row in states) == (expected_calls - failures)
+
+
 @pytest.mark.parametrize("columns", [False, True])
 async def test_actual_generation_normalizes_default_numeric_vector_but_keeps_explicit_columns(
     toolkit_setup, columns
