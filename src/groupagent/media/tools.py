@@ -128,15 +128,22 @@ def register_media_tools(
 
     async def tts(arguments: SpeechInput, context: ToolContext) -> MediaRef:
         route = configured(arguments.route_id, Capability.TTS)
-        if (
-            output_source is None
-            or speech_permission is None
-            or not await speech_permission(context)
-        ):
-            raise DomainError(
-                "voice_not_requested", "Trusted request evidence has not authorized speech output"
-            )
-        source = await output_source(context, "audio")
+        try:
+            if (
+                output_source is None
+                or speech_permission is None
+                or not await speech_permission(context)
+            ):
+                raise ToolFailure(
+                    "voice_not_requested",
+                    "Trusted request evidence has not authorized speech output",
+                    no_effect=True,
+                )
+            source = await output_source(context, "audio")
+        except DomainError as error:
+            # Permission/provenance checks precede synthesize and cannot have
+            # called a provider, reserved its charge or launched a media worker.
+            raise ToolFailure(error.code, error.message, no_effect=True) from error
         return await service.synthesize(
             context,
             arguments.text,

@@ -24,7 +24,8 @@ from groupagent.billing.prices import deepseek_20261114
 from groupagent.channels import AgentWechatAdapter, AgentWechatConfig, MemberRecord
 from groupagent.channels.local import LocalChannel
 from groupagent.config import AppConfig, ConfigError
-from groupagent.conversation.intent import new_work_intent
+from groupagent.conversation.intent import explicitly_requires_execution, new_work_intent
+from groupagent.conversation.participation import outside_quotes
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import CoordinationResult, Decision
@@ -137,6 +138,8 @@ class RuntimeApp:
 
     async def start(self) -> None:
         self._fence_application()
+        self._publish_foreground()
+        await asyncio.to_thread(self._retire_pending_acknowledgements)
         if self.worker_startup is not None:
             try:
                 await self.worker_startup()
@@ -187,6 +190,49 @@ class RuntimeApp:
             self._last_arrival = now
         return len(batch.event_ids)
 
+    def _publish_foreground(self) -> None:
+        publish = getattr(self.worker_governor, "foreground_pending", None)
+        if callable(publish):
+            publish(len(self._processing))
+
+    def _retire_pending_acknowledgements(self) -> int:
+        """Cancel only old source-bound placeholders with no submitted part."""
+        with self.store.transaction(self.technical) as tx:
+            rows = tx.conn.execute(
+                "SELECT id,created_by FROM ga_deliveries WHERE group_id=%s AND state='pending' "
+                "AND request_event_id IS NOT NULL AND work_id IS NULL "
+                "AND left(idempotency_key,10)='early_ack:' ORDER BY created_at,id LIMIT 100",
+                (tx.group_id,),
+            ).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                actor = self.resolve_actor(row["created_by"])
+                with self.store.transaction(actor) as tx:
+                    self._fence_application(tx)
+                    intent = tx.get_delivery(row["id"])
+                    if intent.state.value != "pending" or not intent.idempotency_key.startswith(
+                        "early_ack:"
+                    ):
+                        continue
+                    if tx.conn.execute(
+                        "SELECT 1 FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s "
+                        "AND state<>'pending' LIMIT 1",
+                        (tx.group_id, intent.id),
+                    ).fetchone():
+                        continue
+                    tx.cancel_pending_delivery(intent.id, expected_revision=intent.revision)
+                    count += 1
+            except DomainError as error:
+                if error.code in {"stale_lease", "policy_changed", "restore_pending"}:
+                    raise
+        return count
+
+    async def early_ack_tick(self) -> int:
+        """Compatibility hook: ordinary chat never emits placeholder replies."""
+        self._publish_foreground()
+        return 0
+
     def _ready_events(self) -> list[GroupEvent]:
         with self.store.transaction(self.technical) as tx:
             rows = tx.conn.execute(
@@ -229,6 +275,7 @@ class RuntimeApp:
         self._fence_application()
         source_id = event.id
         self._processing.add(source_id)
+        self._publish_foreground()
         try:
             if (
                 event.kind == EventKind.AUDIO
@@ -290,6 +337,7 @@ class RuntimeApp:
                 self._failure_reply(event, error.code)
         finally:
             self._processing.discard(source_id)
+            self._publish_foreground()
 
     def _failure_reply(self, event: GroupEvent, code: str) -> None:
         # A missing capability or exhausted budget is not a successful response.
@@ -342,6 +390,37 @@ class RuntimeApp:
         except DomainError:
             pass
 
+    def _bypass_batch(self, event: GroupEvent) -> bool:
+        if event.kind != EventKind.TEXT or event.reply_to or event.attachments:
+            return False
+        if new_work_intent(event.text, identity=self.identity) is not None:
+            return True  # Preserve the existing independent-work admission path.
+        plain = outside_quotes(event.text)
+        if not plain or plain != event.text.strip() or len(plain) > 1200:
+            return False
+        request = self.identity.strip_address(plain)
+        if explicitly_requires_execution(plain, identity=self.identity):
+            return False
+        if request == plain and not re.search(r"[?？]", request):
+            return False
+        if re.search(
+            r"文件|文档|附件|图片|截图|音频|语音|视频|生成|制作|导出|交付|下载|上传|删除|修改|"
+            r"分配|安排|提醒|忽略|绕过|越权|密钥|密码|"
+            r"(?<![A-Za-z0-9_])(?:PDF|DOCX|PPTX?|Markdown|WAV|MP3|PNG|JPEG|Shell|secret|password|prompt)(?![A-Za-z0-9_])",
+            request,
+            re.I,
+        ):
+            return False
+        return (
+            re.search(
+                r"[?？]|什么|啥|怎么|为何|为什么|解释|说明|讲讲|告诉我|叫什么|是谁|多少|区别|吗|"
+                r"\b(?:what|how|why|who|explain|describe)\b",
+                request,
+                re.I,
+            )
+            is not None
+        )
+
     async def process_pending(self, *, controls_only: bool = False, batched: bool = True) -> int:
         events = self._ready_events()
         controls = [
@@ -353,17 +432,39 @@ class RuntimeApp:
         if controls:
             await self._process(controls[0])
             return 1
+        if events:
+            # Receipt-proven echoes are bookkeeping, not conversation. Drain
+            # them without the idle window or a full history reconstruction.
+            with self.store.transaction(self.technical) as tx:
+                echo = tx.conn.execute(
+                    "SELECT e.id FROM ga_events e WHERE e.group_id=%s AND e.id=ANY(%s) AND e.kind<>'recall' "
+                    "AND (EXISTS(SELECT 1 FROM ga_delivery_parts p WHERE p.group_id=e.group_id "
+                    "AND p.platform_message_id=e.body->>'platform_message_id' AND p.state='accepted') "
+                    "OR EXISTS(SELECT 1 FROM ga_deliveries d WHERE d.group_id=e.group_id "
+                    "AND d.platform_message_id=e.body->>'platform_message_id' AND d.state='accepted')) "
+                    "ORDER BY e.sequence LIMIT 1",
+                    (self.technical.group_id, [item.id for item in events]),
+                ).fetchone()
+            if echo:
+                await self._process(next(item for item in events if item.id == echo["id"]))
+                return 1
+        identities = [
+            event
+            for event in events
+            if self._bypass_batch(event)
+            and self.coordinator._fast_identity_reply(event, self.identity.context()) is not None
+        ]
+        if identities:
+            # A verified name response performs no model/tool call, so it can
+            # use the same responsive lane as controls during a slow dialogue.
+            await self._process(identities[0])
+            return 1
         if controls_only or not events:
             return 0
         now = time.monotonic()
         if (
             batched
-            and not (
-                events[0].kind == EventKind.TEXT
-                and not events[0].reply_to
-                and not events[0].attachments
-                and new_work_intent(events[0].text, identity=self.identity) is not None
-            )
+            and not self._bypass_batch(events[0])
             and self._first_arrival
             and (
                 now - self._last_arrival < self.config.conversation.idle_batch_seconds
@@ -507,6 +608,10 @@ class RuntimeApp:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.supervisor.close()
+        self._publish_foreground()
+        governor_close = getattr(self.worker_governor, "aclose", None)
+        if callable(governor_close):
+            await governor_close()
         for resource in self.resources:
             await resource.aclose()
 
@@ -716,7 +821,12 @@ def build_app(
             enabled=config.resources.enabled,
             reserve_memory_mb=config.resources.reserve_memory_mb,
             transfer_memory_mb=config.resources.transfer_memory_mb,
-        )
+        ),
+        foreground_socket=(
+            Path(config.runtime.broker_control_socket)
+            if config.runtime.broker_control_socket
+            else None
+        ),
     )
     input_sandbox = DockerSandbox(
         config.runtime.worker_image,

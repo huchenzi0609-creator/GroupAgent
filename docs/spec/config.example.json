@@ -5,7 +5,9 @@
     "enabled": false,
     "internal_id": "group_demo",
     "external_group_id": "CONFIGURE_BEFORE_DEPLOYMENT",
-    "owner_ids": ["member_owner_demo"],
+    "owner_ids": [
+      "member_owner_demo"
+    ],
     "time_zone": "Asia/Shanghai",
     "participation_mode": "natural",
     "quiet_hours": [],
@@ -16,7 +18,7 @@
     "natural_participation": true,
     "image_understanding": true,
     "audio_transcription": true,
-    "speech_reply_on_request": true,
+    "speech_reply_on_request": false,
     "image_generation": false,
     "document_editing": true,
     "web_research": true,
@@ -50,7 +52,7 @@
   },
   "execution": {
     "max_model_rounds": 24,
-    "max_total_tokens": 200000,
+    "max_total_tokens": null,
     "max_tool_calls": 60,
     "max_active_seconds": 1200,
     "max_subagents": 2,
@@ -90,7 +92,7 @@
     "text_agent": "CONFIGURE_AND_VALIDATE",
     "vision": "CONFIGURE_AND_VALIDATE",
     "speech_to_text": "CONFIGURE_AND_VALIDATE",
-    "text_to_speech": "CONFIGURE_AND_VALIDATE",
+    "text_to_speech": "NOT_IN_CURRENT_SCOPE",
     "image_generation": "NOT_IN_CURRENT_SCOPE"
   },
   "engine": {
@@ -101,7 +103,14 @@
   "runtime": {
     "engine": "harness",
     "bot_name": "Pot",
-    "bot_aliases": ["机器人", "机器人组长", "组长", "小伴"],
-    "bot_badge": "【Pot】"
+    "bot_aliases": [
+      "机器人",
+      "机器人组长",
+      "组长",
+      "小伴"
+    ],
+    "bot_badge": "【Pot】",
+    "early_ack_enabled": false,
+    "early_ack_seconds": 2.0
   }
 }

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from groupagent.domain import DomainError
+from groupagent.foreground import ForegroundPublisher
 
 _MIB = 1024 * 1024
 _CURRENT_RESERVATION: ContextVar[ResourceReservation | None] = ContextVar(
@@ -138,11 +139,21 @@ class ResourceGovernor:
         policy: ResourcePolicy | None = None,
         *,
         sampler: Callable[[], MemorySnapshot] = linux_memory_snapshot,
+        foreground_socket: Path | None = None,
     ) -> None:
         self.policy = policy or ResourcePolicy()
         self._sampler = sampler
         self._active: ResourceReservation | None = None
         self._poisoned = False
+        self._foreground = ForegroundPublisher(foreground_socket) if foreground_socket else None
+
+    def foreground_pending(self, pending: int) -> None:
+        if self._foreground is not None:
+            self._foreground.report(pending)
+
+    async def aclose(self) -> None:
+        if self._foreground is not None:
+            await self._foreground.aclose()
 
     @property
     def busy(self) -> bool:
@@ -162,6 +173,8 @@ class ResourceGovernor:
         if not self.policy.enabled:
             return True
         if self.busy or self.poisoned:
+            return False
+        if self._foreground is not None and self._foreground.memory_pressure:
             return False
         try:
             available = self._sampler().available_bytes

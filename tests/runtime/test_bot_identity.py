@@ -56,7 +56,9 @@ async def test_real_context_and_wire_identity_keep_shared_account_echo_receipt_b
 
     app.coordinator.provider_factory = lambda *_: OfflineIdentityProvider()
     try:
-        request = event(env, "pOt，你是谁？", platform_message_id="synthetic-human-request")
+        request = event(
+            env, "pOt，请介绍你在群里的协作方式。", platform_message_id="synthetic-human-request"
+        )
         await admit(app, env, request)
         assert contexts[0]["agent_name"] == "Pot"
         assert contexts[0]["bot_badge"] == "【Pot】" and "Pot" in contexts[0]["agent_aliases"]

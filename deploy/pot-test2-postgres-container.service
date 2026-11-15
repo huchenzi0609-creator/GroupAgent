@@ -1,0 +1,21 @@
+[Unit]
+Description=Pot dedicated socket-only PostgreSQL container
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/install -d -o 70 -g pot-test2 -m 770 /run/pot-test2-postgres
+ExecStart=/usr/bin/docker start --attach pot-test2-postgres
+ExecStop=-/usr/bin/docker stop --time 30 pot-test2-postgres
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+KillMode=process
+UMask=0077
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

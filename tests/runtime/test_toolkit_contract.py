@@ -300,7 +300,6 @@ async def test_real_toolkit_catalog_contains_file_research_media_compute_and_con
         "media_ocr",
         "provider_ocr",
         "audio_transcribe",
-        "speech_synthesize",
         "python_compute",
         "process_run",
         "shell_command",
@@ -313,8 +312,11 @@ async def test_real_toolkit_catalog_contains_file_research_media_compute_and_con
         "web_fetch",
     }
     assert expected <= run.prepared.request.allowed_tools
-    assert run.prepared.request.allowed_tools == run.gateway.registered_names
+    assert run.gateway.registered_names - run.prepared.request.allowed_tools == {
+        "speech_synthesize"
+    }
     assert "image_generate" not in run.prepared.request.allowed_tools
+    assert "speech_synthesize" not in run.prepared.request.allowed_tools
     assert not any("video" in name for name in run.prepared.request.allowed_tools)
     objective = json.loads(run.prepared.request.objective)
     assert objective["goal"] == run.work.goal and objective["input_files"] == []

@@ -1056,7 +1056,13 @@ class WorkToolkit:
             revision=work.goal_revision,
             budget=ExecutionBudget(
                 max_rounds=min(limits.max_model_rounds, original_limits.max_model_rounds),
-                max_tokens=min(limits.max_total_tokens, original_limits.max_total_tokens),
+                max_tokens=(
+                    None
+                    if limits.max_total_tokens is None
+                    else limits.max_total_tokens
+                    if original_limits.max_total_tokens is None
+                    else min(limits.max_total_tokens, original_limits.max_total_tokens)
+                ),
                 max_tool_calls=min(limits.max_tool_calls, original_limits.max_tool_calls),
                 max_active_seconds=min(
                     limits.max_active_seconds, original_limits.max_active_seconds

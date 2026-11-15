@@ -36,9 +36,9 @@ jobs:
           python-version: ${{ matrix.python }}
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run --no-sync ruff check src tests scripts
-      - run: uv run --no-sync ruff format --check src tests scripts
-      - run: uv run --no-sync mypy --no-incremental src
+      - run: uv run --no-sync ruff check src tests scripts deploy
+      - run: uv run --no-sync ruff format --check src tests scripts deploy
+      - run: uv run --no-sync mypy --no-incremental src deploy/pot_capacity.py deploy/pot_docker_proxy.py deploy/prepare_pot_runtime_secrets.py
       - run: uv run --no-sync pytest --strict-markers --strict-config -m "not render and not sandbox and not live" -q
       - run: uv build --no-build-isolation
       - run: uv run --no-sync pip-audit --progress-spinner off
@@ -139,9 +139,11 @@ jobs:
           uv export --frozen --no-dev --no-emit-project --format requirements.txt --output-file runtime/ci/requirements.txt
           diff -u <(tail -n +3 deploy/worker/requirements.txt) <(tail -n +3 runtime/ci/requirements.txt)
           worker_build_tag="groupagent-worker:ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker build --build-arg BASE_IMAGE=python@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72 -f deploy/worker/Dockerfile --iidfile runtime/ci/worker.iid --tag "$worker_build_tag" .
+          docker build --platform linux/amd64 --build-arg BASE_IMAGE=python@sha256:f3dac913ab53b78c64f26d5518fcd7043d5a1a46522d6a493b598c3ed12f62a6 -f deploy/worker/Dockerfile --iidfile runtime/ci/worker.iid --tag "$worker_build_tag" .
           test "$(docker image inspect --format '{{.Id}}' "$worker_build_tag")" = "$(cat runtime/ci/worker.iid)"
+          test "$(docker image inspect --format '{{.Architecture}}' "$worker_build_tag")" = "amd64"
           docker build --build-arg WORKER_IMAGE="$worker_build_tag" -f deploy/worker/Dockerfile.harness --iidfile runtime/ci/harness.iid .
+          test "$(docker image inspect --format '{{.Architecture}}' "$(cat runtime/ci/harness.iid)")" = "amd64"
           echo "GROUPAGENT_WORKER_IMAGE=$(cat runtime/ci/worker.iid)" >> "$GITHUB_ENV"
           echo "GROUPAGENT_HARNESS_IMAGE=$(cat runtime/ci/harness.iid)" >> "$GITHUB_ENV"
       - name: Verify genuine SDK, process isolation and artifact pipelines

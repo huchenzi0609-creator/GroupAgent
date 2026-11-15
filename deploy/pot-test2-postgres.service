@@ -1,0 +1,43 @@
+[Unit]
+Description=Dedicated Pot test_2 PostgreSQL 16+
+After=local-fs.target
+StartLimitIntervalSec=120
+StartLimitBurst=6
+
+[Service]
+Type=forking
+User=pot-test2-pg
+Group=pot-test2
+PIDFile=/var/lib/pot-test2-postgres/data/postmaster.pid
+ExecStartPre=/usr/bin/test -s /var/lib/pot-test2-postgres/data/PG_VERSION
+ExecStart=/opt/pot-test2/postgresql/bin/pg_ctl -D /var/lib/pot-test2-postgres/data -o "-c config_file=/etc/pot-test2/postgresql.conf" -w -t 60 start
+ExecStop=/opt/pot-test2/postgresql/bin/pg_ctl -D /var/lib/pot-test2-postgres/data -m fast -w -t 30 stop
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=75
+TimeoutStopSec=45
+KillMode=mixed
+KillSignal=SIGINT
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pot-test2-postgres /run/pot-test2-postgres
+StateDirectory=pot-test2-postgres
+StateDirectoryMode=0700
+RuntimeDirectory=pot-test2-postgres
+RuntimeDirectoryMode=0750
+MemoryAccounting=yes
+MemoryMax=192M
+CPUAccounting=yes
+CPUQuota=25%
+CPUShares=128
+Nice=5
+OOMScoreAdjust=200
+TasksMax=64
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -309,6 +309,52 @@ async def test_tool_cannot_self_authorize_speech(tmp_path, media_context, media_
             replace(context, idempotency_key="another"),
         )
         assert not result.success and result.error_code == "voice_not_requested"
+        assert result.effect_state == EffectState.NO_EFFECT
+
+
+@pytest.mark.parametrize(
+    "stage,code",
+    [
+        ("denied", "voice_not_requested"),
+        ("permission_error", "permission_denied"),
+        ("source_error", "source_unavailable"),
+    ],
+)
+async def test_tts_precondition_denial_has_zero_cost_and_no_uncertain_effect(
+    tmp_path, media_context, stage, code
+):
+    worker, budget, source_calls = InlineSyntheticWorker(), NoChargeFixtureBudget(), []
+
+    async def permission(context):
+        if stage == "permission_error":
+            raise DomainError("permission_denied", "Synthetic scope denial")
+        return stage != "denied"
+
+    async def source(context, kind):
+        source_calls.append(kind)
+        raise DomainError("source_unavailable", "Synthetic withdrawn source")
+
+    with ArtifactStore(tmp_path / "store") as store:
+        service = MediaService(store, worker, budget=budget)
+        gateway = ToolGateway()
+        register_media_tools(
+            gateway,
+            service,
+            {"tts": route("tts")},
+            speech_permission=permission,
+            output_source=source,
+        )
+        scope = replace(media_context.scope, allowed_tools=frozenset({"speech_synthesize"}))
+        gateway.bind_scope(scope)
+        result = await gateway.invoke(
+            "speech_synthesize",
+            {"text": "Synthetic short speech", "route_id": "tts"},
+            replace(media_context, scope=scope),
+        )
+    assert not result.success and result.error_code == code
+    assert result.effect_state == EffectState.NO_EFFECT
+    assert worker.calls == [] and budget.keys == {} and budget.states == {}
+    assert source_calls == (["audio"] if stage == "source_error" else [])
 
 
 @pytest.mark.parametrize(

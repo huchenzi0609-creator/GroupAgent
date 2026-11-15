@@ -1,0 +1,47 @@
+[Unit]
+Description=Pot test_2 trusted controller
+After=network-online.target docker.service pot-test2-postgres.service
+Wants=network-online.target pot-test2-postgres.service
+Requires=docker.service
+StartLimitIntervalSec=120
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=pot-test2
+Group=pot-test2
+WorkingDirectory=/opt/pot-test2/app
+Environment=PATH=/opt/pot-test2/venv/bin:/opt/pot-test2/postgresql/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/opt/pot-test2/venv/bin/groupagent check-config /etc/pot-test2/config.json
+ExecStart=/opt/pot-test2/venv/bin/groupagent serve --config /etc/pot-test2/config.json --dsn-file /etc/pot-test2/database.dsn --root /var/lib/pot-test2/app --secrets /etc/pot-test2/secrets.env
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pot-test2
+StateDirectory=pot-test2
+StateDirectoryMode=0700
+MemoryAccounting=yes
+# Leaves enough controller-cgroup headroom for the full 768 MiB worker admission check.
+# Docker workers use their own 512 MiB cgroups; this value does not reserve RAM.
+MemoryMax=1280M
+CPUAccounting=yes
+CPUQuota=75%
+CPUShares=128
+Nice=5
+OOMScoreAdjust=300
+TasksMax=128
+StandardOutput=journal
+StandardError=journal
+# The staging script can generate a drop-in with NetworkNamespacePath pointing
+# to the existing wxclient Docker SandboxKey. Do not use PrivateNetwork=yes.
+
+[Install]
+WantedBy=multi-user.target

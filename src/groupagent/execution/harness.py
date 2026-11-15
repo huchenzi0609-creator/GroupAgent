@@ -418,7 +418,9 @@ class HarnessEngine(ScopedToolEngine):
         if self._usage(run).active_seconds >= budget.max_active_seconds:
             raise DomainError("time_budget_exhausted", "Execution active time budget exhausted")
         estimate = estimate_input_tokens(request)
-        allowance = min(budget.max_output_tokens, budget.max_tokens - run.usage.tokens - estimate)
+        allowance = budget.max_output_tokens
+        if budget.max_tokens is not None:
+            allowance = min(allowance, budget.max_tokens - run.usage.tokens - estimate)
         if allowance < 1:
             raise DomainError("token_budget_exhausted", "Model token budget exhausted")
         request = request.model_copy(update={"max_output_tokens": allowance})

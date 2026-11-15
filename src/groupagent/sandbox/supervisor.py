@@ -41,22 +41,46 @@ PROGRAMS = {
 }
 
 
-def resource_usage() -> dict[str, int]:
-    usage = {}
-    for field, name in (("memory_peak_bytes", "memory.peak"), ("pids_peak", "pids.peak")):
-        try:
-            usage[field] = int(Path("/sys/fs/cgroup", name).read_text().strip())
-        except (OSError, ValueError):
-            pass
+def resource_usage(*, cgroup_root: Path = Path("/sys/fs/cgroup")) -> dict[str, int]:
+    """Read worker-local counters; the optional root is a trusted test seam."""
+    usage: dict[str, int] = {}
+
+    def counter(*names: str) -> int | None:
+        for name in names:
+            try:
+                value = int((cgroup_root / name).read_text().strip())
+                if value >= 0:
+                    return value
+            except (OSError, ValueError):
+                pass
+        return None
+
+    memory_peak = counter("memory.peak", "memory/memory.max_usage_in_bytes")
+    if memory_peak is not None:
+        usage["memory_peak_bytes"] = memory_peak
+    pids_peak = counter("pids.peak", "pids/pids.peak")
+    if pids_peak is not None:
+        usage["pids_peak"] = pids_peak
+    else:
+        pids_current = counter("pids.current", "pids/pids.current")
+        if pids_current is not None:
+            usage["pids_current"] = pids_current
     try:
-        cpu = dict(
-            line.split() for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines()
-        )
-        usage["cpu_usage_usec"] = int(cpu["usage_usec"])
+        cpu = dict(line.split() for line in (cgroup_root / "cpu.stat").read_text().splitlines())
+        cpu_usec = int(cpu["usage_usec"])
+        if cpu_usec >= 0:
+            usage["cpu_usage_usec"] = cpu_usec
     except (OSError, ValueError, KeyError):
         pass
+    if "cpu_usage_usec" not in usage:
+        cpu_ns = counter("cpu,cpuacct/cpuacct.usage", "cpuacct/cpuacct.usage")
+        if cpu_ns is not None:
+            usage["cpu_usage_usec"] = cpu_ns // 1000
     for path, name in (("/work", "workspace_used_bytes"), ("/tmp", "temp_used_bytes")):
-        info = os.statvfs(path)
+        try:
+            info = os.statvfs(path)
+        except OSError:
+            continue
         usage[name] = (info.f_blocks - info.f_bfree) * info.f_frsize
     return usage
 

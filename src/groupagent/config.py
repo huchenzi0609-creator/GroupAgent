@@ -83,7 +83,7 @@ class FeatureConfig(StrictModel):
     natural_participation: bool = True
     image_understanding: bool = True
     audio_transcription: bool = True
-    speech_reply_on_request: bool = True
+    speech_reply_on_request: bool = False
     image_generation: Literal[False] = False
     document_editing: bool = True
     web_research: bool = True
@@ -126,7 +126,7 @@ class LimitsConfig(StrictModel):
 
 class ExecutionConfig(StrictModel):
     max_model_rounds: PositiveInt = 24
-    max_total_tokens: PositiveInt = 200_000
+    max_total_tokens: PositiveInt | None = None
     max_tool_calls: PositiveInt = 60
     max_active_seconds: PositiveInt = 1200
     max_subagents: Annotated[int, Field(strict=True, ge=0)] = 2
@@ -255,6 +255,9 @@ class RuntimeConfig(StrictModel):
     harness_image: str | None = None
     docker_host: str | None = None
     poll_seconds: float = Field(default=0.25, gt=0, le=30)
+    early_ack_enabled: bool = False
+    early_ack_seconds: float = Field(default=2.0, gt=0, le=8)
+    broker_control_socket: str | None = None
     message_chunk_characters: int = Field(default=1800, ge=100, le=4000)
     bot_name: str = Field(default=DEFAULT_BOT_NAME, min_length=1, max_length=64)
     bot_aliases: list[str] = Field(default_factory=lambda: list(LEGACY_BOT_ALIASES), max_length=20)
@@ -264,6 +267,15 @@ class RuntimeConfig(StrictModel):
     semantic_validation: bool = True
     local_member_names: dict[str, str] = Field(default_factory=dict)
     pg_bin_dir: str | None = None
+
+    @field_validator("broker_control_socket")
+    @classmethod
+    def local_broker_socket(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not Path(value).is_absolute() or "\x00" in value or len(value.encode()) > 104
+        ):
+            raise ValueError("The broker control socket must be a bounded absolute Unix path")
+        return value
 
     @field_validator("bot_name", "bot_badge")
     @classmethod

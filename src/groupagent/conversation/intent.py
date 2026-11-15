@@ -392,11 +392,56 @@ def requires_research(text: str) -> bool:
     return bool(_POSITIVE_RESEARCH.search(_NEGATIVE_RESEARCH.sub(" ", text)))
 
 
+_SPEECH_DATA = re.compile(
+    r"```.*?```|~~~.*?~~~|`[^`\n]*`|“[^”]*”|‘[^’]*’|『[^』]*』|「[^」]*」|\"[^\"\n]*\"|'[^'\n]*'|(?m:^>[^\n]*)",
+    re.S,
+)
+_VOICE = (
+    r"(?:(?:一|1)?(?:条|段|则|个)|一小段)?(?:(?:简短|短|清晰)(?:的)?){0,2}(?:语音|音频)(?:消息)?"
+)
+_SPEECH_ACTION = re.compile(
+    r"^(?:用|以)" + _VOICE + r"(?:来)?(?:说|读|念|回复|回答|讲|告诉|播报|朗读)"
+    r"|^(?:发|发送|发给我|给我发|回我|回复我)(?:给我|给我们|给大家|到群里)?"
+    + _VOICE
+    + r"(?=说|读|念|讲|回复|回答|并|[\s：:，,。.!！?？]|$)"
+    r"|^(?:合成|生成|制作)(?:给我)?"
+    + _VOICE
+    + r"(?=说|读|念|讲|回复|回答|并|[\s：:，,。.!！?？]|$)"
+    r"|^(?:(?:把|将).{0,100})?(?:朗读|读出来|读给我|念给我|说给我听)(?!功能|原理|接口|方法|技术|效果|能力|权限|是什么|怎么|如何)"
+    r"|^(?:语音|音频)(?:回复|回答|讲给我听)(?=我|我们|一下|这|那|刚才|上面|下面|[\s：:，,。.!！?？]|$)"
+    r"|^(?:say|read|speak)\b.{0,120}\b(?:in|as|using|with)\s+(?:a\s+)?(?:short\s+)?(?:voice|audio|speech)\b"
+    r"|^(?:say|read|speak)\b.{0,120}\b(?:aloud|out\s+loud)\b"
+    r"|^(?:send|generate|create|synthesize|synthesise)\s+(?:me\s+)?(?:a\s+)?(?:short\s+)?(?:voice\s+message|audio(?:\s+message)?|speech)\b",
+    re.I,
+)
+_NO_SPEECH = re.compile(
+    r"(?:不要|不用|不必|无需|不需要|禁止|别|暂不|先不)[^，,。；;：:\n!?！？]{0,12}"
+    r"(?:语音|音频|朗读|读出来|读给我|念给我|说给我听)"
+    r"|\b(?:do\s+not|don't|never|without|no)\b[^,.;:\n!?]{0,70}\b(?:voice|audio|speech|aloud)\b",
+    re.I,
+)
+_SPEECH_DISCUSSION = re.compile(
+    r"^(?:解释|说明|介绍|讨论|翻译|分析|比较|评价|如何|怎么|为什么|什么是|假如|如果|假设|举例|示例|引用|转发|转述)"
+    r"|^(?:explain|describe|discuss|translate|what|how|why|if)\b",
+    re.I,
+)
+
+
 def requests_speech_reply(text: str) -> bool:
-    """Explicit delivery wording shared by admission and media permission."""
-    return bool(
-        re.search(
-            r"语音(?:回复|回答|讲给我听)|音频(?:回复|回答)|朗读|读出来|读给我|念给我|说给我听", text
-        )
-        and not re.search(r"(?:不要|不用|别).{0,5}(?:语音|音频|朗读)", text)
-    )
+    """Require an outer speech-delivery action; quoted examples grant nothing."""
+    outside = _SPEECH_DATA.sub(" <quoted data> ", text)
+    if _NO_SPEECH.search(outside):
+        return False
+    # Without quotation boundaries, a reported command cannot become authority
+    # merely because a comma divides the report from its alleged command.
+    if outside == text and re.match(
+        r"^\s*(?:引用|转发|转述|示例|例子|只是.{0,5}(?:引用|转发))", main_request(outside)
+    ):
+        return False
+    for clause in re.split(r"[，,。；;\n]|并(?:且)?\s*(?=(?:用|以)(?:语音|音频)|朗读)", outside):
+        main = main_request(clause)
+        main = re.sub(r"^(?:please\s+|(?:can|could|would)\s+you\s+)", "", main, flags=re.I)
+        main = re.sub(r"^给我", "", main)
+        if not _SPEECH_DISCUSSION.search(main) and _SPEECH_ACTION.search(main):
+            return True
+    return False

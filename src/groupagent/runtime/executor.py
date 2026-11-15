@@ -1402,7 +1402,7 @@ class WorkSupervisor:
         repairable = not (
             count >= self.validation_repair_limit
             or snapshot.usage.rounds >= budget.max_rounds
-            or snapshot.usage.tokens >= budget.max_tokens
+            or (budget.max_tokens is not None and snapshot.usage.tokens >= budget.max_tokens)
             or snapshot.usage.active_seconds + elapsed >= budget.max_active_seconds
         )
         redacted = redact_credentials(error.message)

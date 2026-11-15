@@ -628,9 +628,9 @@ class ScopedToolEngine:
                 await self._finish(run, RunState.PAUSED, "input_budget_exhausted")
                 return
             estimate = estimate_input_tokens(request)
-            allowance = min(
-                budget.max_output_tokens, budget.max_tokens - run.usage.tokens - estimate
-            )
+            allowance = budget.max_output_tokens
+            if budget.max_tokens is not None:
+                allowance = min(allowance, budget.max_tokens - run.usage.tokens - estimate)
             if allowance < 1:
                 await self._finish(run, RunState.PAUSED, "token_budget_exhausted")
                 return

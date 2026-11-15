@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -42,6 +43,7 @@ from groupagent.runtime.artifacts import ArtifactRegistry
 from groupagent.runtime.tool_selection import message_only_research_request
 from groupagent.scheduling import Scheduler
 from groupagent.scheduling.reminders import extract_reminder_body, is_time_only_reminder_change
+from groupagent.security import redact_credentials
 
 from .actions import (
     ACTION_ADAPTER,
@@ -87,6 +89,31 @@ _ERRORS = {
 
 def _strings(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def _work_admission_text(
+    required_tools: list[str], output_formats: list[str], *, research_required: bool
+) -> str:
+    if "python_compute" in required_tools:
+        return "我会实际运行 Python 计算，再把结果发回来。"
+    if "process_run" in required_tools:
+        return "我会实际运行这段程序，再把结果发回来。"
+    labels = {
+        "docx": "Word",
+        "pdf": "PDF",
+        "pptx": "PPT",
+        "md": "Markdown",
+        "png": "图片",
+        "jpeg": "图片",
+    }
+    files = "、".join(dict.fromkeys(labels[value] for value in output_formats if value in labels))
+    if research_required and files:
+        return f"我会先查资料并核对来源，再整理成 {files}，检查后发回来。"
+    if research_required:
+        return "我会查找资料并核对来源，再把结论发回来。"
+    if files:
+        return f"我会整理成 {files}，检查内容后发回来。"
+    return "这项工作已排队；有结果或需要补充资料时我会回复。"
 
 
 def _scope_sources(scope: dict[str, Any]) -> set[str]:
@@ -776,6 +803,153 @@ class ConversationCoordinator(Coordinator):
             ],
             outputs=list(intent.outputs),
             directness="direct" if addressed else "open",
+            confidence=1,
+        )
+
+    def _fast_identity_reply(self, event: GroupEvent, context: dict) -> Decision | None:
+        """Answer only a standalone question about this configured bot's name."""
+        if (
+            event.kind != EventKind.TEXT
+            or event.reply_to
+            or event.attachments
+            or len(event.text) > 200
+            or fast_observe(event, context) is not None
+        ):
+            return None
+        raw = event.text.strip()
+        if outside_quotes(raw) != raw or self.identity.strip_address(raw) == raw:
+            return None
+        main = main_request(raw, identity=self.identity).strip(" ?？。!！")
+        if (
+            re.fullmatch(
+                r"(?:(?:告诉|告知)我)?"
+                r"(?:(?:你|您)(?:叫(?:什么|啥)(?:名字)?|是谁)|(?:你|您)的?名字(?:是什么|是啥|叫什么)"
+                r"|what(?:'s| is) your name|who are you)"
+                r"(?:[，,]\s*(?:请用|用)?(?:一句话|一句|一行)(?:回答|回复)(?:即可|就好)?)?",
+                main,
+                re.I,
+            )
+            is None
+        ):
+            return None
+        return Decision(
+            kind="reply",
+            reason_code="bot_identity_query",
+            response=f"我叫{self.identity.name}。",
+            directness="direct",
+            confidence=1,
+        )
+
+    def _fast_fact_reply(
+        self, event: GroupEvent, context: dict, actor: ActorContext, *, tx: UnitOfWork | None = None
+    ) -> Decision | None:
+        """Read one exact, source-bound groupwide record; never infer a fact."""
+        if (
+            event.kind != EventKind.TEXT
+            or event.reply_to
+            or event.attachments
+            or len(event.text) > 200
+            or context.get("context_incomplete")
+            or context.get("_topic_id")
+        ):
+            return None
+        raw = event.text.strip()
+        if outside_quotes(raw) != raw or self.identity.strip_address(raw) == raw:
+            return None
+        main = main_request(raw, identity=self.identity)
+        main = re.sub(r"^(?:(?:用一句话(?:回答|回复|告诉我))[，,：:\s]*|(?:告诉|告知)我)", "", main)
+        main = re.sub(r"^(?:(?:我|你|您)?(?:刚才|之前|此前|已经)?(?:记住|记下|记录)的)", "", main)
+        match = re.fullmatch(
+            r"([^，,。；;：:\s!?！？]{1,50}?)(?:是什么|是啥|是多少|有多少|多少)"
+            r"(?:[，,?？]\s*(?:请用|用)?一句话(?:回答|回复)(?:即可|就好)?)?[?？。!！]*",
+            main,
+        )
+        if match is None:
+            return None
+        predicate = match[1]
+        if re.search(
+            r"^(?:我|你|您|他|她|本人|谁)|更正|更新|修改|删除|记住|生成|执行|解释|翻译|并|且|顺便|另外|密钥|密码|口令|凭据|token|password|secret|api[_ -]?key",
+            predicate,
+            re.I,
+        ):
+            return None
+        if any(
+            isinstance(member.get("name"), str) and member["name"] + "的" in predicate
+            for member in context.get("members", [])
+            if isinstance(member, dict)
+        ):
+            return None
+        hits = [
+            item
+            for item in context.get("memory", [])
+            if item.get("kind") in {"fact", "decision"} and item.get("predicate") == predicate
+        ]
+        if len(hits) != 1:
+            return None
+        hit = hits[0]
+        value = hit.get("value")
+        if value is None or not isinstance(value, (str, int, float, bool)):
+            return None
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        display = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        if (
+            not display
+            or len(display) > 100
+            or not display.isprintable()
+            or display != display.strip()
+        ):
+            return None
+        if redact_credentials(predicate + display) != predicate + display:
+            return None
+        snapshot = context["_snapshot"]
+        original = next((item for item in snapshot["items"] if item["id"] == hit["id"]), None)
+        sources = set(hit.get("source_event_ids", []))
+        if (
+            original is None
+            or original.get("incomplete")
+            or hit.get("topic_id") is not None
+            or hit.get("context_excerpt_truncated")
+            or hit.get("source_refs_truncated")
+            or not sources
+            or not sources.issubset(snapshot["source_fingerprints"])
+            or sources != {ref["event_id"] for ref in original["source_refs"]}
+            or any(ref["state"] != "active" for ref in original["source_refs"])
+            or any(
+                original.get(key) != hit.get(key)
+                for key in ("predicate", "value", "revision", "kind")
+            )
+        ):
+            return None
+        if tx is None:
+            with self.store.transaction(actor) as owned:
+                self.memory.prepare_in_tx(owned)
+                self.memory.assert_snapshot_in_tx(owned, snapshot)
+                return self._fast_fact_reply(event, context, actor, tx=owned)
+        rows = tx.conn.execute(
+            "SELECT id,kind,subject_id,revision,value,source_event_ids FROM ga_memory_facts "
+            "WHERE group_id=%s AND topic_id IS NULL AND state='active' AND predicate=%s ORDER BY id LIMIT 2",
+            (actor.group_id, predicate),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        current = rows[0]
+        if (
+            current["subject_id"] not in {None, actor.member_id, actor.group_id}
+            or current["id"] != hit["id"]
+            or current["kind"] != hit["kind"]
+            or current["revision"] != hit["revision"]
+            or set(current["source_event_ids"]) != sources
+            or json.dumps(current["value"], ensure_ascii=False)
+            != json.dumps(value, ensure_ascii=False)
+        ):
+            return None
+        context["_exact_fact_reply"] = True
+        return Decision(
+            kind="reply",
+            reason_code="exact_known_fact",
+            response=f"我记下的{predicate}是{display}。",
+            directness="direct",
             confidence=1,
         )
 
@@ -1472,6 +1646,18 @@ class ConversationCoordinator(Coordinator):
                     ).fetchone()
                 )
             )
+            if echo and event.kind != EventKind.RECALL:
+                # A durable native receipt is enough to discard our own text;
+                # it needs no history, model call or generated-reply context.
+                self.execution_guard(tx)
+                result = CoordinationResult(
+                    event_id=event.id,
+                    decision=Decision(kind="ignore", reason_code="verified_bot_receipt"),
+                )
+                tx.record_decision(
+                    event.id, {"kind": "ignore", "result": result.model_dump(mode="json")}
+                )
+                return result
         if event.kind == EventKind.RECALL:
             self.memory.recall(self.service_actor, event.id, now=self.clock())
         context = self._context(actor, event)
@@ -1542,6 +1728,10 @@ class ConversationCoordinator(Coordinator):
             else:
                 immediate = self._fast_control(event, context)
                 if immediate is None:
+                    immediate = self._fast_identity_reply(event, context)
+                if immediate is None:
+                    immediate = self._fast_fact_reply(event, context, actor)
+                if immediate is None:
                     immediate = self._fast_new_work(event, context)
                     fast_admitted = immediate is not None
                 decision = immediate or await self.provider_factory(actor, event).decide(
@@ -1556,6 +1746,13 @@ class ConversationCoordinator(Coordinator):
                     update={"duplicate": True}
                 )
             self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
+            if (
+                context.get("_exact_fact_reply")
+                and self._fast_fact_reply(event, context, actor, tx=tx) != decision
+            ):
+                raise DomainError(
+                    "memory_changed", "Exact fact changed before its reply was committed"
+                )
             if event.platform_message_id and (
                 tx.is_bot_message(event.platform_message_id)
                 or tx.conn.execute(
@@ -1774,7 +1971,13 @@ class ConversationCoordinator(Coordinator):
                         )
                         work_id = work.id
                         decision = decision.model_copy(
-                            update={"response": "收到，我会处理这项工作，完成后把结果发回来。"}
+                            update={
+                                "response": _work_admission_text(
+                                    required_tools,
+                                    [item.format for item in outputs],
+                                    research_required=research_required,
+                                )
+                            }
                         )
                     elif decision.kind == "update_work":
                         attachment_ids = self._inputs(tx, event, decision, context)
