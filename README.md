@@ -34,19 +34,13 @@ uv --no-config build --no-build-isolation
 
 ## 验收与发布状态
 
-[实现状态](docs/development/IMPLEMENTATION_STATUS.md) 区分已接通代码和已取得证据；[本地验证进展](docs/development/LOCAL_VALIDATION_PROGRESS.md) 保留成功与失败；[A01—A48证据矩阵](docs/development/LOCAL_ACCEPTANCE_MATRIX.md) 按 L1—L5 分层记录。测试总数、候选语义分数和整项业务验收使用不同分母。
+当前最终候选为 **c411860f… / 122py / freeze18**：core18为2134 PASS、52 SKIP、31 DESELECTED（158.30秒），worker19为110 PASS、零skip（284.07秒），覆盖新增的core worker skip；静态与images18同源检查通过。其他skip不算能力通过。
 
-当前冻结源码为 `25b1be61…`，源码提交 `974edd7…`，后续测试提交 `946ce37…` 未改产品源码。最终core11为 **1727 PASS、51 SKIP、28 DESELECTED，106.98秒**；09版worker/Harness均核对120个Python文件与此源码一致。快受理后的真实Harness执行三例已 **3/3 PASS**：Markdown、独立解码核对3页/标题的PPT、实际Python工具回执输出391并本地交付。
+固定30项本地综合验收已 **30/30 PASS**，全部使用同一冻结源码和镜像。本轮真实模型执行及必要的独立代理内容复核已完成；流程图的原始OCR漏字记录和一次同图真实OCR核验保留。结果见[修复报告](docs/development/FOUR_FAILURE_REPAIR.md)、[验证进展](docs/development/LOCAL_VALIDATION_PROGRESS.md)及[A01—A48矩阵](docs/development/LOCAL_ACCEPTANCE_MATRIX.md)。
 
-当前09版worker整套 **97 PASS、258.17秒**。最终同源码短答、接单、取消各30项全部正确，P95保守上界分别 **6.2003 / 2.0442 / 1.1754秒**，达到20/5/2秒门槛。短答实模，长任务受理为真实规则快路且held执行lane，取消为固定provider/真实PG与gateway；实际执行由上述三例单列。
+原累计预算daily/total均50 CNY、revision1未改。用户新报告累计实扣11.65 CNY已由可信Owner对账审计282332应用，原5笔unknown/held0.562140保留；最终有效上界17.266165包含后续suffix保守估算，非新实扣。对账是同一50元预算的计量校准，不是退款或追加额度；报告时间口径与证据见[修复报告](docs/development/FOUR_FAILURE_REPAIR.md)。
 
-`runtime-matrix-06` 在原 `ee73a730…` 执行结果上追加真实云OCR和独立assistant复核后为 **26 PASS、4 FAIL / 30（86.6667%）**；固定gold、四项失败、复核前25/30及所有本地OCR失败均保留。此结果保留执行/检查版本差异，没有在当前源码重跑30项。固定264条候选的召回215/219（98.1735%）、误介入0/32绑定更早的`88a5999e…`；独立身份/记忆50组场景及1项哈希校验共51项通过。以上分母与证据范围分别记录，全部L5、目标Linux服务器、七天试运行和生产切换均为 **NOT_RUN**。
-
-本轮65项Python依赖0项已知漏洞，327个可发表文件凭据扫描0发现；wheel147条、sdist328条均无私有运行资料。累计policy仍50元；最终有效预算用量上界 **21.023746元**，含2笔未知预留，属于“用户报告的历史4.83元+后续保守估算”，不是实际扣费。原记录保留，最新完整控制台实扣尚未回传，见[费用说明](docs/development/LOCAL_VALIDATION_PROGRESS.md#费用与仍待完成的门槛)。
-
-已验证代码head`7a268…`的[CI run43632514186](https://github.com/huchenzi0609-creator/GroupAgent/actions/runs/43632514186)四job（双Python core/render/isolated-worker）全部成功；这是该head的历史证明，最新提交CI以[PR #8 checks](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)为准。[PR #8](https://github.com/huchenzi0609-creator/GroupAgent/pull/8)仍为draft，base仍未合并[PR #1](https://github.com/huchenzi0609-creator/GroupAgent/pull/1)，本轮不构成上线批准。
-
-配置样例默认关闭群处理。`check-config --production` 只检查配置字段门槛，不能替代真实通道、模型质量、隔离、预算、备份、交付或发布审批。
+[PR #8](https://github.com/huchenzi0609-creator/GroupAgent/pull/8)仍draft、base [PR #1](https://github.com/huchenzi0609-creator/GroupAgent/pull/1)尚未合并；最新提交CI以[动态checks页面](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)为准。真实微信L5、目标Linux容量、至少七天shadow、真实迁移及单发送者切换全部 **NOT_RUN**，本轮不部署。配置样例默认关闭群处理，`check-config --production`仅检查配置字段。
 
 ## 文档
 
@@ -56,6 +50,7 @@ uv --no-config build --no-build-isolation
 - [开发任务与依赖](docs/spec/IMPLEMENTATION_PLAN_V0.1.md)
 - [工程纪律](docs/ENGINEERING.md)
 - [实现与验证状态](docs/development/IMPLEMENTATION_STATUS.md)
+- [四项失败修复报告](docs/development/FOUR_FAILURE_REPAIR.md)
 - [本地运行手册](docs/development/LOCAL_RUNBOOK.md)
 - [分层验收矩阵](docs/development/LOCAL_ACCEPTANCE_MATRIX.md)
 - [Harness 实验](docs/development/HARNESS_POC.md)、[微信契约实验](docs/development/WECHAT_ADAPTER_POC.md)、[worker 构建与容量](deploy/worker/README.md)

@@ -4,6 +4,8 @@
 
 本表是证据映射，不是48项全部通过的声明。各层分别评分，不得把pytest总数、模型候选分数或文件样本数直接当A场景分母。所有L5均为NOT_RUN；即使本地子项通过，也不能使需要真实通道的整项验收变为PASS。
 
+**最新修复入口：[FOUR_FAILURE_REPAIR.md](FOUR_FAILURE_REPAIR.md)。** 当前c411/122py（freeze18）的core18为2134 PASS/52 SKIP/31 DESELECTED/158.30秒，worker19为110 PASS/零skip/284.07秒；mypy122/Ruff/format285、images18同源通过，新增第52项core skip已在worker覆盖。focus22三任务均completed，Chart02全11硬checks/像素绑定通过、双WEB本轮sidecar review PASS；原raw1 PASS/2 NEEDS_REVIEW保留，未作统一3/3汇总。full22已在同一c411源码、images18和固定checkerfa下完成30/30 PASS；必要语义/视觉复核均绑定本轮产物，最终零付费汇总未增加调用。Owner audit282332已实际应用用户累计11.65基准，原50/50 policy与revision1不变，unknown5/held0.562140继续保留；最终有效上界17.266165含后续suffix保守估算与原unknown预留，非控制台实扣。
+
 ## 证据层与已执行批次
 
 | 层 | 含义与本轮边界 |
@@ -16,17 +18,17 @@
 
 | 代号 | 定位与现有结果 | 可以支持的结论 |
 | --- | --- | --- |
-| R | 当前core11：1727 PASS、51 SKIP、28 DESELECTED，106.98秒，源码25b；`runtime/ci/final-core-11.xml/log` | 09/10各一项fixture错误FAIL保留，仅修测试后通过。历史core07=1667绑定6f、06=1524绑定ee；skip不算能力通过 |
+| R | 此前core11：1727 PASS、51 SKIP、28 DESELECTED，106.98秒，源码25b；`runtime/ci/final-core-11.xml/log` | 09/10各一项fixture错误FAIL保留，仅修测试后通过。历史core07=1667绑定6f、06=1524绑定ee；不移作当前候选结果 |
 | ID | [独立身份/记忆固定清单](../../tests/memory/test_identity_acceptance.py)：50组场景加1项哈希校验，51 PASS；清单hash `503c4042ad0ce25d4c0cf34cce7927ed4c73150bb929809769e3fabc9b688a6b` | 真实PG合成身份/记忆与负责人边界，属于L1/L2；不替代原生微信成员字段和真实群测试 |
 | W | 06版真实worker选集97 PASS、零skip，271.17秒；`runtime/ci/final-workers-06.log` / `.xml`，执行源码`ee73a730…` | 真Docker/SDK、文档、OCR/浏览器/输入与隔离边界；选集含合成模型/HTTP/通道，不能称97次真实供应商任务或微信验收 |
-| W9 | 当前09 worker97 PASS、零skip，258.17秒；两镜像全120py匹配25b，worker350ac689…、Harness377a2cf1… | 当前日志`runtime/ci/final-workers-09.log/.xml`，完整ID/proof见[实现状态](IMPLEMENTATION_STATUS.md)。含合成模型/HTTP；旧W97/271.17秒独立保留 |
+| W9 | 此前09 worker97 PASS、零skip，258.17秒；全120py匹配25b，worker350ac689…、Harness377a2cf1… | 旧日志`runtime/ci/final-workers-09.log/.xml`和完整ID保留；不是d74a的repair-workers-03 |
 | W0 | 历史Pillow13镜像86/86混合回归，227.29秒；[CI isolated-worker选集](../../.github/workflows/ci.yml) | 历史证据保留，不移植为后续计费源码的结果 |
 | W2 | 历史worker `080ff780…` 的43/43实际容器文档回归，177.96秒；`runtime/build/document-final-regression.txt` | 4×10代表样本及普通模板/遮挡检查；不把历史镜像结果移植为最终镜像整套通过 |
 | M | 真实媒体API：30/30合成图片、20/20真实TTS→ASR语义样本；`runtime/live/`私有证据 | 合成图片关键问答和合成语音意图。无真实群传输、噪声录音或人类标注复核结果 |
 | S | 历史真实本地冒烟：Python计算、MD交付、中文DOCX交付3/3 | 较早版本真模型/Harness/worker/本地回执，不代替当前快受理后的代表执行 |
-| E | 当前执行03真实Harness/09镜像3/3 PASS：MD、独立3页/标题PPT、Python实际ToolReceipt输出391及本地接受 | 未held、前后源码25b不变。原02 compute无Tool被Engine拒绝FAIL、01 helper默认None错误/原生取消均保留；此3不是原30分母 |
+| E | 此前执行03真实Harness/09镜像3/3 PASS：MD、独立3页/标题PPT、Python实际ToolReceipt输出391及本地接受 | 未held、源25b；旧helper/compute失败保留。此3既不是原30分母，也不是新08执行 |
 | I | 最新`runtime/live/interaction-release-06/`；[固定集](../../tests/fixtures/interaction_cases.json)，hash `5922f43451acfea2dfab66069bf5cbb26a5ab0d1aec10c763ca7c0a009c53730` | 246/264精确匹配；实际门控离线复核召回215/219（98.1735%）、误介入0/32；禁止写候选0、业务写入0、候选P95 2.419秒。下表列类别关联，不暗示该类别全部PASS |
-| T | [固定30任务](../../tests/fixtures/runtime_acceptance_cases.json)，hash `10f8ffbb473b596b409cd7318a39483082f4a5ef9e727808055ea38a4d58dffd`未变；`runtime/live/runtime-matrix-06/summary-after-ocr-review.json` | 26 PASS、4 FAIL / 30（86.6667%），整轮status仍FAIL；Chart02补无prompt/gold的云OCR/独立assistant复核。原25/30和所有本地OCR失败保留；四项FAIL及unknown见[进展](LOCAL_VALIDATION_PROGRESS.md) |
+| T | [固定30任务](../../tests/fixtures/runtime_acceptance_cases.json)，hash `10f8ffbb473b596b409cd7318a39483082f4a5ef9e727808055ea38a4d58dffd`未变；`runtime/live/runtime-matrix-06/summary-after-ocr-review.json` | 26 PASS、4 FAIL / 30（86.6667%），旧T06整轮status为FAIL；Chart02补无prompt/gold的云OCR/独立assistant复核。原25/30和所有本地OCR失败保留；四项FAIL及unknown见[进展](LOCAL_VALIDATION_PROGRESS.md) |
 | P | 前后同25b：最终短答/接单/取消各30/30、0失败，P95保守6.200338417/2.044179791/1.175423541秒均PASS | `perf-live-final`短答实模、长任务真实规则快路且held；`perf-cancel-final`固定provider/真实PG-gateway拒绝旧租约。旧FAIL保留，非执行吞吐/微信时延 |
 | B | 后续计费源码`798e6379…`，`runtime/ci/billing-reconciliation.xml`，61 PASS、零skip | 可信Owner累计对账，reserve/begin统一容量；原估算/unknown/50元policy不改；审计仅应用级追加，不是DB强制不变或connector验票 |
 | F | `runtime/ci/fault-injection-evidence-final.json`：12个不同故障位置、12个既有JUnit PASS，源码25b/测试提交946ce37 | Core11的10项含真实PG/本地文件及明确夹具；Workers09的2项为真实本地容器。逐项边界见[故障短表](#故障注入证据)，不计参数变体或新增测试运行 |
@@ -35,7 +37,7 @@ I的源码SHA256为`88a5999ed5454631b4cf93d4c06a68d6aeebb5b0d9ac53d5b9f0b30c4eb3
 
 T06原执行SUT本地commit为`f83a9173a0dea2aa02afa3230c88eb3d406cc276`，宿主与06镜像源码SHA256均为`ee73a7302b58a261f14bf854b466aa59928ce762a000f2fd41b35417e6c3d44d`；120个Python源码文件和依赖锁一致，证据`runtime/build/frozen-image-source-proof-06.json`。后续检查环境含计费源码`798e6379919b0c68c87c65d724987c6755b73926a8109e9bd6fc525d034559a8`，汇总明确保留`mixed_product_sources=true`和checker/runner revision；26/30不是此新源码重跑、单一最终构建或未知样本盲测。Harness复用已锁定SDK/runtime依赖层，没有本轮全新安装/native复现证据。历史04的18 PASS、11 FAIL、1 NOT_RUN与05的21 PASS、9 FAIL独立保留，不拼接。
 
-当前源码25b、源码提交974edd7、仅测试提交946ce37，schema001—012保持、无013。快路对原30的selection命中0（当时6f），只说明选择覆盖，未重跑原30。当前core11、worker09、镜像同源、真实03执行、最终同源三性能/账本均有证据；最新提交CI以[PR #8 checks](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)为准。
+本表25b证据对应974edd7/946ce37；当前c411 focus22三任务completed/必要checks与sidecar review通过，原raw1 PASS/2 NEEDS_REVIEW保留，未统一3/3；新完整full22正式30/30 PASS，见[修复报告](FOUR_FAILURE_REPAIR.md)。旧case不拼入新run；schema001—012、gold/PASS阈值未改，checkerfa0122从新run起点固定，旧checker/修订保全。最新CI见[PR #8 checks](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)。
 
 下表L1/L2链接说明可运行的测试入口及其子行为，不凭源码存在判PASS。T只支持所列本地固定任务的结果；没有对应完整场景证据的子项仍NOT_RUN。整行最终状态均为IN_PROGRESS，全部L5为NOT_RUN。
 
@@ -88,9 +90,9 @@ T06原执行SUT本地commit为`f83a9173a0dea2aa02afa3230c88eb3d406cc276`，宿�
 
 | 场景 | L1/L2代表证据与范围 | L3候选证据 | L4实际证据及缺口 | L5 |
 | --- | --- | --- | --- | --- |
-| A36 自然创建提醒 | L1/L2：[time/provider](../../tests/conversation/test_provider.py)、[scheduler](../../tests/scheduling/test_postgres_scheduler.py) 基于来源时间/时区、一次提交 | I：schedule_create、deadline_edges | T创建1/1；触发项仍FAIL，非真实时钟等待 | NOT_RUN |
+| A36 自然创建提醒 | L1/L2：[time/provider](../../tests/conversation/test_provider.py)、[scheduler](../../tests/scheduling/test_postgres_scheduler.py) 基于来源时间/时区、一次提交 | I：schedule_create、deadline_edges | 旧T06创建1/1、原触发FAIL保留，非真实时钟等待；当前候选见[修复报告](FOUR_FAILURE_REPAIR.md) | NOT_RUN |
 | A37 周期修改与取消 | L2：[scheduler](../../tests/scheduling/test_postgres_scheduler.py)、[schedule tools](../../tests/scheduling/test_tools.py) revision/取消与历史不改写 | I：schedule_change、schedule_control | T规则修改1/1；完整服务重启后周期控制NOT_RUN | NOT_RUN |
-| A38 重启与补跑 | L1/L2：[recurrence](../../tests/scheduling/test_recurrence.py)、[scheduler](../../tests/scheduling/test_postgres_scheduler.py) DST/最新一次/24小时/并发重启不重复 | NOT_RUN自然语言停机回放 | T触发通知正确但required_text不连续匹配，0/1仍FAIL；真实停机跨时刻NOT_RUN | NOT_RUN |
+| A38 重启与补跑 | L1/L2：[recurrence](../../tests/scheduling/test_recurrence.py)、[scheduler](../../tests/scheduling/test_postgres_scheduler.py) DST/最新一次/24小时/并发重启不重复 | NOT_RUN自然语言停机回放 | 旧T06通知required_text不连续匹配，原0/1 FAIL保留；当前候选见[修复报告](FOUR_FAILURE_REPAIR.md)，真实停机跨时刻NOT_RUN | NOT_RUN |
 | A39 循环与配额 | L2：[triggers](../../tests/scheduling/test_event_triggers.py)、[tools](../../tests/scheduling/test_tools.py) 源权限/配额/派生递归拒绝 | I：schedule_create/control的有限候选 | NOT_RUN真实模型持续派生压力场景 | NOT_RUN |
 | A40 自动有限跟进 | L2：[triggers](../../tests/scheduling/test_event_triggers.py)、[tools](../../tests/scheduling/test_tools.py) 期限、取消、来源撤权、真实完成事实 | I：schedule_create的有限候选 | NOT_RUN真实模型职责→后续事件→交付完整场景 | NOT_RUN |
 | A41 压缩与重启记忆 | L2：[compaction](../../tests/memory/test_compaction.py)、[snapshots](../../tests/memory/test_snapshots.py) token阈值、原子游标、失败不推进 | I：memory_and_identity仅可见上下文 | NOT_RUN真实模型长对话压缩→服务重启→早期追问完整质量样本 | NOT_RUN |
@@ -129,7 +131,7 @@ F从已有Core11/Workers09的JUnit PASS中，每个不同注入位置取1个未�
 | --- | --- | --- |
 | ≥200窗口；明确Agent/预授权开放请求召回≥95% | I：实际门控复核215/219=98.1735%；原始候选精确匹配另为246/264 | L3固定集已有证据；不代表端到端完成或未见样本 |
 | 不应介入误介入≤5%；错误写归属单列 | I：误介入0/32；禁止写候选0，实际业务写入0；未以整体精确匹配率反推 | L3固定集已有证据；未执行写入不能证明实际写归属全部正确 |
-| ≥30端到端任务，无人工补救成功≥85% | T06复核后26/30=86.6667%，gold未改、原产物未人工修复；追加OCR/assistant复核及混合执行/检查版本全部披露 | 达到固定集数值门槛；整轮仍FAIL，非单一最终构建或L5通过 |
+| ≥30端到端任务，无人工补救成功≥85% | T06复核后26/30=86.6667%，gold未改、原产物未人工修复；追加OCR/assistant复核及混合执行/检查版本全部披露 | 旧T06达到固定集数值门槛；该历史轮仍FAIL，非单一最终构建或L5通过 |
 | 四格式每种≥10代表样本，100%结构/关键内容/渲染通过 | W2历史4×10结构/所声明断言/渲染及模板遮挡证据，W的06选集97 PASS；不是任意模板保真或全部Office特性 | 容器代表样本已有受限证据；T DOCX/PDF各2/3，不把业务失败写成全通过 |
 | ≥30图、≥20语音，关键问题/意图≥90% | M30/30、20/20；合成输入与TTS→ASR，不是实际群录音或人类评分 | 已有受限证据，L5 NOT_RUN |
 | ≥50身份/记忆；负责人串人阻断 | ID：独立50组真实PG合成场景，加固定清单哈希校验共51 PASS | L1/L2已有固定集证据；L5 NOT_RUN |
@@ -137,7 +139,7 @@ F从已有Core11/Workers09的JUnit PASS中，每个不同注入位置取1个未�
 | ≥10不同位置故障注入，无可重现重复高影响副作用 | F：12个不同注入位置/12个既有JUnit PASS，按各项不变量计数；10项Core11、2项真实本地容器Workers09，不重复计参数变体 | 本地位置数门槛已满足；不扩大为通用无重复副作用或外部/生产验收通过，边界见短表 |
 | L5与G4七天 | 实际群、手机、原生登录/重连/回声、目标Linux amd64和七天shadow均未执行 | NOT_RUN |
 
-当前09镜像同25b的证明与历史06分列，完整commit/tree、镜像、锁、schema和轨迹见[实现状态](IMPLEMENTATION_STATUS.md)。最终有效预算用量上界21.023746 CNY，gross settled55.079718为估算，unknown2笔0.168044保留；daily/total仍50、revision1，历史user-reported实扣仅4.83，后续完整实扣未回传。该上界不作账单、退款或新额度，见[费用说明](LOCAL_VALIDATION_PROGRESS.md#费用与仍待完成的门槛)。
+当前09镜像同25b的证明与历史06分列，完整commit/tree、镜像、锁、schema和轨迹见[实现状态](IMPLEMENTATION_STATUS.md)。25b历史有效预算用量上界21.023746 CNY，gross settled55.079718为估算，unknown2笔0.168044保留；daily/total仍50、revision1，该阶段当时user-reported实扣4.83；最新累计报告11.65及Owner对账见修复报告。该上界不作账单、退款或新额度，见[费用说明](LOCAL_VALIDATION_PROGRESS.md#费用与仍待完成的门槛)。
 
 当前扫描65项Python依赖0 known vulns、327可发表文件0leaks、wheel147/sdist328条私有0，不扩大到系统依赖或目标服务器。历史代码head7a268…的[CI43632514186](https://github.com/huchenzi0609-creator/GroupAgent/actions/runs/43632514186)四job全success；最新提交CI以[PR #8 checks](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)为准，不预判后续head。[PR #8](https://github.com/huchenzi0609-creator/GroupAgent/pull/8)仍draft/base未合并[PR #1](https://github.com/huchenzi0609-creator/GroupAgent/pull/1)。
 

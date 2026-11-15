@@ -4,14 +4,16 @@
 
 用户已排除独立插画服务与视频处理。保留图片理解、OCR、程序绘图、四种文档、语音、搜索、自然语言任务与有限调度。旧生产机器人、实际微信群、旧数据库和服务器均未用于本轮测试。
 
-## 已取得的证据
+**最新修复见[四项失败修复报告](FOUR_FAILURE_REPAIR.md)。** 当前c411/122py（freeze18）的core18为2134 PASS/52 SKIP/31 DESELECTED/158.30秒，worker19为110 PASS/零skip/284.07秒；mypy122/Ruff/format285、images18同源通过，新增第52项core skip已在worker覆盖。focus22三任务均completed，Chart02全11硬checks/像素绑定通过、双WEB本轮sidecar review PASS；原raw1 PASS/2 NEEDS_REVIEW保留，未作统一3/3汇总。full22已在同一c411源码、images18和固定checkerfa下完成30/30 PASS；必要语义/视觉复核均绑定本轮产物，最终零付费汇总未增加调用。Owner audit282332已实际应用用户累计11.65基准，原50/50 policy与revision1不变，unknown5/held0.562140继续保留；最终有效上界17.266165含后续suffix保守估算与原unknown预留，非控制台实扣。
+
+## 此前25b及更早证据归档
 
 | 范围 | 实际结果与边界 |
 | --- | --- |
-| 当前冻结源码 | src SHA256`25b1be619b9e6a55ad328ada603aaed7accfef63a1b4856b965f52377d66296a`；源码提交974edd7，后续仅测试提交946ce37未改产品源码。schema001—012未改，无013应用；最新提交CI见[PR #8 checks](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)。 |
-| 当前core11 | 1727 PASS、51 SKIP、28 DESELECTED，106.98秒；`runtime/ci/final-core-11.xml/log`，绑定25b。core09/10各1项fixture错误FAIL原日志保留，仅修测试后确定性通过；不计skip为能力通过。 |
-| 当前09镜像同源与worker | worker350ac689…、Harness377a2cf1…全120py与25b一致；完整ID见[实现状态](IMPLEMENTATION_STATUS.md)，`frozen-image-source-proof-09.json`。worker09为97 PASS/零skip/258.17秒，`runtime/ci/final-workers-09.log/.xml`。复用固定依赖层，无native独立重现声明。 |
-| 当前快受理后执行03 | 3/3 PASS；`runtime/live/fast-admission-execution-03/`。真实Harness/09镜像执行、未held；Markdown、独立解码核对3页及标题的PPT、Python实际ToolReceipt输出391均有本地接受回执，前后25b不变。与原30任务分母分列。 |
+| 此前25b冻结源码 | src SHA256`25b1be619b9e6a55ad328ada603aaed7accfef63a1b4856b965f52377d66296a`；源码974edd7/测试946ce37，schema001—012保持。此处归档不替代当前候选；最新提交CI见[PR checks](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)。 |
+| 此前core11 | 1727 PASS、51 SKIP、28 DESELECTED，106.98秒；`runtime/ci/final-core-11.xml/log`，绑定25b。core09/10各1项fixture错误FAIL原日志保留，仅修测试后通过；不计skip为能力通过。 |
+| 此前09镜像与worker | worker350ac689…、Harness377a2cf1…全120py与25b一致；完整ID见[实现状态](IMPLEMENTATION_STATUS.md)，`frozen-image-source-proof-09.json`。worker09为97 PASS/零skip/258.17秒，`runtime/ci/final-workers-09.log/.xml`。不移作当前候选结果。 |
+| 此前快受理执行03 | 3/3 PASS；`runtime/live/fast-admission-execution-03/`。真实Harness/09镜像执行、未held；MD、3页/标题PPT、Python391均有本地接受，绑定25b。与原30和新08分列。 |
 | 最终同源短答/接单 | `perf-live-final`各30/30、0失败，P95保守上界短答6.200338417秒PASS、接单2.044179791秒PASS；前后25b不变。短答真实Model，长任务为真实规则快路、无预Model账单且held执行lane，执行另以03三例证明。 |
 | 最终同源取消 | `perf-cancel-final`：30/30全正确、0失败，旧租约工具调用均被拒绝；P95保守上界1.175423541秒PASS，前后25b不变。固定provider、真实PG/gateway，无Model费用，不冒称真实Model取消。 |
 | 历史core07 | 1667 PASS、51 SKIP、28 DESELECTED，130.95秒，`runtime/ci/final-core-07.log` / `.xml`；绑定`6fcb2b39…`。当前25b以core11单列，不能移用旧计数。 |
@@ -25,7 +27,7 @@
 | 真实闭环冒烟 | Python计算、Markdown交付、中文Word交付 3/3，通过真实 DeepSeek、Harness、隔离进程和本地消息通道。Word两页另做视觉抽查，未发现缺字、空白页、溢出或遮挡。 |
 | 最新自然语言固定集 | `interaction-release-06`：264条独立Agent预标注样例，246 PASS、18 FAIL；请求召回215/219（98.1735%），误介入0/32，其余13条observe 11/reply 2；禁止写候选0、实际业务写入0。候选P95 2.419秒，不是daemon接收至outbox性能。 |
 | 真实恢复与隐私 | PostgreSQL dump/空库恢复、恢复隔离、外置fsync删除日志、原始资料到期、已验证文档独立保留、版本级物理清理、任务字段来源及删除权限均有合成数据回归。实际旧库尚未迁移。 |
-| 当前依赖、凭据与打包 | Python65项0 known vulns（`runtime/final-python-audit-09.json`）；Gitleaks327个可发布文件0leaks（`runtime/ci/final-gitleaks-09.log`）；wheel147/sdist328条私有0（`runtime/package-content-check-final-09.json`）。build成功；仅代表此快照，不涵盖系统包或真实通道。 |
+| 此前依赖、凭据与打包 | Python65项0 known vulns、327文件0leaks、wheel147/sdist328私有0，原09快照保留。不是当前候选扫描或打包结果，也不涵盖系统包/真实通道。 |
 
 release06的`manifest.json`记录源码SHA256为`88a5999ed5454631b4cf93d4c06a68d6aeebb5b0d9ac53d5b9f0b30c4eb369de`，运行前后未变。`result.json`保留原始候选结果，`gated-participation.json`按真实`service._gate`离线计算固定219/32分母；使用默认natural模式、无持久群/静默覆盖且独立窗口主动计数为0。这些结果不代表未见样本泛化、人类最终标注、实际业务成功率或规定性能SLO。
 
@@ -76,18 +78,22 @@ Chart02的原产物追加一次真实云OCR，接口未获得prompt/gold，提�
 
 ## 费用与仍待完成的门槛
 
+本节21.023746及其明细属于此前25b轮/07前历史口径，原数据保留。当前已实际应用用户新累计11.65 CNY的Owner schema2审计282332；基准上界12.212140包含保留的5 unknown/held0.562140，随后suffix仍保守估算。原50 policy/revision1未变，新完整full22正式30/30 PASS、最终有效上界17.266165，见[修复报告](FOUR_FAILURE_REPAIR.md)。
+
 用户报告：截至2026-11-14 23:00（Asia/Shanghai）前，DeepSeek控制台显示测试实际总扣费为 **4.83元**；这是用户报告的控制台金额（`user_reported_deepseek_console`），不含该时点之后的调用。记录保存在 `runtime/billing/console-report-20261114.json`。
 
 同一历史前缀的 **39.054016元** 是计量用量与保守价格表计算的估算，账本字段`actual`仍表示这种估算。Root通过可信Owner API，以截至2026-11-14 22:59:59（Asia/Shanghai）的2203笔terminal记录核对count/gross后，追加`user_reported_provider_console`审计111620，将有效预算口径中的此前缀替换为报告的4.83元；原reservation、gross、价格和全部预留不改。daily/total policy均50.000000、revision1未变，未新建账本或额度。
 
 历史应用快照（2026-11-15 00:36:38，Asia/Shanghai）为gross settled48.907864、unknown held0.108410，有效累计上界14.792258 CNY，证据`runtime/billing/applied-console-reconciliation.json`；它不含后续OCR/性能调用，现由下面最终快照补齐。该口径依赖Owner报告准确完整，不是新的供应商实扣；同一50元预算不因对账退款、重置或另开额度，历史预留合计也不作收费额。
 
-最终快照`runtime/billing/final-verification-report.json`（2026-11-15 03:42:30，Asia/Shanghai）记录2808笔settled、gross settled **55.079718 CNY保守估算**，以及2笔unknown预留 **0.168044 CNY**，均未伪结算。有效预算用量上界为`55.079718 + 0.168044 - 39.054016 + 4.83 = 21.023746 CNY`，basis为`owner_reported_prefix_plus_conservative_suffix`。policy daily/total均50、revision1始终未改。此上界和gross都不是实际账单或扣费；截至23:00前的4.83是唯一用户报告的实扣，后续完整控制台金额尚未回传。原始记录、unknown和审计111620均保留，不退款、不清账、不另开额度。
+此前25b轮最终快照`runtime/billing/final-verification-report.json`（2026-11-15 03:42:30，Asia/Shanghai）记录2808 settled、gross55.079718保守估算、unknown2/held0.168044、上界21.023746 CNY；仅属旧4.83报告口径，不覆盖最新用户累计11.65。新报告证据为`runtime/billing/console-report-20261115-1165.json`，实际Owner应用为`runtime/billing/console-reconciliation-20261115-1165.json`：schema2 audit282332/prev111620、基准上界12.212140、3974 settled/5 unknown不变；原policy/prices/reservations全量hash一致，旧46.821060上界及gross80.482936估算保留，非退款/重置额度/伪settle。
 
-对账不暴露给模型、自然语言或群通道，仅有受信本地Owner API。审计为应用级追加，payload/hash链和已对账prefix不符会失败关闭；没有DB强制不可变或connector验票的承诺，原用户报告证据仍保留。
+对账只供受信本地Owner API，不暴露给模型/自然语言/群通道。旧默认含unknown仍拒绝；新显式opt-in累计模式仅替换settled前缀估算，所有unknown/预留继续held，即使用户累计可能已含其真实费用也保守覆盖。报告as_of取Root接收“当前”答复的2026-11-15 06:21:31 UTC，用户未给精确查询时刻、期间paid/active已空；不是独立connector验票。审计仅应用级追加，prefix/hash异常失败关闭，不承诺DB强制不可变；旧V1审计及报告保留。
 
 历史取消03（798e）保守P95 **1.1299235秒**PASS、并行负载01/02的2.228/3.320秒FAIL均保留；最终取消采用同25b的独立30样本和1.175423541秒，不用历史样本补当前分母。最终费用上界已按上述快照记录，不等同新实扣。
 
 [PR #8](https://github.com/huchenzi0609-creator/GroupAgent/pull/8)仍draft，base为未合并[PR #1](https://github.com/huchenzi0609-creator/GroupAgent/pull/1)。已验证代码remote`7a268eba0e50b33ba4f108f348da3c9c64bf368e`与本地946ce37同tree292292ed…，[CI43632514186](https://github.com/huchenzi0609-creator/GroupAgent/actions/runs/43632514186)双core/render/isolated-worker四job全success。core11、worker09、09同源、执行03、最终三性能与扫描/账本各有绑定版本；最新提交CI以[PR #8 checks](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)为准，历史成功不预判未来head。
 
 全部L5、真实微信文件/语音/回声/登录恢复、目标Linux amd64服务器与容量、至少7天试运行均为NOT_RUN；本地通过不能替代这些门槛，也不构成全功能完成或上线批准。
+
+855dd094绿仅属修复前历史。当前c411 focus22取得必要checks/reviews、原raw1 PASS/2 NEEDS_REVIEW保留；full22正式30/30 PASS，最终有效上界17.266165；账本及发布证据见[修复报告](FOUR_FAILURE_REPAIR.md)，最新CI见[PR #8 checks](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)。
