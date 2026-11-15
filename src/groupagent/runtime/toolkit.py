@@ -166,6 +166,95 @@ _REMINDER_INSTRUCTION = (
 )
 
 
+_RESEARCH_AMOUNT = re.compile(
+    # A long unrelated digit run must not be retried from every character with
+    # an unbounded greedy suffix. These are human-readable extraction counts.
+    r"(?<![\d,._])\d[\d,._]{0,24}(?![\d,._])(?:\s*[kKmM])?\s*(?:个\s*)?"
+    r"(?:utf-?8\s*)?(?:字节|字符|码点|词元|bytes?|chars?|characters?|tokens?|unicode\s+code\s*points?)",
+    re.I,
+)
+_RESEARCH_METER_BRIDGE = (
+    r"(?:\s|[:：,，()（）-]|到|了|的|正文|内容|长度|大小|上限|限制|额度|预算|总共|共|仅|只|"
+    r"最多|约|为|是|有|已|the|source|page|content|body|response|was|is|has|been|to|at|of|only|"
+    r"about|limited|truncated|up\s+to){0,25}"
+)
+_RESEARCH_METER_PREFIX = re.compile(
+    r"(?:"
+    r"(?:我(?:们)?(?:本次|这次|此次)?|本次|这次|此次|该工具|工具|\bI\b|\bwe\b|\bthe tool\b|\bour tool\b)"
+    r"(?:\s|实际|仅|只|已|本次|这次|工具|have|has|only|actually){0,8}"
+    r"(?:抓取|读取|读回|收到|返回|下载|截断|传输|fetch(?:ed)?|read|receiv(?:ed)?|return(?:ed)?|retriev(?:ed)?|truncat(?:ed|e))"
+    r"|(?:the\s+)?(?:fetched|retrieved|returned|received)\s+(?:content|body|page|response)"
+    r")" + _RESEARCH_METER_BRIDGE + r"$",
+    re.I,
+)
+
+
+def _research_metrics_requested(text: str) -> bool:
+    if not re.search(
+        r"抓取|读取|返回|响应|工具|截断|传输|下载|编码|unicode|utf.?8|fetch|retriev|response|tool|truncat|encod",
+        text,
+        re.I,
+    ):
+        return False
+    # A prohibition that mentions counts is not a request for them. Check each
+    # clause so "do not confuse the units; report both counts" still works.
+    for clause in re.split(r"[。!?！？\n，,；;]", text):
+        if re.search(
+            r"(?:不要|不用|不必|无需|不需要|勿|(?<!分)别)(?:再|向我)?"
+            r"(?:报告|统计|披露|显示|输出|提供|说明|计算|列出|给出|提及)|"
+            r"(?:\bdo\s+not|\bdon['’]t|\bno\s+need\s+to)\s+"
+            r"(?:report|count|measure|include|show|disclose|provide)\b|"
+            r"\bwithout\s+(?:reporting|counting|measuring|showing|disclosing)\b",
+            clause,
+            re.I,
+        ):
+            continue
+        if re.search(
+            r"多少|多长|计数|统计|计量|长度|字节数|字符数|token数|诊断|count|length|size|how many|diagnos",
+            clause,
+            re.I,
+        ):
+            return True
+    return False
+
+
+def _has_internal_research_metrics(text: str) -> bool:
+    """Match retrieval measurements, not ordinary domain facts or timestamps."""
+    if re.search(r"\bcontent_bytes_(?:received|returned)\s*[=:：]\s*\d", text, re.I):
+        return True
+    for amount in _RESEARCH_AMOUNT.finditer(text):
+        prefix = re.split(r"[。!?！？\n]", text[max(0, amount.start() - 140) : amount.start()])[-1]
+        if _RESEARCH_METER_PREFIX.search(prefix):
+            return True
+    return False
+
+
+def _research_source_metrics(source: dict[str, Any]) -> dict[str, Any]:
+    """Keep real receipt units visible even when the narrative excerpt is cut."""
+    result = {
+        key: source[key]
+        for key in (
+            "source_id",
+            "url",
+            "citation",
+            "retrieved_at",
+            "operation",
+            "evidence_kind",
+            "content_sha256",
+            "truncated_fields",
+        )
+        if key in source
+    }
+    for key in ("content_bytes_received", "content_bytes_returned"):
+        if key in source:
+            result["receipt_" + key] = source[key]
+    content = source.get("content")
+    if isinstance(content, str):
+        result["observed_content_utf8_bytes"] = len(content.encode("utf-8"))
+        result["observed_content_unicode_codepoints"] = len(content)
+    return result
+
+
 class PublishInput(ToolData):
     version_ids: tuple[str, ...] = Field(min_length=1, max_length=20)
 
@@ -838,6 +927,7 @@ class WorkToolkit:
                         "For a text-only question, answer directly from the actual tool evidence once it resolves the question; do not invent an output file, export inputs or search unrelated history. Research excerpts explicitly report truncation; do not claim to have read omitted text.",
                         "For concise research explanations, give the requested facts, links and retrieval times. Do not add code examples or demonstrations unless the user asks for them. When an example is requested, verify every input/output against actual tool/source evidence; preserve all values rather than inventing a plausible result.",
                         "For research deliverables, cite only sources returned by successful web_search/web_fetch calls and copy each cited source.citation alongside that link. It records the actual retrieval time in UTC; you may additionally show local time. Do not substitute a publication date, the current clock, or another source's time. A search result observation is not proof of reading the full page.",
+                        "In research answers, omit unrequested internal fetch/read/truncation sizes, byte/character counts and token budgets. Explain meaningful evidence limits qualitatively. Only an explicit measurement/encoding diagnostic request calls for those figures: receipt content_bytes_* are UTF-8 bytes; len(source.content) counts Unicode code points, not bytes or tokens. Verify each requested value against actual returned content/receipts; a configured limit is not an observed count, and missing token evidence is not zero. Never hide a real truncation limitation.",
                         "When artifact_deliver is absent from this goal's tool catalog, plain text is the deliverable. Do not create or export a file; finish with the supported answer or use request_input only for genuinely missing information.",
                         "Default to concise natural Chinese. A candidate is not yet delivered; do not claim that it was sent.",
                         "Write only the final user-facing content; do not add internal labels such as candidate, awaiting validation, or not sent yet. For a short question use 1–3 short sentences plus the requested example and source link. Prefer a concise paraphrase to long webpage quotations.",
@@ -1112,6 +1202,7 @@ class WorkToolkit:
         observations = []
         source_urls: set[str] = set()
         research_sources: list[dict[str, Any]] = []
+        research_metrics: list[dict[str, Any]] = []
         for receipt in snapshot.receipts:
             if not receipt.success:
                 continue
@@ -1127,6 +1218,13 @@ class WorkToolkit:
                         if isinstance(source, dict) and isinstance(source.get("url"), str):
                             source_urls.add(str(source["url"]))
                             research_sources.append(source)
+                            research_metrics.append(
+                                {
+                                    "tool": receipt.tool_name,
+                                    "call_id": receipt.call_id,
+                                    **_research_source_metrics(source),
+                                }
+                            )
             observations.append(
                 {
                     "tool": receipt.tool_name,
@@ -1142,6 +1240,15 @@ class WorkToolkit:
                     "Requested research requires actual research tool evidence and citations to retrieved sources",
                 )
             validate_research_citations(full_answer, research_sources, require_access_time=True)
+            if (
+                not outputs
+                and not _research_metrics_requested(original_event.text)
+                and _has_internal_research_metrics(answer)
+            ):
+                raise DomainError(
+                    "validation_failed",
+                    "Remove unrequested internal retrieval measurements; retain requested facts/citations and explain actual evidence limits qualitatively. Bytes, Unicode code points and tokens are different units; do not rewrite unsupported counts as another unit.",
+                )
             examples_requested = bool(
                 re.search(
                     r"示例|例子|举例|实例|演示|代码|程序|example|demo|\bcode\b",
@@ -1191,6 +1298,7 @@ class WorkToolkit:
                             + "结合original_request和真实提取证据理解用户词义；当前goal和criteria仍决定后续授权变更。"
                             "报告中的标识码不因此需要满足程序代码语法。只按用户要求和已有证据核验，不添加用户未要求的标准。"
                             "任何实际给出的代码、算术或示例输入/输出也属于需核对的事实；逐项核对数量、元素、数值及输出，核心结论正确不能抵消示例丢元素或算错。未请求示例时以简短所需事实为准，不要求补例子。"
+                            "研究答复默认不公开未请求的内部抓取/读取/截断字节数、字符数或token预算；真实证据限制可定性说明，不得隐瞒截断。明确诊断请求的数值必须逐项核对research_source_metrics：receipt_content_bytes_*单位为UTF-8字节，observed_content_unicode_codepoints是实际收到content的Unicode码点数，不是字节、字形或token。正文摘录省略不影响这些独立列出的receipt单位证据；缺少token证据不能猜测为零，收到部分正文不代表已读省略部分。"
                             "标题声明用的书名号/引号通常是引用定界标记；除非用户明确要求保留符号，不得仅因实际标题省略这些定界符而拒绝。"
                             "PPT的metadata.title是从实际文件读回的主题元数据；当原文逐页指定了不同标题且未要求可见展示主题时，不要求把主题重复塞进页内文字、增加封面或改变指定标题。"
                             "document_read中unit.editable仅表示当前机器人文本编辑接口是否支持该unit，不表示Office对象本身不可编辑。metadata.native_table_count来自实际Office结构；正数证明含原生可编辑表格，不能因聚合unit的editable:false把它误判成图片。零或缺失不能证明原生表格，不得把纯文本画格或截图当作原生表格。"
@@ -1221,6 +1329,7 @@ class WorkToolkit:
                                         "answer": answer,
                                         "artifacts": excerpts,
                                         "tool_evidence": observations,
+                                        "research_source_metrics": research_metrics,
                                         "capabilities": "Scoped files, public research, isolated compute, approved media and finite scheduling only. No email, purchases, payments or external-account submissions. File delivery happens after this check, never before.",
                                     },
                                     ensure_ascii=False,
