@@ -38,6 +38,7 @@ from groupagent.memory import MemberService, MemoryService
 from groupagent.memory.retrieval import visible_events
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
+from groupagent.runtime.tool_selection import message_only_research_request
 from groupagent.scheduling import Scheduler
 from groupagent.scheduling.reminders import extract_reminder_body, is_time_only_reminder_change
 
@@ -62,6 +63,7 @@ from .intent import (
     explicitly_requires_execution,
     main_request,
     new_work_intent,
+    requests_speech_reply,
     requires_research,
     task_write_request,
 )
@@ -1590,8 +1592,20 @@ class ConversationCoordinator(Coordinator):
                                 for identifier in task_ids
                             }
                     elif decision.kind == "start_work":
+                        planner_outputs: list[JsonValue] = [value for value in decision.outputs]
+                        message_only = bool(
+                            event.kind == EventKind.TEXT
+                            and not event.reply_to
+                            and not event.attachments
+                            and not decision.input_versions
+                            and not decision.input_event_ids
+                            and message_only_research_request(event.text)
+                        )
                         outputs = [
-                            OutputRequirement.model_validate(value) for value in decision.outputs
+                            OutputRequirement.model_validate(value)
+                            for value in (
+                                [{"format": "text"}] if message_only else decision.outputs
+                            )
                         ]
                         formats = {item.format for item in outputs}
                         if (
@@ -1626,14 +1640,7 @@ class ConversationCoordinator(Coordinator):
                             actor, event.id, topic_id, evidence_event_ids=[event.id]
                         )
                         request_text = str(context["model_event"].get("text", event.text))
-                        speech_requested = bool(
-                            re.search(
-                                r"语音(?:回复|回答)|朗读|读出来|读给我|念给我|说给我听",
-                                request_text,
-                            )
-                        ) and not bool(
-                            re.search(r"(?:不要|不用|别).{0,5}(?:语音|朗读)", request_text)
-                        )
+                        speech_requested = requests_speech_reply(request_text)
                         if speech_requested and not self.config.features.speech_reply_on_request:
                             raise DomainError("feature_disabled", "Speech output is disabled")
                         delivery_artifacts = not bool(
@@ -1700,9 +1707,13 @@ class ConversationCoordinator(Coordinator):
                             | set(snapshot.get("retained_context_source_ids", []))
                         )
                         work = tx.create_work(
-                            decision.goal or "",
+                            event.text if message_only else decision.goal or "",
                             event.id,
-                            acceptance_criteria=decision.acceptance_criteria,
+                            acceptance_criteria=[
+                                "完成原始请求中的全部说明、事实及来源要求，以有证据的文字消息交付，不增加原文未要求的附件。"
+                            ]
+                            if message_only
+                            else decision.acceptance_criteria,
                             input_versions=decision.input_versions,
                             scope={
                                 "allowed_group_ids": [actor.group_id],
@@ -1717,6 +1728,8 @@ class ConversationCoordinator(Coordinator):
                                 "attachment_event_ids": [str(value) for value in attachment_ids],
                                 "retained_fact_source_ids": retained,
                                 "outputs": [item.model_dump(mode="json") for item in outputs],
+                                "research_message_only": message_only,
+                                "planner_outputs": planner_outputs,
                                 "admission_path": "deterministic_current_request"
                                 if fast_admitted
                                 else "provider_candidate",

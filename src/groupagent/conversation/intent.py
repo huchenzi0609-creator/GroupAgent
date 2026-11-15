@@ -386,3 +386,13 @@ def requires_research(text: str) -> bool:
     A separate positive request or actual URL still requires real tool evidence.
     """
     return bool(_POSITIVE_RESEARCH.search(_NEGATIVE_RESEARCH.sub(" ", text)))
+
+
+def requests_speech_reply(text: str) -> bool:
+    """Explicit delivery wording shared by admission and media permission."""
+    return bool(
+        re.search(
+            r"语音(?:回复|回答|讲给我听)|音频(?:回复|回答)|朗读|读出来|读给我|念给我|说给我听", text
+        )
+        and not re.search(r"(?:不要|不用|别).{0,5}(?:语音|音频|朗读)", text)
+    )

@@ -12,7 +12,12 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from groupagent.conversation.intent import requires_research
+from groupagent.conversation.intent import (
+    main_request,
+    requests_speech_reply,
+    requires_research,
+    task_write_request,
+)
 from groupagent.domain import DomainError, WorkOrder
 from groupagent.scheduling.reminders import get_reminder_body
 
@@ -99,6 +104,58 @@ _ADDITIONAL_DELEGATION = re.compile(
 )
 
 
+def message_only_research_request(text: str) -> bool:
+    """A canonical information request cannot implicitly authorize a new file.
+
+    URLs, code and quoted examples are data. Explicit file/report/format clauses
+    remain file requests; ambiguous or operational goals keep their existing plan.
+    """
+    if not text.strip() or len(text) > 12_000:
+        return False
+    outside = re.sub(
+        r'```.*?```|~~~.*?~~~|“[^”]*”|「[^」]*」|『[^』]*』|《[^》]*》|"[^"\n]*"|\'[^\'\n]*\'',
+        " <quoted data> ",
+        text,
+        flags=re.S,
+    )
+    if not requires_research(outside):
+        return False
+    outside = re.sub(r'https?://[^\s<>，。；！？“”「」『』"\'\u4e00-\u9fff]+', " <url> ", outside)
+    if requests_speech_reply(outside):
+        return False
+    if (
+        _COMPUTE.search(outside)
+        or task_write_request(outside)
+        or _SCHEDULING.search(outside)
+        or _requires_memory(outside)
+    ):
+        return False
+    for clause in re.split(
+        r"[，,。；;\n]|\b(?:and|then|also)\b|并且|同时|然后|最后|另外|"
+        r"并(?=生成|制作|保存|导出|写成|输出|交付|提供|撰写|形成)",
+        outside,
+        flags=re.I,
+    ):
+        clause = main_request(re.sub(r"^(?:并且|并|同时|然后|最后|另外)\s*", "", clause.strip()))
+        if _FILE_OUTPUT.search(clause) or re.search(
+            r"(?:输出|交付|提供|撰写|写一份|形成).{0,24}(?:文件|报告|文档|附件)"
+            r"|(?:结果|输出|交付|格式).{0,12}(?:Markdown|PDF|Word|DOCX|PPTX?|CSV|\.md\b)"
+            r"|(?:以|采用|用)\s*(?:Markdown|PDF|Word|DOCX|PPTX?|CSV)\s*(?:文件|文档|格式)"
+            r"|\b(?:as|in|using)\s+(?:a\s+)?(?:PDF|Markdown|Word|DOCX|PPTX|CSV)\s+(?:file|report|format)\b"
+            r"|(?:保存|导出|写入)(?:为|成|到)?\s*<quoted data>",
+            clause,
+            re.I,
+        ):
+            return False
+    return bool(
+        re.search(
+            r"说明|解释|回答|比较|对比|区别|差异|简短|简要|总结|概括|摘要|summari[sz]|explain|difference|compare|brief|answer",
+            outside,
+            re.I,
+        )
+    )
+
+
 def _required(work: WorkOrder, available: frozenset[str]) -> frozenset[str]:
     raw = work.scope.get("required_tools", [])
     if (
@@ -156,6 +213,22 @@ def select_tools(
     raw_formats = [ref.get("format") if isinstance(ref, Mapping) else None for ref in input_refs]
     formats = [value.casefold() if isinstance(value, str) else None for value in raw_formats]
     profile: frozenset[str] | None = None
+    if work.scope.get("research_message_only") is True and work.goal_revision == 1:
+        if (
+            not research
+            or not text_only
+            or input_refs
+            or work.input_versions
+            or work.scope.get("attachment_event_ids")
+            or derived
+            or team_write
+        ):
+            raise DomainError("scope_violation", "Message-only research scope is inconsistent")
+        if not required.issubset(_WEB_TOOLS):
+            raise DomainError(
+                "permission_denied", "Message-only research cannot require file or execution tools"
+            )
+        return available & _WEB_TOOLS
 
     # A reminder tells the requester to act. Its quoted/action text is not an
     # instruction for the agent to execute Python, inspect files or do that job.

@@ -1084,6 +1084,11 @@ class WorkToolkit:
             for row in self.registry.outputs(actor, work.id, lease.goal_revision)
             if row["purpose"] == "result"
         ]
+        if work.scope.get("research_message_only") is True and work.goal_revision == 1 and outputs:
+            raise DomainError(
+                "validation_failed",
+                "This canonical request is message-only research; do not add an unrequested artifact delivery",
+            )
         with self.store.transaction(actor) as tx:
             original_event = tx.get_event(work.request_event_id)
         requirements = _output_requirements(work, original_event)
