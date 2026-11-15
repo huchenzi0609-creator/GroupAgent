@@ -218,8 +218,24 @@ def _research_metrics_requested(text: str) -> bool:
     return False
 
 
-def _has_internal_research_metrics(text: str) -> bool:
+def _has_internal_research_metrics(text: str, *, request_text: str = "") -> bool:
     """Match retrieval measurements, not ordinary domain facts or timestamps."""
+    # Translation can legitimately introduce a new-language version of a
+    # measurement sentence. Let semantic review see the full text and receipts
+    # rather than treating translated source data as this runtime's operation.
+    if re.search(r"翻译|translat", request_text, re.I):
+        return False
+    if re.search(r"原样|逐字|原文|引用|quote|verbatim|literal", request_text, re.I):
+        for quoted in re.finditer(
+            r'“([^“”\n]{1,1200})”|‘([^‘’\n]{1,1200})’|"([^"\n]{1,1200})"|'
+            r"'([^'\n]{1,1200})'|「([^「」\n]{1,1200})」|『([^『』\n]{1,1200})』|`([^`\n]{1,1200})`",
+            request_text,
+        ):
+            literal = next(value for value in quoted.groups() if value is not None)
+            if _has_internal_research_metrics(literal):
+                # Classify a copy; semantic review and delivery retain the
+                # unchanged original answer, including every quotation.
+                text = text.replace(literal, "[requested quoted text]")
     if re.search(r"\bcontent_bytes_(?:received|returned)\s*[=:：]\s*\d", text, re.I):
         return True
     for amount in _RESEARCH_AMOUNT.finditer(text):
@@ -928,6 +944,7 @@ class WorkToolkit:
                         "For concise research explanations, give the requested facts, links and retrieval times. Do not add code examples or demonstrations unless the user asks for them. When an example is requested, verify every input/output against actual tool/source evidence; preserve all values rather than inventing a plausible result.",
                         "For research deliverables, cite only sources returned by successful web_search/web_fetch calls and copy each cited source.citation alongside that link. It records the actual retrieval time in UTC; you may additionally show local time. Do not substitute a publication date, the current clock, or another source's time. A search result observation is not proof of reading the full page.",
                         "In research answers, omit unrequested internal fetch/read/truncation sizes, byte/character counts and token budgets. Explain meaningful evidence limits qualitatively. Only an explicit measurement/encoding diagnostic request calls for those figures: receipt content_bytes_* are UTF-8 bytes; len(source.content) counts Unicode code points, not bytes or tokens. Verify each requested value against actual returned content/receipts; a configured limit is not an observed count, and missing token evidence is not zero. Never hide a real truncation limitation.",
+                        "Preserve user-requested quotations and translations as source data. Quoting a sentence does not mean this runtime performed its described operation. Other actual-operation claims still need real evidence.",
                         "When artifact_deliver is absent from this goal's tool catalog, plain text is the deliverable. Do not create or export a file; finish with the supported answer or use request_input only for genuinely missing information.",
                         "Default to concise natural Chinese. A candidate is not yet delivered; do not claim that it was sent.",
                         "Write only the final user-facing content; do not add internal labels such as candidate, awaiting validation, or not sent yet. For a short question use 1–3 short sentences plus the requested example and source link. Prefer a concise paraphrase to long webpage quotations.",
@@ -1243,7 +1260,7 @@ class WorkToolkit:
             if (
                 not outputs
                 and not _research_metrics_requested(original_event.text)
-                and _has_internal_research_metrics(answer)
+                and _has_internal_research_metrics(answer, request_text=original_event.text)
             ):
                 raise DomainError(
                     "validation_failed",
@@ -1299,6 +1316,7 @@ class WorkToolkit:
                             "报告中的标识码不因此需要满足程序代码语法。只按用户要求和已有证据核验，不添加用户未要求的标准。"
                             "任何实际给出的代码、算术或示例输入/输出也属于需核对的事实；逐项核对数量、元素、数值及输出，核心结论正确不能抵消示例丢元素或算错。未请求示例时以简短所需事实为准，不要求补例子。"
                             "研究答复默认不公开未请求的内部抓取/读取/截断字节数、字符数或token预算；真实证据限制可定性说明，不得隐瞒截断。明确诊断请求的数值必须逐项核对research_source_metrics：receipt_content_bytes_*单位为UTF-8字节，observed_content_unicode_codepoints是实际收到content的Unicode码点数，不是字节、字形或token。正文摘录省略不影响这些独立列出的receipt单位证据；缺少token证据不能猜测为零，收到部分正文不代表已读省略部分。"
+                            "用户要求原样引用或翻译的句子按被引用数据检查，不能当作机器人本次实际操作声明；其它额外计量仍需核对，不因存在引文或翻译而自动通过。"
                             "标题声明用的书名号/引号通常是引用定界标记；除非用户明确要求保留符号，不得仅因实际标题省略这些定界符而拒绝。"
                             "PPT的metadata.title是从实际文件读回的主题元数据；当原文逐页指定了不同标题且未要求可见展示主题时，不要求把主题重复塞进页内文字、增加封面或改变指定标题。"
                             "document_read中unit.editable仅表示当前机器人文本编辑接口是否支持该unit，不表示Office对象本身不可编辑。metadata.native_table_count来自实际Office结构；正数证明含原生可编辑表格，不能因聚合unit的editable:false把它误判成图片。零或缺失不能证明原生表格，不得把纯文本画格或截图当作原生表格。"

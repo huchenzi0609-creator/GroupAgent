@@ -67,6 +67,26 @@ def test_long_unrelated_digit_run_does_not_stall_research_delivery():
 
 
 @pytest.mark.parametrize(
+    "quotation",
+    ["‘I read 3200 characters.’", '"I read 3200 characters."', "`I read 3200 characters.`"],
+)
+def test_exact_requested_quotations_are_data_but_other_operation_claims_are_not(quotation):
+    request = f"请查阅公开资料，原样引用我给出的句子{quotation}并给来源。"
+    answer = f"原句：{quotation}"
+    assert not _has_internal_research_metrics(answer, request_text=request)
+    assert _has_internal_research_metrics(
+        answer + "\nThe tool returned 15000 bytes.", request_text=request
+    )
+    assert _has_internal_research_metrics(answer, request_text="请查阅并给出引用来源。")
+
+
+def test_translation_uses_semantic_review_without_converting_data_into_operation_claims():
+    request = "请联网查阅资料，把‘I read 3200 characters.’翻译成中文。"
+    answer = "原句：I read 3200 characters. 译文：我读取了3200个字符。"
+    assert not _has_internal_research_metrics(answer, request_text=request)
+
+
+@pytest.mark.parametrize(
     "text,expected",
     [
         ("请检索官方资料，简短说明差别，给链接和访问时间。", False),
@@ -196,3 +216,45 @@ async def test_long_actual_fetch_retains_separate_byte_and_codepoint_evidence(
     assert any(
         "omit unrequested internal fetch/read/truncation sizes" in item for item in instructions
     )
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("translation", [False, True])
+async def test_requested_literal_and_translation_reach_semantic_review_unchanged(
+    toolkit_setup, translation
+):
+    setup = toolkit_setup
+    request = "请查阅公开资料解释计量，原样引用我给出的句子‘I read 3200 characters.’并给实际来源和访问时间。"
+    if translation:
+        request += "请把这句翻译成中文。"
+    run = await prepare(
+        setup, scope={"research_required": True}, goal=request, request_text=request
+    )
+    fetched = await call(run, "web_fetch", {"url": "https://example.com/source"})
+    assert fetched.success
+    answer = "你提供的原句：‘I read 3200 characters.’"
+    if translation:
+        answer += " 译文：我读取了3200个字符。"
+    answer += "\n" + fetched.output["source"]["citation"]
+    accepted = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, candidate(run, answer, (fetched,)), run.workspace
+    )
+    assert accepted.checks["result"] and len(setup.model.requests) == 1
+    payload = json.loads(setup.model.requests[-1].messages[1].content)
+    assert payload["answer"] == answer and payload["research_source_metrics"]
+    assert "被引用数据" in setup.model.requests[-1].messages[0].content
+    setup.model.passed = False
+    bad_answer = answer + "\nThe tool returned 15000 bytes."
+    with pytest.raises(DomainError):
+        await setup.toolkit.validate(
+            run.work,
+            run.lease,
+            setup.env.actor,
+            candidate(run, bad_answer, (fetched,)),
+            run.workspace,
+        )
+    if translation:
+        assert len(setup.model.requests) == 2
+        assert json.loads(setup.model.requests[-1].messages[1].content)["answer"] == bad_answer
+    else:
+        assert len(setup.model.requests) == 1
