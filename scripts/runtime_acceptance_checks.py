@@ -176,19 +176,62 @@ def _independent_ocr_texts(case_id: str, evidence: dict[str, Any]) -> tuple[list
 
 
 def _markdown_edges(markdown: str) -> set[tuple[str, str]]:
-    """Read a small declarative arrow/Mermaid subset without executing it."""
-    labels = {}
+    """Read literal arrows and scoped Mermaid aliases, without executing code.
+
+    Ordinary prose such as ``Start (top)`` must not rename every ``Start``
+    elsewhere in a Markdown document. Each declared Mermaid graph has its own
+    alias map; plain-text edges retain their actual endpoint names.
+    """
     node = re.compile(r"([A-Za-z][A-Za-z0-9_-]*)\s*[\[({]\s*[\"']?([^\])}\n\"']+)[\"']?\s*[\])}]")
-    for match in node.finditer(markdown):
-        labels[match[1]] = match[2].strip()
-    plain = node.sub(lambda match: match[1], markdown)
-    return {
-        (_normal(labels.get(match[1], match[1])), _normal(labels.get(match[2], match[2])))
-        for match in re.finditer(
-            r"(?<![A-Za-z0-9_-])(?=([A-Za-z][A-Za-z0-9_-]*)\s*(?:-->|→|->|=>|➜)(?:\|[^|\n]{0,100}\|)?\s*([A-Za-z][A-Za-z0-9_-]*))",
-            plain,
+
+    def read(text: str, *, graph: bool = False) -> set[tuple[str, str]]:
+        labels = {}
+        if graph:
+            text = re.sub(r"(?m)^[ \t]*%%[^\n]*$", "", text)
+            labels = {match[1]: match[2].strip() for match in node.finditer(text)}
+            text = node.sub(lambda match: match[1], text)
+        return {
+            (_normal(labels.get(match[1], match[1])), _normal(labels.get(match[2], match[2])))
+            for match in re.finditer(
+                r"(?<![A-Za-z0-9_-])(?=([A-Za-z][A-Za-z0-9_-]*)\s*(?:-->|→|->|=>|➜)(?:\|[^|\n]{0,100}\|)?\s*([A-Za-z][A-Za-z0-9_-]*))",
+                text,
+            )
+        }
+
+    def plain_blocks(text: str) -> set[tuple[str, str]]:
+        result = set()
+        for block in re.split(r"\n[ \t]*\n", text):
+            declared = bool(re.match(r"\s*(?:graph|flowchart)\s+(?:TD|TB|BT|LR|RL)\b", block))
+            result.update(read(block, graph=declared))
+        return result
+
+    result: set[tuple[str, str]] = set()
+    outside: list[str] = []
+    lines = markdown.splitlines()
+    index = 0
+    while index < len(lines):
+        fence = re.fullmatch(
+            r"[ \t]{0,3}(`{3,}|~{3,})[ \t]*([A-Za-z0-9_-]*)(?:[ \t]+[^\n]*)?", lines[index]
         )
-    }
+        if fence is None:
+            outside.append(lines[index])
+            index += 1
+            continue
+        result.update(plain_blocks("\n".join(outside)))
+        outside.clear()
+        marker, language = fence.groups()
+        closing = re.compile(
+            r"[ \t]{0,3}" + re.escape(marker[0]) + "{" + str(len(marker)) + r",}[ \t]*"
+        )
+        body = []
+        index += 1
+        while index < len(lines) and closing.fullmatch(lines[index]) is None:
+            body.append(lines[index])
+            index += 1
+        result.update(read("\n".join(body), graph=language.lower() == "mermaid"))
+        index += 1
+    result.update(plain_blocks("\n".join(outside)))
+    return result
 
 
 def evaluate_case(case: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:

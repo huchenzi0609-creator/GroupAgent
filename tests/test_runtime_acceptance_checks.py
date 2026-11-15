@@ -150,6 +150,47 @@ def test_mermaid_edges_are_read_as_labeled_nodes_not_identifier_substrings():
     )
 
 
+def test_plain_markdown_edges_are_not_renamed_by_parenthetical_position_prose():
+    text = (
+        "# Flow\n\nThree-node vertical flow: Start → Review → Done.\n\n"
+        "## Edges\n\n1. Start -> Review\n2. Review -> Done\n\n"
+        "## Diagram\n\n- Nodes: Start (top), Review (middle), Done (bottom).\n"
+    )
+    assert CHECKS._markdown_edges(text) == {("start", "review"), ("review", "done")}
+    evidence = {"scope": {"group_id": "g", "work_id": "w"}, "artifacts": [artifact(text=text)]}
+    required = {"markdown_required_edges": [["Start", "Review"], ["Review", "Done"]]}
+    assert evaluate(required, evidence)["status"] == "PASS"
+    for bad in (
+        "Nodes: Start (top), Review (middle), Done (bottom).",
+        "Start -> Review\nNodes: Start (top), Review (middle), Done (bottom).",
+        "Review -> Start\nDone -> Review\nNodes: Start (top), Review (middle), Done (bottom).",
+    ):
+        evidence["artifacts"][0]["decoded"]["text"] = bad
+        assert evaluate(required, evidence)["status"] == "FAIL"
+
+
+def test_mermaid_aliases_are_scoped_to_each_graph_and_never_plain_prose():
+    wanted = {"markdown_required_edges": [["Start", "Review"]]}
+    evidence = {"scope": {"group_id": "g", "work_id": "w"}, "artifacts": [artifact()]}
+    for valid in (
+        "```mermaid\ngraph TD\n A[Start] --> B[Review]\n```\n\nStart (top), Review (middle).",
+        "~~~mermaid\nflowchart TD\n A[Start] --> B[Review]\n~~~~",
+        "graph TD\nA[Start] --> B[Review]",
+        "```mermaid\ngraph TD\n A[Start] --> B[Review]\n %% B[Unrelated]\n```",
+        "```mermaid\ngraph TD\n A[Start] --> B[Review]\n```\n\n```mermaid\ngraph TD\n A[Other] --> B[Else]\n```",
+    ):
+        evidence["artifacts"][0]["decoded"]["text"] = valid
+        assert evaluate(wanted, evidence)["status"] == "PASS"
+    for invalid in (
+        "```mermaid\ngraph TD\n A[Start]\n B[Review]\n```\n\nA --> B",
+        "```mermaid\ngraph TD\n A[Other] --> B[Else]\n```\n\nA[Start], B[Review]",
+        "```text\nA[Start] --> B[Review]\n```",
+        "```mermaid\ngraph TD\n A[Start] <-- B[Review]\n```",
+    ):
+        evidence["artifacts"][0]["decoded"]["text"] = invalid
+        assert evaluate(wanted, evidence)["status"] == "FAIL"
+
+
 def test_audio_decode_or_matching_words_without_bound_asr_evidence_is_not_speech_acceptance():
     clip = artifact(
         format="wav",
