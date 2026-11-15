@@ -26,7 +26,7 @@ from groupagent.artifacts.formats import build_markdown, extract
 from groupagent.artifacts.worker_operations import unpack_document
 from groupagent.billing import BudgetLedger, PriceSnapshot
 from groupagent.config import AppConfig, GroupConfig, RuntimeConfig, SpendConfig
-from groupagent.domain import DomainError
+from groupagent.domain import DomainError, WorkState
 from groupagent.execution.models import (
     EngineCheckpoint,
     ModelReply,
@@ -38,6 +38,7 @@ from groupagent.execution.models import (
 from groupagent.media.validation import inspect_image
 from groupagent.memory import MemoryService
 from groupagent.research import DeepSeekResearchClient
+from groupagent.runtime.dispatch import Dispatcher
 from groupagent.runtime.inputs import InputProcessor
 from groupagent.runtime.state import source_fingerprint
 from groupagent.runtime.toolkit import WorkToolkit
@@ -317,6 +318,9 @@ async def test_real_toolkit_catalog_contains_file_research_media_compute_and_con
     assert not any("video" in name for name in run.prepared.request.allowed_tools)
     objective = json.loads(run.prepared.request.objective)
     assert objective["goal"] == run.work.goal and objective["input_files"] == []
+    assert objective["agent_name"] == "Pot" and objective["bot_badge"] == "【Pot】"
+    assert "Pot" in objective["agent_aliases"]
+    assert any("你的名字是Pot" in item for item in objective["instructions"])
 
 
 @pytest.mark.parametrize("required", [[], ["python_compute"]])
@@ -812,6 +816,8 @@ async def test_trusted_scheduled_reminder_names_recipient_work_not_agent_work(to
     objective = json.loads(prepared.request.objective)
     assert objective["execution_intent"] == "reminder" and objective["goal"] == "检查作业"
     assert objective["reminder_body"] == "检查作业"
+    assert objective["agent_name"] == "Pot" and objective["bot_badge"] == "【Pot】"
+    assert any("你的名字是Pot" in item for item in objective["instructions"])
     assert "发送提醒本身不需要" in objective["instructions"][0]
     assert "不要为了被提醒的事项调用 request_input" in objective["instructions"][0]
     assert not objective["input_files"] and prepared.request.allowed_tools == frozenset()
@@ -842,6 +848,20 @@ async def test_trusted_scheduled_reminder_names_recipient_work_not_agent_work(to
         len(result.deliveries) == 1
         and result.deliveries[0].payload_ref == "text:提醒：该检查作业了。"
     )
+    with env.store.transaction(env.actor) as tx:
+        current = tx.get_work(work.id)
+        current = tx.transition_work(
+            work.id, WorkState.VALIDATING, expected_revision=current.revision, lease=lease
+        )
+        tx.record_validation(work.id, lease, "synthetic-reminder-validation")
+        tx.transition_work(
+            work.id, WorkState.DELIVERING, expected_revision=current.revision, lease=lease
+        )
+        env.state.enqueue_bundle_in_tx(tx, lease, result.deliveries)
+    dispatcher = Dispatcher(env.state, env.service, lambda _: env.actor, env.channel, env.registry)
+    assert await dispatcher.tick() == 1
+    sent = [json.loads(path.read_text()) for path in (env.root / "channel/outgoing").glob("*.json")]
+    assert len(sent) == 1 and sent[0]["payload"]["text"] == "【Pot】提醒：该检查作业了。"
     assert not setup.http_calls
 
 

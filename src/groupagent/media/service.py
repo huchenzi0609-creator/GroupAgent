@@ -44,10 +44,34 @@ class MediaService:
         providers: dict[str, MediaHTTPProvider] | None = None,
         budget: Any | None = None,
         source_guard: SourceGuard | None = None,
+        max_image_bytes: int = 15 * 1024 * 1024,
+        max_image_pixels: int = 40_000_000,
+        max_images: int = 10,
     ):
+        if (
+            type(max_image_bytes) is not int
+            or not 0 < max_image_bytes <= 15 * 1024 * 1024
+            or type(max_image_pixels) is not int
+            or not 0 < max_image_pixels <= 40_000_000
+            or type(max_images) is not int
+            or not 0 < max_images <= 10
+        ):
+            raise ValueError("Media image limits must be within 15 MiB, 40 MP and ten images")
         self.store, self.worker = store, worker
         self.providers, self.budget, self.source_guard = providers or {}, budget, source_guard
+        self.max_image_bytes, self.max_image_pixels, self.max_images = (
+            max_image_bytes,
+            max_image_pixels,
+            max_images,
+        )
         self.registry = CapabilityRegistry()
+
+    def _image_parameters(self) -> dict[str, int]:
+        return {"max_bytes": self.max_image_bytes, "max_pixels": self.max_image_pixels}
+
+    def _image_bytes(self, content: bytes) -> None:
+        if not content or len(content) > self.max_image_bytes:
+            raise DomainError("image_size_limit", "Image exceeds its configured byte limit")
 
     @staticmethod
     def scope(context: ToolContext) -> ArtifactScope:
@@ -143,10 +167,13 @@ class MediaService:
         await self._check(context, (source,))
         if source.declared_kind not in {"image", "file"}:
             raise DomainError("unsupported_image", "Source is not an image attachment")
-        if len(content) > 15 * 1024 * 1024:
-            raise DomainError("image_size_limit", "Image exceeds 15 MiB")
+        self._image_bytes(content)
         result, _ = await self.worker.run(
-            context, "image_validate", (content,), outputs=("view.png",)
+            context,
+            "image_validate",
+            (content,),
+            parameters=self._image_parameters(),
+            outputs=("view.png",),
         )
         info = ImageInfo.model_validate(result)
         if info.source_sha256 != hashlib.sha256(content).hexdigest():
@@ -220,6 +247,8 @@ class MediaService:
         operation = "ocr_pdf" if reference.format == "pdf" else "ocr_image"
         if reference.format not in {"pdf", "png", "jpeg", "jpg", "webp", "gif"}:
             raise DomainError("unsupported_ocr_format", "OCR requires a PDF or supported image")
+        if reference.format != "pdf":
+            self._image_bytes(content)
         if route is not None:
             if route.capability != Capability.OCR:
                 raise DomainError(
@@ -234,7 +263,11 @@ class MediaService:
                 filename = "document.pdf"
             else:
                 _, views = await self.worker.run(
-                    context, "image_validate", (content,), outputs=("view.png",)
+                    context,
+                    "image_validate",
+                    (content,),
+                    parameters=self._image_parameters(),
+                    outputs=("view.png",),
                 )
                 cloud_content, page_count, filename = views[0], 1, "image.png"
             response = await self._paid(
@@ -260,7 +293,11 @@ class MediaService:
             context,
             operation,
             (content,),
-            parameters={"languages": languages, "force_ocr": force_ocr},
+            parameters={
+                "languages": languages,
+                "force_ocr": force_ocr,
+                **(self._image_parameters() if operation == "ocr_image" else {}),
+            },
         )
         await self._check(context, (reference.source,))
         return OCRResult(
@@ -348,23 +385,28 @@ class MediaService:
     ) -> VisionResult:
         if (
             route.capability != Capability.VISION
-            or not 1 <= len(references) <= 10
+            or not 1 <= len(references) <= self.max_images
             or not prompt.strip()
             or len(prompt) > 8000
         ):
             raise DomainError(
-                "invalid_media_request", "Vision requires a bounded prompt and one to ten images"
+                "invalid_media_request", "Vision prompt or image count exceeds its configured limit"
             )
         views, labels, hashes, sources, static, bindings = [], [], [], [], [], []
         for index, reference in enumerate(references):
             content = await self._content(context, reference)
+            self._image_bytes(content)
             source_sha256 = hashlib.sha256(content).hexdigest()
             if source_sha256 != reference.sha256:
                 raise DomainError(
                     "media_reference_mismatch", "Image bytes differ from their reference"
                 )
             result, outputs = await self.worker.run(
-                context, "image_validate", (content,), outputs=("view.png",)
+                context,
+                "image_validate",
+                (content,),
+                parameters=self._image_parameters(),
+                outputs=("view.png",),
             )
             info = ImageInfo.model_validate(result)
             if len(outputs) != 1:
@@ -572,8 +614,13 @@ class MediaService:
             {"images": Decimal(1)},
             lambda provider: provider.generate_image(route, prompt),
         )
+        self._image_bytes(response.content)
         result, _ = await self.worker.run(
-            context, "image_validate", (response.content,), outputs=("view.png",)
+            context,
+            "image_validate",
+            (response.content,),
+            parameters=self._image_parameters(),
+            outputs=("view.png",),
         )
         info = ImageInfo.model_validate(result)
         if info.format != "png" or (info.width, info.height) != (1024, 1024):

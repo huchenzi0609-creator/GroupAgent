@@ -97,5 +97,11 @@
     "candidate": "deepseek_harness",
     "approved_runtime_version": null,
     "extra_session_log_upload": false
+  },
+  "runtime": {
+    "engine": "harness",
+    "bot_name": "Pot",
+    "bot_aliases": ["机器人", "机器人组长", "组长", "小伴"],
+    "bot_badge": "【Pot】"
   }
 }

@@ -37,12 +37,20 @@ from groupagent.execution import (
 from groupagent.execution.models import UsageTotals
 from groupagent.media import MediaService
 from groupagent.persistence import PostgresStore
+from groupagent.resources import MemorySnapshot, ResourceDeferred, ResourceGovernor, ResourcePolicy
 from groupagent.runtime.contracts import DeliveryDraft, PreparedExecution, ValidatedCandidate
 from groupagent.runtime.executor import WorkSupervisor
 from groupagent.runtime.inputs import InputProcessor
 from groupagent.runtime.state import RuntimeState
 from groupagent.scheduling.triggers import EventTriggerService
-from groupagent.tools import ToolContext, ToolGateway, ToolScope, register_request_input_tool
+from groupagent.tools import (
+    ToolContext,
+    ToolData,
+    ToolDefinition,
+    ToolGateway,
+    ToolScope,
+    register_request_input_tool,
+)
 
 pytestmark = pytest.mark.postgres
 
@@ -195,6 +203,334 @@ async def test_candidate_is_not_completed_until_bundle_receipts_are_accepted(env
         accept_pending(env, work.id)
         await service.tick()
         assert work_state(env, work.id).state == WorkState.COMPLETED
+    finally:
+        await service.close()
+
+
+@pytest.fixture
+def resource_clock(monkeypatch):
+    clock = {"now": datetime.now(UTC)}
+
+    class ControlledDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"].astimezone(tz) if tz else clock["now"].replace(tzinfo=None)
+
+    monkeypatch.setattr("groupagent.runtime.executor.datetime", ControlledDateTime)
+    return clock
+
+
+def advance_resources(clock):
+    from datetime import timedelta
+
+    clock["now"] += timedelta(seconds=10)
+
+
+async def test_resource_pre_admission_keeps_work_unclaimed_and_durable(env):
+    work = new_work(env)
+    ready = [False]
+    factory = Factory()
+    service = supervisor(env, factory, resource_ready=lambda: ready[0])
+    try:
+        assert await service.run_once() is None
+        assert work_state(env, work.id).state == WorkState.QUEUED and factory.models == []
+        with env.store.transaction(env.actor) as tx:
+            assert not tx.conn.execute(
+                "SELECT 1 FROM ga_execution_attempts WHERE group_id=%s", (env.actor.group_id,)
+            ).fetchone()
+            assert not tx.conn.execute(
+                "SELECT 1 FROM ga_process_leases WHERE group_id=%s AND name='heavy-worker'",
+                (env.actor.group_id,),
+            ).fetchone()
+        ready[0] = True
+        assert (await service.run_once()).state == WorkState.DELIVERING
+    finally:
+        await service.close()
+
+
+class ResourceBatchFactory:
+    def __init__(self, admission, capacity, effects, *, continuation=False):
+        self.admission, self.capacity, self.effects = admission, capacity, effects
+        self.continuation = continuation
+        self.models = []
+
+    async def __call__(self, work, lease, actor, workspace):
+        gateway = ToolGateway()
+
+        async def first(arguments, context):
+            with (workspace / "completed-once.txt").open("x") as output:
+                output.write("Synthetic completed effect")
+            self.effects.append("first")
+            self.capacity[0] = False
+            return ToolData()
+
+        async def second(arguments, context):
+            self.effects.append("second")
+            return ToolData()
+
+        gateway.register(ToolDefinition("first", "first", ToolData, ToolData, first))
+        gateway.register(ToolDefinition("second", "second", ToolData, ToolData, second))
+        gateway.bind_resource_admission(
+            self.admission, memory_mb=512, tool_names=frozenset({"second"})
+        )
+        reply = (
+            ModelReply(
+                text="Verified synthetic answer",
+                usage=TokenUsage(input_tokens=20, output_tokens=10),
+            )
+            if self.continuation
+            else ModelReply(
+                tool_calls=(
+                    ModelToolCall(id="first", name="first", arguments={}),
+                    ModelToolCall(id="second", name="second", arguments={}),
+                ),
+                finish_reason="tool_calls",
+                usage=TokenUsage(input_tokens=20, output_tokens=10),
+            )
+        )
+        model = ScriptedFakeModel([reply])
+        self.models.append(model)
+        return PreparedExecution(
+            ScopedToolEngine(model, gateway),
+            ExecutionRequest(
+                work_id=work.id,
+                attempt_id=lease.attempt_id,
+                actor=actor,
+                objective=work.goal,
+                workspace=workspace,
+                revision=work.goal_revision,
+                trace_id=work.request_event_id,
+                allowed_tools=frozenset({"first", "second"}),
+                budget=ExecutionBudget(max_rounds=2, max_tool_calls=2),
+            ),
+        )
+
+
+def batch_admission(capacity):
+    return ResourceGovernor(
+        ResourcePolicy(enabled=True, reserve_memory_mb=128, transfer_memory_mb=96),
+        sampler=lambda: MemorySnapshot((2048 if capacity[0] else 0) * 1024 * 1024),
+    )
+
+
+async def test_resource_tool_deferral_survives_close_restart_without_repaying_model(
+    env, resource_clock
+):
+    work = new_work(env)
+    capacity, effects = [True], []
+    admission = batch_admission(capacity)
+    first_factory = ResourceBatchFactory(admission, capacity, effects)
+    first = supervisor(
+        env, first_factory, resource_ready=lambda: admission.ready(512), execution_backend="scoped"
+    )
+    queued = await first.run_once()
+    assert queued.state == WorkState.QUEUED
+    assert queued.scope["_runtime_resource_wait"]["stage"] == "execution"
+    before = env.state.load_checkpoint(env.actor, work.id)
+    assert before.safe_to_resume and before.state == RunState.PAUSED
+    assert (before.usage.rounds, before.usage.tool_calls, before.usage.tokens) == (1, 1, 30)
+    assert before.backend_state["execution_backend"] == "scoped"
+    await first.close()
+    assert env.state.load_checkpoint(env.actor, work.id).state == RunState.PAUSED
+
+    factory = ResourceBatchFactory(admission, capacity, effects, continuation=True)
+    restarted = supervisor(
+        env, factory, resource_ready=lambda: admission.ready(512), execution_backend="scoped"
+    )
+    try:
+        advance_resources(resource_clock)
+        assert await restarted.run_once() is None and not factory.models
+        capacity[0] = True
+        result = await restarted.run_once()
+        assert result.state == WorkState.DELIVERING and effects == ["first", "second"]
+        final = env.state.load_checkpoint(env.actor, work.id)
+        assert (final.usage.rounds, final.usage.tool_calls, final.usage.tokens) == (2, 2, 60)
+        assert len(first_factory.models[0].requests) == len(factory.models[0].requests) == 1
+        assert len(deliveries(env, work.id)) == 1
+    finally:
+        await restarted.close()
+
+
+async def test_resource_goal_revision_finishes_old_tool_messages_before_new_user_input(
+    env, resource_clock
+):
+    work = new_work(env)
+    capacity, effects = [True], []
+    admission = batch_admission(capacity)
+    first = supervisor(env, ResourceBatchFactory(admission, capacity, effects))
+    await first.run_once()
+    await first.close()
+    with env.store.transaction(env.actor) as tx:
+        current = tx.get_work(work.id)
+        tx.revise_work(work.id, "Changed synthetic objective", expected_revision=current.revision)
+    capacity[0] = True
+    factory = ResourceBatchFactory(admission, capacity, effects, continuation=True)
+    restarted = supervisor(env, factory)
+    try:
+        advance_resources(resource_clock)
+        assert (await restarted.run_once()).state == WorkState.DELIVERING
+        assert effects == ["first"]  # The old second proposal is superseded.
+        messages = factory.models[0].requests[0].messages
+        tool_positions = [index for index, message in enumerate(messages) if message.role == "tool"]
+        updated = next(
+            index
+            for index, message in enumerate(messages)
+            if "Changed synthetic objective" in (message.content or "")
+        )
+        assert len(tool_positions) == 2 and max(tool_positions) < updated
+    finally:
+        await restarted.close()
+
+
+async def test_preparation_resource_deferral_does_not_exhaust_attachment_retries_or_emit_fee_notice(
+    env, resource_clock
+):
+    from groupagent.runtime.notices import NoticeService
+
+    work = new_work(env)
+    released = []
+
+    class DeferredFactory(Factory):
+        calls = 0
+
+        async def __call__(self, *args):
+            self.calls += 1
+            if self.calls <= 3:
+                raise ResourceDeferred()
+            return await super().__call__(*args)
+
+    factory = DeferredFactory()
+    service = supervisor(
+        env,
+        factory,
+        release_attempt=lambda work_id, attempt_id: released.append((work_id, attempt_id)),
+    )
+    notices = NoticeService(env.store, env.control, lambda _: env.actor, interval_seconds=60)
+    try:
+        for _ in range(3):
+            result = await service.run_once()
+            assert result.state == WorkState.QUEUED and not factory.models
+            assert result.scope["_runtime_preparation"]["attempts"] == 1
+            assert result.scope["_runtime_resource_wait"]["stage"] == "preparation"
+            assert notices.tick() == 0 and not deliveries(env, work.id)
+            assert await service.run_once() is None
+            advance_resources(resource_clock)
+        assert (await service.run_once()).state == WorkState.DELIVERING
+        assert len(factory.models) == 1 and len(released) == 4
+        assert len(set(released)) == 4 and all(identifier == work.id for identifier, _ in released)
+    finally:
+        await service.close()
+
+
+async def test_validation_resource_deferral_reuses_candidate_without_new_model(env, resource_clock):
+    work = new_work(env)
+
+    class DeferredValidator(Validator):
+        async def validate(self, *args):
+            if self.calls == 0:
+                self.calls += 1
+                raise ResourceDeferred()
+            return await super().validate(*args)
+
+    first_factory, validator = Factory(), DeferredValidator()
+    first = supervisor(env, first_factory, validator)
+    result = await first.run_once()
+    assert (
+        result.state == WorkState.QUEUED
+        and result.scope["_runtime_resource_wait"]["stage"] == "validation"
+    )
+    checkpoint = env.state.load_checkpoint(env.actor, work.id)
+    assert checkpoint.state == RunState.CANDIDATE and checkpoint.safe_to_resume
+    await first.close()
+    factory = Factory()
+    restarted = supervisor(env, factory, validator)
+    try:
+        advance_resources(resource_clock)
+        assert (await restarted.run_once()).state == WorkState.DELIVERING
+        assert not factory.models[0].requests and validator.calls == 2
+        after = env.state.load_checkpoint(env.actor, work.id)
+        assert after.usage.rounds == checkpoint.usage.rounds == 1
+        assert after.usage.tokens == checkpoint.usage.tokens == 30
+        assert len(deliveries(env, work.id)) == 1
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.parametrize(
+    "backend", [{"sessions": {}, "version": "0.2.2rc2"}, {"execution_backend": "harness"}]
+)
+async def test_scoped_profile_does_not_resume_native_harness_history(env, backend):
+    work = new_work(env)
+    with env.store.transaction(env.actor) as tx:
+        lease = tx.claim_work(work.id, "synthetic-prior-backend")
+    checkpoint = EngineCheckpoint(
+        request=ExecutionRequest(
+            work_id=work.id,
+            attempt_id=lease.attempt_id,
+            actor=env.actor,
+            objective=work.goal,
+            workspace=env.root,
+            trace_id=work.request_event_id,
+        ),
+        revision=1,
+        state=RunState.PAUSED,
+        sequence=1,
+        messages=(ModelMessage(role="user", content=work.goal),),
+        usage=UsageTotals(rounds=1, tokens=30),
+        safe_to_resume=True,
+        backend_state=backend,
+    )
+    env.state.save_checkpoint(env.actor, lease, checkpoint)
+    with env.store.transaction(env.actor) as tx:
+        current = tx.get_work(work.id)
+        tx.transition_work(
+            work.id,
+            WorkState.QUEUED,
+            expected_revision=current.revision,
+            lease=lease,
+            reason="recovery",
+        )
+    factory = Factory()
+    service = supervisor(env, factory, execution_backend="scoped")
+    try:
+        result = await service.run_once()
+        assert (
+            result.state == WorkState.PAUSED
+            and result.pause_reason == "checkpoint_backend_mismatch"
+        )
+        assert not factory.models
+    finally:
+        await service.close()
+
+
+async def test_release_attempt_waits_for_confirmed_engine_quiescence(env):
+    work = new_work(env)
+    stopped, released = [False], []
+
+    class RetainedFactory(Factory):
+        async def __call__(self, *args):
+            prepared = await super().__call__(*args)
+            prepared.engine.is_quiescent = lambda _: stopped[0]
+            return prepared
+
+    def release(identifier, attempt):
+        with env.store.transaction(env.actor) as tx:
+            assert tx.conn.execute(
+                "SELECT 1 FROM ga_audit_events WHERE group_id=%s AND resource_ref=%s AND action='execution_stopped' AND details->>'attempt_id'=%s",
+                (env.actor.group_id, identifier, attempt),
+            ).fetchone()
+        released.append((identifier, attempt))
+
+    service = supervisor(env, RetainedFactory(), release_attempt=release)
+    try:
+        assert (await service.run_once()).state == WorkState.DELIVERING
+        assert not released and work.id in service._quiescence_owned
+        stopped[0] = True
+        await service.tick()
+        assert len(released) == 1 and released[0][0] == work.id
+        assert work.id not in service._quiescence_owned
+        await service.tick()
+        assert len(released) == 1
     finally:
         await service.close()
 

@@ -28,6 +28,7 @@ from groupagent.execution import ExecutionRequest, RunSnapshot, ScopedToolEngine
 from groupagent.execution.harness import HarnessEngine
 from groupagent.execution.models import ExecutionBudget, ModelMessage, ModelRequest
 from groupagent.execution.ports import ModelPort
+from groupagent.identity import BotIdentity
 from groupagent.media import MediaService
 from groupagent.media.isolation import IsolatedMediaWorker
 from groupagent.media.models import Capability, MediaSource, ProviderRoute, VisionResult
@@ -40,7 +41,8 @@ from groupagent.research import validate_research_citations
 from groupagent.research.browser import ControlledBrowser, PublicPageBroker
 from groupagent.research.deepseek import DeepSeekResearchClient
 from groupagent.research.tools import register_browser_tool, register_research_tools
-from groupagent.sandbox import DockerSandbox, SandboxLimits
+from groupagent.resources import ResourceGovernor
+from groupagent.sandbox import DockerSandbox
 from groupagent.scheduling import Scheduler
 from groupagent.scheduling.reminders import get_reminder_body
 from groupagent.scheduling.triggers import EventTriggerService
@@ -64,6 +66,7 @@ from .artifact_tools import register_export_tool
 from .artifacts import ArtifactRegistry
 from .contracts import DeliveryDraft, PreparedExecution, ValidatedCandidate
 from .inputs import InputProcessor
+from .resource_profile import worker_limits, worker_tool_names
 from .scheduling_tools import register_scheduling_tools
 from .team_tools import register_team_tools
 from .tool_selection import select_tools
@@ -426,6 +429,7 @@ class WorkToolkit:
         inputs: InputProcessor | None = None,
         scheduler: Scheduler | None = None,
         triggers: EventTriggerService | None = None,
+        resource_governor: ResourceGovernor | None = None,
     ) -> None:
         self.config, self.store, self.artifacts, self.registry, self.memory = (
             config,
@@ -444,6 +448,12 @@ class WorkToolkit:
         self._services: dict[str, tuple[IsolatedDocumentService, MediaService, ToolContext]] = {}
         self.inputs = inputs
         self.scheduler, self.triggers = scheduler, triggers
+        self.resource_governor = resource_governor
+
+    def release_attempt(self, work_id: str, attempt_id: str) -> None:
+        # The supervisor calls this only after the engine and all isolated
+        # children have stopped, including cancellation and reconciliation.
+        self._services.pop(attempt_id, None)
 
     def _sources(
         self, actor: ActorContext, work: WorkOrder, lease: ExecutionLease
@@ -503,17 +513,28 @@ class WorkToolkit:
             DockerSandbox(
                 self.config.runtime.worker_image,
                 docker_host=self.config.runtime.docker_host,
-                limits=SandboxLimits(memory_mb=1024, pids=256, workspace_mb=512, temp_mb=128),
+                limits=worker_limits(self.config),
                 policy_guard=guard,
+                resource_governor=self.resource_governor,
             )
         )
-        documents = IsolatedDocumentService(self.artifacts, worker, policy_guard=guard)
+        documents = IsolatedDocumentService(
+            self.artifacts,
+            worker,
+            policy_guard=guard,
+            max_import_bytes=self.config.limits.office_or_pdf_bytes,
+            max_markdown_bytes=self.config.limits.markdown_bytes,
+            max_output_bytes=self.config.limits.output_file_bytes,
+        )
         media = MediaService(
             self.artifacts,
             worker,
             providers=self.providers,
             budget=self.ledger,
             source_guard=source_guard,
+            max_image_bytes=self.config.limits.image_bytes,
+            max_image_pixels=self.config.limits.image_pixels,
+            max_images=self.config.limits.images_per_work,
         )
         context = ToolContext(
             ToolScope(
@@ -644,7 +665,11 @@ class WorkToolkit:
             extension = Path(arguments.name).suffix.lower()
             if extension in {".md", ".docx", ".pdf", ".pptx"}:
                 version = await documents.import_document(
-                    context, arguments.name, content, provenance=await provenance(context)
+                    context,
+                    arguments.name,
+                    content,
+                    provenance=await provenance(context),
+                    generated_output=True,
                 )
             elif extension in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
                 ref = await media.ingest_image(
@@ -904,6 +929,12 @@ class WorkToolkit:
                 idempotency_mode=IdempotencyMode.MANAGED_TRANSACTION,
             )
         )
+        if self.resource_governor and self.resource_governor.policy.enabled:
+            gateway.bind_resource_admission(
+                self.resource_governor,
+                memory_mb=self.config.resources.worker_memory_mb,
+                tool_names=worker_tool_names(gateway.registered_names),
+            )
         input_refs = []
         if self.inputs:
             input_refs = await self.inputs.import_for_work(
@@ -935,7 +966,9 @@ class WorkToolkit:
             route.capability == Capability.IMAGE_GENERATION for route in self.routes.values()
         ):
             allowed = allowed - {"image_generate"}
-        allowed = select_tools(work, input_refs, allowed)
+        allowed = select_tools(
+            work, input_refs, allowed, identity=BotIdentity.from_runtime(self.config.runtime)
+        )
         with self.store.transaction(actor) as tx:
             original_event = tx.get_event(work.request_event_id)
         execution_intent = _execution_intent(work)
@@ -948,6 +981,7 @@ class WorkToolkit:
         objective = redact_credentials(
             json.dumps(
                 {
+                    **BotIdentity.from_runtime(self.config.runtime).context(),
                     "goal": work.goal,
                     "original_request": _original_request_context(original_event),
                     "execution_intent": execution_intent,
@@ -974,6 +1008,7 @@ class WorkToolkit:
                         if execution_intent == "reminder"
                         else "Use actual scoped tools to complete this goal; do not just offer a plan.",
                         _REQUEST_CONTEXT_INSTRUCTION,
+                        BotIdentity.from_runtime(self.config.runtime).instruction(),
                         "标题/题目声明中的《》或引号通常是指令的引用标记，不是要求写入标题的字符；除非用户明确要求保留这些符号，按required_outputs.expected_text中的真实标题文字校验，不要自行再包上引用标记。",
                         "PPT若逐页明确指定了不同标题，required_outputs.metadata_title表示文件主题元数据，不是额外页内文字。用document_read.metadata.title核对真实主题，expected_text仅核对要求的可见文字；不要为让主题出现在可见文本里添加页脚、封面或改写指定页标题。",
                         "表格默认使用layout=records：名称=数值的一组观测按名称/数值两列、一条记录一行。工具会把默认records模式的一行横向纯数值向量规范化为行记录；只有用户明确要求横向或转置表格时才设置layout=columns，不要自行选择columns绕过默认记录布局。",
@@ -1045,7 +1080,8 @@ class WorkToolkit:
                 DockerSandbox(
                     self.config.runtime.harness_image,
                     docker_host=self.config.runtime.docker_host,
-                    limits=SandboxLimits(memory_mb=1024, pids=256, workspace_mb=512, temp_mb=256),
+                    limits=worker_limits(self.config, harness=True),
+                    resource_governor=self.resource_governor,
                 ),
                 model_budget=budget,
             )

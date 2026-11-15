@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,9 +31,11 @@ from groupagent.domain import (
     WorkState,
 )
 from groupagent.execution import EngineCheckpoint, EnginePort, ModelMessage, RunSnapshot, RunState
-from groupagent.execution.engine import SYSTEM_PROMPT
-from groupagent.execution.models import EngineEvent, ProgressPayload, UsageTotals
+from groupagent.execution.engine import SYSTEM_PROMPT, ScopedToolEngine
+from groupagent.execution.harness import HarnessEngine
+from groupagent.execution.models import EngineEvent, PendingInput, ProgressPayload, UsageTotals
 from groupagent.persistence import PostgresStore
+from groupagent.resources import ResourceDeferred
 from groupagent.sandbox import DockerSandbox
 from groupagent.security import redact_credentials
 
@@ -42,6 +45,7 @@ from .contracts import (
     ExecutionFactory,
     PreparedExecution,
     ProcessLease,
+    ValidatedCandidate,
 )
 from .state import RuntimeState
 
@@ -49,6 +53,7 @@ T = TypeVar("T")
 _CLOSED = {WorkState.COMPLETED, WorkState.CANCELLED, WorkState.FAILED}
 _RACES = {"stale_lease", "lease_busy", "lease_active", "version_conflict"}
 _PREPARATION = "_runtime_preparation"
+_RESOURCE_WAIT = "_runtime_resource_wait"
 
 
 @dataclass
@@ -65,6 +70,8 @@ class _Owned:
     validation_started: float | None = None
     validation_base: UsageTotals | None = None
     stage_task: asyncio.Task | None = None
+    released: bool = False
+    quiesced: bool = False
 
 
 class WorkSupervisor:
@@ -87,6 +94,10 @@ class WorkSupervisor:
         preparation_timeout_seconds: float = 60,
         attachment_retry_seconds: float = 5,
         attachment_wait_seconds: float = 300,
+        resource_ready: Callable[[], bool] | None = None,
+        resource_retry_seconds: float = 5,
+        execution_backend: str | None = None,
+        release_attempt: Callable[[str, str], None | Awaitable[None]] | None = None,
     ) -> None:
         if (
             not 0 < heartbeat_seconds < lease_seconds <= 300
@@ -100,6 +111,10 @@ class WorkSupervisor:
             and 0 < attachment_retry_seconds <= attachment_wait_seconds <= 3600
         ):
             raise ValueError("Preparation and attachment waiting must be bounded")
+        if not math.isfinite(resource_retry_seconds) or not 0 < resource_retry_seconds <= 3600:
+            raise ValueError("Resource retries must have a bounded positive delay")
+        if execution_backend not in {None, "scoped", "harness"}:
+            raise ValueError("Unknown execution backend")
         root = workspace_root.absolute()
         if root != root.resolve() or root.is_symlink():
             raise ValueError("Runtime workspace root must be canonical")
@@ -114,6 +129,10 @@ class WorkSupervisor:
         self.preparation_timeout_seconds = preparation_timeout_seconds
         self.attachment_retry_seconds = attachment_retry_seconds
         self.attachment_wait_seconds = attachment_wait_seconds
+        self.resource_ready = resource_ready
+        self.resource_retry_seconds = resource_retry_seconds
+        self.execution_backend = execution_backend
+        self.release_attempt = release_attempt
         self._task: asyncio.Task[WorkOrder | None] | None = None
         self._owned: _Owned | None = None
         self._delivering: dict[str, _Owned] = {}
@@ -199,7 +218,7 @@ class WorkSupervisor:
     async def tick(self) -> int:
         async with self._tick_lock:
             for identifier, retained in tuple(self._quiescence_owned.items()):
-                if self._record_stopped(retained):
+                if await self._record_stopped(retained):
                     self._quiescence_owned.pop(identifier, None)
             await self._poll_deliveries()
             if self._task and self._task.done():
@@ -213,17 +232,29 @@ class WorkSupervisor:
                 return 0
             self._wake_preparation()
             self._wake_reconciled()
+            self._wake_resources()
+            if not self._resources_ready():
+                return 0
             process = self.state.claim_process(
                 self.control_actor, "heavy-worker", self.worker_id, ttl_seconds=self.lease_seconds
             )
             if process is None:
                 return 0
             works = self.state.queued(self.control_actor)
-            works = [
-                work
-                for work in works
-                if work.id not in self._delivering and work.id not in self._quiescence_owned
-            ]
+            eligible = []
+            for work in works:
+                if work.id in self._delivering or work.id in self._quiescence_owned:
+                    continue
+                try:
+                    if self._resource_due(work):
+                        eligible.append(work)
+                except DomainError as error:
+                    try:
+                        self._pause(self.resolve_actor(work.requester_id), work.id, error.code)
+                    except DomainError:
+                        pass
+                    self._alert(error.code, work.id)
+            works = eligible
             if not works:
                 self.state.release_process(self.control_actor, process)
                 return 0
@@ -429,6 +460,16 @@ class WorkSupervisor:
                             worker_id=self.worker_id,
                             evidence="targeted_quiescence",
                         )
+            for identifier in identifiers:
+                owned = self._quiescence_owned.get(identifier)
+                if owned:
+                    owned.quiesced = True
+                    if not await self._record_stopped(owned):
+                        raise DomainError(
+                            "work_busy",
+                            "Attempt cleanup has not acknowledged completion",
+                            retryable=True,
+                        )
             if self._starting_work_id in identifiers:
                 if self._starting_process:
                     self.state.release_process(self.control_actor, self._starting_process)
@@ -440,7 +481,7 @@ class WorkSupervisor:
                 self._delivering.pop(identifier, None)
                 self._quiescence_owned.pop(identifier, None)
 
-    def _record_stopped(self, owned: _Owned) -> bool:
+    async def _record_stopped(self, owned: _Owned) -> bool:
         if owned.stage_task is not None and not owned.stage_task.done():
             return False
         if DockerSandbox.scope_active(owned.actor.group_id, owned.work.id):
@@ -449,7 +490,7 @@ class WorkSupervisor:
             check = getattr(owned.engine, "is_quiescent", None)
             if not callable(check) or not check(owned.run_id):
                 return False
-        elif self._preparation(owned.work).get("stage") == "inflight":
+        elif not owned.quiesced and self._preparation(owned.work).get("stage") == "inflight":
             return False
         try:
             with self.store.transaction(self.control_actor) as tx:
@@ -465,8 +506,16 @@ class WorkSupervisor:
                         worker_id=self.worker_id,
                         evidence="stage_tasks_finished",
                     )
+            if self.release_attempt is not None and not owned.released:
+                result = self.release_attempt(owned.work.id, owned.lease.attempt_id)
+                if inspect.isawaitable(result):
+                    await result
+                owned.released = True
             return True
         except DomainError:
+            return False
+        except Exception:
+            self._alert("attempt_release_failed", owned.work.id)
             return False
 
     @staticmethod
@@ -526,6 +575,145 @@ class WorkSupervisor:
             ).encode()
         ).hexdigest()
 
+    def _resources_ready(self) -> bool:
+        if self.resource_ready is None:
+            return True
+        try:
+            return bool(self.resource_ready())
+        except Exception:
+            self._alert("resource_probe_failed", "resources")
+            return False
+
+    def _require_resources(self) -> None:
+        if not self._resources_ready():
+            raise ResourceDeferred()
+
+    @staticmethod
+    def _resource_due(work: WorkOrder) -> bool:
+        value = work.scope.get(_RESOURCE_WAIT)
+        if value is None:
+            return True
+        try:
+            if (
+                not isinstance(value, dict)
+                or value["stage"] not in {"preparation", "execution", "validation"}
+                or type(value["goal_revision"]) is not int
+                or not isinstance(value["attempt_id"], str)
+                or not isinstance(value["next_retry_at"], str)
+            ):
+                raise ValueError("Invalid resource wait")
+            due = datetime.fromisoformat(value["next_retry_at"])
+            if due.utcoffset() is None:
+                raise ValueError("Missing timezone")
+        except (KeyError, TypeError, ValueError):
+            raise DomainError("reconciliation_required", "Invalid durable resource wait") from None
+        return value["goal_revision"] != work.goal_revision or datetime.now(UTC) >= due
+
+    def _defer_resources(self, owned: _Owned, stage: str) -> None:
+        with self.store.transaction(owned.actor) as tx:
+            tx.assert_lease(owned.lease)
+            current = tx.get_work(owned.work.id)
+            wait = {
+                "stage": stage,
+                "goal_revision": current.goal_revision,
+                "attempt_id": owned.lease.attempt_id,
+                "next_retry_at": (
+                    datetime.now(UTC) + timedelta(seconds=self.resource_retry_seconds)
+                ).isoformat(),
+            }
+            tx.conn.execute(
+                "UPDATE ga_work_orders SET scope=jsonb_set(scope,%s,%s),revision=revision+1 "
+                "WHERE group_id=%s AND id=%s",
+                ([_RESOURCE_WAIT], Jsonb(wait), owned.actor.group_id, current.id),
+            )
+            current = tx.get_work(current.id)
+            owned.work = tx.transition_work(
+                current.id,
+                WorkState.QUEUED,
+                expected_revision=current.revision,
+                lease=owned.lease,
+                reason="recovery",
+            )
+            tx._audit("work_resource_deferred", current.id, stage=stage)
+
+    def _wake_resources(self) -> None:
+        """Normalize legacy resource pauses into the durable, silent work queue."""
+        with self.store.transaction(self.control_actor) as tx:
+            paused = tx.list_work(state=WorkState.PAUSED, limit=1000)
+        for work in paused:
+            if work.pause_reason != "resource_deferred":
+                continue
+            try:
+                actor = self.resolve_actor(work.requester_id)
+                if actor.group_id != work.group_id or actor.member_id != work.requester_id:
+                    raise DomainError("scope_violation", "Resource wait requester identity changed")
+                checkpoint = self.state.load_checkpoint(actor, work.id)
+                preparation = self._preparation(work)
+                if checkpoint is not None and not checkpoint.safe_to_resume:
+                    continue
+                if checkpoint is None and not (
+                    preparation.get("stage") == "failed"
+                    and preparation.get("error_code") == "resource_deferred"
+                ):
+                    continue
+                with self.store.transaction(actor) as tx:
+                    current = tx.get_work(work.id)
+                    if (
+                        current.state != WorkState.PAUSED
+                        or current.pause_reason != "resource_deferred"
+                    ):
+                        continue
+                    if current.policy_revision != actor.policy_revision:
+                        continue
+                    tx.transition_work(
+                        current.id,
+                        WorkState.QUEUED,
+                        expected_revision=current.revision,
+                        reason="recovery",
+                    )
+            except DomainError as error:
+                if error.code not in _RACES:
+                    self._alert(error.code, work.id)
+
+    @staticmethod
+    def _checkpoint_backend(checkpoint: EngineCheckpoint) -> str:
+        backend = checkpoint.backend_state
+        explicit = backend.get("execution_backend")
+        if isinstance(explicit, str) and explicit in {"scoped", "harness"}:
+            return explicit
+        if explicit is not None:
+            raise DomainError("checkpoint_backend_mismatch", "Checkpoint backend is unrecognized")
+        # Native Harness history lives in sessions, not checkpoint.messages.
+        # A safe legacy native checkpoint cannot be resumed by the host loop.
+        if "sessions" in backend or backend.get("version") == "0.2.2rc2":
+            return "harness"
+        return "scoped"
+
+    def _check_backend(self, checkpoint: EngineCheckpoint) -> None:
+        if (
+            self.execution_backend is not None
+            and self._checkpoint_backend(checkpoint) != self.execution_backend
+        ):
+            raise DomainError(
+                "checkpoint_backend_mismatch", "Checkpoint requires its original execution backend"
+            )
+
+    def _tag_backend(self, checkpoint: EngineCheckpoint, engine: EnginePort) -> EngineCheckpoint:
+        backend = (
+            "harness"
+            if isinstance(engine, HarnessEngine)
+            else "scoped"
+            if isinstance(engine, ScopedToolEngine)
+            else self.execution_backend
+        )
+        if self.execution_backend is not None and backend != self.execution_backend:
+            raise DomainError("checkpoint_backend_mismatch", "Prepared execution backend differs")
+        if backend is None:
+            return checkpoint
+        return checkpoint.model_copy(
+            update={"backend_state": {**checkpoint.backend_state, "execution_backend": backend}}
+        )
+
     def _begin_preparation(self, owned: _Owned, checkpoint: EngineCheckpoint | None) -> float:
         with self.store.transaction(owned.actor) as tx:
             tx.assert_lease(owned.lease)
@@ -580,9 +768,9 @@ class WorkSupervisor:
                 "reserved_seconds": allowance,
             }
             tx.conn.execute(
-                "UPDATE ga_work_orders SET scope=jsonb_set(scope,%s,%s),revision=revision+1,"
+                "UPDATE ga_work_orders SET scope=jsonb_set(scope - %s,%s,%s),revision=revision+1,"
                 "updated_at=clock_timestamp() WHERE group_id=%s AND id=%s",
-                ([_PREPARATION], Jsonb(metadata), owned.actor.group_id, current.id),
+                (_RESOURCE_WAIT, [_PREPARATION], Jsonb(metadata), owned.actor.group_id, current.id),
             )
             tx._audit("preparation_started", current.id, attempt=attempts)
             owned.work = tx.get_work(current.id)
@@ -756,6 +944,8 @@ class WorkSupervisor:
                     "scope_violation", "Actor resolution does not match work ownership"
                 )
             checkpoint = self.state.load_checkpoint(actor, initial.id)
+            if checkpoint is not None:
+                self._check_backend(checkpoint)
             if self._preparation(initial).get("stage") == "inflight":
                 self._pause(actor, initial.id, "preparation_reconciliation_required")
                 self._alert("preparation_reconciliation_required", initial.id)
@@ -795,6 +985,7 @@ class WorkSupervisor:
             preparation_started = time.monotonic()
 
             async def prepare() -> PreparedExecution:
+                self._require_resources()
                 return await self.factory(work, lease, actor, owned.workspace)
 
             try:
@@ -806,6 +997,9 @@ class WorkSupervisor:
                 )
             except DomainError as error:
                 self._finish_preparation(owned, time.monotonic() - preparation_started, error)
+                if error.code == "resource_deferred":
+                    self._defer_resources(owned, "preparation")
+                    return self._get(actor, work.id)
                 if error.code in {
                     "attachment_pending",
                     "attachment_expired",
@@ -839,7 +1033,7 @@ class WorkSupervisor:
                 self.state.save_checkpoint(
                     actor,
                     lease,
-                    value,
+                    self._tag_backend(value, prepared.engine),
                     source_event_ids=self._source_ids(self._get(actor, work.id)),
                 )
 
@@ -864,6 +1058,7 @@ class WorkSupervisor:
                 changed = checkpoint.revision != work.goal_revision
                 messages = checkpoint.messages
                 backend = dict(checkpoint.backend_state)
+                pending = checkpoint.pending_inputs
                 if changed:
                     instruction = (
                         "Accepted objective revision: "
@@ -871,7 +1066,20 @@ class WorkSupervisor:
                         + "\nAcceptance criteria: "
                         + json.dumps(work.acceptance_criteria, ensure_ascii=False)
                     )
-                    messages += (ModelMessage(role="user", content=instruction),)
+                    if backend.get("scoped_pending_tools") is not None:
+                        # Finish the old assistant's unexecuted tool responses
+                        # before inserting the new user objective. Appending a
+                        # user message between tool_calls and tool replies makes
+                        # OpenAI-compatible model history invalid.
+                        pending += (
+                            PendingInput(
+                                revision=work.goal_revision,
+                                input_id=f"objective:{work.id}:{work.goal_revision}",
+                                text=instruction,
+                            ),
+                        )
+                    else:
+                        messages += (ModelMessage(role="user", content=instruction),)
                     backend["resume_instruction"] = instruction
                 checkpoint = checkpoint.model_copy(
                     update={
@@ -880,6 +1088,7 @@ class WorkSupervisor:
                         "sequence": 0,
                         "usage": usage,
                         "messages": messages,
+                        "pending_inputs": pending,
                         "backend_state": backend,
                         "state": RunState.PAUSED
                         if changed or checkpoint.state == RunState.RUNNING
@@ -903,6 +1112,7 @@ class WorkSupervisor:
                     ),
                     usage=UsageTotals(active_seconds=preparation_floor),
                 )
+            checkpoint = self._tag_backend(checkpoint, prepared.engine)
             if checkpoint.usage.active_seconds >= request.budget.max_active_seconds:
                 self.state.save_checkpoint(
                     actor, lease, checkpoint, source_event_ids=self._source_ids(work)
@@ -925,8 +1135,18 @@ class WorkSupervisor:
                 snapshot = await self._monitor(
                     asyncio.create_task(prepared.engine.wait(run_id)), owned
                 )
+            snapshot = snapshot.model_copy(
+                update={"checkpoint": self._tag_backend(snapshot.checkpoint, prepared.engine)}
+            )
             owned.snapshot = snapshot
             self._usage_floor[work.id] = snapshot.usage
+            if (
+                snapshot.state == RunState.PAUSED
+                and snapshot.error_code == "resource_deferred"
+                and snapshot.checkpoint.safe_to_resume
+            ):
+                self._defer_resources(owned, "execution")
+                return self._get(actor, work.id)
             if snapshot.state != RunState.CANDIDATE:
                 with self.store.transaction(actor) as tx:
                     current = tx.get_work(work.id)
@@ -978,16 +1198,24 @@ class WorkSupervisor:
             owned.validation_started = validation_started
             owned.validation_base = snapshot.usage
             remaining = request.budget.max_active_seconds - snapshot.usage.active_seconds
+
+            async def validate() -> ValidatedCandidate:
+                self._require_resources()
+                return await self.validator.validate(
+                    current, lease, actor, snapshot, owned.workspace
+                )
+
             try:
                 candidate = await self._monitor(
-                    asyncio.create_task(
-                        self.validator.validate(current, lease, actor, snapshot, owned.workspace)
-                    ),
+                    asyncio.create_task(validate()),
                     owned,
                     deadline=validation_started + max(0, remaining),
                 )
             except DomainError as exc:
                 snapshot = self._record_validation_time(owned, finish=True)
+                if exc.code == "resource_deferred" and snapshot.checkpoint.safe_to_resume:
+                    self._defer_resources(owned, "validation")
+                    return self._get(actor, work.id)
                 if exc.code == "validation_failed" and self._repair(owned, snapshot, exc, 0):
                     return self._get(actor, work.id)
                 raise
@@ -1081,7 +1309,7 @@ class WorkSupervisor:
                 pass
             if owned:
                 owned.process = None
-                if not self._record_stopped(owned):
+                if not await self._record_stopped(owned):
                     self._quiescence_owned[owned.work.id] = owned
 
     async def _monitor(
@@ -1144,7 +1372,11 @@ class WorkSupervisor:
         if owned.engine and owned.run_id:
             try:
                 snapshot = await owned.engine.inspect(owned.run_id)
-                if snapshot.state in {RunState.RUNNING, RunState.WAITING_INPUT, RunState.PAUSED}:
+                quiescent = getattr(owned.engine, "is_quiescent", None)
+                stopped = callable(quiescent) and quiescent(owned.run_id)
+                if snapshot.state == RunState.RUNNING or (
+                    snapshot.state in {RunState.WAITING_INPUT, RunState.PAUSED} and not stopped
+                ):
                     await owned.engine.cancel(owned.run_id, owned.actor)
                     snapshot = await asyncio.wait_for(
                         owned.engine.wait(owned.run_id), timeout=self.cancel_grace_seconds

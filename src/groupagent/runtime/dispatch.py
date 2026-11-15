@@ -13,6 +13,7 @@ from uuid import uuid4
 from groupagent.channels import ChannelReceipt
 from groupagent.conversation.quiet import is_quiet
 from groupagent.domain import ActorContext, DeliveryIntent, DeliveryState, DomainError
+from groupagent.identity import DEFAULT_BOT_BADGE, without_bot_badge
 
 from .artifacts import ArtifactRegistry
 from .contracts import ActorResolver, ProcessLease
@@ -77,13 +78,15 @@ class Dispatcher:
         channel: DeliveryPort,
         artifacts: ArtifactRegistry,
         *,
-        badge: str = "【机器人组长】",
+        badge: str = DEFAULT_BOT_BADGE,
         chunk_characters: int = 1800,
         after_submit: Callable[[DeliveryIntent, int], Awaitable[None]] | None = None,
         time_zone: str = "Asia/Shanghai",
         quiet_hours: list[str] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if not badge.strip():
+            raise ValueError("Text delivery requires a bot identity badge")
         self.state, self.service_actor, self.actor_resolver = state, service_actor, actor_resolver
         self.channel, self.artifacts = channel, artifacts
         self.badge, self.chunk_characters = badge, chunk_characters
@@ -194,7 +197,7 @@ class Dispatcher:
             text = intent.payload_ref[5:]
             if hashlib.sha256(text.encode()).hexdigest() != intent.payload_hash:
                 raise DomainError("source_unavailable", "Outgoing text was changed or removed")
-            chunks = split_text(text, maximum=self.chunk_characters)
+            chunks = split_text(without_bot_badge(text, self.badge), maximum=self.chunk_characters)
             return tuple(
                 (
                     "text",

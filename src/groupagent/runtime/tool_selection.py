@@ -19,6 +19,7 @@ from groupagent.conversation.intent import (
     task_write_request,
 )
 from groupagent.domain import DomainError, WorkOrder
+from groupagent.identity import DEFAULT_IDENTITY, BotIdentity
 from groupagent.scheduling.reminders import get_reminder_body
 
 _IMAGE = frozenset({"png", "jpg", "jpeg", "webp", "gif"})
@@ -98,13 +99,9 @@ _REMINDER_GOAL = re.compile(
     r"^(?:(?:请|到时|届时|到点后|按时|定时|定期)[，,:：\s]*)*(?:提醒(?:我|我们|大家|成员)?|通知(?:我|我们|大家)|remind\b|notify\b)",
     re.I,
 )
-_ADDITIONAL_DELEGATION = re.compile(
-    r"(?:并|另外|同时|顺便).{0,5}(?:帮我|替我|由你|你来|机器人|组长)|(?:and|also)\s+(?:you|create|generate|search|fetch)",
-    re.I,
-)
 
 
-def message_only_research_request(text: str) -> bool:
+def message_only_research_request(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> bool:
     """A canonical information request cannot implicitly authorize a new file.
 
     URLs, code and quoted examples are data. Explicit file/report/format clauses
@@ -125,7 +122,7 @@ def message_only_research_request(text: str) -> bool:
         return False
     if (
         _COMPUTE.search(outside)
-        or task_write_request(outside)
+        or task_write_request(outside, identity=identity)
         or _SCHEDULING.search(outside)
         or _requires_memory(outside)
     ):
@@ -136,7 +133,10 @@ def message_only_research_request(text: str) -> bool:
         outside,
         flags=re.I,
     ):
-        clause = main_request(re.sub(r"^(?:并且|并|同时|然后|最后|另外)\s*", "", clause.strip()))
+        clause = main_request(
+            re.sub(r"^(?:并且|并|同时|然后|最后|另外)\s*", "", clause.strip()),
+            identity=identity,
+        )
         if _FILE_OUTPUT.search(clause) or re.search(
             r"(?:输出|交付|提供|撰写|写一份|形成).{0,24}(?:文件|报告|文档|附件)"
             r"|(?:结果|输出|交付|格式).{0,12}(?:Markdown|PDF|Word|DOCX|PPTX?|CSV|\.md\b)"
@@ -192,6 +192,8 @@ def select_tools(
     work: WorkOrder,
     input_refs: Sequence[Mapping[str, Any]],
     registered_names: Iterable[str],
+    *,
+    identity: BotIdentity = DEFAULT_IDENTITY,
 ) -> frozenset[str]:
     """Return only existing eligible names; never alter grants or budgets.
 
@@ -247,7 +249,7 @@ def select_tools(
         and text_only
         and not research
         and not team_write
-        and (literal_reminder or not _ADDITIONAL_DELEGATION.search(goal))
+        and (literal_reminder or not identity.additional_request(goal))
         and not _requires_memory(criteria)
         and not requires_research(criteria)
         # Criteria describe work the agent must actually satisfy, even when

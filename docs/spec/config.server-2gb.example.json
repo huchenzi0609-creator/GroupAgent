@@ -1,0 +1,125 @@
+{
+  "schema_version": "groupagent.config.v0.1",
+  "deployment_mode": "development",
+  "group": {
+    "enabled": false,
+    "internal_id": "group_demo",
+    "external_group_id": "CONFIGURE_BEFORE_DEPLOYMENT",
+    "owner_ids": ["member_owner_demo"],
+    "time_zone": "Asia/Shanghai",
+    "participation_mode": "natural",
+    "quiet_hours": [],
+    "roster_sync": "on_startup",
+    "periodic_roster_refresh": false
+  },
+  "features": {
+    "natural_participation": true,
+    "image_understanding": true,
+    "audio_transcription": true,
+    "speech_reply_on_request": true,
+    "image_generation": false,
+    "document_editing": true,
+    "web_research": true,
+    "durable_schedules": true,
+    "video_analysis": false,
+    "video_generation": false,
+    "realtime_voice_call": false
+  },
+  "conversation": {
+    "idle_batch_seconds": 2,
+    "max_batch_wait_seconds": 5,
+    "proactive_messages_per_10_minutes": 2,
+    "min_progress_interval_seconds": 60,
+    "hard_reply_character_limit": null,
+    "short_reply_style": "one_to_three_short_sentences"
+  },
+  "limits": {
+    "image_bytes": 8388608,
+    "image_pixels": 12000000,
+    "images_per_work": 4,
+    "markdown_bytes": 2097152,
+    "office_or_pdf_bytes": 16777216,
+    "document_render_pages": 200,
+    "presentation_slides": 100,
+    "audio_file_bytes": 26214400,
+    "audio_file_seconds": 600,
+    "input_files_per_work": 8,
+    "total_input_bytes_per_work": 33554432,
+    "workspace_bytes": 134217728,
+    "output_file_bytes": 26214400
+  },
+  "execution": {
+    "max_model_rounds": 24,
+    "max_total_tokens": 200000,
+    "max_tool_calls": 60,
+    "max_active_seconds": 1200,
+    "max_subagents": 2,
+    "max_concurrent_heavy_work": 1,
+    "tool_timeout_seconds": 60,
+    "browser_timeout_seconds": 90,
+    "render_timeout_seconds": 180,
+    "additional_retry_limit": 2,
+    "lease_seconds": 30,
+    "heartbeat_seconds": 10,
+    "cancel_grace_seconds": 10
+  },
+  "schedule": {
+    "default_valid_days": 30,
+    "max_active_per_group": 10,
+    "min_interval_seconds": 3600,
+    "missed_one_shot_grace_seconds": 86400,
+    "misfire_policy": "latest_only",
+    "overlap_policy": "coalesce"
+  },
+  "retention": {
+    "raw_message_days": 30,
+    "raw_attachment_days": 30,
+    "generated_artifact_days": 90,
+    "audit_days": 90,
+    "backup_days": 7,
+    "project_facts": "until_archive_or_authorized_deletion",
+    "owner_approval_required_before_production": true
+  },
+  "spend": {
+    "currency": "CNY",
+    "group_daily_limit": null,
+    "pricing_snapshot_id": null,
+    "production_requires_explicit_limit": true
+  },
+  "model_routes": {
+    "text_agent": "CONFIGURE_AND_VALIDATE",
+    "vision": "CONFIGURE_AND_VALIDATE",
+    "speech_to_text": "CONFIGURE_AND_VALIDATE",
+    "text_to_speech": "CONFIGURE_AND_VALIDATE",
+    "image_generation": "NOT_IN_CURRENT_SCOPE"
+  },
+  "engine": {
+    "candidate": "deepseek_harness",
+    "approved_runtime_version": null,
+    "extra_session_log_upload": false
+  },
+  "runtime": {
+    "engine": "scoped",
+    "bot_name": "Pot",
+    "bot_aliases": ["机器人", "机器人组长", "组长", "小伴"],
+    "bot_badge": "【Pot】",
+    "channel": "local",
+    "allow_live_send": false,
+    "worker_image": null,
+    "harness_image": null
+  },
+  "resources": {
+    "profile": "server_2gb",
+    "worker_memory_mb": 512,
+    "reserve_memory_mb": 128,
+    "transfer_memory_mb": 128,
+    "worker_cpus": 0.75,
+    "worker_cpu_shares": 128,
+    "worker_oom_score_adj": 500,
+    "worker_pids": 192,
+    "worker_workspace_mb": 128,
+    "worker_temp_mb": 64,
+    "retry_seconds": 5,
+    "maintenance_interval_seconds": 180
+  }
+}

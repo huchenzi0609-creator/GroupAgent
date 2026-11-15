@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from groupagent.identity import DEFAULT_BOT_BADGE, DEFAULT_BOT_NAME, LEGACY_BOT_ALIASES
 
 PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 
@@ -203,6 +205,45 @@ class EngineConfig(StrictModel):
     extra_session_log_upload: Literal[False] = False
 
 
+class ResourceConfig(StrictModel):
+    """An opt-in host budget; neighbouring services keep their own resources."""
+
+    profile: Literal["standard", "server_2gb"] = "standard"
+    worker_memory_mb: Annotated[int, Field(strict=True, ge=512, le=4096)] = 1024
+    reserve_memory_mb: Annotated[int, Field(strict=True, ge=64, le=4096)] = 128
+    transfer_memory_mb: Annotated[int, Field(strict=True, ge=32, le=1024)] = 128
+    worker_cpus: float = Field(default=1, gt=0, le=4)
+    worker_cpu_shares: Annotated[int, Field(strict=True, ge=2, le=262144)] = 1024
+    worker_oom_score_adj: Annotated[int, Field(strict=True, ge=0, le=1000)] = 0
+    worker_pids: Annotated[int, Field(strict=True, ge=32, le=512)] = 256
+    worker_workspace_mb: Annotated[int, Field(strict=True, ge=32, le=512)] = 512
+    worker_temp_mb: Annotated[int, Field(strict=True, ge=32, le=512)] = 128
+    retry_seconds: Annotated[int, Field(strict=True, ge=1, le=60)] = 5
+    maintenance_interval_seconds: Annotated[int, Field(strict=True, ge=60, le=3600)] = 60
+
+    @model_validator(mode="before")
+    @classmethod
+    def profile_defaults(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("profile") == "server_2gb":
+            value = dict(value)
+            for key, default in {
+                "worker_memory_mb": 512,
+                "worker_cpus": 0.75,
+                "worker_cpu_shares": 128,
+                "worker_oom_score_adj": 500,
+                "worker_pids": 192,
+                "worker_workspace_mb": 128,
+                "worker_temp_mb": 64,
+                "maintenance_interval_seconds": 180,
+            }.items():
+                value.setdefault(key, default)
+        return value
+
+    @property
+    def enabled(self) -> bool:
+        return self.profile == "server_2gb"
+
+
 class RuntimeConfig(StrictModel):
     channel: Literal["local", "agentwechat"] = "local"
     channel_base_url: str = "http://127.0.0.1:8788"
@@ -215,12 +256,40 @@ class RuntimeConfig(StrictModel):
     docker_host: str | None = None
     poll_seconds: float = Field(default=0.25, gt=0, le=30)
     message_chunk_characters: int = Field(default=1800, ge=100, le=4000)
-    bot_badge: str = "【机器人组长】"
+    bot_name: str = Field(default=DEFAULT_BOT_NAME, min_length=1, max_length=64)
+    bot_aliases: list[str] = Field(default_factory=lambda: list(LEGACY_BOT_ALIASES), max_length=20)
+    bot_badge: str = Field(default=DEFAULT_BOT_BADGE, min_length=1, max_length=66)
     browser_hosts: list[str] = Field(default_factory=list, max_length=30)
     image_generation_price_id: str | None = None
     semantic_validation: bool = True
     local_member_names: dict[str, str] = Field(default_factory=dict)
     pg_bin_dir: str | None = None
+
+    @field_validator("bot_name", "bot_badge")
+    @classmethod
+    def printable_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value or not value.isprintable():
+            raise ValueError("Bot identity must be nonblank printable text")
+        return value
+
+    @field_validator("bot_aliases")
+    @classmethod
+    def valid_bot_aliases(cls, values: list[str]) -> list[str]:
+        aliases = [value.strip() for value in values]
+        if any(not value or not value.isprintable() or len(value) > 64 for value in aliases):
+            raise ValueError(
+                "Bot aliases must be nonblank printable names of at most 64 characters"
+            )
+        if len({value.casefold() for value in aliases}) != len(aliases):
+            raise ValueError("Bot aliases must be unique ignoring case")
+        return aliases
+
+    @model_validator(mode="after")
+    def coherent_bot_identity(self) -> RuntimeConfig:
+        if self.bot_badge != f"【{self.bot_name}】":
+            raise ValueError("Bot badge must match the configured bot name")
+        return self
 
     @field_validator("worker_image", "harness_image")
     @classmethod
@@ -248,6 +317,54 @@ class AppConfig(StrictModel):
     model_routes: ModelRoutes = Field(default_factory=ModelRoutes)
     engine: EngineConfig = Field(default_factory=EngineConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    resources: ResourceConfig = Field(default_factory=ResourceConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def low_memory_defaults(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            resource = value.get("resources")
+            profile = (
+                resource.profile
+                if isinstance(resource, ResourceConfig)
+                else (resource.get("profile") if isinstance(resource, dict) else None)
+            )
+            if profile == "server_2gb":
+                value = dict(value)
+                raw_runtime = value.get("runtime", {})
+                runtime = (
+                    raw_runtime.model_dump(exclude_unset=True)
+                    if isinstance(raw_runtime, RuntimeConfig)
+                    else dict(raw_runtime)
+                )
+                runtime.setdefault("engine", "scoped")
+                value["runtime"] = runtime
+                raw_limits = value.get("limits", {})
+                limits = (
+                    raw_limits.model_dump(exclude_unset=True)
+                    if isinstance(raw_limits, LimitsConfig)
+                    else dict(raw_limits)
+                )
+                for key, default in {
+                    "image_bytes": 8 * 1024**2,
+                    "image_pixels": 12_000_000,
+                    "images_per_work": 4,
+                    "office_or_pdf_bytes": 16 * 1024**2,
+                    "input_files_per_work": 8,
+                    "total_input_bytes_per_work": 32 * 1024**2,
+                    "workspace_bytes": 128 * 1024**2,
+                }.items():
+                    limits.setdefault(key, default)
+                value["limits"] = limits
+        return value
+
+    @model_validator(mode="after")
+    def resource_contract(self) -> AppConfig:
+        if self.resources.enabled and (
+            self.runtime.engine != "scoped" or self.execution.max_concurrent_heavy_work != 1
+        ):
+            raise ValueError("The 2GB profile requires scoped execution and one active heavy work")
+        return self
 
     def production_blockers(self) -> list[str]:
         blockers = []

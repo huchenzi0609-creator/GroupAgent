@@ -211,14 +211,23 @@ class InputProcessor:
         *,
         max_total_input_bytes: int = 100 * 1024 * 1024,
         max_images: int = 10,
+        max_input_files: int = 20,
+        max_image_bytes: int = 15 * 1024 * 1024,
+        max_document_bytes: int = 30 * 1024 * 1024,
+        max_image_pixels: int = 40_000_000,
     ):
-        if (
-            type(max_total_input_bytes) is not int
-            or not 0 < max_total_input_bytes <= 100 * 1024 * 1024
-            or type(max_images) is not int
-            or not 0 < max_images <= 10
+        if any(
+            type(value) is not int or not 0 < value <= maximum
+            for value, maximum in (
+                (max_total_input_bytes, 100 * 1024 * 1024),
+                (max_images, 10),
+                (max_input_files, 20),
+                (max_image_bytes, 15 * 1024 * 1024),
+                (max_document_bytes, 30 * 1024 * 1024),
+                (max_image_pixels, 40_000_000),
+            )
         ):
-            raise ValueError("Input limits must be within 100 MiB and ten images")
+            raise ValueError("Input file, byte, image and pixel limits exceed supported bounds")
         root = workspace_root.absolute()
         if root != root.resolve() or root.is_symlink():
             raise DomainError("invalid_path", "Input workspace root must be canonical")
@@ -238,6 +247,8 @@ class InputProcessor:
         )
         self.registry = ArtifactRegistry(store, artifacts)
         self.max_total_input_bytes, self.max_images = max_total_input_bytes, max_images
+        self.max_input_files, self.max_image_bytes = max_input_files, max_image_bytes
+        self.max_document_bytes, self.max_image_pixels = max_document_bytes, max_image_pixels
         self._active_audio: dict[str, set[asyncio.Task[GroupEvent]]] = {}
         self._quiesced_events: set[str] = set()
 
@@ -275,8 +286,7 @@ class InputProcessor:
         # All subsequent bytes, timestamps and metadata come from this stored event.
         return actor, canonical
 
-    @staticmethod
-    def _handles(event: GroupEvent) -> tuple[AttachmentHandle, ...]:
+    def _handles(self, event: GroupEvent) -> tuple[AttachmentHandle, ...]:
         if event.kind == EventKind.UNSUPPORTED_VIDEO or any(
             item.get("kind") == "unsupported_video" for item in event.attachments
         ):
@@ -308,15 +318,35 @@ class InputProcessor:
             handles.append(handle)
         if (
             not handles
-            or len(handles) > 20
+            or len(handles) > self.max_input_files
             or len({_attachment_key(h) for h in handles}) != len(handles)
         ):
             raise DomainError(
-                "invalid_attachment", "One to twenty distinct attachment handles are required"
+                "invalid_attachment", "Attachment selection exceeds the distinct file limit"
             )
         return tuple(handles)
 
+    def _check_input_size(self, kind: str, name: str | None, size: int | None) -> None:
+        suffix = Path(name or "").suffix.lower().lstrip(".")
+        if kind == "image" or suffix in _IMAGE_FORMATS:
+            maximum = self.max_image_bytes
+        elif kind == "audio" or suffix in _AUDIO_FORMATS:
+            maximum = 25 * 1024 * 1024
+        else:
+            maximum = self.max_document_bytes
+        if size is not None and size > min(maximum, self.max_total_input_bytes):
+            raise DomainError("input_limit", "Selected attachment exceeds its input byte limit")
+
+    def _check_handle_size(self, handle: AttachmentHandle) -> None:
+        self._check_input_size(
+            handle.kind,
+            handle.filename,
+            handle.size_bytes if handle.size_bytes is not None else handle.advertised_size_bytes,
+        )
+
     async def _download(self, event: GroupEvent, reference: AttachmentHandle) -> AttachmentContent:
+        _reject_video(reference)
+        self._check_handle_size(reference)
         handles = await self.channel.attachment_handles(reference.message_id)
         candidates = [
             h
@@ -346,6 +376,7 @@ class InputProcessor:
                 pending = [h for h in candidates if h.availability == "pending"]
                 request = getattr(self.channel, "request_attachment_download", None)
                 if len(pending) == 1 and request is not None:
+                    self._check_handle_size(pending[0])
                     await request(pending[0])
                 raise DomainError(
                     "attachment_pending" if pending else "attachment_unavailable",
@@ -357,19 +388,20 @@ class InputProcessor:
             )
         handle = choices[0]
         _reject_video(handle)
+        self._check_handle_size(handle)
         if (
             handle.platform_message_id is not None
             and handle.platform_message_id != event.platform_message_id
         ):
             raise DomainError("scope_violation", "Attachment platform identity changed")
         content = await self.channel.fetch_attachment(handle)
+        self._check_input_size(handle.kind, handle.filename, len(content.content))
         digest = hashlib.sha256(content.content).hexdigest()
         if (
             content.handle != handle
             or content.sha256 != digest
             or (handle.sha256 and handle.sha256 != digest)
             or (handle.size_bytes is not None and handle.size_bytes != len(content.content))
-            or len(content.content) > 30 * 1024 * 1024
         ):
             raise DomainError(
                 "validation_failed", "Downloaded attachment does not match its metadata"
@@ -498,6 +530,14 @@ class InputProcessor:
                 raise DomainError(
                     "already_processed", "Audio source already has a durable decision"
                 )
+            reconciliation = body.get("reconciliation_reservation_id")
+            if isinstance(reconciliation, str) and reconciliation:
+                raise DomainError(
+                    "provider_reconciliation_required",
+                    "Audio preprocessing already has a paid reservation; reconcile before retry",
+                    effect_state="unknown",
+                    resource_ref=reconciliation,
+                )
             if (
                 body.get("state") == "processing"
                 and body.get("claim_until", 0) > row["now"].timestamp()
@@ -530,9 +570,17 @@ class InputProcessor:
             return attempt
 
     def _failed(
-        self, actor: ActorContext, event: GroupEvent, attachment: str, token: str, code: str
-    ) -> None:
+        self,
+        actor: ActorContext,
+        event: GroupEvent,
+        attachment: str,
+        token: str,
+        code: str,
+        *,
+        unstarted_attempt: tuple[int, str] | None = None,
+    ) -> str | None:
         # Do not restore invalidated rows or replace a newer process's claim.
+        reservation_id = None
         with self.store.transaction(actor) as tx:
             memory_lock(tx)
             row = tx.conn.execute(
@@ -540,8 +588,27 @@ class InputProcessor:
                 (actor.group_id, event.id, attachment),
             ).fetchone()
             if row and row["body"].get("claim") == token:
-                body = {**row["body"], "state": "failed", "error_code": code, "claim_until": 0}
+                body = dict(row["body"])
+                if unstarted_attempt is not None:
+                    attempt, prefix = unstarted_attempt
+                    if body.get("attempts") == attempt:
+                        # Reserve takes the same memory lock. Check the durable
+                        # ledger, including reserved/unknown/settled/released rows,
+                        # rather than inferring nonpayment from a local set.
+                        paid_prefix = prefix + ":asr-"
+                        reservation = tx.conn.execute(
+                            "SELECT id FROM ga_budget_reservations WHERE group_id=%s AND left(key,length(%s))=%s LIMIT 1",
+                            (actor.group_id, paid_prefix, paid_prefix),
+                        ).fetchone()
+                        if reservation is None:
+                            body["attempts"] = attempt - 1
+                        else:
+                            reservation_id = str(reservation["id"])
+                            code = "provider_reconciliation_required"
+                            body["reconciliation_reservation_id"] = reservation_id
+                body.update(state="failed", error_code=code, claim_until=0)
                 self._put(tx, event, attachment, body)
+        return reservation_id
 
     def _finish(
         self,
@@ -667,6 +734,7 @@ class InputProcessor:
                 "invalid_attachment", "A voice message needs exactly one audio attachment"
             )
         handle = handles[0]
+        self._check_handle_size(handle)
         attachment, fingerprint, token = (
             _attachment_key(handle),
             source_fingerprint(event),
@@ -705,13 +773,22 @@ class InputProcessor:
                     return
 
         ticker = asyncio.create_task(heartbeat())
+        unstarted_attempt: tuple[int, str] | None = None
         try:
             service = MediaService(
-                self.artifacts, self.worker, providers=self.providers, source_guard=guard
+                self.artifacts,
+                self.worker,
+                providers=self.providers,
+                source_guard=guard,
+                max_image_bytes=self.max_image_bytes,
+                max_image_pixels=self.max_image_pixels,
+                max_images=self.max_images,
             )
             if isinstance(body.get("reference"), dict):
                 reference = MediaRef.model_validate(body["reference"])
-                await service._content(context, reference)
+                self._check_input_size(
+                    "audio", None, len(await service._content(context, reference))
+                )
             else:
                 downloaded = await self._download(event, handle)
                 await guard(context, (event.id,))
@@ -746,6 +823,7 @@ class InputProcessor:
                 self._attempt, actor, event, attachment, token, fingerprint
             )
             prefix = context.idempotency_key + ":attempt-" + str(attempt)
+            unstarted_attempt = (attempt, prefix)
             context = ToolContext(context.scope, context.call_id, prefix, context.cancelled)
             service.budget = _InputBudget(
                 self, actor, event, attachment, token, fingerprint, prefix
@@ -765,15 +843,32 @@ class InputProcessor:
             )
         except BaseException as error:
             context.cancelled.set()
+            deferred = (
+                isinstance(error, DomainError)
+                and error.code == "resource_deferred"
+                and error.effect_state == "not_started"
+            )
+            reservation_id = None
             with suppress(Exception):
-                await asyncio.to_thread(
+                reservation_id = await asyncio.to_thread(
                     self._failed,
                     actor,
                     event,
                     attachment,
                     token,
                     error.code if isinstance(error, DomainError) else "input_incomplete",
+                    unstarted_attempt=unstarted_attempt if deferred else None,
                 )
+            if reservation_id is not None:
+                # A later local worker may be unstarted while this ASR attempt
+                # already owns a paid/unknown call. Never silently replay it or
+                # release its hold merely because the last operation was denied.
+                raise DomainError(
+                    "provider_reconciliation_required",
+                    "Audio preprocessing already has a paid reservation; reconcile before retry",
+                    effect_state="unknown",
+                    resource_ref=reservation_id,
+                ) from error
             raise
         finally:
             ticker.cancel()
@@ -839,6 +934,7 @@ class InputProcessor:
         *,
         extra: dict[str, Any] | None = None,
     ) -> ArtifactVersion:
+        self._check_input_size(source.declared_kind, name, len(content))
         suffix = Path(name).suffix.lower().lstrip(".")
         if source.declared_kind == "image" or suffix in _IMAGE_FORMATS:
             reference = await media.ingest_image(context, source, content)
@@ -870,16 +966,16 @@ class InputProcessor:
         raw = current.scope.get("attachment_event_ids", [])
         if (
             not isinstance(raw, list)
-            or len(raw) > 20
+            or len(raw) > self.max_input_files
             or any(not isinstance(value, str) for value in raw)
             or len(set(raw)) != len(raw)
         ):
             raise DomainError(
                 "invalid_input",
-                "Work attachments must name at most twenty distinct authorized events",
+                "Work attachments exceed the distinct authorized file limit",
             )
         event_ids = [str(value) for value in raw]
-        if len(current.input_versions) > 20:
+        if len(current.input_versions) > self.max_input_files:
             raise DomainError("invalid_input", "Too many explicit artifact inputs")
         imported: list[dict[str, Any]] = []
         total_bytes, images = 0, 0
@@ -896,8 +992,8 @@ class InputProcessor:
         for event_id in event_ids:
             event = await asyncio.to_thread(self._work_event, context, current, event_id)
             for sequence, handle in enumerate(self._handles(event)):
-                if len(imported) >= 20:
-                    raise DomainError("input_limit", "A work may import at most twenty attachments")
+                if len(imported) >= self.max_input_files:
+                    raise DomainError("input_limit", "Work exceeds its selected file limit")
                 attachment, fingerprint = _attachment_key(handle), source_fingerprint(event)
                 cache_key = current.id + ":" + str(lease.goal_revision)
                 with self.store.transaction(context.actor) as tx:
@@ -911,6 +1007,11 @@ class InputProcessor:
                     await asyncio.to_thread(self._work_guard, current, lease, context)
                     cached_version, cached_bytes = self.registry.read(
                         context.actor, cached["version_id"]
+                    )
+                    self._check_input_size(
+                        "image" if cached_version.format in _IMAGE_FORMATS else "file",
+                        cached_version.name,
+                        len(cached_bytes),
                     )
                     admit(cached_bytes, is_image=cached_version.format in _IMAGE_FORMATS)
                     imported.append(cached)
@@ -945,6 +1046,7 @@ class InputProcessor:
                     content, actual_handle = downloaded.content, downloaded.handle
                 await asyncio.to_thread(self._work_guard, current, lease, context)
                 await asyncio.to_thread(self._work_event, context, current, event_id)
+                self._check_input_size(actual_handle.kind, name, len(content))
                 admit(
                     content,
                     is_image=actual_handle.kind == "image"
@@ -980,10 +1082,15 @@ class InputProcessor:
                     self._put(tx, event, attachment, body)
                 imported.append(item)
         for original_id in dict.fromkeys(current.input_versions):
-            if len(imported) >= 20:
-                raise DomainError("input_limit", "A work may import at most twenty attachments")
+            if len(imported) >= self.max_input_files:
+                raise DomainError("input_limit", "Work exceeds its selected file limit")
             await asyncio.to_thread(self._work_guard, current, lease, context)
             original, content = self.registry.read(context.actor, original_id)
+            self._check_input_size(
+                "image" if original.format in _IMAGE_FORMATS else "file",
+                original.name,
+                len(content),
+            )
             admit(content, is_image=original.format in _IMAGE_FORMATS)
             with self.store.transaction(context.actor) as tx:
                 memory_lock(tx)

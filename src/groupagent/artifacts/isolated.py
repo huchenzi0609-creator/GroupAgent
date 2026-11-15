@@ -33,8 +33,31 @@ class IsolatedDocumentService:
         worker: Any,
         *,
         policy_guard: Callable[[ToolContext], Awaitable[None]] | None = None,
+        max_import_bytes: int = 30 * 1024 * 1024,
+        max_markdown_bytes: int = 2 * 1024 * 1024,
+        max_output_bytes: int = 25 * 1024 * 1024,
     ):
+        if (
+            type(max_import_bytes) is not int
+            or not 0 < max_import_bytes <= 30 * 1024 * 1024
+            or type(max_markdown_bytes) is not int
+            or not 0 < max_markdown_bytes <= 2 * 1024 * 1024
+            or type(max_output_bytes) is not int
+            or not 0 < max_output_bytes <= 30 * 1024 * 1024
+        ):
+            raise ValueError("Document limits must be within 30 MiB and 2 MiB input Markdown")
         self.store, self.worker, self.policy_guard = store, worker, policy_guard
+        self.max_import_bytes, self.max_markdown_bytes = max_import_bytes, max_markdown_bytes
+        self.max_output_bytes = max_output_bytes
+
+    def _output(self, content: bytes) -> bytes:
+        if len(content) > self.max_output_bytes:
+            raise ToolFailure(
+                "file_too_large",
+                "Generated output exceeds the configured file byte limit; no artifact was published.",
+                no_effect=True,
+            )
+        return content
 
     @staticmethod
     def _format(name: str, *, media: bool = False) -> str:
@@ -92,7 +115,7 @@ class IsolatedDocumentService:
             outputs=("document." + format_name,),
         )
         scope = await self._scope(context)
-        return self.store.create(scope, name, outputs[0], provenance=provenance)
+        return self.store.create(scope, name, self._output(outputs[0]), provenance=provenance)
 
     async def render_chart(
         self,
@@ -116,7 +139,7 @@ class IsolatedDocumentService:
         version = self.store.create(
             scope,
             name,
-            outputs[0],
+            self._output(outputs[0]),
             provenance={
                 **(provenance or {}),
                 "media_metadata": metadata,
@@ -153,16 +176,33 @@ class IsolatedDocumentService:
         content: bytes,
         *,
         provenance: dict[str, Any] | None = None,
+        generated_output: bool = False,
     ) -> ArtifactVersion:
+        # Only the trusted artifact_from_workspace adoption path sets this;
+        # channel/history imports retain the smaller input limits.
+        if type(generated_output) is not bool:
+            raise ValueError("Generated-output adoption must be an explicit boolean")
         await self._scope(context)
         format_name = self._format(name)
-        if len(content) > (2 if format_name == "md" else 30) * 1024 * 1024:
+        limit = (
+            self.max_output_bytes
+            if generated_output
+            else self.max_markdown_bytes
+            if format_name == "md"
+            else self.max_import_bytes
+        )
+        if len(content) > limit:
             raise ToolFailure(
                 "file_too_large",
-                "Field content exceeds 2 MiB for Markdown or 30 MiB for Office/PDF; no artifact was published.",
+                "Field content exceeds the configured document import byte limit; no artifact was published.",
                 no_effect=True,
             )
-        await self._run(context, "document_inspect", (content,), parameters={"format": format_name})
+        await self._run(
+            context,
+            "document_inspect",
+            (content,),
+            parameters={"format": format_name, "max_import_bytes": limit},
+        )
         scope = await self._scope(context)
         return self.store.create(scope, name, content, provenance=provenance)
 
@@ -246,7 +286,7 @@ class IsolatedDocumentService:
         )
         scope = await self._scope(context)
         return self.store.revise(
-            scope, file_id, outputs[0], expected_version_id=expected_version_id
+            scope, file_id, self._output(outputs[0]), expected_version_id=expected_version_id
         )
 
     async def search(
@@ -374,7 +414,7 @@ class IsolatedDocumentService:
             "media_metadata": result,
         }
         extracted = self.store.create(
-            scope, f"embedded-{image_index}.png", outputs[0], provenance=provenance
+            scope, f"embedded-{image_index}.png", self._output(outputs[0]), provenance=provenance
         )
         self.store.record_validation(
             scope,
@@ -422,7 +462,7 @@ class IsolatedDocumentService:
         )
         scope = await self._scope(context)
         return self.store.revise(
-            scope, file_id, outputs[0], expected_version_id=expected_version_id
+            scope, file_id, self._output(outputs[0]), expected_version_id=expected_version_id
         )
 
     async def select_pdf_pages(
@@ -500,7 +540,7 @@ class IsolatedDocumentService:
         return self.store.create(
             scope,
             name,
-            outputs[0],
+            self._output(outputs[0]),
             provenance={
                 **provenance,
                 "declared_kind": "file",

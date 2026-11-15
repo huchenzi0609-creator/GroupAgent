@@ -34,6 +34,7 @@ from groupagent.domain import (
     TeamTaskState,
     WorkState,
 )
+from groupagent.identity import BotIdentity, control_request
 from groupagent.memory import MemberService, MemoryService
 from groupagent.memory.retrieval import visible_events
 from groupagent.persistence import PostgresStore, UnitOfWork
@@ -67,7 +68,7 @@ from .intent import (
     requires_research,
     task_write_request,
 )
-from .participation import fast_observe, policy_intent
+from .participation import fast_observe, outside_quotes, policy_intent
 from .quiet import is_quiet
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
@@ -120,6 +121,7 @@ class ConversationCoordinator(Coordinator):
             scheduler,
         )
         self.artifacts, self.clock = artifacts, clock or (lambda: datetime.now(UTC))
+        self.identity = BotIdentity.from_runtime(config.runtime)
         self.execution_guard: Callable[..., None] = lambda *args: None
         self.service_actor = ActorContext(
             group_id=config.group.internal_id,
@@ -671,6 +673,7 @@ class ConversationCoordinator(Coordinator):
             },
         }
         payload = alias_value(payload)
+        payload.update(self.identity.context())
         payload.update(
             {
                 "_snapshot": snapshot,
@@ -756,24 +759,14 @@ class ConversationCoordinator(Coordinator):
             or policy_intent(event, context) is not None
         ):
             return None
-        intent = new_work_intent(event.text)
+        identity = BotIdentity.from_context(context)
+        intent = new_work_intent(event.text, identity=identity)
         if intent is None:
             return None
         # Only self-contained requests qualify. Missing unrelated history grants
         # no input references; the shared final transaction still asserts the
         # original complete snapshot, role and source below.
-        aliases = context.get("agent_aliases", [])
-        addressed = isinstance(aliases, list) and any(
-            isinstance(alias, str)
-            and alias
-            and re.match(
-                r"^\s*(?:请|麻烦|拜托)?\s*@?"
-                + re.escape(alias)
-                + r"[，,:：\s]*(?:请|帮|制作|生成|用|计算)",
-                event.text,
-            )
-            for alias in aliases
-        )
+        addressed = identity.strip_address(event.text) != event.text.strip()
         return Decision(
             kind="start_work",
             reason_code="explicit_new_work_admission",
@@ -789,12 +782,8 @@ class ConversationCoordinator(Coordinator):
     def _fast_control(self, event: GroupEvent, context: dict) -> Decision | None:
         if event.kind not in {EventKind.TEXT, EventKind.QUOTE}:
             return None
-        text = re.sub(r"^\s*(?:/组长|@?机器人组长|@?组长)[，,:：\s]*", "", event.text).strip()
-        match = re.fullmatch(
-            r"(停止|取消|暂停|先停一下|停一下|别做了)(?:这个任务|这项任务|刚才的任务|这个工作|任务)?[。！!\s]*",
-            text,
-        )
-        if not match:
+        command = control_request(event.text, identity=BotIdentity.from_context(context))
+        if command is None:
             return None
         works = [
             work
@@ -826,7 +815,7 @@ class ConversationCoordinator(Coordinator):
             reason_code="explicit_local_control",
             target_work_id=work["id"],
             expected_revision=work["revision"],
-            control="pause" if match[1] in {"暂停", "先停一下", "停一下"} else "cancel",
+            control="pause" if command in {"暂停", "先停一下", "停一下"} else "cancel",
             directness="direct",
             confidence=1,
         )
@@ -852,7 +841,7 @@ class ConversationCoordinator(Coordinator):
             requested_execution = event.kind in {
                 EventKind.TEXT,
                 EventKind.QUOTE,
-            } and explicitly_requires_execution(event.text)
+            } and explicitly_requires_execution(event.text, identity=self.identity)
             unsupported = bool(re.search(r"(?:无法|不能|不支持|没有权限)", decision.response or ""))
             if requested_execution and not unsupported:
                 formats: list[dict[str, JsonValue]] = []
@@ -1194,14 +1183,22 @@ class ConversationCoordinator(Coordinator):
         if isinstance(action, CreateSchedule):
             if not self.config.features.durable_schedules:
                 raise DomainError("feature_disabled", "Scheduling is disabled")
+            outside = self.identity.strip_address(outside_quotes(event.text))
             reminder_only = bool(
-                re.search(r"(?:提醒|通知)(?:我|我们|大家|一下|：|:)", event.text)
-            ) and not bool(
+                re.search(r"(?:提醒|通知)(?:我|我们|大家|一下|：|:)", outside)
+            ) and not (
                 re.search(
-                    r"(?:你|帮我|替我|机器人).{0,8}(?:实际|执行|生成|制作|搜索|整理成)", event.text
+                    r"(?:你|帮我|替我|"
+                    + self.identity.name_pattern
+                    + r").{0,8}(?:实际|执行|生成|制作|搜索|整理成)",
+                    outside,
+                    re.I,
                 )
+                or self.identity.additional_request(outside)
             )
-            body = extract_reminder_body(event.text) if reminder_only else None
+            body = (
+                extract_reminder_body(event.text, identity=self.identity) if reminder_only else None
+            )
             scope = {
                 "source_event_ids": list(context["_snapshot"]["source_fingerprints"]),
                 "source_fingerprints": context["_snapshot"]["source_fingerprints"],
@@ -1239,12 +1236,14 @@ class ConversationCoordinator(Coordinator):
                 for key in ("timing", "goal", "valid_until")
                 if key in action.model_fields_set
             }
-            replacement_body = extract_reminder_body(event.text, replacement=True)
+            replacement_body = extract_reminder_body(
+                event.text, replacement=True, identity=self.identity
+            )
             if replacement_body is not None:
                 values["goal"] = replacement_body
             elif previous_schedule.scope.get(
                 "reminder_body_literal"
-            ) is True and is_time_only_reminder_change(event.text):
+            ) is True and is_time_only_reminder_change(event.text, identity=self.identity):
                 # A timing-only request cannot replace its original literal
                 # body with a paraphrased goal supplied by the router.
                 values.pop("goal", None)
@@ -1286,7 +1285,7 @@ class ConversationCoordinator(Coordinator):
                 current_request = re.sub(
                     r"“[^”]*”|『[^』]*』|「[^」]*」|\"[^\"]*\"",
                     "<quoted data>",
-                    main_request(event.text),
+                    main_request(event.text, identity=self.identity),
                 )
                 reminder_text = current_request + "\n" + rule.goal
                 scope["reminder_only"] = bool(
@@ -1300,8 +1299,11 @@ class ConversationCoordinator(Coordinator):
                     re.search(
                         r"(?:不要|不用|不再|取消).{0,5}(?:提醒|通知)"
                         r"|(?:你|帮我|替我|机器人).{0,8}(?:实际|执行|生成|制作|搜索|检索|整理成)"
-                        r"|(?:并|另外|同时|顺便).{0,5}(?:帮我|替我|由你|你来|机器人|组长)",
+                        r"|(?:并|另外|同时|顺便).{0,5}(?:帮我|替我|由你|你来|"
+                        + self.identity.name_pattern
+                        + r")",
                         reminder_text,
+                        re.I,
                     )
                 )
             tx.conn.execute(
@@ -1599,7 +1601,7 @@ class ConversationCoordinator(Coordinator):
                             and not event.attachments
                             and not decision.input_versions
                             and not decision.input_event_ids
-                            and message_only_research_request(event.text)
+                            and message_only_research_request(event.text, identity=self.identity)
                         )
                         outputs = [
                             OutputRequirement.model_validate(value)
@@ -1653,14 +1655,14 @@ class ConversationCoordinator(Coordinator):
                         direct_fetch = bool(
                             re.match(
                                 r"(?:真正|实际|现在|直接)?(?:读取|打开|查看|访问).{0,20}https?://",
-                                main_request(request_text),
+                                main_request(request_text, identity=self.identity),
                             )
                         )
                         research_required = research_required or direct_fetch
                         if research_required and not self.config.features.web_research:
                             raise DomainError("feature_disabled", "Web research is disabled")
                         required_tools = []
-                        main = main_request(request_text)
+                        main = main_request(request_text, identity=self.identity)
                         if re.match(
                             r"(?:真正|实际|现在|直接)?(?:用|使用)(?:受控的?)?\s*[Pp]ython", main
                         ):
@@ -1670,7 +1672,11 @@ class ConversationCoordinator(Coordinator):
                             main,
                         ):
                             required_tools.append("process_run")
-                        admitted_intent = new_work_intent(event.text) if fast_admitted else None
+                        admitted_intent = (
+                            new_work_intent(event.text, identity=self.identity)
+                            if fast_admitted
+                            else None
+                        )
                         if (
                             admitted_intent
                             and admitted_intent.required_tool
@@ -1683,7 +1689,7 @@ class ConversationCoordinator(Coordinator):
                             required_tools.append("web_fetch")
                         if re.match(r"(?:联网)?(?:检索|搜索|上网.{0,3}查)", main):
                             required_tools.append("web_search")
-                        team_write = task_write_request(request_text)
+                        team_write = task_write_request(request_text, identity=self.identity)
                         team_targets = [
                             row["id"]
                             for row in context["_tasks"]

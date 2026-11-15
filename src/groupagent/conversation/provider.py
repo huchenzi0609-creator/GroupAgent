@@ -15,6 +15,7 @@ from groupagent.coordinator import Decision
 from groupagent.domain import DomainError, GroupEvent
 from groupagent.execution.models import ModelMessage, ModelRequest
 from groupagent.execution.ports import ModelPort
+from groupagent.identity import BotIdentity
 from groupagent.scheduling.models import _timing_adapter as timing_contract
 from groupagent.scheduling.models import parse_timing
 from groupagent.security import redact_credentials
@@ -660,6 +661,8 @@ class ModelDecisionProvider:
             for key, value in context.items()
             if not key.startswith("_") and key != "model_event"
         }
+        identity = BotIdentity.from_context(context)
+        public.update(identity.context())
         public.update(time_resolution=temporal.to_dict(), reference_catalog=catalog)
         if intent is not None:
             public["interaction_intent"] = {
@@ -682,7 +685,13 @@ class ModelDecisionProvider:
             raise DomainError(
                 "context_too_large", "Conversation context exceeds the bounded router input"
             )
-        system = SYSTEM + "\nDecision schema:\n" + json.dumps(decision_schema(), ensure_ascii=False)
+        system = (
+            SYSTEM
+            + "\n"
+            + identity.instruction()
+            + "\nDecision schema:\n"
+            + json.dumps(decision_schema(), ensure_ascii=False)
+        )
         messages = [
             ModelMessage(role="system", content=system),
             ModelMessage(role="user", content=payload),

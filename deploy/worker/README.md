@@ -32,6 +32,8 @@ BuildKit 的 `FROM` 不按本机 image ID 查找 `sha256:...`；构建 Harness �
 
 ## 实际资源测量
 
+以下数值和“未连接目标主机”状态属于 2026年11月14日的历史基线。2026年11月15日目标主机已由主流程通过 `pot-server` 只读盘点；新增 `server_2gb` 档采用 512 MiB 短时单 worker，部署说明与未验收边界见 [Pot 的 2GB 共存部署档](../SERVER_2GB.md)。本节历史 1 GiB／arm64 测量不构成该档或目标 x86_64 完整服务通过。
+
 `measure_resources.py` 在专用 Colima VM（Linux arm64，2 CPU、3 GiB RAM、20 GiB 开发盘，无 host mounts）同时运行真实 Harness SDK 与离线 Chromium。模型为显式 ScriptedFakeModel，故意延迟 10 秒确保进程重叠；供应商调用数为 0。完整机器可读证据是 `resource-evidence.json`。
 
 | 测试进程 | cgroup memory.peak | pids.peak | 私有 tmpfs 使用 |

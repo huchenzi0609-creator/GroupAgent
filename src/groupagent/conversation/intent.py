@@ -11,15 +11,18 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from groupagent.identity import DEFAULT_IDENTITY, BotIdentity
 
-def main_request(text: str) -> str:
-    text = re.sub(r"^\s*(?:/组长|@?机器人组长|@?组长)[，,:：\s]*", "", text).strip()
+
+def main_request(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> str:
+    text = identity.strip_address(text)
     previous = None
     while text != previous:
         previous = text
         text = re.sub(
             r"^(?:请你?|麻烦你?|帮我|替我|能否|能不能|可不可以|(?:你)?可以)[，,：:\s]*", "", text
         ).strip()
+        text = identity.strip_address(text)
     return text
 
 
@@ -147,7 +150,7 @@ def _enumerated_ppt_intent(main: str) -> NewWorkIntent | None:
     return NewWorkIntent(({"format": "pptx", "exact_units": count, "expected_text": visible},))
 
 
-def new_work_intent(text: str) -> NewWorkIntent | None:
+def new_work_intent(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> NewWorkIntent | None:
     """A bounded, self-contained new task; this hint never grants authority.
 
     Existing files, discussion references, human assignments, schedules and
@@ -156,15 +159,14 @@ def new_work_intent(text: str) -> NewWorkIntent | None:
     """
     if not text.strip() or len(text) > 6000:
         return None
-    main = re.sub(r"^\s*(?:@?机器人组长|@?机器人|@?组长|@?小伴)[，,:：\s]*", "", text)
-    main = main_request(main)
+    main = main_request(text, identity=identity)
     main = re.sub(
         r"^(?:新建|创建|新开|另开)(?:一(?:个|项|份))?(?:独立(?:的)?)?"
         r"(?:工作|任务)[，,:：\s]*",
         "",
         main,
     )
-    main = main_request(main)
+    main = main_request(main, identity=identity)
     enumerated = _enumerated_ppt_intent(main)
     if enumerated is not None:
         return enumerated
@@ -322,8 +324,8 @@ def new_work_intent(text: str) -> NewWorkIntent | None:
     return NewWorkIntent((output,), tool)
 
 
-def explicitly_requires_execution(text: str) -> bool:
-    main = main_request(text)
+def explicitly_requires_execution(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> bool:
+    main = main_request(text, identity=identity)
     # Quoted strings are request data, not request verbs.
     main = re.sub(r"“[^”]*”|『[^』]*』|「[^」]*」|\"[^\"]*\"", "<quoted data>", main)
     if re.match(r"(?:解释|说明|说说|翻译|为什么|如何|怎么|如果|假如|假设|不要|不用|别|不想)", main):
@@ -344,9 +346,11 @@ def explicitly_requires_execution(text: str) -> bool:
     )
 
 
-def task_write_request(text: str) -> bool:
+def task_write_request(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> bool:
     outside = re.sub(
-        r"“[^”]*”|『[^』]*』|「[^」]*」|\"[^\"]*\"", "<quoted data>", main_request(text)
+        r"“[^”]*”|『[^』]*』|「[^」]*」|\"[^\"]*\"",
+        "<quoted data>",
+        main_request(text, identity=identity),
     )
     if re.search(
         r"(?:不要|不用|别|不作|不做).{0,8}(?:登记|分配|任务|落库|写入)|仅供参考|只.{0,5}(?:建议|方案)|虚构分工",
