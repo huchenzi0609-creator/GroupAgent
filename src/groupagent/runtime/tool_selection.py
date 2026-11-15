@@ -191,7 +191,10 @@ def select_tools(
         )
         and required.issubset(_REMINDER_TOOLS)
     ):
-        profile = _REMINDER_TOOLS
+        # A source-bound literal notification already has its complete body and
+        # recipient authorization. Offering request_input here can turn an
+        # optional follow-up question into a blocking material requirement.
+        profile = frozenset() if literal_reminder and not required else _REMINDER_TOOLS
     elif (
         text_only
         and not business

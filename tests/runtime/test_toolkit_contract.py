@@ -769,7 +769,18 @@ async def test_trusted_scheduled_reminder_names_recipient_work_not_agent_work(to
     assert objective["reminder_body"] == "检查作业"
     assert "发送提醒本身不需要" in objective["instructions"][0]
     assert "不要为了被提醒的事项调用 request_input" in objective["instructions"][0]
-    assert not objective["input_files"] and prepared.request.allowed_tools == {"request_input"}
+    assert not objective["input_files"] and prepared.request.allowed_tools == frozenset()
+    reminder_scope = ToolScope(
+        env.actor.group_id, work.id, env.actor, workspace, frozenset(), authorization.id
+    )
+    prepared.engine.gateway.bind_scope(reminder_scope)
+    forbidden_input = await prepared.engine.gateway.invoke(
+        "request_input",
+        {"question": "请提供清单文件", "required_inputs": ["清单"]},
+        ToolContext(reminder_scope, "forbidden-input", "forbidden-input", asyncio.Event()),
+    )
+    assert not forbidden_input.success and forbidden_input.control is None
+    assert forbidden_input.error_code == "permission_denied"
     run = SimpleNamespace(work=work, lease=lease, workspace=workspace, prepared=prepared)
     with pytest.raises(DomainError, match="preserve reminder_body verbatim"):
         await setup.toolkit.validate(

@@ -254,7 +254,7 @@ def literal_reminder_work():
 
 
 def test_bound_literal_reminder_body_is_recipient_data_not_additional_delegation():
-    assert select_tools(literal_reminder_work(), [], CATALOG) == {"request_input"}
+    assert select_tools(literal_reminder_work(), [], CATALOG) == frozenset()
 
 
 def test_literal_reminder_does_not_hide_separate_agent_execution_criteria():
@@ -548,7 +548,15 @@ async def test_goal_change_recomputes_reminder_before_scheduled_work_selection(
         with env.store.transaction(env.actor) as tx:
             current = tx.get_work(occurrence.work_id)
         selected = select_tools(current, [], CATALOG)
-        assert (selected == {"request_input"}) is reminder
+        if reminder:
+            expected = (
+                frozenset()
+                if current.scope.get("reminder_body_literal") is True
+                else {"request_input"}
+            )
+            assert selected == expected
+        else:
+            assert selected != frozenset() and selected != {"request_input"}
         if not reminder:
             assert {"web_search", "web_fetch"} <= selected
         assert not models

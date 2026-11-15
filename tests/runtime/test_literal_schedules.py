@@ -88,7 +88,7 @@ async def test_literal_body_survives_router_paraphrase_and_schedule_updates(
             work = tx.get_work(occurrence.work_id)
         assert work.goal == expected and work.scope["reminder_body"] == expected
         assert work.scope["reminder_body_source_event_id"] == body_source
-        assert select_tools(work, [], CATALOG) == {"request_input"}
+        assert select_tools(work, [], CATALOG) == frozenset()
         assert len(scheduler.list(env.actor)) == 1 and not execution_models
     finally:
         await app.close()
