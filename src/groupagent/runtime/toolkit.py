@@ -271,6 +271,51 @@ def _research_source_metrics(source: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _research_source_content(
+    sources: list[dict[str, Any]], question: str, answer: str
+) -> list[dict[str, Any]]:
+    """At most 12,000 UTF-8 bytes of received text, separate from JSON heads.
+
+    Prefer fetched sources and question/candidate identifier overlap. Omission
+    markers describe this review projection, not whether a whole page was read.
+    """
+    terms = set(re.findall(r"[A-Za-z_][A-Za-z0-9_.-]{2,}", question.lower() + " " + answer.lower()))
+    ranked = []
+    for source in sources:
+        content = source.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        raw = content.encode("utf-8")
+        words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_.-]{2,}", content.lower()))
+        rank = (source.get("operation") == "fetch", len(terms & words))
+        ranked.append((rank, source, raw))
+    remaining = 12_000
+    evidence = []
+    seen = set()
+    for _, source, raw in sorted(ranked, key=lambda item: item[0], reverse=True):
+        identity = (source.get("url"), hashlib.sha256(raw).hexdigest())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        excerpt = raw[:remaining].decode("utf-8", errors="ignore")
+        used = len(excerpt.encode("utf-8"))
+        remaining -= used
+        evidence.append(
+            {
+                "source_id": source.get("source_id"),
+                "url": source.get("url"),
+                "citation": source.get("citation"),
+                "operation": source.get("operation"),
+                "evidence_kind": source.get("evidence_kind"),
+                "received_content_excerpt": excerpt,
+                "excerpt_complete_for_received_content": used == len(raw),
+                "omitted_received_content": used < len(raw),
+                "source_truncated_fields": source.get("truncated_fields", []),
+            }
+        )
+    return evidence
+
+
 class PublishInput(ToolData):
     version_ids: tuple[str, ...] = Field(min_length=1, max_length=20)
 
@@ -943,6 +988,7 @@ class WorkToolkit:
                         "For a text-only question, answer directly from the actual tool evidence once it resolves the question; do not invent an output file, export inputs or search unrelated history. Research excerpts explicitly report truncation; do not claim to have read omitted text.",
                         "For concise research explanations, give the requested facts, links and retrieval times. Do not add code examples or demonstrations unless the user asks for them. When an example is requested, verify every input/output against actual tool/source evidence; preserve all values rather than inventing a plausible result.",
                         "For research deliverables, cite only sources returned by successful web_search/web_fetch calls and copy each cited source.citation alongside that link. It records the actual retrieval time in UTC; you may additionally show local time. Do not substitute a publication date, the current clock, or another source's time. A search result observation is not proof of reading the full page.",
+                        "Research answers should contain the requested facts and only the requested examples, expressed concisely in your own words. Avoid long source quotations and unrelated operating tutorials or restrictions. Review every extra note as a factual claim: a source's recommendation, default or example does not establish a unique requirement. Omit unsupported side claims rather than turning them into mandatory advice. Synthetic example values and correct direct deductions need not occur verbatim in the source, but must follow its actual semantics and must not be claimed as real events or already executed actions.",
                         "In research answers, omit unrequested internal fetch/read/truncation sizes, byte/character counts and token budgets. Explain meaningful evidence limits qualitatively. Only an explicit measurement/encoding diagnostic request calls for those figures: receipt content_bytes_* are UTF-8 bytes; len(source.content) counts Unicode code points, not bytes or tokens. Verify each requested value against actual returned content/receipts; a configured limit is not an observed count, and missing token evidence is not zero. Never hide a real truncation limitation.",
                         "Preserve user-requested quotations and translations as source data. Quoting a sentence does not mean this runtime performed its described operation. Other actual-operation claims still need real evidence.",
                         "When artifact_deliver is absent from this goal's tool catalog, plain text is the deliverable. Do not create or export a file; finish with the supported answer or use request_input only for genuinely missing information.",
@@ -1315,6 +1361,7 @@ class WorkToolkit:
                             + "结合original_request和真实提取证据理解用户词义；当前goal和criteria仍决定后续授权变更。"
                             "报告中的标识码不因此需要满足程序代码语法。只按用户要求和已有证据核验，不添加用户未要求的标准。"
                             "任何实际给出的代码、算术或示例输入/输出也属于需核对的事实；逐项核对数量、元素、数值及输出，核心结论正确不能抵消示例丢元素或算错。未请求示例时以简短所需事实为准，不要求补例子。"
+                            "研究核验必须审查答复中的全部事实和额外旁注，尤其接口能力、限制、推荐与必需的区别：默认值、推荐或网页示例不能推导为唯一必需；没有支持的额外限制或完成声明应拒绝并要求删去。research_source_content是同工作成功检索的实际已收到正文，单独限总UTF-8字节预算；优先核对其中相关段落，不只看tool_evidence的JSON开头。excerpt_complete_for_received_content仅指该receipt正文是否在本次检查完整给出，不等于完整网页；省略或截断标记之外的内容不能当作已读或已有证据。用户要求的合成示例字面值、给定数据直接推导的结果，以及明确原样引文或翻译，不要求在网页出现相同字面值，但必须核算法/语义或忠实性；不能把合成例子说成真实世界事实或本次已执行动作。"
                             "研究答复默认不公开未请求的内部抓取/读取/截断字节数、字符数或token预算；真实证据限制可定性说明，不得隐瞒截断。明确诊断请求的数值必须逐项核对research_source_metrics：receipt_content_bytes_*单位为UTF-8字节，observed_content_unicode_codepoints是实际收到content的Unicode码点数，不是字节、字形或token。正文摘录省略不影响这些独立列出的receipt单位证据；缺少token证据不能猜测为零，收到部分正文不代表已读省略部分。"
                             "用户要求原样引用或翻译的句子按被引用数据检查，不能当作机器人本次实际操作声明；其它额外计量仍需核对，不因存在引文或翻译而自动通过。"
                             "标题声明用的书名号/引号通常是引用定界标记；除非用户明确要求保留符号，不得仅因实际标题省略这些定界符而拒绝。"
@@ -1348,6 +1395,9 @@ class WorkToolkit:
                                         "artifacts": excerpts,
                                         "tool_evidence": observations,
                                         "research_source_metrics": research_metrics,
+                                        "research_source_content": _research_source_content(
+                                            research_sources, original_event.text, answer
+                                        ),
                                         "capabilities": "Scoped files, public research, isolated compute, approved media and finite scheduling only. No email, purchases, payments or external-account submissions. File delivery happens after this check, never before.",
                                     },
                                     ensure_ascii=False,
