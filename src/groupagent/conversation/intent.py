@@ -74,6 +74,79 @@ def _page_count(value: str) -> int | None:
     return number if 1 <= number <= 200 else None
 
 
+_PPT_NUMBER = r"(?:[0-9]{1,3}|[零〇一二两三四五六七八九十百]+)"
+_PPT_LITERAL = (
+    r'(?:“[^“”\r\n]{1,1000}”|「[^「」\r\n]{1,1000}」|『[^『』\r\n]{1,1000}』|"[^"\r\n]{1,1000}")'
+)
+_PPT_LITERAL_RE = re.compile(_PPT_LITERAL)
+_PPT_SEPARATOR = re.compile(r"[\s，,。；;:：.]+")
+_PPT_HEAD = re.compile(
+    r"(?:现在|直接|实际|真正)?(?:制作|生成|做成|新建|创建)(?:并(?:发送|交付))?"
+    r"(?:一(?:份|套))?(?:恰好)?(?P<count>" + _PPT_NUMBER + r")\s*页(?:的)?"
+    r"(?:可编辑(?:的)?)?(?:PPTX?|幻灯片)(?:文件)?(?:并(?:发送|交付))?",
+    re.I,
+)
+_PPT_TOPIC = re.compile(r"主题(?:为|是)?\s*(?P<topic>《[^《》\r\n]{1,180}》|" + _PPT_LITERAL + r")")
+_PPT_PAGE = re.compile(
+    r"第(?P<index>" + _PPT_NUMBER + r")\s*页(?:的)?\s*标题(?:为|是)?\s*"
+    r"(?P<title>" + _PPT_LITERAL + r")\s*[，,:：]\s*"
+    r"(?:写|正文(?:为|是)?|内容(?:为|是)?)\s*"
+    r"(?P<body>" + _PPT_LITERAL + r"(?:\s*(?:[、，,]\s*)?" + _PPT_LITERAL + r")*)"
+)
+_PPT_CONSTRAINT = re.compile(
+    r"(?:只|仅)(?:用|使用)(?:这些|上述|给定)(?:的)?(?:内容|文字)"
+    r"|(?:不|不要|不用|无需)(?:生成|制作|添加|使用|需要)?(?:额外的?)?插画"
+    r"|(?:不|不要|不用|无需)(?:联网|搜索|检索)"
+)
+
+
+def _enumerated_ppt_intent(main: str) -> NewWorkIntent | None:
+    """Consume a complete current-request slide specification, without history."""
+    head = _PPT_HEAD.match(main)
+    count = _page_count(head["count"]) if head else None
+    if head is None or count is None or count > 100:
+        return None
+    separator = _PPT_SEPARATOR.match(main, head.end())
+    if separator is None:
+        return None
+    position = separator.end()
+    topic = _PPT_TOPIC.match(main, position)
+    if topic:
+        if not topic["topic"][1:-1].strip():
+            return None
+        separator = _PPT_SEPARATOR.match(main, topic.end())
+        if separator is None:
+            return None
+        position = separator.end()
+    visible = []
+    for index in range(1, count + 1):
+        page = _PPT_PAGE.match(main, position)
+        if page is None or _page_count(page["index"]) != index:
+            return None
+        title = page["title"][1:-1]
+        body = [value[0][1:-1] for value in _PPT_LITERAL_RE.finditer(page["body"])]
+        if not title.strip() or len(title) > 90 or not 1 <= len(body) <= 6:
+            return None
+        if any(not value.strip() for value in body):
+            return None
+        visible.extend([title, *body])
+        position = page.end()
+        if position < len(main):
+            separator = _PPT_SEPARATOR.match(main, position)
+            if separator is None:
+                return None
+            position = separator.end()
+    # Only reviewed constraints may follow all declared pages. In particular,
+    # a positive creation prefix must not swallow a control/action suffix.
+    tail = [value for value in _PPT_SEPARATOR.split(main[position:]) if value]
+    if any(_PPT_CONSTRAINT.fullmatch(value) is None for value in tail):
+        return None
+    visible = list(dict.fromkeys(visible))
+    if len(visible) > 30:  # Existing OutputRequirement literal limit.
+        return None
+    return NewWorkIntent(({"format": "pptx", "exact_units": count, "expected_text": visible},))
+
+
 def new_work_intent(text: str) -> NewWorkIntent | None:
     """A bounded, self-contained new task; this hint never grants authority.
 
@@ -92,6 +165,9 @@ def new_work_intent(text: str) -> NewWorkIntent | None:
         main,
     )
     main = main_request(main)
+    enumerated = _enumerated_ppt_intent(main)
+    if enumerated is not None:
+        return enumerated
     outside = _QUOTED_DATA.sub(" <quoted data> ", main)
     if _NEW_WORK_EXCLUSIONS.search(outside):
         return None
