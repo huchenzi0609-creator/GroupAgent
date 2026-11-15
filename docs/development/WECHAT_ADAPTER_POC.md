@@ -69,7 +69,7 @@ The adapter never acknowledges automatically. Persist admitted events and the co
 
 ## Attachments and video boundary
 
-Ordinary text, images, voice messages, supported files, embedded quote excerpts, simple forwarded-chat text and system/recall notices have explicit normalization. Unknown message/app subtypes fail. This does not cover every WeChat card, location, sticker encoding or forwarded attachment.
+Ordinary text, images, voice messages, supported files, embedded quote excerpts, simple forwarded-chat text, link cards and system/recall notices have explicit normalization. An authenticated message with an unsupported numeric type/app subtype becomes a metadata-only `SYSTEM` event with an `unsupported_content` marker, its stable sender/message IDs and the numeric discriminants. Its body, XML, location coordinates, payment amounts and arbitrary card fields are discarded. This allows durable observation and cursor progress without pretending to understand the content. Missing/invalid identity or timestamp fields, unknown event-stream kinds, invalid cursor ordering and malformed envelope schemas still fail closed. Unsupported content cannot acquire the synthetic system identity reserved for documented system notices.
 
 An intake event stores an immutable message-level `AttachmentHandle` with `availability="unresolved"` and no asset ID. Mutable availability, checked hash and byte length are queried through `attachment_handles`; they do not alter the original event on replay. Cached fetch resolves the reference again, checks its platform message identity, verifies ownership, bounds the response and checks size/SHA-256. A previously issued hash cannot silently change. Metadata `contentUrl` and filesystem-looking fields are never used as request targets; the client constructs only pinned API routes on the configured origin.
 
@@ -103,3 +103,62 @@ The fixtures test normalization, large stable IDs, epoch and storage-reset rules
 Unpassed release gates include real scoped-token/account access, account/profile migration and local-reference remapping, mixed/all-skipped batch cursor integration with PostgreSQL, complete control-event coverage, automatic wakeup/reconciliation of media jobs, media-format/client-display acceptance, native-send receipts under real disconnect/restart faults, echo attribution for shared accounts, live roster freshness, full WeChat message parity, real delivery and monitoring, and sandboxed worker execution. Attachment references from a replaced profile must be migrated or retired explicitly; changing an epoch must not silently relabel old local IDs.
 
 Production remains unchanged. No old bot credentials, running data or production sender were inspected or reused.
+
+## Image and voice sending extension (2026-11-14)
+
+The pinned v2.2.1 transport now exposes:
+
+```python
+await adapter.send_media(
+    group_id, name, content,
+    kind="image",  # or "voice"
+    idempotency_key=stable_key,
+    duration_seconds=None,
+    allow_file_fallback=False,
+)
+```
+
+Image/voice availability and byte ceilings come from explicit runtime
+capabilities, bounded by the application's own limits. Image sending does not
+weaken `send_file`'s four-document-format allowlist. Voice requires validated
+duration metadata; native voice has a 60-second ceiling. An unavailable native
+voice capability or a longer validated clip can use an audio-file fallback only
+when the trusted caller explicitly permits it. The returned receipt carries
+`requested_kind`, `wire_kind` and `fallback_reason`; a file is never described as
+a native voice bubble. No video kind or container is accepted.
+
+Kind, selected wire mode, filename, duration and content hash participate in
+idempotency. In-process concurrent sends stage once, restart lookups reconcile
+existing keys, and uncertain sends are not retried blindly. Receipt lookup never
+converts accepted into read. Real pixel/audio decoding remains the isolated
+artifact-validation gate; channel magic/size checks are additional transport
+checks, not a host parser substitute. Contract tests cover capabilities, limits,
+explicit fallback, changed-content keys, concurrency and unknown receipts (64
+channel contract cases passed). Actual WeChat recipient-client image/voice
+acceptance remains an external gate without real channel credentials.
+
+## Unsupported-content cursor recovery and link cards (2026-11-14)
+
+The pinned generated contract explicitly supplies `NativeMessage.link` with a
+`LinkCard` containing nullable `title` and `url` (plus description/sourceName,
+which this adapter intentionally discards). Type 49, subtype 5 is normalized
+from those two fields into a text link and a structured `kind=link` attachment
+marked `untrusted_content=true`, `fetched=false`. The adapter never parses raw
+message XML, guesses a URL from the body, follows the URL, or fetches a thumbnail.
+Absent, malformed or unsupported card metadata produces a metadata-only event;
+credentials in a URL, unsupported URL schemes and explicit video-file links are
+not projected. A later public Fetch still needs its own URL/DNS authorization.
+
+Source verification used the fixed generated contract and Rust contract linked
+above, read again on 2026-11-14. The GitHub connector provided the pinned file
+contents when the web fetch cache could not retrieve them. No moving-branch
+schema or inferred XML format was used.
+
+Validation: **93 channel tests passed**, including the existing HTTP contracts
+and five real PostgreSQL intake tests. The added mixed batch contains text, a
+location, a payment-card subtype, a documented link, a video and following text.
+All six canonical events persist before ACK, the unsupported/system/video events
+are observed without model requests, the final cursor persists, and restart
+resumes from that cursor. Malformed identity in the middle of that same batch
+still refuses the batch without ACK. These are synthetic transport/database
+tests, not live WeChat acceptance.

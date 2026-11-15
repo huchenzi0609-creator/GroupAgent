@@ -19,11 +19,13 @@ from xml.sax.saxutils import escape
 from docx import Document
 from PIL import Image, ImageChops
 from pptx import Presentation
+from pptx.enum.dml import MSO_FILL_TYPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.presentation import Presentation as PPTXPresentation
 from pptx.text.text import TextFrame
 from reportlab.pdfbase import pdfmetrics
 
-from .formats import DECK_MARKER, REPORT_MARKER, inspect_office, open_pdf
+from .formats import REPORT_MARKER, inspect_office, open_pdf
 from .models import ArtifactError
 
 
@@ -95,7 +97,12 @@ class DocumentRenderer:
             )
 
     def render(
-        self, content: bytes, format_name: str, *, expected_text: tuple[str, ...]
+        self,
+        content: bytes,
+        format_name: str,
+        *,
+        expected_text: tuple[str, ...],
+        ocr_text: str | None = None,
     ) -> RenderResult:
         if format_name not in {"pdf", "docx", "pptx"}:
             raise ArtifactError("unsupported_format", "This format has no paginated renderer")
@@ -113,19 +120,23 @@ class DocumentRenderer:
             "preview_count",
         ]
         supported = False
+        occlusions: list[list[tuple[tuple[float, ...], tuple[float, ...]]]] = []
         if format_name in {"docx", "pptx"}:
             inspect_office(content, format_name, for_render=True)
             if format_name == "docx":
                 document = Document(io.BytesIO(content))
-                supported = document.core_properties.keywords == REPORT_MARKER
+                supported = self._docx_profile(document)
             else:
                 presentation = Presentation(io.BytesIO(content))
-                supported = presentation.core_properties.keywords == DECK_MARKER
+                supported = self._pptx_profile(presentation)
                 issues.extend(self._slide_geometry(presentation))
+                occlusions = self._slide_occlusions(presentation)
                 checks.extend(("slide_shape_bounds_and_overlap", "slide_text_capacity"))
         else:
             reader = open_pdf(content)
             supported = reader.metadata is not None and reader.metadata.subject == REPORT_MARKER
+            if ocr_text is not None:
+                supported = True
         with tempfile.TemporaryDirectory(prefix="groupagent-render-") as directory:
             work = Path(directory)
             if self.font_directories:
@@ -171,12 +182,20 @@ class DocumentRenderer:
             if format_name == "pptx" and count != len(presentation.slides):
                 issues.append("rendered_slide_count_mismatch")
             text = normalized_text("\n".join(page.extract_text() or "" for page in reader.pages))
+            if ocr_text is not None:
+                text = normalized_text(ocr_text)
+                checks.append("ocr_page_content")
             for index, expected in enumerate(expected_text):
                 if normalized_text(expected) not in text:
                     issues.append(f"rendered_missing_content:{index}")
             bbox = work / "bounds.html"
             self._run([self.pdftotext, "-bbox", "-enc", "UTF-8", str(pdf), str(bbox)], work)
-            issues.extend(self._page_geometry(bbox))
+            geometry_issues = self._page_geometry(bbox, occlusions=occlusions)
+            if ocr_text is not None:
+                geometry_issues = [
+                    issue for issue in geometry_issues if not issue.startswith("no_page_text:")
+                ]
+            issues.extend(geometry_issues)
             self._run(
                 [
                     self.pdftoppm,
@@ -216,6 +235,78 @@ class DocumentRenderer:
             )
 
     @staticmethod
+    def _docx_profile(document) -> bool:
+        if document.element.xpath(
+            ".//w:sdt|.//w:altChunk|.//w:txbxContent|.//wp:anchor|.//w:ins|.//w:del"
+        ):
+            return False
+        for section in document.sections:
+            for columns in section._sectPr.xpath("./w:cols"):
+                if (
+                    columns.get(
+                        "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}num", "1"
+                    )
+                    != "1"
+                ):
+                    return False
+        return True
+
+    @staticmethod
+    def _pptx_profile(presentation: PPTXPresentation) -> bool:
+        allowed = {
+            MSO_SHAPE_TYPE.AUTO_SHAPE,
+            MSO_SHAPE_TYPE.TEXT_BOX,
+            MSO_SHAPE_TYPE.PICTURE,
+            MSO_SHAPE_TYPE.TABLE,
+            MSO_SHAPE_TYPE.CHART,
+            MSO_SHAPE_TYPE.PLACEHOLDER,
+            MSO_SHAPE_TYPE.LINE,
+        }
+        return all(
+            shape.shape_type in allowed and shape.rotation == 0
+            for slide in presentation.slides
+            for shape in slide.shapes
+        )
+
+    @staticmethod
+    def _slide_occlusions(
+        presentation: PPTXPresentation,
+    ) -> list[list[tuple[tuple[float, ...], tuple[float, ...]]]]:
+        pages = []
+        for slide in presentation.slides:
+            text_shapes: list[tuple[float, ...]] = []
+            pairs: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
+            for shape in slide.shapes:
+                box = tuple(
+                    value / 12700
+                    for value in (
+                        shape.left,
+                        shape.top,
+                        shape.left + shape.width,
+                        shape.top + shape.height,
+                    )
+                )
+                opaque = shape.shape_type in {
+                    MSO_SHAPE_TYPE.PICTURE,
+                    MSO_SHAPE_TYPE.CHART,
+                    MSO_SHAPE_TYPE.TABLE,
+                }
+                if shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE and not shape.text.strip():
+                    # An inherited theme fill is uncertain and fails closed;
+                    # explicit background/no-fill does not paint over text.
+                    opaque = shape.fill.type != MSO_FILL_TYPE.BACKGROUND
+                if opaque:
+                    pairs.extend((box, text_box) for text_box in text_shapes)
+                if (
+                    (shape.has_text_frame and shape.text.strip())
+                    or shape.has_table
+                    or shape.has_chart
+                ):
+                    text_shapes.append(box)
+            pages.append(pairs)
+        return pages
+
+    @staticmethod
     def _slide_geometry(presentation: PPTXPresentation) -> list[str]:
         issues = []
         # python-pptx's dynamic shape types expose dimensions at runtime.
@@ -235,15 +326,19 @@ class DocumentRenderer:
                     or bottom > presentation.slide_height
                 ):
                     issues.append(f"shape_outside_slide:{index + 1}:{shape.shape_id}")
-                if shape.has_text_frame or shape.has_table:
+                if (shape.has_text_frame and shape.text.strip()) or shape.has_table:
                     for prior in boxes:
                         if min(right, prior[2]) > max(left, prior[0]) and min(
                             bottom, prior[3]
                         ) > max(top, prior[1]):
                             issues.append(f"shape_overlap:{index + 1}:{shape.shape_id}")
                     boxes.append((left, top, right, bottom))
-                if shape.has_text_frame and not DocumentRenderer._frame_fits(
-                    shape.text_frame, shape.width, shape.height
+                if (
+                    shape.has_text_frame
+                    and shape.text.strip()
+                    and not DocumentRenderer._frame_fits(
+                        shape.text_frame, shape.width, shape.height
+                    )
                 ):
                     issues.append(f"text_frame_overflow:{index + 1}:{shape.shape_id}")
                 if shape.has_table:
@@ -291,7 +386,11 @@ class DocumentRenderer:
         return used_height <= available_height + 1
 
     @staticmethod
-    def _page_geometry(bbox: Path) -> list[str]:
+    def _page_geometry(
+        bbox: Path,
+        *,
+        occlusions: list[list[tuple[tuple[float, ...], tuple[float, ...]]]] | None = None,
+    ) -> list[str]:
         if bbox.stat().st_size > 20 * 1024 * 1024:
             raise ArtifactError("render_limit", "Rendered text bounds exceed the limit")
         try:
@@ -312,6 +411,18 @@ class DocumentRenderer:
                 ):
                     issues.append(f"text_outside_page:{index + 1}")
                 words.append(coordinates)
+                if occlusions and index < len(occlusions):
+                    for cover, owner in occlusions[index]:
+                        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                        overlap = max(0, min(x1, cover[2]) - max(x0, cover[0])) * max(
+                            0, min(y1, cover[3]) - max(y0, cover[1])
+                        )
+                        if (
+                            owner[0] <= cx <= owner[2]
+                            and owner[1] <= cy <= owner[3]
+                            and overlap > (x1 - x0) * (y1 - y0) * 0.5
+                        ):
+                            issues.append(f"text_occluded:{index + 1}")
             if not words:
                 issues.append(f"no_page_text:{index + 1}")
             if len(words) > 25000:

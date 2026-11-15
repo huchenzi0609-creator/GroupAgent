@@ -9,10 +9,11 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from typing import Protocol
 
 from pydantic import ValidationError
 
-from groupagent.channels import AgentWechatAdapter, ChannelCursor
+from groupagent.channels import AgentWechatConfig, ChannelCursor, EventBatch
 from groupagent.coordinator import CoordinationResult, Coordinator
 from groupagent.domain import ActorContext, DomainError, Role
 
@@ -25,8 +26,18 @@ class IntakeResult:
     acknowledged: bool
 
 
+class IntakePort(Protocol):
+    config: AgentWechatConfig
+
+    async def consume(
+        self, after_cursor: ChannelCursor | None = None, *, limit: int = 100
+    ) -> EventBatch: ...
+
+    async def ack_committed(self, cursor: ChannelCursor) -> None: ...
+
+
 class ChannelIntake:
-    def __init__(self, adapter: AgentWechatAdapter, coordinator: Coordinator) -> None:
+    def __init__(self, adapter: IntakePort, coordinator: Coordinator) -> None:
         channel, group = adapter.config, coordinator.config.group
         if (
             not group.enabled
@@ -80,17 +91,34 @@ class ChannelIntake:
             self._cursor(saved.cursor if saved else None), limit=limit
         )
         canonical_ids = []
+        rejected_count = 0
         for item in batch.entries:
+            if not self.coordinator.accepts_event(item.event):
+                rejected_count += 1
+                continue
             actor = self.coordinator.actor(item.event)
-            with store.transaction(actor, trace_id=item.event.id) as tx:
-                current = tx.get_cursor(self.stream_id)
-                self._not_after(current.cursor if current else None, item.cursor)
-                ingested = tx.ingest_event(
-                    item.event,
-                    stream_id=self.stream_id,
-                    cursor=item.cursor.serialize(),
-                    expected_cursor_revision=current.revision if current else 0,
-                )
+            try:
+                with store.transaction(actor, trace_id=item.event.id) as tx:
+                    current = tx.get_cursor(self.stream_id)
+                    self._not_after(current.cursor if current else None, item.cursor)
+                    ingested = tx.ingest_event(
+                        item.event,
+                        stream_id=self.stream_id,
+                        cursor=item.cursor.serialize(),
+                        expected_cursor_revision=current.revision if current else 0,
+                    )
+            except DomainError as error:
+                if error.code != "member_left":
+                    raise
+                with store.transaction(self.service_actor, trace_id=item.event.id) as tx:
+                    tx._audit(
+                        "channel_event_rejected",
+                        item.event.id,
+                        reason="member_left",
+                        source_digest=hashlib.sha256(item.event.source_key.encode()).hexdigest(),
+                    )
+                rejected_count += 1
+                continue
             canonical_ids.append(ingested.event.id)
         # Foreign/control-only batches still advance, without persisting another
         # group's message body or fabricating an authorized group's message.
@@ -108,7 +136,7 @@ class ChannelIntake:
         await self.adapter.ack_committed(batch.next_cursor)
         return IntakeResult(
             event_ids=tuple(canonical_ids),
-            skipped_count=len(batch.skipped),
+            skipped_count=len(batch.skipped) + rejected_count,
             cursor=batch.next_cursor.serialize(),
             acknowledged=True,
         )

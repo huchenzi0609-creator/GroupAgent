@@ -1,0 +1,28 @@
+[Unit]
+Description=GroupAgent trusted control service
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=groupagent
+Group=groupagent
+SupplementaryGroups=docker
+WorkingDirectory=/opt/groupagent
+ExecStart=/opt/groupagent/.venv/bin/groupagent serve --config /etc/groupagent/config.json --dsn-file /etc/groupagent/database.dsn --root /var/lib/groupagent/app --secrets /etc/groupagent/secrets.env
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=25
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/groupagent
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Annotated, Any, ClassVar, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
-from groupagent.domain import ActorContext, Role
+from groupagent.domain import ActorContext, DomainError, Role
 
 
 class ToolData(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+    # Reviewed static hints only. Never use validation exception text or raw inputs.
+    validation_hints: ClassVar[dict[str, str]] = {}
 
 
 class EffectState(StrEnum):
@@ -33,6 +35,38 @@ class IdempotencyMode(StrEnum):
     NON_RETRYABLE = "non_retryable"
 
 
+class InputRequest(ToolData):
+    question: str = Field(min_length=1, max_length=2000)
+    required_inputs: tuple[Annotated[str, Field(min_length=1, max_length=200)], ...] = Field(
+        default=(), max_length=8
+    )
+
+    @field_validator("question")
+    @classmethod
+    def meaningful_question(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("A concrete question is required")
+        return value.strip()
+
+    @field_validator("required_inputs")
+    @classmethod
+    def meaningful_inputs(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not value.strip() for value in values):
+            raise ValueError("Required input names must be concrete")
+        return tuple(dict.fromkeys(value.strip() for value in values))
+
+
+class ToolControl(ToolData):
+    kind: Literal["request_input"] = "request_input"
+    input_request: InputRequest
+
+
+class ToolInputIssue(ToolData):
+    field: tuple[str | int, ...]
+    kind: str
+    hint: str | None = None
+
+
 class ToolReceipt(ToolData):
     call_id: str
     tool_name: str
@@ -43,11 +77,61 @@ class ToolReceipt(ToolData):
     error_code: str | None = None
     message: str | None = None
     replayed: bool = False
+    # Set by a trusted ToolDefinition capability, never parsed from tool output.
+    control: ToolControl | None = None
+    input_issues: tuple[ToolInputIssue, ...] = ()
+    # Added only by the host Gateway from reviewed registration + fresh policy.
+    # Model arguments and output dictionaries cannot populate receipt metadata.
+    required_tool_evidence: frozenset[Literal["process_run", "shell_command"]] = frozenset()
+
+
+ISOLATED_PROCESS_TOOLS = frozenset({"process_run", "shell_command"})
+
+
+def successful_required_tools(
+    receipts: Iterable[ToolReceipt], allowed_tools: frozenset[str]
+) -> frozenset[str]:
+    successful = set()
+    for receipt in receipts:
+        if (
+            not receipt.success
+            or receipt.effect_state not in {EffectState.SUCCEEDED, EffectState.NO_EFFECT}
+            or receipt.tool_name not in allowed_tools
+        ):
+            continue
+        successful.add(receipt.tool_name)
+        if (
+            receipt.tool_name in ISOLATED_PROCESS_TOOLS
+            and receipt.effect_state == EffectState.SUCCEEDED
+        ):
+            successful.update(
+                receipt.required_tool_evidence & allowed_tools & ISOLATED_PROCESS_TOOLS
+            )
+    return frozenset(successful)
 
 
 class ToolLedgerEntry(ToolData):
     fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
     receipt: ToolReceipt
+
+
+class ToolFailure(DomainError):
+    """Reviewed handlers may provide bounded typed diagnostics for a failed action."""
+
+    def __init__(
+        self, code: str, message: str, *, output: BaseModel | None = None, no_effect: bool = False
+    ):
+        super().__init__(code, message)
+        self.output = output
+        self.no_effect = no_effect
+
+
+class ToolInputRequired(DomainError):
+    """Trusted precondition failure after no effect or a confirmed DB rollback."""
+
+    def __init__(self, question: str, *, required_inputs: tuple[str, ...] = ()):
+        super().__init__("input_required", "Confirmed input is required before this action")
+        self.input_request = InputRequest(question=question, required_inputs=required_inputs)
 
 
 @dataclass(frozen=True)
@@ -110,6 +194,9 @@ class ToolDefinition(Generic[InputT, OutputT]):
     idempotency_mode: IdempotencyMode = IdempotencyMode.NON_RETRYABLE
     input_path_fields: tuple[str, ...] = ()
     output_path_fields: tuple[str, ...] = ()
+    control_kind: Literal["request_input"] | None = None
+    may_request_input: bool = False
+    required_tool_family: Literal["isolated_process"] | None = None
 
     def describe(self) -> dict[str, Any]:
         return {

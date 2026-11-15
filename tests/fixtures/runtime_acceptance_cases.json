@@ -1,0 +1,882 @@
+{
+  "schema_version": "groupagent.runtime-acceptance.v1",
+  "frozen_date": "2026-11-14",
+  "authoring": {
+    "source": "Independent execution agent; hand-authored synthetic positive objectives",
+    "sut_results_used_for_labels": false,
+    "provider_calls_during_authoring": 0,
+    "not_human_adjudicated": true,
+    "reference_urls_checked": [
+      "https://docs.python.org/3/howto/sorting.html",
+      "https://docs.python.org/3/library/json.html"
+    ]
+  },
+  "evaluation_contract": {
+    "case_count": 30,
+    "pass_requires_all_checks": true,
+    "model_assertions_are_not_evidence": true,
+    "expectations_never_enter_model_context": true,
+    "artifact_text_source": "Decode the delivered immutable bytes in the isolated worker; never use prompt, tool arguments, or model summary as extracted text.",
+    "text_matching": "Normalize Unicode NFKC and whitespace; required_text means all entries. any_of_text_groups means at least one member of every group. Regex checks run on decoded result text, not prompts.",
+    "artifact_checks": [
+      "delivered bytes have declared format and SHA-256",
+      "artifact registry binds current group/work/goal",
+      "current validation passed",
+      "DOCX/PDF/PPTX actually rendered with nonblank previews and no layout errors",
+      "every required outbox part accepted before Work completed"
+    ],
+    "execution_checks": [
+      "successful scoped tool receipt exists when required",
+      "no unbounded retries or extra paid route",
+      "shared parent-controlled monetary ledger covers every paid attempt",
+      "no video or independent illustration provider"
+    ],
+    "input_binding": "Fixture inputs become canonical scoped attachments; source_case references are bound to actual previous artifact/rule IDs by the runner. Do not invent IDs or bypass source guards.",
+    "schedule_clock": "Only the trusted test harness may advance the injected due-scan clock. Do not modify host time, create cron, or ask a model to claim a timer fired.",
+    "speech_semantics": "Decode actual returned audio. TTS content must be checked by budgeted ASR round-trip or recorded listening review; duration and provider request text alone cannot pass speech-content checks.",
+    "unavailable_check": "Report BLOCKED/NOT_RUN/FAIL explicitly. Never delete or weaken a frozen check to improve the score."
+  },
+  "cases_sha256": "10f8ffbb473b596b409cd7318a39483082f4a5ef9e727808055ea38a4d58dffd",
+  "cases": [
+    {
+      "id": "RA-DOCX-01",
+      "category": "docx",
+      "prompt": "请生成并发来一份一页Word文档，标题为《合成项目周会纪要》。包含讨论事项、决定、后续事项三个小节。写明：日期2030-06-08；决定采用方案B；成员甲负责整理资料，成员乙负责核对数字；预算待定。后续事项用两行表格列出负责人和事项，不要虚构其他参会人。",
+      "checks": {
+        "expected_format": "docx",
+        "required_text": [
+          "合成项目周会纪要",
+          "讨论事项",
+          "决定",
+          "后续事项",
+          "2030-06-08",
+          "方案B",
+          "成员甲",
+          "成员乙",
+          "预算待定"
+        ],
+        "exact_units": 1,
+        "unit_kind": "rendered_pages",
+        "table_min_rows_including_header": 3
+      }
+    },
+    {
+      "id": "RA-DOCX-02",
+      "category": "docx",
+      "prompt": "帮我把这组完全合成的数据做成Word方案比较报告并发文件：方案A预算1600元、工期5天；方案B预算2100元、工期3天。标题《两方案比较》，正文分为数据、差异、结论，必须有一张含方案/预算/工期的表。结论只说A更省钱、B更快，不添加外部事实。",
+      "checks": {
+        "expected_format": "docx",
+        "required_text": [
+          "两方案比较",
+          "数据",
+          "差异",
+          "结论",
+          "方案A",
+          "1600",
+          "5",
+          "方案B",
+          "2100",
+          "3"
+        ],
+        "table_min_rows_including_header": 3,
+        "rendered_page_range": [
+          1,
+          2
+        ],
+        "semantic_claims": {
+          "cheaper": "方案A",
+          "faster": "方案B"
+        }
+      }
+    },
+    {
+      "id": "RA-DOCX-03",
+      "category": "docx",
+      "prompt": "请制作一个Word测试发布检查单，文件要可下载。标题《合成发布检查单》，列出TEST-01依赖检查、TEST-02文件验证、TEST-03投递回执三项，状态都为待检查；最后保留一句“本清单不代表已完成验收”。用表格排版，不要替我勾选通过。",
+      "checks": {
+        "expected_format": "docx",
+        "required_text": [
+          "合成发布检查单",
+          "TEST-01",
+          "依赖检查",
+          "TEST-02",
+          "文件验证",
+          "TEST-03",
+          "投递回执",
+          "待检查",
+          "本清单不代表已完成验收"
+        ],
+        "table_min_rows_including_header": 4,
+        "rendered_page_range": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "id": "RA-PPTX-01",
+      "category": "pptx",
+      "prompt": "请做成并发送恰好3页PPT，主题《合成项目启动》。第1页标题“项目目标”，写“完成一份可验证报告”；第2页标题“角色分工”，写“成员甲：整理资料”“成员乙：核对数字”；第3页标题“行动计划”，写“下一步：整理资料”。只用这些内容，不生成插画。",
+      "checks": {
+        "expected_format": "pptx",
+        "exact_units": 3,
+        "unit_kind": "slides",
+        "required_text": [
+          "项目目标",
+          "完成一份可验证报告",
+          "角色分工",
+          "成员甲",
+          "成员乙",
+          "行动计划",
+          "下一步：整理资料"
+        ],
+        "per_unit_text": {
+          "1": [
+            "项目目标"
+          ],
+          "2": [
+            "角色分工"
+          ],
+          "3": [
+            "行动计划"
+          ]
+        }
+      }
+    },
+    {
+      "id": "RA-PPTX-02",
+      "category": "pptx",
+      "prompt": "给我一份恰好4页的PPT，逐页讲解合成演练的四个阶段：接收需求、执行处理、验证结果、交付回执。每页用对应阶段作标题，再写一句该阶段做什么。最后一页必须写“有回执才报告已交付”，不要把模型草稿当完成。",
+      "checks": {
+        "expected_format": "pptx",
+        "exact_units": 4,
+        "unit_kind": "slides",
+        "required_text": [
+          "接收需求",
+          "执行处理",
+          "验证结果",
+          "交付回执",
+          "有回执才报告已交付"
+        ],
+        "per_unit_text": {
+          "1": [
+            "接收需求"
+          ],
+          "2": [
+            "执行处理"
+          ],
+          "3": [
+            "验证结果"
+          ],
+          "4": [
+            "交付回执",
+            "有回执才报告已交付"
+          ]
+        }
+      }
+    },
+    {
+      "id": "RA-PPTX-03",
+      "category": "pptx",
+      "prompt": "把这组数据做成2页PPT发来：第1页标题“合成测量记录”，用表格列Alpha=12、Beta=24、Gamma=36；第2页标题“核对结论”，写“总数72，Gamma最多”。保持数字不变，表格要可编辑，不用截图冒充表格。",
+      "checks": {
+        "expected_format": "pptx",
+        "exact_units": 2,
+        "unit_kind": "slides",
+        "required_text": [
+          "合成测量记录",
+          "Alpha",
+          "12",
+          "Beta",
+          "24",
+          "Gamma",
+          "36",
+          "核对结论",
+          "72"
+        ],
+        "native_table_count_min": 1,
+        "table_expected_rows": [
+          [
+            "Alpha",
+            "12"
+          ],
+          [
+            "Beta",
+            "24"
+          ],
+          [
+            "Gamma",
+            "36"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "RA-PDF-01",
+      "category": "pdf",
+      "prompt": "请生成一页PDF通知并发文件，标题《合成实验室开放日》。内容：日期2030-06-08，时间14:00，地点B204，参加方式为现场登记。排版清晰即可，不需要插画，也不要把这是合成通知的说明删掉。",
+      "checks": {
+        "expected_format": "pdf",
+        "exact_units": 1,
+        "unit_kind": "pages",
+        "required_text": [
+          "合成实验室开放日",
+          "2030-06-08",
+          "14:00",
+          "B204",
+          "现场登记",
+          "合成通知"
+        ]
+      }
+    },
+    {
+      "id": "RA-PDF-02",
+      "category": "pdf",
+      "prompt": "请把以下数据做成一份简洁PDF实验摘要并发来：标题《合成实验摘要》，样本数24，完成数21，未完成数3。分为方法、结果、限制三个小节，注明“仅为合成测试数据，不代表真实研究”。不推断统计显著性，控制在两页以内。",
+      "checks": {
+        "expected_format": "pdf",
+        "rendered_page_range": [
+          1,
+          2
+        ],
+        "required_text": [
+          "合成实验摘要",
+          "方法",
+          "结果",
+          "限制",
+          "24",
+          "21",
+          "3",
+          "仅为合成测试数据",
+          "不代表真实研究"
+        ]
+      }
+    },
+    {
+      "id": "RA-PDF-03",
+      "category": "pdf",
+      "prompt": "给我一个一页PDF评分表，标题《合成演示评分表》，表格三行分别为内容完整性40分、表达清晰度35分、时间控制25分，并列出总分100。留出评语一栏，不填入任何真实姓名或实际得分。",
+      "checks": {
+        "expected_format": "pdf",
+        "exact_units": 1,
+        "unit_kind": "pages",
+        "required_text": [
+          "合成演示评分表",
+          "内容完整性",
+          "40",
+          "表达清晰度",
+          "35",
+          "时间控制",
+          "25",
+          "100",
+          "评语"
+        ]
+      }
+    },
+    {
+      "id": "RA-MD-01",
+      "category": "md",
+      "prompt": "请把一份Markdown文件发给我，标题《合成交接说明》，包含准备、执行、核对三个二级标题。准备写“确认输入来源”；执行写“使用受控工具”；核对写“检查产物和回执”。不要只在聊天中贴正文。",
+      "checks": {
+        "expected_format": "md",
+        "required_text": [
+          "合成交接说明",
+          "确认输入来源",
+          "使用受控工具",
+          "检查产物和回执"
+        ],
+        "markdown_h2": [
+          "准备",
+          "执行",
+          "核对"
+        ]
+      }
+    },
+    {
+      "id": "RA-MD-02",
+      "category": "md",
+      "prompt": "生成并发送Markdown数据说明：标题《合成预算》，用表格列设备600元、材料250元、交通150元，表后写合计1000元。另设“数据来源”小节，明确全部数字来自本条合成请求，没有联网调查。",
+      "checks": {
+        "expected_format": "md",
+        "required_text": [
+          "合成预算",
+          "设备",
+          "600",
+          "材料",
+          "250",
+          "交通",
+          "150",
+          "1000",
+          "数据来源",
+          "合成请求"
+        ],
+        "markdown_table_min_data_rows": 3,
+        "no_research_call_required": true
+      }
+    },
+    {
+      "id": "RA-MD-03",
+      "category": "md",
+      "prompt": "请给我一个Markdown文件《合成接口记录》，含一个JSON代码块，内容必须是对象：status为ok、count为3、items依次为alpha/beta/gamma；再用一段话说明这是示例数据。不要把JSON代码块改成图片。",
+      "checks": {
+        "expected_format": "md",
+        "required_text": [
+          "合成接口记录",
+          "示例数据"
+        ],
+        "json_codeblock_equals": {
+          "status": "ok",
+          "count": 3,
+          "items": [
+            "alpha",
+            "beta",
+            "gamma"
+          ]
+        }
+      }
+    },
+    {
+      "id": "RA-PYTHON-01",
+      "category": "python",
+      "prompt": "请真正用受控Python计算sum(range(1, 101))和7**12。进程输出一个JSON对象，键为sum_1_100和power_7_12，再根据实际stdout回复结果，不要只口算。",
+      "checks": {
+        "successful_tools_all": [
+          "python_compute"
+        ],
+        "process_exit_code": 0,
+        "stdout_json_equals": {
+          "sum_1_100": 5050,
+          "power_7_12": 13841287201
+        },
+        "required_text": [
+          "5050",
+          "13841287201"
+        ],
+        "work_completed_after_accepted_delivery": true
+      }
+    },
+    {
+      "id": "RA-SHELL-01",
+      "category": "shell",
+      "prompt": "请用受控进程实际运行cat /etc/os-release，读取隔离容器的系统名称和版本号，并按真实stdout回复。只读容器内这个公开文件，不读取宿主配置。",
+      "checks": {
+        "successful_tools_any": [
+          "process_run",
+          "shell_command"
+        ],
+        "process_exit_code": 0,
+        "stdout_os_release_keys": [
+          "NAME",
+          "VERSION_ID"
+        ],
+        "answer_matches_stdout_values": [
+          "NAME",
+          "VERSION_ID"
+        ],
+        "execution_backend": "docker"
+      }
+    },
+    {
+      "id": "RA-CHART-01",
+      "category": "programmatic_chart",
+      "prompt": "请用程序绘图生成并发来PNG柱状图，标题Synthetic Counts，横轴Alpha、Beta、Gamma，对应数值12、24、36，图上标出数值。不调用文生图服务。",
+      "checks": {
+        "expected_format": "png",
+        "successful_tools_any": [
+          "chart_render",
+          "python_compute"
+        ],
+        "image_min_dimensions": [
+          600,
+          400
+        ],
+        "image_nonblank": true,
+        "chart_data_equals": {
+          "kind": "bar",
+          "categories": [
+            "Alpha",
+            "Beta",
+            "Gamma"
+          ],
+          "values": [
+            12,
+            24,
+            36
+          ]
+        },
+        "image_ocr_required_text": [
+          "Synthetic Counts",
+          "Alpha",
+          "Beta",
+          "Gamma",
+          "12",
+          "24",
+          "36"
+        ],
+        "forbidden_tools": [
+          "image_generate"
+        ]
+      }
+    },
+    {
+      "id": "RA-CHART-02",
+      "category": "programmatic_chart",
+      "prompt": "生成一张PNG折线图并发送：标题Synthetic Trend，四个点W1=2、W2=4、W3=3、W4=7，按顺序连线，并在每个点旁标数字。这是合成数据，请使用程序绘图。",
+      "checks": {
+        "expected_format": "png",
+        "successful_tools_any": [
+          "chart_render",
+          "python_compute"
+        ],
+        "image_min_dimensions": [
+          600,
+          400
+        ],
+        "image_nonblank": true,
+        "chart_data_equals": {
+          "kind": "line",
+          "categories": [
+            "W1",
+            "W2",
+            "W3",
+            "W4"
+          ],
+          "values": [
+            2,
+            4,
+            3,
+            7
+          ]
+        },
+        "image_ocr_required_text": [
+          "Synthetic Trend",
+          "W1",
+          "W2",
+          "W3",
+          "W4"
+        ],
+        "forbidden_tools": [
+          "image_generate"
+        ]
+      }
+    },
+    {
+      "id": "RA-FLOW-01",
+      "category": "flowchart",
+      "prompt": "请用Python程序绘制三节点竖向流程图：Start向下到Review，再向下到Done，矩形节点和向下箭头，保存并发送至少600×400的flow.png。同时发一份flow.md，列出两条边Start -> Review和Review -> Done。不要调用插画生成服务。",
+      "checks": {
+        "expected_formats": [
+          "png",
+          "md"
+        ],
+        "successful_tools_all": [
+          "python_compute"
+        ],
+        "image_min_dimensions": [
+          600,
+          400
+        ],
+        "image_nonblank": true,
+        "image_ocr_required_text": [
+          "Start",
+          "Review",
+          "Done"
+        ],
+        "markdown_required_edges": [
+          [
+            "Start",
+            "Review"
+          ],
+          [
+            "Review",
+            "Done"
+          ]
+        ],
+        "visual_review_required": [
+          "three labeled nodes",
+          "two downward connecting arrows"
+        ],
+        "forbidden_tools": [
+          "image_generate"
+        ]
+      }
+    },
+    {
+      "id": "RA-IMAGE-01",
+      "category": "image_analysis",
+      "prompt": "请实际查看附件图片，报告代码是什么？只给出代码。",
+      "inputs": [
+        {
+          "fixture": "groupagent.media.acceptance.make_image_cases",
+          "case_id": "text-0",
+          "kind": "image"
+        }
+      ],
+      "checks": {
+        "successful_tools_any": [
+          "image_analyze",
+          "media_ocr",
+          "provider_ocr"
+        ],
+        "actual_pixel_input_required": true,
+        "required_text": [
+          "COURSE-17"
+        ],
+        "source_attachment_binding_required": true
+      }
+    },
+    {
+      "id": "RA-IMAGE-02",
+      "category": "image_analysis",
+      "prompt": "请读附件表格，Beta组有多少人？只回答阿拉伯数字。",
+      "inputs": [
+        {
+          "fixture": "groupagent.media.acceptance.make_image_cases",
+          "case_id": "table-2",
+          "kind": "image"
+        }
+      ],
+      "checks": {
+        "successful_tools_any": [
+          "image_analyze",
+          "media_ocr",
+          "provider_ocr"
+        ],
+        "actual_pixel_input_required": true,
+        "numeric_answer": 26,
+        "source_attachment_binding_required": true
+      }
+    },
+    {
+      "id": "RA-IMAGE-03",
+      "category": "image_analysis",
+      "prompt": "实际查看附件图，红色圆形相对蓝色正方形在哪里？回答left、right、above、below或inside之一。",
+      "inputs": [
+        {
+          "fixture": "groupagent.media.acceptance.make_image_cases",
+          "case_id": "position-4",
+          "kind": "image"
+        }
+      ],
+      "checks": {
+        "successful_tools_all": [
+          "image_analyze"
+        ],
+        "actual_pixel_input_required": true,
+        "any_of_text_groups": [
+          [
+            "inside",
+            "内部",
+            "里面"
+          ]
+        ],
+        "source_attachment_binding_required": true
+      }
+    },
+    {
+      "id": "RA-WEB-01",
+      "category": "web_research",
+      "prompt": "请联网检索Python官方文档，简短说明sorted()与list.sort()的区别：是否修改原列表、返回什么。提供实际查到的官方页面链接和访问时间，不要凭记忆编引用。",
+      "checks": {
+        "successful_tools_all": [
+          "web_search"
+        ],
+        "citation_hosts_all": [
+          "docs.python.org"
+        ],
+        "citations_min": 1,
+        "citations_must_match_tool_provenance": true,
+        "citation_access_time_required": true,
+        "required_text": [
+          "sorted",
+          "list.sort",
+          "None"
+        ],
+        "semantic_claims": {
+          "sorted_returns_new_list": true,
+          "list_sort_modifies_in_place": true,
+          "list_sort_returns": "None"
+        }
+      }
+    },
+    {
+      "id": "RA-WEB-02",
+      "category": "web_research",
+      "prompt": "请实际读取https://docs.python.org/3/library/json.html，说明json.dumps怎样保留中文字符，并给一个只有姓名键和合成名字的短示例。附该原始页面链接和访问时间，不需要其他网站。",
+      "checks": {
+        "successful_tools_all": [
+          "web_fetch"
+        ],
+        "citation_hosts_all": [
+          "docs.python.org"
+        ],
+        "citation_path_suffix": "/library/json.html",
+        "citations_min": 1,
+        "citations_must_match_tool_provenance": true,
+        "citation_access_time_required": true,
+        "required_regex": [
+          "ensure_ascii\\s*=\\s*False"
+        ],
+        "semantic_claims": {
+          "ensure_ascii_false_preserves_non_ascii": true
+        }
+      }
+    },
+    {
+      "id": "RA-TTS-01",
+      "category": "tts",
+      "prompt": "请用简短的合成语音朗读并发来WAV音频：这是合成语音验收。会议在上午九点开始。",
+      "checks": {
+        "expected_format": "wav",
+        "successful_tools_all": [
+          "speech_synthesize"
+        ],
+        "audio_decode_required": true,
+        "audio_duration_seconds_range": [
+          1,
+          20
+        ],
+        "audio_non_silent": true,
+        "speech_content_check_required": true,
+        "transcript_any_of_text_groups": [
+          [
+            "合成语音验收"
+          ],
+          [
+            "上午九点",
+            "上午9点"
+          ],
+          [
+            "开始"
+          ]
+        ],
+        "file_fallback_allowed": true
+      }
+    },
+    {
+      "id": "RA-TTS-02",
+      "category": "tts",
+      "prompt": "请合成英语语音，保存为WAV并发给我，朗读原句：This is a synthetic test. The report contains three sections. 不添加开场白。",
+      "checks": {
+        "expected_format": "wav",
+        "successful_tools_all": [
+          "speech_synthesize"
+        ],
+        "audio_decode_required": true,
+        "audio_duration_seconds_range": [
+          1,
+          20
+        ],
+        "audio_non_silent": true,
+        "speech_content_check_required": true,
+        "transcript_any_of_text_groups": [
+          [
+            "synthetic test"
+          ],
+          [
+            "report"
+          ],
+          [
+            "three sections",
+            "3 sections"
+          ]
+        ],
+        "file_fallback_allowed": true
+      }
+    },
+    {
+      "id": "RA-ASR-01",
+      "category": "asr",
+      "prompt": "请准确转写附件音频并回复原句，不创建提醒或人类任务。",
+      "inputs": [
+        {
+          "fixture": "parent_budgeted_tts",
+          "kind": "audio",
+          "format": "wav",
+          "text": "这是合成语音测试。本次实验共有二十四名学生。",
+          "binding": "Attach to this explicit transcription request using canonical source linkage; fixture preparation uses the same shared ledger."
+        }
+      ],
+      "checks": {
+        "asr_provider_receipt_required": true,
+        "actual_audio_bytes_required": true,
+        "any_of_text_groups": [
+          [
+            "合成语音测试"
+          ],
+          [
+            "本次实验"
+          ],
+          [
+            "二十四",
+            "24"
+          ],
+          [
+            "学生"
+          ]
+        ],
+        "source_attachment_binding_required": true,
+        "new_human_tasks": 0,
+        "new_schedules": 0
+      }
+    },
+    {
+      "id": "RA-SCHEDULE-01",
+      "category": "schedule_create",
+      "prompt": "请在十分钟后提醒我检查合成实验清单，只提醒一次。",
+      "checks": {
+        "new_time_rules": 1,
+        "timing_kind": "at",
+        "relative_due_seconds": 600,
+        "due_tolerance_seconds": 60,
+        "time_anchor": "current canonical event occurred_at",
+        "goal_required_text": [
+          "检查合成实验清单"
+        ],
+        "creator_is_requester": true,
+        "rule_state": "active",
+        "processing_same_event_twice_keeps_one_rule": true
+      }
+    },
+    {
+      "id": "RA-SCHEDULE-02",
+      "category": "schedule_update",
+      "prompt": "把刚才那条检查合成实验清单的提醒改到二十分钟后，仍然只提醒一次。",
+      "inputs": [
+        {
+          "source_case": "RA-SCHEDULE-01",
+          "reference": "actual_rule",
+          "bind_as": "referenced_schedule"
+        }
+      ],
+      "checks": {
+        "same_rule_as": "RA-SCHEDULE-01",
+        "new_time_rules": 0,
+        "revision_increased": true,
+        "timing_kind": "at",
+        "relative_due_seconds": 1200,
+        "due_tolerance_seconds": 60,
+        "time_anchor": "current canonical event occurred_at",
+        "goal_required_text": [
+          "检查合成实验清单"
+        ]
+      }
+    },
+    {
+      "id": "RA-SCHEDULE-03",
+      "category": "schedule_fire",
+      "prompt": "到点后提醒我：检查合成实验清单。",
+      "inputs": [
+        {
+          "source_case": "RA-SCHEDULE-02",
+          "reference": "actual_rule",
+          "bind_as": "due_schedule"
+        }
+      ],
+      "harness_action": {
+        "kind": "advance_injected_due_scan_clock",
+        "to": "referenced_rule.next_due_at plus one second",
+        "repeat_same_tick": 2
+      },
+      "checks": {
+        "new_enqueued_occurrences": 1,
+        "new_works_from_referenced_rule": 1,
+        "required_text": [
+          "检查合成实验清单"
+        ],
+        "all_delivery_parts_accepted": true,
+        "work_completed_after_accepted_delivery": true,
+        "duplicate_tick_creates_no_extra_work_or_delivery": true,
+        "derived_depth": 1
+      }
+    },
+    {
+      "id": "RA-EDIT-01",
+      "category": "version_edit",
+      "prompt": "请编辑我引用的周会纪要Word文件，只把“预算待定”改成“预算1200元”，保留其余段落和表格，再把新版本文件发来。原文件不要覆盖。",
+      "inputs": [
+        {
+          "source_case": "RA-DOCX-01",
+          "reference": "delivered_artifact",
+          "bind_as": "editable_document"
+        }
+      ],
+      "checks": {
+        "expected_format": "docx",
+        "successful_tools_all": [
+          "document_edit"
+        ],
+        "required_text": [
+          "预算1200元",
+          "合成项目周会纪要",
+          "成员甲",
+          "成员乙",
+          "方案B"
+        ],
+        "forbidden_text": [
+          "预算待定"
+        ],
+        "new_version_required": true,
+        "source_bytes_unchanged": true,
+        "source_provenance_chain_required": true,
+        "rendered_page_range": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "id": "RA-EDIT-02",
+      "category": "version_edit",
+      "prompt": "请修改我引用的三页项目启动PPT，只将第三页的“下一步：整理资料”改为“下一步：完成验收”。页数仍为3，前两页内容保持不变，发给我新版本，保留原版本。",
+      "inputs": [
+        {
+          "source_case": "RA-PPTX-01",
+          "reference": "delivered_artifact",
+          "bind_as": "editable_presentation"
+        }
+      ],
+      "checks": {
+        "expected_format": "pptx",
+        "successful_tools_all": [
+          "document_edit"
+        ],
+        "exact_units": 3,
+        "unit_kind": "slides",
+        "required_text": [
+          "项目目标",
+          "角色分工",
+          "下一步：完成验收"
+        ],
+        "forbidden_text": [
+          "下一步：整理资料"
+        ],
+        "unchanged_source_units": [
+          1,
+          2
+        ],
+        "new_version_required": true,
+        "source_bytes_unchanged": true,
+        "source_provenance_chain_required": true
+      }
+    }
+  ],
+  "category_counts": {
+    "docx": 3,
+    "pptx": 3,
+    "pdf": 3,
+    "md": 3,
+    "python": 1,
+    "shell": 1,
+    "programmatic_chart": 2,
+    "flowchart": 1,
+    "image_analysis": 3,
+    "web_research": 2,
+    "tts": 2,
+    "asr": 1,
+    "schedule_create": 1,
+    "schedule_update": 1,
+    "schedule_fire": 1,
+    "version_edit": 2
+  }
+}

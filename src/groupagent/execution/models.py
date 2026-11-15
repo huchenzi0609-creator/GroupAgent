@@ -10,7 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from groupagent.domain import ActorContext
-from groupagent.tools.models import ToolLedgerEntry, ToolReceipt
+from groupagent.tools.models import InputRequest, ToolLedgerEntry, ToolReceipt
 
 
 class EngineData(BaseModel):
@@ -25,6 +25,8 @@ class ExecutionBudget(EngineData):
     max_output_tokens: int = Field(default=4096, ge=1, le=65_536)
     model_timeout_seconds: float = Field(default=60, gt=0)
     max_input_bytes: int = Field(default=1_000_000, ge=1)
+    additional_retry_limit: int = Field(default=2, ge=0, le=5)
+    max_retry_after_seconds: float = Field(default=30, ge=0, le=60)
 
 
 class ExecutionRequest(EngineData):
@@ -117,6 +119,10 @@ class EngineCheckpoint(EngineData):
     ledger: tuple[ToolLedgerEntry, ...] = ()
     unresolved_tools: frozenset[str] = frozenset()
     safe_to_resume: bool
+    backend_state: dict[str, JsonValue] = Field(default_factory=dict)
+    candidate_text: str | None = None
+    error_code: str | None = None
+    input_request: InputRequest | None = None
 
 
 class RunSnapshot(EngineData):

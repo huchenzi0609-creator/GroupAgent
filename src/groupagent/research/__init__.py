@@ -1,5 +1,6 @@
 """Optional research adapters. No paid request occurs on import or registration."""
 
+from .citations import source_citation, validate_research_citations
 from .deepseek import DeepSeekResearchClient
 from .models import FetchInput, FetchOutput, ResearchSource, SearchInput, SearchOutput
 from .tools import register_research_tools
@@ -14,4 +15,6 @@ __all__ = [
     "SearchInput",
     "SearchOutput",
     "register_research_tools",
+    "source_citation",
+    "validate_research_citations",
 ]

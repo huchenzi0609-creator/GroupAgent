@@ -9,11 +9,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 from datetime import UTC, datetime
 from pathlib import PurePath
-from typing import Any, TypeVar
-from urllib.parse import quote
+from typing import Any, Literal, TypeVar
+from urllib.parse import quote, urlsplit
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
@@ -38,7 +39,7 @@ from .models import (
     valid_identifier,
     wire_key,
 )
-from .wire import NativeAsset, NativeAssets, NativeEvents, NativeMessage
+from .wire import NativeAsset, NativeAssets, NativeEvents, NativeLinkCard, NativeMessage
 
 T = TypeVar("T", bound=BaseModel)
 _VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".3gp", ".3g2", ".mj2"}
@@ -175,6 +176,7 @@ class AgentWechatAdapter:
         self._issued_cursors: set[str] = set()
         self._last_ack = -1
         self._file_requests: dict[str, str] = {}
+        self._media_modes: dict[str, tuple[str, str, str | None]] = {}
 
     async def __aenter__(self) -> AgentWechatAdapter:
         return self
@@ -398,6 +400,16 @@ class AgentWechatAdapter:
             daemon_server_id=server_id,
             media_upload_max_bytes=min(upload_limit, self.config.max_send_bytes),
             file_send_max_bytes=min(file_limit, self.config.max_send_bytes),
+            image_send_max_bytes=self._runtime_kind_limit(
+                send_limits, kinds, "image", 15 * 1024 * 1024
+            ),
+            voice_send_max_bytes=self._runtime_kind_limit(
+                send_limits, kinds, "voice", self.config.max_send_bytes
+            ),
+            native_voice_reported="voice" in kinds,
+            send_kinds=tuple(
+                ["text", "file"] + [kind for kind in ("image", "voice") if kind in kinds]
+            ),
             metadata_media_kinds=tuple(kind for kind in kinds if kind != "video"),
             upstream_features=tuple(features),
             quoted_text_send_reported=remote.get("quotedTextSend") is True,
@@ -408,6 +420,18 @@ class AgentWechatAdapter:
             )
         self._runtime = result
         return result
+
+    def _runtime_kind_limit(
+        self, limits: dict[str, Any], kinds: list[str], kind: str, maximum: int
+    ) -> int | None:
+        if kind not in kinds:
+            return None
+        value = limits.get(kind)
+        if type(value) is not int or value <= 0:
+            raise DomainError(
+                "invalid_channel_response", "Advertised media kind has no positive byte limit"
+            )
+        return min(value, maximum, self.config.max_send_bytes)
 
     async def _ensure_runtime(self) -> ChannelCapabilities:
         async with self._handshake_lock:
@@ -550,7 +574,17 @@ class AgentWechatAdapter:
                 _server_id(message.serverId),
                 _timestamp(message.recall.get("recalledAt") or message.recall.get("observedAt")),
             )
-        elif message.type in {43, 62}:
+        # Only the documented system-notice type may lack a sender. A metadata-only
+        # unsupported-content event must still preserve a verified real identity.
+        sender = _identifier(
+            "system:agentwechat"
+            if message.senderId is None and message.type == 10000
+            else message.senderId
+        )
+        platform_id = _server_id(message.serverId) if message.serverId is not None else None
+        source = stable_key(self.config, platform_id or message.id, server=platform_id is not None)
+        occurred_at = _timestamp(message.createdAt)
+        if message.type in {43, 62}:
             kind = EventKind.UNSUPPORTED_VIDEO
             text = ""
             attachments.append(
@@ -564,6 +598,24 @@ class AgentWechatAdapter:
             kind, text = EventKind.TEXT, message.body or ""
         elif message.type == 10000:
             kind, text = EventKind.SYSTEM, message.body or ""
+        elif message.type == 49 and message.appMessageType == 5:
+            link = self._link_card(message.link)
+            if link is None:
+                kind, text = EventKind.SYSTEM, ""
+                attachments.append(self._unsupported_content(message, "link_metadata_unavailable"))
+            else:
+                kind = EventKind.TEXT
+                title, url = link
+                text = "[Link]" + (" " + title if title else "") + ("\n" + url if url else "")
+                attachments.append(
+                    {
+                        "kind": "link",
+                        "title": title,
+                        "url": url,
+                        "fetched": False,
+                        "untrusted_content": True,
+                    }
+                )
         elif message.type in {3, 34, 47} or (
             message.type == 49 and message.appMessageType in {6, 8}
         ):
@@ -618,18 +670,10 @@ class AgentWechatAdapter:
                 }
             )
         else:
-            raise DomainError(
-                "unsupported_message", "Message type is outside the implemented adapter subset"
-            )
+            kind, text = EventKind.SYSTEM, ""
+            attachments.append(self._unsupported_content(message, "message_content_not_supported"))
         if len(text.encode()) > 256 * 1024:
             raise DomainError("message_too_large", "Normalized message text exceeds its limit")
-        sender = message.senderId
-        if sender is None and kind in {EventKind.SYSTEM, EventKind.RECALL}:
-            sender = "system:agentwechat"
-        sender = _identifier(sender)
-        platform_id = _server_id(message.serverId) if message.serverId is not None else None
-        source = stable_key(self.config, platform_id or message.id, server=platform_id is not None)
-        occurred_at = _timestamp(message.createdAt)
         return GroupEvent(
             id=str(uuid5(NAMESPACE_URL, source)),
             source_key=source,
@@ -647,6 +691,47 @@ class AgentWechatAdapter:
             trusted_actor_origin="agentwechat_authenticated_message_metadata",
             policy_revision=self.config.policy_revision,
         )
+
+    @staticmethod
+    def _unsupported_content(message: NativeMessage, reason: str) -> dict[str, JsonValue]:
+        # No body, XML, location, payment or arbitrary card fields are persisted.
+        return {
+            "kind": "unsupported_content",
+            "message_type": message.type,
+            "app_message_type": message.appMessageType,
+            "availability": "unsupported",
+            "reason": reason,
+        }
+
+    @staticmethod
+    def _link_card(raw: Any) -> tuple[str | None, str | None] | None:
+        """Project documented card fields only; do not fetch or derive URLs from XML."""
+        try:
+            card = NativeLinkCard.model_validate(raw)
+            title = card.title.strip() if card.title else None
+            url = card.url.strip() if card.url else None
+            if title:
+                title.encode("utf-8")
+                if any(ord(char) < 32 or ord(char) == 127 for char in title):
+                    return None
+            if url:
+                url.encode("utf-8")
+                parsed = urlsplit(url)
+                if (
+                    parsed.scheme not in {"http", "https"}
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or "\\" in url
+                    or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)
+                    or parsed.port is not None
+                    and not 1 <= parsed.port <= 65535
+                    or PurePath(parsed.path).suffix.lower() in _VIDEO_SUFFIXES
+                ):
+                    return None
+            return (title, url) if title or url else None
+        except (ValueError, UnicodeError):
+            return None
 
     def _recall_event(self, platform_id: str, occurred_at: datetime) -> GroupEvent:
         original = stable_key(self.config, platform_id, server=True)
@@ -1114,7 +1199,181 @@ class AgentWechatAdapter:
             params={"key": wire},
             allow_not_found=True,
         )
-        return None if raw is None else self._receipt(raw, key)
+        if raw is None:
+            return None
+        receipt = self._receipt(raw, key)
+        mode = self._media_modes.get(wire)
+        if mode:
+            receipt = receipt.model_copy(
+                update={"requested_kind": mode[0], "wire_kind": mode[1], "fallback_reason": mode[2]}
+            )
+        return receipt
+
+    async def send_media(
+        self,
+        group_id: str,
+        name: str,
+        content: bytes,
+        *,
+        kind: Literal["image", "voice"],
+        idempotency_key: str,
+        duration_seconds: float | None = None,
+        allow_file_fallback: bool = False,
+    ) -> ChannelReceipt:
+        """Send registry-validated media; full decoding remains in the isolated worker.
+
+        Voice duration is trusted validated metadata, not an untrusted header parsed
+        in this channel process. A fallback is explicit and recorded as a file send.
+        """
+        self._scope(group_id)
+        key = self._key(idempotency_key)
+        _filename(name)
+        suffix = PurePath(name).suffix.lower()
+        if suffix in _VIDEO_SUFFIXES or kind not in {"image", "voice"}:
+            raise DomainError(
+                "unsupported_video"
+                if suffix in _VIDEO_SUFFIXES or kind == "video"
+                else "unsupported_attachment",
+                "Only reviewed image and voice send kinds are supported",
+            )
+        if not isinstance(content, bytes) or not content:
+            raise DomainError("invalid_attachment", "Nonempty validated media bytes are required")
+        if len(content) > self.config.max_send_bytes:
+            raise DomainError(
+                "attachment_too_large", "Media exceeds the project delivery byte limit"
+            )
+        if (
+            content.startswith((b"\x1aE\xdf\xa3", b"FLV"))
+            or (content[:4] == b"RIFF" and content[8:12] == b"AVI ")
+            or content[4:8] == b"ftyp"
+            or (content.startswith(b"OggS") and b"theora" in content[:65536])
+        ):
+            raise DomainError("unsupported_video", "Video containers are never staged")
+        if kind == "image":
+            signatures = {
+                ".png": (content.startswith(b"\x89PNG\r\n\x1a\n"), "image/png"),
+                ".jpg": (content.startswith(b"\xff\xd8\xff"), "image/jpeg"),
+                ".jpeg": (content.startswith(b"\xff\xd8\xff"), "image/jpeg"),
+                ".gif": (content.startswith((b"GIF87a", b"GIF89a")), "image/gif"),
+                ".webp": (content.startswith(b"RIFF") and content[8:12] == b"WEBP", "image/webp"),
+            }
+            valid, mime = signatures.get(suffix, (False, ""))
+            validated_duration = 0.0
+        else:
+            valid = (
+                suffix == ".wav"
+                and len(content) >= 44
+                and content.startswith(b"RIFF")
+                and content[8:12] == b"WAVE"
+            ) or (suffix == ".ogg" and content.startswith(b"OggS") and b"OpusHead" in content[:128])
+            mime = "audio/wav" if suffix == ".wav" else "audio/ogg"
+            if (
+                not isinstance(duration_seconds, (float, int))
+                or isinstance(duration_seconds, bool)
+                or not math.isfinite(duration_seconds)
+                or not 0 < duration_seconds <= 600
+            ):
+                raise DomainError(
+                    "media_metadata_required",
+                    "Voice send requires validated duration within ten minutes",
+                )
+            validated_duration = float(duration_seconds)
+        if not valid:
+            raise DomainError(
+                "media_format_mismatch",
+                "Media signature does not match its supported filename/kind",
+            )
+        runtime = await self.capabilities()
+        wire_kind: Literal["image", "voice", "file"] = kind
+        fallback: str | None = None
+        limit = runtime.image_send_max_bytes if kind == "image" else runtime.voice_send_max_bytes
+        if kind == "voice" and (limit is None or validated_duration > 60 or len(content) > limit):
+            fallback = (
+                "native_voice_unavailable"
+                if limit is None
+                else "native_voice_duration_limit"
+                if validated_duration > 60
+                else "native_voice_size_limit"
+            )
+            if allow_file_fallback is not True:
+                raise DomainError(
+                    fallback,
+                    "Native voice cannot carry this artifact; an explicit audio-file fallback is required",
+                )
+            wire_kind, limit = "file", runtime.file_send_max_bytes
+        if limit is None:
+            raise DomainError(
+                "channel_capability_unavailable", "Runtime does not advertise this media send kind"
+            )
+        if len(content) > min(runtime.media_upload_max_bytes, limit):
+            raise DomainError(
+                "attachment_too_large", "Media exceeds the runtime kind/staging limit"
+            )
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                [
+                    kind,
+                    wire_kind,
+                    name,
+                    round(validated_duration * 1000) if kind == "voice" else None,
+                ],
+                separators=(",", ":"),
+            ).encode()
+            + b"\0"
+            + content
+        ).hexdigest()
+        async with self._send_lock:
+            previous = self._file_requests.get(key)
+            if previous is not None and previous != fingerprint:
+                raise DomainError(
+                    "idempotency_conflict",
+                    "This media-send key is bound to another payload or mode",
+                )
+            existing = await self.lookup_delivery(group_id, idempotency_key)
+            if existing is not None:
+                if previous is None:
+                    raise DomainError(
+                        "delivery_requires_reconciliation",
+                        "An earlier media send exists; reconcile the durable intent via lookup_delivery",
+                        effect_state="unknown",
+                        resource_ref=key,
+                    )
+                return existing
+            self._file_requests[key] = fingerprint
+            self._media_modes[key] = (kind, wire_kind, fallback)
+            uploaded = await self._request(
+                "POST", self._path("uploads"), files={"file": (name, content, mime)}, mutation=True
+            )
+            if (
+                uploaded.get("name") != name
+                or uploaded.get("byteLength") != len(content)
+                or uploaded.get("sha256") != hashlib.sha256(content).hexdigest()
+            ):
+                raise DomainError(
+                    "media_integrity_failed",
+                    "Staged media does not match the validated artifact bytes",
+                )
+            source_id = _identifier(uploaded.get("id"))
+            raw = await self._request(
+                "POST",
+                self._path("sends"),
+                key=key,
+                mutation=True,
+                body={
+                    "threadId": self.config.external_group_id,
+                    "kind": wire_kind,
+                    "sourceId": source_id,
+                    "standardSourceId": None,
+                    "thumbnailSourceId": None,
+                    "playSeconds": None,
+                    "durationMs": round(validated_duration * 1000)
+                    if wire_kind == "voice"
+                    else None,
+                },
+            )
+            return self._receipt(raw, idempotency_key).model_copy(
+                update={"requested_kind": kind, "wire_kind": wire_kind, "fallback_reason": fallback}
+            )
 
     async def send_file(
         self, group_id: str, name: str, content: bytes, idempotency_key: str

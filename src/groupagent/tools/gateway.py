@@ -14,17 +14,104 @@ from pydantic import ValidationError
 from groupagent.domain import DomainError, Role
 
 from .models import (
+    ISOLATED_PROCESS_TOOLS,
     EffectState,
     IdempotencyMode,
+    InputRequest,
     PolicyDecision,
     PolicyProvider,
     ToolContext,
+    ToolControl,
     ToolDefinition,
+    ToolFailure,
+    ToolInputIssue,
+    ToolInputRequired,
     ToolLedgerEntry,
     ToolReceipt,
     ToolScope,
 )
 from .paths import scoped_path
+
+_INPUT_ERROR_TYPES = frozenset(
+    {
+        "missing",
+        "extra_forbidden",
+        "string_type",
+        "string_too_short",
+        "string_too_long",
+        "list_type",
+        "tuple_type",
+        "int_type",
+        "int_parsing",
+        "int_from_float",
+        "float_type",
+        "float_parsing",
+        "bool_type",
+        "bool_parsing",
+        "dict_type",
+        "literal_error",
+        "enum",
+        "greater_than",
+        "greater_than_equal",
+        "less_than",
+        "less_than_equal",
+        "finite_number",
+        "too_long",
+        "too_short",
+        "union_tag_invalid",
+        "union_tag_not_found",
+        "model_type",
+        "value_error",
+        "datetime_type",
+        "datetime_parsing",
+        "datetime_from_date_parsing",
+        "timezone_aware",
+        "json_invalid",
+        "string_pattern_mismatch",
+    }
+)
+
+
+def _input_issues(
+    error: ValidationError, definition: ToolDefinition[Any, Any]
+) -> tuple[ToolInputIssue, ...]:
+    names: set[str] = set()
+
+    def fields(schema: Any) -> None:
+        if isinstance(schema, dict):
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                names.update(properties)
+            for value in schema.values():
+                fields(value)
+        elif isinstance(schema, list):
+            for value in schema:
+                fields(value)
+
+    fields(definition.input_model.model_json_schema())
+    issues = []
+    for entry in error.errors(include_input=False, include_context=False, include_url=False)[:8]:
+        # Unknown keys may themselves contain credentials. Only declared schema
+        # names and bounded array indices may appear in model-visible diagnostics.
+        location = tuple(
+            part
+            if isinstance(part, str) and part in names
+            else part
+            if type(part) is int and 0 <= part < 4096
+            else "<extra>"
+            for part in entry["loc"][:6]
+        )
+        kind = entry["type"] if entry["type"] in _INPUT_ERROR_TYPES else "invalid_value"
+        hints = getattr(definition.input_model, "validation_hints", {})
+        hint = None
+        if isinstance(hints, dict):
+            hint = hints.get(
+                ".".join(str(part) for part in location), hints.get(kind, hints.get("*"))
+            )
+        if not isinstance(hint, str) or len(hint) > 600:
+            hint = None
+        issues.append(ToolInputIssue(field=location, kind=kind, hint=hint))
+    return tuple(issues)
 
 
 async def static_policy(scope: ToolScope) -> PolicyDecision:
@@ -40,7 +127,30 @@ class ToolGateway:
         self._ledger: dict[tuple[str, str, str], tuple[str, ToolReceipt]] = {}
         self._active: dict[tuple[str, str, str], asyncio.Task[Any]] = {}
 
+    @property
+    def registered_names(self) -> frozenset[str]:
+        return frozenset(self._tools)
+
+    @property
+    def control_names(self) -> frozenset[str]:
+        return frozenset(
+            name for name, definition in self._tools.items() if definition.control_kind
+        )
+
+    def normalize_arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Pure schema normalization for adapters; this does not authorize invocation."""
+        definition = self._tools.get(name)
+        if definition is None:
+            raise DomainError("tool_not_registered", "The requested tool is not registered")
+        return definition.input_model.model_validate(arguments).model_dump(mode="json")
+
     def register(self, definition: ToolDefinition[Any, Any]) -> None:
+        if definition.required_tool_family is not None and (
+            definition.name not in ISOLATED_PROCESS_TOOLS
+            or definition.risk_class != "local_draft"
+            or definition.idempotency_mode != IdempotencyMode.RECONCILE_BEFORE_RETRY
+        ):
+            raise ValueError("Only reviewed isolated process registrations can share requirements")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", definition.name):
             raise ValueError("Tool names must be compatible with function-calling APIs")
         if definition.name in self._tools:
@@ -63,6 +173,12 @@ class ToolGateway:
             raise ValueError("Tool limits must be positive")
         if not {"group", "work"}.issubset(definition.resource_scopes):
             raise ValueError("Every tool must declare group and work resource scopes")
+        if definition.control_kind and (
+            definition.control_kind != "request_input"
+            or definition.output_model is not InputRequest
+            or definition.idempotency_mode != IdempotencyMode.READ_ONLY
+        ):
+            raise ValueError("Control tools require the reviewed typed read-only contract")
         self._tools[definition.name] = definition
 
     def bind_scope(self, scope: ToolScope) -> None:
@@ -122,6 +238,29 @@ class ToolGateway:
             raise DomainError("cancelled", "This execution was cancelled")
         return replace(context, scope=replace(context.scope, actor=actor))
 
+    async def _required_evidence(self, result: ToolReceipt, context: ToolContext) -> ToolReceipt:
+        definition = self._tools.get(result.tool_name)
+        evidence = set()
+        if (
+            result.success
+            and result.effect_state == EffectState.SUCCEEDED
+            and definition is not None
+            and definition.required_tool_family == "isolated_process"
+        ):
+            evidence.add(result.tool_name)
+            for name in ISOLATED_PROCESS_TOOLS - {result.tool_name}:
+                alternate = self._tools.get(name)
+                if alternate is None or alternate.required_tool_family != "isolated_process":
+                    continue
+                try:
+                    # Recheck the alternative on replay too: old receipts cannot
+                    # revive an unregistered or newly forbidden tool requirement.
+                    await self.authorize(name, context)
+                except Exception:
+                    continue
+                evidence.add(name)
+        return result.model_copy(update={"required_tool_evidence": frozenset(evidence)})
+
     async def invoke(
         self, name: str, arguments: dict[str, Any], context: ToolContext
     ) -> ToolReceipt:
@@ -140,13 +279,16 @@ class ToolGateway:
                 message=message,
             )
 
+        validating_arguments = False
         try:
             effective_context = await self.authorize(name, context)
             definition = self._tools[name]
             encoded = json.dumps(arguments, sort_keys=True, allow_nan=False).encode("utf-8")
             if len(encoded) > definition.max_input_bytes:
                 return receipt("input_too_large")
+            validating_arguments = True
             validated = definition.input_model.model_validate(arguments)
+            validating_arguments = False
             for path_field in definition.input_path_fields:
                 value = getattr(validated, path_field)
                 if not isinstance(value, str):
@@ -154,7 +296,22 @@ class ToolGateway:
                 scoped_path(context.workspace, value)
         except DomainError as exc:
             return receipt(exc.code)
-        except (ValidationError, TypeError, ValueError):
+        except ValidationError as error:
+            if not validating_arguments:
+                return receipt("policy_unavailable")
+            issues = _input_issues(error, definition)
+            description = "; ".join(
+                (".".join(str(part) for part in issue.field) or "<root>")
+                + " ("
+                + issue.kind
+                + ")"
+                + (": " + issue.hint if issue.hint else "")
+                for issue in issues
+            )
+            return receipt("invalid_input", message="Correct input: " + description).model_copy(
+                update={"input_issues": issues}
+            )
+        except (TypeError, ValueError):
             return receipt("invalid_input")
         except Exception:
             return receipt("policy_unavailable")
@@ -165,7 +322,8 @@ class ToolGateway:
         if previous:
             if previous[0] != fingerprint:
                 return receipt("idempotency_conflict")
-            return previous[1].model_copy(update={"call_id": context.call_id, "replayed": True})
+            replay = previous[1].model_copy(update={"call_id": context.call_id, "replayed": True})
+            return await self._required_evidence(replay, context)
         if context.cancelled.is_set():
             return receipt("cancelled")
         if context.deadline_monotonic is not None and (
@@ -227,9 +385,38 @@ class ToolGateway:
                             else EffectState.SUCCEEDED
                         ),
                         output=output.model_dump(mode="json"),
+                        control=ToolControl(input_request=InputRequest.model_validate(output))
+                        if definition.control_kind == "request_input"
+                        else None,
                     )
         except asyncio.CancelledError:
             result = receipt("cancelled", uncertain)
+        except ToolInputRequired as exc:
+            if definition.may_request_input:
+                result = receipt(
+                    "input_required",
+                    EffectState.NO_EFFECT,
+                    message="This action was not performed; confirmed input is required.",
+                ).model_copy(update={"control": ToolControl(input_request=exc.input_request)})
+            else:
+                result = receipt("unregistered_tool_control", uncertain)
+        except ToolFailure as exc:
+            if exc.output is None:
+                result = receipt(
+                    exc.code,
+                    EffectState.NO_EFFECT if exc.no_effect else uncertain,
+                    message=exc.message,
+                )
+            else:
+                failed_output = definition.output_model.model_validate(exc.output)
+                if len(failed_output.model_dump_json().encode()) <= definition.max_output_bytes:
+                    result = receipt(
+                        exc.code,
+                        EffectState.NO_EFFECT if exc.no_effect else uncertain,
+                        message=exc.message,
+                    ).model_copy(update={"output": failed_output.model_dump(mode="json")})
+                else:
+                    result = receipt("output_too_large", uncertain)
         except DomainError as exc:
             result = receipt(exc.code, uncertain)
         except Exception:
@@ -250,7 +437,17 @@ class ToolGateway:
                 task.add_done_callback(
                     lambda finished: finished.exception() if not finished.cancelled() else None
                 )
-        self._ledger[key] = (fingerprint, result)
+        result = await self._required_evidence(result, context)
+        if (
+            result.control is not None
+            and not result.success
+            and result.effect_state == EffectState.NO_EFFECT
+        ):
+            # No business effect occurred. Fresh, trusted input may permit this
+            # same logical call after resume; never cache a stale question forever.
+            self._ledger.pop(key, None)
+        else:
+            self._ledger[key] = (fingerprint, result)
         return result
 
     def inspect_effect(
@@ -263,6 +460,33 @@ class ToolGateway:
         for key, task in tuple(self._active.items()):
             if key[:2] == (group_id, work_id):
                 task.cancel()
+
+    async def quiesce(self, scope: ToolScope, *, timeout_seconds: float) -> None:
+        self._check_scope(scope)
+        active = {
+            task
+            for key, task in self._active.items()
+            if key[:2] == (scope.group_id, scope.work_id) and not task.done()
+        }
+        for task in active:
+            task.cancel()
+        if active:
+            _, pending = await asyncio.wait(active, timeout=timeout_seconds)
+            if pending:
+                raise DomainError(
+                    "work_busy", "A scoped tool has not acknowledged termination", retryable=True
+                )
+        for key, task in tuple(self._active.items()):
+            if key[:2] == (scope.group_id, scope.work_id) and task.done():
+                self._active.pop(key, None)
+
+    def is_quiescent(self, scope: ToolScope) -> bool:
+        self._check_scope(scope)
+        return not any(
+            not task.done()
+            for key, task in self._active.items()
+            if key[:2] == (scope.group_id, scope.work_id)
+        )
 
     def export_ledger(self, scope: ToolScope) -> tuple[ToolLedgerEntry, ...]:
         self._check_scope(scope)

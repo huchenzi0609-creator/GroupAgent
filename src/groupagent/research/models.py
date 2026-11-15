@@ -35,6 +35,10 @@ class ResearchSource(ToolData):
     url: str
     title: str
     retrieved_at: AwareDatetime
+    citation: str = Field(
+        default="",
+        description="Client-built URL and actual retrieval time in UTC; copy this citation, optionally adding local time",
+    )
     provider: Literal["deepseek"] = "deepseek"
     operation: Literal["search", "fetch"]
     evidence_kind: Literal["search_result", "provider_fetched_page"]
@@ -58,9 +62,11 @@ class SearchOutput(ToolData):
     provider_result_count: int = Field(ge=0)
     filtered_result_count: int = Field(ge=0)
     untrusted_content: Literal[True] = True
+    budget_receipt: str | None = None
 
 
 class FetchOutput(ToolData):
     requested_url: str
     source: ResearchSource
     untrusted_content: Literal[True] = True
+    budget_receipt: str | None = None

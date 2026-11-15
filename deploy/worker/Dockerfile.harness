@@ -1,0 +1,8 @@
+ARG WORKER_IMAGE
+FROM ${WORKER_IMAGE}
+COPY deploy/worker/harness-requirements.txt /opt/groupagent-harness-requirements.txt
+RUN python -m pip install --no-cache-dir --no-deps --require-hashes -r /opt/groupagent-harness-requirements.txt
+COPY src/groupagent/execution /usr/local/lib/python3.13/site-packages/groupagent/execution
+COPY deploy/worker/dropuid-dsh /opt/groupagent-dropuid-dsh
+RUN chmod 0755 /opt/groupagent-dropuid-dsh
+LABEL org.groupagent.harness-sdk="0.2.2rc2"

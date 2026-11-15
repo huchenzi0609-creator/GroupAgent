@@ -1,0 +1,23 @@
+{
+  "checked_at": "2026-11-14",
+  "reference_commit": "39163dd30f703a79079e2d2446545cff3c453738",
+  "selected_release": "0.2.2rc2",
+  "release_tag": "dsh-v0.2.2-rc.2",
+  "release_tag_commit": "ddac96760b6edf8fa0fe17cbdcf0b512f4c12b2c",
+  "root_license": "MIT",
+  "sdk_api_py_sha256": "9c772909775196fc4070182191738ad227a3bfdccc68d1b6f4e8b90dec08430b",
+  "sdk_client_py_sha256": "e0bdbf82d5932d38bb38a2eb8b2ae123487c7c520444c64c859c70e4504028da",
+  "sdk_api_and_client_match_reference_commit": true,
+  "sdk_wheel_sha256": "ad14f1b1fccb29f7d97e5a7e0ee9dbb96d8af11292308bba66bf19a623d31899",
+  "runtime_linux_aarch64_wheel_sha256": "dc8f6e2c463c9c174b8fbafa394ada62351ff16b9febde4b90dca6b57f1b4e84",
+  "runtime_linux_x86_64_wheel_sha256": "3c8f15a7a92b12857032995ec5dbcc105f192c36218e9b6bb2c5b54b4ee7db17",
+  "pypi_provenance_endpoint_available": false,
+  "binary_reproducible_build_verified": false,
+  "evidence_urls": [
+    "https://pypi.org/pypi/deepseek-harness-sdk/0.2.2rc2/json",
+    "https://pypi.org/pypi/deepseek-harness-runtime-bin/0.2.2rc2/json",
+    "https://api.github.com/repos/deepseek-ai/deepseek-harness/git/ref/tags/dsh-v0.2.2-rc.2",
+    "https://github.com/deepseek-ai/deepseek-harness/tree/39163dd30f703a79079e2d2446545cff3c453738"
+  ],
+  "limits": "Release tag mapping and publisher wheel hashes are verified; this is not an independently reproduced native build or a verified PyPI attestation. The source pyprojects use generated 0.0.0.dev0 placeholders; the reference root rc3 is not a published matching Python package at review time."
+}
