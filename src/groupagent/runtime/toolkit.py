@@ -836,6 +836,7 @@ class WorkToolkit:
                         "Use chart_render's actual chart_spec and a bounded pixel/visual check to verify chart data. OCR can misread W1 as WL or miss small numbers; it is an extraction aid, not a requirement to keep redrawing a correct chart. Resolve a real visual defect once, then select the final artifact.",
                         "After a successful format/content check, call artifact_deliver and provide the candidate answer. The control service performs independent validation before sending; do not spend the entire budget repeating identical successful checks.",
                         "For a text-only question, answer directly from the actual tool evidence once it resolves the question; do not invent an output file, export inputs or search unrelated history. Research excerpts explicitly report truncation; do not claim to have read omitted text.",
+                        "For concise research explanations, give the requested facts, links and retrieval times. Do not add code examples or demonstrations unless the user asks for them. When an example is requested, verify every input/output against actual tool/source evidence; preserve all values rather than inventing a plausible result.",
                         "For research deliverables, cite only sources returned by successful web_search/web_fetch calls and copy each cited source.citation alongside that link. It records the actual retrieval time in UTC; you may additionally show local time. Do not substitute a publication date, the current clock, or another source's time. A search result observation is not proof of reading the full page.",
                         "When artifact_deliver is absent from this goal's tool catalog, plain text is the deliverable. Do not create or export a file; finish with the supported answer or use request_input only for genuinely missing information.",
                         "Default to concise natural Chinese. A candidate is not yet delivered; do not claim that it was sent.",
@@ -1143,6 +1144,22 @@ class WorkToolkit:
                     "Requested research requires actual research tool evidence and citations to retrieved sources",
                 )
             validate_research_citations(full_answer, research_sources, require_access_time=True)
+            examples_requested = bool(
+                re.search(
+                    r"示例|例子|举例|实例|演示|代码|程序|example|demo|\bcode\b",
+                    original_event.text,
+                    re.I,
+                )
+            )
+            if (
+                not outputs
+                and not examples_requested
+                and re.search(r"```|~~~|例如|示例|举例|例子|for example|\be\.g\.", answer, re.I)
+            ):
+                raise DomainError(
+                    "validation_failed",
+                    "This request asks for a concise sourced explanation, not extra examples; remove unsolicited code/demonstrations and keep the requested facts with their actual citations and retrieval times",
+                )
         if self.config.runtime.semantic_validation:
             execution_intent = _execution_intent(work)
             with self.store.transaction(actor) as tx:
@@ -1165,6 +1182,7 @@ class WorkToolkit:
                             "不得把尚未发送、等待审核、尚无发送回执当作内容缺陷，也不得要求执行模型提前发送来通过审核；实际派送及回执由后续控制服务独立检查。"
                             + "结合original_request和真实提取证据理解用户词义；当前goal和criteria仍决定后续授权变更。"
                             "报告中的标识码不因此需要满足程序代码语法。只按用户要求和已有证据核验，不添加用户未要求的标准。"
+                            "任何实际给出的代码、算术或示例输入/输出也属于需核对的事实；逐项核对数量、元素、数值及输出，核心结论正确不能抵消示例丢元素或算错。未请求示例时以简短所需事实为准，不要求补例子。"
                             "标题声明用的书名号/引号通常是引用定界标记；除非用户明确要求保留符号，不得仅因实际标题省略这些定界符而拒绝。"
                             "PPT的metadata.title是从实际文件读回的主题元数据；当原文逐页指定了不同标题且未要求可见展示主题时，不要求把主题重复塞进页内文字、增加封面或改变指定标题。"
                             "document_read中unit.editable仅表示当前机器人文本编辑接口是否支持该unit，不表示Office对象本身不可编辑。metadata.native_table_count来自实际Office结构；正数证明含原生可编辑表格，不能因聚合unit的editable:false把它误判成图片。零或缺失不能证明原生表格，不得把纯文本画格或截图当作原生表格。"

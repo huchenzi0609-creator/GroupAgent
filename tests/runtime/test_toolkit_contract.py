@@ -511,6 +511,39 @@ async def test_research_claim_without_actual_receipt_cannot_pass(toolkit_setup):
         )
 
 
+@pytest.mark.parametrize("requested", [False, True])
+async def test_concise_research_does_not_publish_unsolicited_code_examples(
+    toolkit_setup, requested
+):
+    setup = toolkit_setup
+    text = "请检索公开资料，简短说明两个操作并给链接和访问时间。"
+    if requested:
+        text += "请给一个代码示例。"
+    run = await prepare(setup, scope={"research_required": True}, goal=text, request_text=text)
+    fetched = await call(run, "web_fetch", {"url": "https://example.com/source"})
+    assert fetched.success
+    answer = (
+        "操作说明。\n```python\nitems = [3, 1, 2]\nprint(sorted(items))  # [1, 2, 3]\n```\n"
+        + fetched.output["source"]["citation"]
+    )
+    if not requested:
+        with pytest.raises(DomainError, match="not extra examples"):
+            await setup.toolkit.validate(
+                run.work,
+                run.lease,
+                setup.env.actor,
+                candidate(run, answer, (fetched,)),
+                run.workspace,
+            )
+        assert not setup.model.requests
+    else:
+        result = await setup.toolkit.validate(
+            run.work, run.lease, setup.env.actor, candidate(run, answer, (fetched,)), run.workspace
+        )
+        assert result.checks["result"] and len(setup.model.requests) == 1
+        assert "逐项核对数量、元素、数值及输出" in setup.model.requests[0].messages[0].content
+
+
 @pytest.mark.parametrize("configured,effective", [(0, 0), (1, 1), (5, 2)])
 async def test_execution_retry_policy_cannot_exceed_original_work_grant(
     toolkit_setup, configured, effective
