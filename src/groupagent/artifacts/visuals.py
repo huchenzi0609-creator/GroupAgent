@@ -186,6 +186,23 @@ def chart_png(chart: ChartData) -> bytes:
                 anchor = "mt" if below else "mb"
                 text = f"{value:g}"
                 bounds = draw.textbbox(location, text, font=value_font, anchor=anchor)
+                # Font bearings differ across platforms. Move a label only if
+                # its actual glyph box intersects an adjacent trend segment.
+                edge_distances = []
+                overlaps = False
+                for neighbor_x, neighbor_y in neighbors:
+                    edge_x = bounds[0] if neighbor_x < middle else bounds[2]
+                    fraction = min(1.0, abs((edge_x - middle) / (neighbor_x - middle)))
+                    edge_y = position + (neighbor_y - position) * fraction
+                    edge_distances.append(abs(edge_y - position))
+                    overlaps |= (
+                        max(position, edge_y) >= bounds[1] and min(position, edge_y) <= bounds[3]
+                    )
+                if overlaps:
+                    current_gap = bounds[1] - position if below else position - bounds[3]
+                    shift = math.ceil(max(edge_distances) + 8 - current_gap)
+                    location = (middle, location[1] + shift if below else location[1] - shift)
+                    bounds = draw.textbbox(location, text, font=value_font, anchor=anchor)
                 draw.rectangle(
                     (bounds[0] - 3, bounds[1] - 3, bounds[2] + 3, bounds[3] + 3), fill="white"
                 )

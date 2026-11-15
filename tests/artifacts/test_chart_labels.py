@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from groupagent.artifacts import ArtifactError, ArtifactScope, ChartData, ChartSeries
 from groupagent.artifacts.visuals import chart_png
@@ -34,7 +34,14 @@ def intersects(segment, rectangle):
 
 
 @pytest.mark.parametrize("values", [(2, 4, 3, 7), (-2, -4, -3, -7), (2, 2, 2, 2), (0, 0, 0, 0)])
-def test_real_line_chart_value_glyphs_do_not_intersect_trend_segments(monkeypatch, values):
+@pytest.mark.parametrize("font_mode", ["managed", "pillow_default"])
+def test_real_line_chart_value_glyphs_do_not_intersect_trend_segments(
+    monkeypatch, values, font_mode
+):
+    if font_mode == "pillow_default":
+        monkeypatch.setattr(
+            "groupagent.artifacts.visuals._font", lambda size: ImageFont.load_default(size=size)
+        )
     labels, segments, draw_order = [], [], []
     original_draw = ImageDraw.Draw
 
