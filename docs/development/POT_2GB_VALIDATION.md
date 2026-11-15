@@ -25,6 +25,8 @@
 | 重启遗留容器 | 17 个资源 pure case 及 1 个本地真实 idle 音频孤儿清理 PASS；不依赖原进程内存登记 |
 | 静态检查 | 全部 Ruff/格式通过；mypy 覆盖 125 个源码文件通过 |
 
+首轮远程 Python 3.11 CI 发现离线参与率验收脚本通过 `__new__` 绕过协调器初始化，漏设新增身份字段：2310 PASS、1 FAIL、53 SKIP、37 DESELECTED。已按每条冻结 context 初始化 `BotIdentity`，未修改产品源码、冻结样本或评分标准；该验收脚本选集本地 20 PASS。原失败保留，后续 CI 以 [PR #9 checks](https://github.com/huchenzi0609-creator/GroupAgent/pull/9/checks) 对应提交为准。
+
 最终 worker 为 `sha256:80b04370b2f1d756c54f8bf89c867df6bbed151d344467f891147903f5cae2e0`，125 个 Python 文件与本地最终源码逐文件 SHA256 一致。它是在原锁定依赖镜像上叠加源码的 **Linux arm64** 开发构建，不是目标 amd64 发布镜像，也不是独立重新下载依赖的构建。证据保存在忽略目录 `runtime/pot-server/final-source-proof.json` 和 `final-worker/`。
 
 ## 目标服务器实测边界
