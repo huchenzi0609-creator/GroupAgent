@@ -990,6 +990,7 @@ class ConversationCoordinator(Coordinator):
             if tx.get_event(identifier).content_state != "active":
                 raise DomainError("source_unavailable", "Attachment event is unavailable")
         retained = set(snapshot.get("artifact_retained_source_ids", []))
+        artifact_request_sources: set[str] = set()
         if decision.input_versions and self.artifacts is None:
             raise DomainError("not_found", "Artifact registry is unavailable")
         if self.artifacts:
@@ -1000,13 +1001,32 @@ class ConversationCoordinator(Coordinator):
                         "permission_denied", "Input file was not in the request context"
                     )
                 fingerprints, expired = self.artifacts.consume_in_tx(tx, version_id)
+                provenance = self.artifacts._row(tx, version_id)["body"].get("provenance", {})
+                primary_source = (
+                    provenance.get("source_event_id") if isinstance(provenance, dict) else None
+                )
+                if isinstance(primary_source, str) and primary_source in fingerprints:
+                    artifact_request_sources.add(primary_source)
                 snapshot["source_fingerprints"].update(fingerprints)
                 snapshot.setdefault("source_task_revisions", {}).update(
                     self.artifacts.task_sources_in_tx(tx, version_id)
                 )
                 retained.update(expired)
         snapshot["artifact_retained_source_ids"] = sorted(retained)
-        return selected
+        # A generated artifact's original request may be selected twice: once
+        # as its immutable version, once as a purported channel attachment.
+        # Keep that request as authorized provenance, without asking the media
+        # importer to download a nonexistent attachment. Only the registered
+        # primary source qualifies; other dependencies or malformed media do not.
+        return [
+            identifier
+            for identifier in selected
+            if not (
+                identifier in artifact_request_sources
+                and (source := tx.get_event(identifier)).kind in {EventKind.TEXT, EventKind.QUOTE}
+                and not source.attachments
+            )
+        ]
 
     def _apply_action(
         self, tx: UnitOfWork, event: GroupEvent, decision: Decision, context: dict

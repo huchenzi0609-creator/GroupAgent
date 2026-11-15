@@ -58,6 +58,34 @@ def test_all_thirty_frozen_cases_are_not_run_when_evidence_is_missing():
         assert not result["business_writes_applied_by_checker"]
 
 
+def test_paused_edit_without_comparison_is_not_run_instead_of_raising_or_passing():
+    requirements = {
+        "new_version_required": True,
+        "source_bytes_unchanged": True,
+        "source_provenance_chain_required": True,
+        "unchanged_source_units": [1, 2],
+    }
+    for comparison in [
+        None,
+        {},
+        {"source_artifact": None, "new_artifact": None},
+        {"source_artifact": {"decoded": None}, "new_artifact": None},
+        {"source_artifact": "malformed", "new_artifact": {"decoded": None}},
+    ]:
+        result = evaluate(
+            requirements,
+            {
+                "scope": {"group_id": "g", "work_id": "w"},
+                "artifacts": [],
+                "tool_receipts": [],
+                "comparison": comparison,
+            },
+        )
+        assert result["status"] == "NOT_RUN"
+        assert all(result["checks"][key]["status"] == "NOT_RUN" for key in requirements)
+        assert not result["business_writes_applied_by_checker"]
+
+
 def test_correct_stdout_from_wrong_scope_cannot_pass():
     result = evaluate(
         {"successful_tools_all": ["python_compute"], "stdout_json_equals": {"answer": 5}},

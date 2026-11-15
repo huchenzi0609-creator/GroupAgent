@@ -408,7 +408,8 @@ def _evaluate_case(case: dict[str, Any], evidence: dict[str, Any]) -> dict[str, 
 
     schedule = evidence.get("scheduling", {})
     rule = schedule.get("rule")
-    comparison = evidence.get("comparison", {})
+    comparison_value = evidence.get("comparison")
+    comparison = comparison_value if isinstance(comparison_value, dict) else {}
     before_after = evidence.get("before_after", {})
     delivery = evidence.get("delivery", {})
     for key, value in expected.items():
@@ -1025,7 +1026,8 @@ def _evaluate_case(case: dict[str, Any], evidence: dict[str, Any]) -> dict[str, 
                 "Immutable source and result identities",
             )
         elif key == "source_bytes_unchanged":
-            source = comparison.get("source_artifact", {})
+            source_value = comparison.get("source_artifact")
+            source = source_value if isinstance(source_value, dict) else {}
             after = comparison.get("source_sha256_after")
             record(
                 key,
@@ -1035,8 +1037,12 @@ def _evaluate_case(case: dict[str, Any], evidence: dict[str, Any]) -> dict[str, 
                 "Source bytes re-read after editing",
             )
         elif key == "source_provenance_chain_required":
-            source = comparison.get("source_artifact", {})
-            new = comparison.get("new_artifact", {})
+            source_value, new_value = (
+                comparison.get("source_artifact"),
+                comparison.get("new_artifact"),
+            )
+            source = source_value if isinstance(source_value, dict) else {}
+            new = new_value if isinstance(new_value, dict) else {}
             chain = comparison.get("provenance_version_ids")
             record(
                 key,
@@ -1046,8 +1052,14 @@ def _evaluate_case(case: dict[str, Any], evidence: dict[str, Any]) -> dict[str, 
                 "Runner-resolved actual version/provenance chain",
             )
         elif key == "unchanged_source_units":
-            source = comparison.get("source_artifact", {}).get("decoded", {})
-            new = comparison.get("new_artifact", {}).get("decoded", {})
+            source_value, new_value = (
+                comparison.get("source_artifact"),
+                comparison.get("new_artifact"),
+            )
+            source_decoded = source_value.get("decoded") if isinstance(source_value, dict) else None
+            new_decoded = new_value.get("decoded") if isinstance(new_value, dict) else None
+            source = source_decoded if isinstance(source_decoded, dict) else {}
+            new = new_decoded if isinstance(new_decoded, dict) else {}
             before = {
                 item.get("index"): item.get("content_sha256") for item in source.get("units", [])
             }
