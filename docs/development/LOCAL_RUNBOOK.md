@@ -1,5 +1,7 @@
 # 本地运行与发布准备（进行中）
 
+**CI字体兼容小修：** 完整30/30实模验收绑定c411源码。最终提交另含`5c9c4640ac097c4a4c94b7a9c7a26708eb6ddd5a4ee982c0cb134b9b8880029e`的负数折线图标签避让修复；Linux DejaVu字体已复现原FAIL并验证修复PASS，正数验收样例及恒定/零值PNG字节不变。仅图表相关回归（13项及文档绘图选集172项）和必要CI重新验证，未重跑付费30项，旧CI失败记录保留。
+
 更新：2026-11-15。适用于 `feat/local-readiness` 的隔离开发环境。当前默认通道为持久本地消息通道；本轮不连接微信、生产服务器或旧数据库，不安装systemd服务。
 
 当前c411/122py（freeze18）的core18为2134 PASS/52 SKIP/31 DESELECTED/158.30秒，worker19为110 PASS/零skip/284.07秒；mypy122/Ruff/format285、images18同源通过，新增第52项core skip已在worker覆盖。focus22三任务均completed，Chart02全11硬checks/像素绑定通过、双WEB本轮sidecar review PASS；原raw1 PASS/2 NEEDS_REVIEW保留，未作统一3/3汇总。full22已在同一c411源码、images18和固定checkerfa下完成30/30 PASS；必要语义/视觉复核均绑定本轮产物，最终零付费汇总未增加调用。Owner audit282332已实际应用用户累计11.65基准，原50/50 policy与revision1不变，unknown5/held0.562140继续保留；最终有效上界17.266165含后续suffix保守估算与原unknown预留，非控制台实扣。 详见[修复报告](FOUR_FAILURE_REPAIR.md)；不以焦点sidecar替代全量正式汇总。
@@ -49,11 +51,11 @@ export GROUPAGENT_OFFICE_FONT='WenQuanYi Zen Hei'
 
 这些字体路径只适用于安装相应软件包的Linux环境。macOS使用可信的本机中文字体，不复制商业字体入库；可通过 `GROUPAGENT_PDF_FONT`、`GROUPAGENT_FONT_DIRS`、`GROUPAGENT_OFFICE_FONT` 指定路径/字体族。合成中文OCR输入使用 `GROUPAGENT_TEST_CJK_FONT` 或 `GROUPAGENT_PDF_FONT`；没有中文字体不能以缺字图片验收OCR。
 
-worker构建步骤见 [deploy/worker/README.md](../../deploy/worker/README.md)。以下默认复现当前c411/images18，`frozen-image-source-proof-repair-18.json`核对两镜像122py同源、uid65532；worker19完整选集实际110 PASS、零skip、284.07秒，含新增真实worker用例、覆盖新增第52项core skip。先确认iid与proof一致；SDK/runtime依赖层复用，不称native独立重现。其他skip不算能力通过，旧候选仅为[历史证据](FOUR_FAILURE_REPAIR.md)。
+worker构建步骤见 [deploy/worker/README.md](../../deploy/worker/README.md)。完整30项历史受测环境为c411/images18；以下命令使用CI字体小修后的images19，源码一致性见`frozen-image-source-proof-repair-19.json`。此前`frozen-image-source-proof-repair-18.json`核对两镜像122py同源、uid65532；worker19完整选集实际110 PASS、零skip、284.07秒，含新增真实worker用例、覆盖新增第52项core skip。先确认iid与proof一致；SDK/runtime依赖层复用，不称native独立重现。其他skip不算能力通过，旧候选仅为[历史证据](FOUR_FAILURE_REPAIR.md)。
 
 ```sh
-export GROUPAGENT_WORKER_IMAGE="$(cat runtime/build/worker-repair-18.iid)"
-export GROUPAGENT_HARNESS_IMAGE="$(cat runtime/build/harness-repair-18.iid)"
+export GROUPAGENT_WORKER_IMAGE="$(cat runtime/build/worker-repair-19.iid)"
+export GROUPAGENT_HARNESS_IMAGE="$(cat runtime/build/harness-repair-19.iid)"
 # 只指定独立开发Docker服务的Unix socket；默认本机Docker可不设置这一项。
 export GROUPAGENT_DOCKER_HOST=unix:///REPLACE_WITH_DEVELOPMENT_DOCKER_SOCKET
 .venv/bin/pytest --strict-markers --strict-config tests/sandbox tests/execution/test_harness_real.py tests/artifacts/test_isolated_matrix.py tests/artifacts/test_chart_labels.py tests/media/test_sandbox_media.py tests/media/test_browser_worker.py tests/runtime/test_inputs.py -q

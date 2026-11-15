@@ -1,5 +1,7 @@
 # GroupAgent
 
+**CI字体兼容小修：** 完整30/30实模验收绑定c411源码。最终提交另含`5c9c4640ac097c4a4c94b7a9c7a26708eb6ddd5a4ee982c0cb134b9b8880029e`的负数折线图标签避让修复；Linux DejaVu字体已复现原FAIL并验证修复PASS，正数验收样例及恒定/零值PNG字节不变。仅图表相关回归（13项及文档绘图选集172项）和必要CI重新验证，未重跑付费30项，旧CI失败记录保留。
+
 微信群协作智能体，按 [Spec v0.1](docs/SPEC_V0.1.zh-CN.md) 开发。GroupAgent 是暂用工程名。
 
 当前处于 **本地集成开发与验收中**，工作分支为 `feat/local-readiness`。已接通 PostgreSQL 持久状态、自然语言协调、真实 Harness SDK、无宿主挂载的隔离 worker、四种文档、图片/OCR、ASR/TTS、搜索、程序绘图、长期记忆和有限调度。正在用固定样本检查实际结果、产物字节、费用及投递回执；尚未完成整版发布验收。

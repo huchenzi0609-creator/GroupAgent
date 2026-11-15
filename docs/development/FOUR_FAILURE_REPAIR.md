@@ -1,5 +1,7 @@
 # 四项综合验收失败修复记录
 
+**CI字体兼容小修：** 完整30/30实模验收绑定c411源码。最终提交另含`5c9c4640ac097c4a4c94b7a9c7a26708eb6ddd5a4ee982c0cb134b9b8880029e`的负数折线图标签避让修复；Linux DejaVu字体已复现原FAIL并验证修复PASS，正数验收样例及恒定/零值PNG字节不变。仅图表相关回归（13项及文档绘图选集172项）和必要CI重新验证，未重跑付费30项，旧CI失败记录保留。
+
 更新：2026-11-15。当前c411/122py：core18为2134 PASS/52 SKIP/31 DESELECTED/158.30秒，worker19为110 PASS/零skip/284.07秒，images18同源。focus22三任务completed并取得必要checks/reviews，原raw1 PASS/2 NEEDS_REVIEW保留，未统一3/3；同源无过滤full22已正式30/30 PASS，必要复核和最终零付费汇总完成。用户累计11.65的Owner审计282332已实际应用，原50/rev1及unknown held不变；本轮只保留必要最终校验，不再逐阶段扩写历史。
 
 ## 版本与当前证据
