@@ -4,7 +4,7 @@ import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Any, Literal, Self
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -39,10 +39,9 @@ def _money(value: Decimal) -> Decimal:
     return value.quantize(QUANTUM)
 
 
-class _BillingReconciliation(BaseModel):
+class _BillingReconciliationBase(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = 1
     key: str = Field(min_length=1, max_length=200, strict=True)
     source: Literal["user_reported_provider_console"] = "user_reported_provider_console"
     operator_role: Literal["owner"] = "owner"
@@ -83,7 +82,7 @@ class _BillingReconciliation(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def consistent(self) -> _BillingReconciliation:
+    def consistent(self) -> Self:
         if (
             self.as_of > self.recorded_at
             or sum(self.prefix_by_day.values(), Decimal(0)) != self.prefix_gross
@@ -91,6 +90,34 @@ class _BillingReconciliation(BaseModel):
         ):
             raise ValueError("Invalid reconciliation time, daily totals or predecessor")
         return self
+
+
+class _BillingReconciliation(_BillingReconciliationBase):
+    # Keep the exact v1 fields/digest readable; old audits are never rewritten.
+    schema_version: Literal[1] = 1
+
+
+class _HeldUnknownBillingReconciliation(_BillingReconciliationBase):
+    schema_version: Literal[2] = 2
+    unknown_prefix_policy: Literal["retain_reserved_amounts"] = "retain_reserved_amounts"
+    prefix_unknown_count: int = Field(default=0, ge=0, strict=True)
+    prefix_unknown_held: Decimal = Decimal(0)
+
+    @field_validator("prefix_unknown_held")
+    @classmethod
+    def held_money(cls, value: Decimal) -> Decimal:
+        return _money(value)
+
+    @model_validator(mode="after")
+    def unknown_totals_consistent(self) -> Self:
+        if self.prefix_unknown_count > self.prefix_count or (
+            self.prefix_unknown_count == 0 and self.prefix_unknown_held != 0
+        ):
+            raise ValueError("Unknown prefix counts and holds must describe existing records")
+        return self
+
+
+_BillingRecord = _BillingReconciliation | _HeldUnknownBillingReconciliation
 
 
 def _digest(value: Any) -> str:
@@ -105,7 +132,7 @@ def _digest(value: Any) -> str:
 
 
 def _reconciliation_digest(
-    group_id: str, actor_id: str, policy_revision: int, body: _BillingReconciliation
+    group_id: str, actor_id: str, policy_revision: int, body: _BillingRecord
 ) -> str:
     return _digest(
         {
@@ -206,15 +233,20 @@ class BudgetLedger:
                 raise DomainError("version_conflict", "Price snapshots are immutable; use a new ID")
 
     @staticmethod
-    def _billing_prefix(tx: Any, as_of: datetime, currency: str) -> dict[str, Any]:
+    def _billing_prefix(
+        tx: Any, as_of: datetime, currency: str, *, preserve_unknown_holds: bool = False
+    ) -> dict[str, Any]:
         summary = tx.conn.execute(
             "SELECT count(*) AS count, "
-            "count(*) FILTER (WHERE state NOT IN ('settled','released') "
+            "count(*) FILTER (WHERE (state NOT IN ('settled','released') "
+            "AND NOT (%s AND state='unknown')) "
             "OR (state='settled' AND actual_amount IS NULL) OR currency<>%s) AS invalid, "
             "COALESCE(sum(actual_amount) FILTER (WHERE state='settled'),0) AS gross, "
+            "count(*) FILTER (WHERE state='unknown') AS unknown_count, "
+            "COALESCE(sum(reserved_amount) FILTER (WHERE state='unknown'),0) AS unknown_held, "
             "max(updated_at) AS last_update FROM ga_budget_reservations "
             "WHERE group_id=%s AND created_at<=%s",
-            (currency, tx.group_id, as_of),
+            (preserve_unknown_holds, currency, tx.group_id, as_of),
         ).fetchone()
         assert summary is not None
         if not summary["count"] or summary["invalid"] or summary["last_update"] > as_of:
@@ -236,23 +268,32 @@ class BudgetLedger:
         return {
             "count": int(summary["count"]),
             "gross": summary["gross"],
+            "unknown_count": int(summary["unknown_count"]),
+            "unknown_held": summary["unknown_held"],
             "sha256": _digest(rows),
             "by_day": {row["budget_day"]: row["gross"] for row in by_day},
         }
 
     @staticmethod
-    def _billing_reconciliations(
-        tx: Any, currency: str
-    ) -> list[tuple[str, _BillingReconciliation]]:
+    def _billing_reconciliations(tx: Any, currency: str) -> list[tuple[str, _BillingRecord]]:
         rows = tx.conn.execute(
             "SELECT * FROM ga_audit_events WHERE group_id=%s AND action=%s ORDER BY id",
             (tx.group_id, _RECONCILIATION_ACTION),
         ).fetchall()
-        records: list[tuple[str, _BillingReconciliation]] = []
+        records: list[tuple[str, _BillingRecord]] = []
         keys: set[str] = set()
         try:
             for row in rows:
-                body = _BillingReconciliation.model_validate(row["details"])
+                if not isinstance(row["details"], dict):
+                    raise ValueError("Billing reconciliation payload is not an object")
+                version = row["details"].get("schema_version")
+                if type(version) is not int or version not in {1, 2}:
+                    raise ValueError("Unknown billing reconciliation version")
+                body: _BillingRecord = (
+                    _BillingReconciliation.model_validate(row["details"])
+                    if version == 1
+                    else _HeldUnknownBillingReconciliation.model_validate(row["details"])
+                )
                 prior_id, prior = records[-1] if records else (None, None)
                 if (
                     body.model_dump(mode="json") != row["details"]
@@ -312,12 +353,24 @@ class BudgetLedger:
         records = self._billing_reconciliations(tx, policy["currency"])
         if records:
             identifier, latest = records[-1]
-            prefix = self._billing_prefix(tx, latest.as_of, latest.currency)
+            prefix = self._billing_prefix(
+                tx,
+                latest.as_of,
+                latest.currency,
+                preserve_unknown_holds=isinstance(latest, _HeldUnknownBillingReconciliation),
+            )
             if (
                 prefix["count"] != latest.prefix_count
                 or prefix["gross"] != latest.prefix_gross
                 or prefix["sha256"] != latest.prefix_sha256
                 or prefix["by_day"] != latest.prefix_by_day
+                or (
+                    isinstance(latest, _HeldUnknownBillingReconciliation)
+                    and (
+                        prefix["unknown_count"] != latest.prefix_unknown_count
+                        or prefix["unknown_held"] != latest.prefix_unknown_held
+                    )
+                )
             ):
                 raise DomainError(
                     "reconciliation_required", "Reconciled billing prefix no longer matches"
@@ -343,11 +396,18 @@ class BudgetLedger:
         evidence_ref: str,
         evidence_sha256: str,
         expected_previous_id: str | None = None,
+        preserve_unknown_holds: bool = False,
     ) -> dict[str, Any]:
         """Trusted local Owner operator API; never register as a model/channel tool.
 
         Preserve policy, prices and reservations. The existing audit is application-
         append-only, not a database-enforced or independently attested billing log.
+
+        The explicit v2 mode accepts a cumulative Owner report while preserving
+        every unknown reservation as an additional conservative hold. It replaces
+        only the settled estimates: no unknown usage or effect is resolved, and
+        reserved/inflight prefixes are still rejected. This can intentionally
+        double-count unknown fees already included in the reported total.
         """
         if actor.role != Role.OWNER:
             raise DomainError("permission_denied", "Only a trusted Owner may reconcile billing")
@@ -356,6 +416,7 @@ class BudgetLedger:
             or as_of.utcoffset() is None
             or not isinstance(reported_total, Decimal)
             or not isinstance(expected_prefix_gross, Decimal)
+            or type(preserve_unknown_holds) is not bool
         ):
             raise DomainError(
                 "invalid_input", "Reconciliation needs aware time and Decimal amounts"
@@ -373,7 +434,12 @@ class BudgetLedger:
             assert clock is not None
             stamp = clock["now"]
             try:
-                request = _BillingReconciliation(
+                record_type = (
+                    _HeldUnknownBillingReconciliation
+                    if preserve_unknown_holds
+                    else _BillingReconciliation
+                )
+                request = record_type(
                     key=key,
                     as_of=as_of,
                     recorded_at=stamp,
@@ -397,6 +463,7 @@ class BudgetLedger:
             # Revalidate any current prefix even on an idempotent retry.
             self._budget_usage(tx, policy, stamp.astimezone(ZoneInfo(policy["time_zone"])).date())
             fields = {
+                "schema_version",
                 "key",
                 "as_of",
                 "currency",
@@ -423,19 +490,25 @@ class BudgetLedger:
                 raise DomainError(
                     "version_conflict", "Cumulative billing must advance without refunds"
                 )
-            prefix = self._billing_prefix(tx, request.as_of, currency)
+            prefix = self._billing_prefix(
+                tx, request.as_of, currency, preserve_unknown_holds=preserve_unknown_holds
+            )
             if prefix["count"] != expected_prefix_count or prefix["gross"] != expected_prefix_gross:
                 raise DomainError(
                     "version_conflict", "Billing prefix count or gross estimate differs"
                 )
-            body = _BillingReconciliation.model_validate(
-                {
-                    **request.model_dump(),
-                    "prefix_sha256": prefix["sha256"],
-                    "prefix_by_day": prefix["by_day"],
-                    "previous_digest": previous.integrity_sha256 if previous else None,
-                }
-            )
+            payload = {
+                **request.model_dump(),
+                "prefix_sha256": prefix["sha256"],
+                "prefix_by_day": prefix["by_day"],
+                "previous_digest": previous.integrity_sha256 if previous else None,
+            }
+            if preserve_unknown_holds:
+                payload.update(
+                    prefix_unknown_count=prefix["unknown_count"],
+                    prefix_unknown_held=prefix["unknown_held"],
+                )
+            body = record_type.model_validate(payload)
             body = body.model_copy(
                 update={
                     "integrity_sha256": _reconciliation_digest(
