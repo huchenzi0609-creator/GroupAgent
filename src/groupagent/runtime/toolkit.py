@@ -30,7 +30,7 @@ from groupagent.execution.models import ExecutionBudget, ModelMessage, ModelRequ
 from groupagent.execution.ports import ModelPort
 from groupagent.media import MediaService
 from groupagent.media.isolation import IsolatedMediaWorker
-from groupagent.media.models import Capability, MediaSource, ProviderRoute
+from groupagent.media.models import Capability, MediaSource, ProviderRoute, VisionResult
 from groupagent.media.providers import MediaHTTPProvider
 from groupagent.media.tools import register_media_tools
 from groupagent.memory import MemberService, MemoryService
@@ -984,6 +984,7 @@ class WorkToolkit:
                         "For a new DOCX/PDF report, comparison table, rubric, score sheet or checklist, start with document_generate(kind=report). Its sections support native tables and blank paragraphs/cells for comments or writing space, with managed CJK fonts and verified layout. Use document_validate, then artifact_deliver. Use custom Python drawing only when the requested content/layout cannot be expressed by those structured fields or explicitly requires custom code; do not redraw a supported table as a custom PDF or use OCR instead of its native text.",
                         "For charts/diagrams, use reproducible computation. Independent illustration APIs and all video processing are outside the current scope.",
                         "Use chart_render's actual chart_spec and a bounded pixel/visual check to verify chart data. OCR can misread W1 as WL or miss small numbers; it is an extraction aid, not a requirement to keep redrawing a correct chart. Resolve a real visual defect once, then select the final artifact.",
+                        "image_analyze.image_bindings maps an exact source file/version/source_sha256 to the normalized_view_sha256 actually sent to the provider. image_sha256 is the normalized PNG view hash, not the original file hash; normalization may change bytes through RGB, EXIF orientation and alpha handling. static_views=false only means this is not a GIF first-frame view. Verify the current candidate's exact source binding; a different image/version's observation does not verify this candidate.",
                         "After a successful format/content check, call artifact_deliver and provide the candidate answer. The control service performs independent validation before sending; do not spend the entire budget repeating identical successful checks.",
                         "For a text-only question, answer directly from the actual tool evidence once it resolves the question; do not invent an output file, export inputs or search unrelated history. Research excerpts explicitly report truncation; do not claim to have read omitted text.",
                         "For concise research explanations, give the requested facts, links and retrieval times. Do not add code examples or demonstrations unless the user asks for them. When an example is requested, verify every input/output against actual tool/source evidence; preserve all values rather than inventing a plausible result.",
@@ -1211,6 +1212,9 @@ class WorkToolkit:
                 validation = records[-1].to_dict()
                 excerpts.append(
                     {
+                        "file_id": version.file_id,
+                        "version_id": version.version_id,
+                        "source_sha256": version.sha256,
                         "name": version.name,
                         "format": version.format,
                         "checks": validation.get("checks", []),
@@ -1271,10 +1275,57 @@ class WorkToolkit:
         source_urls: set[str] = set()
         research_sources: list[dict[str, Any]] = []
         research_metrics: list[dict[str, Any]] = []
+        candidate_images = {
+            (row["file_id"], row["version_id"], row["sha256"])
+            for row in (item["artifact"] for item in outputs)
+            if row["format"] in {"png", "jpeg", "jpg", "webp", "gif"}
+        }
+        vision_bindings: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         for receipt in snapshot.receipts:
             if not receipt.success:
                 continue
             body = receipt.output or {}
+            if receipt.tool_name == "image_analyze" and receipt.tool_name in successful:
+                try:
+                    vision = VisionResult.model_validate(body)
+                except ValueError:
+                    raise DomainError(
+                        "validation_failed", "Image analysis evidence is malformed"
+                    ) from None
+                if vision.image_bindings and not (
+                    len(vision.image_bindings)
+                    == len(vision.sources)
+                    == len(vision.image_sha256)
+                    == len(vision.static_views)
+                ):
+                    raise DomainError(
+                        "validation_failed", "Image analysis binding count is inconsistent"
+                    )
+                for index, binding in enumerate(vision.image_bindings):
+                    reference = media.load_ref(context, binding.file_id, binding.version_id)
+                    if (
+                        binding.image_index != index
+                        or binding.source != vision.sources[index]
+                        or binding.source != reference.source
+                        or binding.source_sha256 != reference.sha256
+                        or binding.normalized_view_sha256 != vision.image_sha256[index]
+                        or binding.static_first_frame != vision.static_views[index]
+                    ):
+                        raise DomainError(
+                            "validation_failed",
+                            "Image analysis binding does not match its immutable source and view",
+                        )
+                    content = await media._content(context, reference)
+                    if hashlib.sha256(content).hexdigest() != binding.source_sha256:
+                        raise DomainError(
+                            "validation_failed", "Image analysis source bytes no longer match"
+                        )
+                    identity = (binding.file_id, binding.version_id, binding.source_sha256)
+                    vision_bindings[(*identity, binding.normalized_view_sha256)] = {
+                        "call_id": receipt.call_id,
+                        **binding.model_dump(mode="json"),
+                        "matches_candidate": identity in candidate_images,
+                    }
             if receipt.tool_name in {"web_search", "web_fetch"} and receipt.tool_name in successful:
                 sources = (
                     body.get("results", [])
@@ -1372,6 +1423,7 @@ class WorkToolkit:
                             "标题声明用的书名号/引号通常是引用定界标记；除非用户明确要求保留符号，不得仅因实际标题省略这些定界符而拒绝。"
                             "PPT的metadata.title是从实际文件读回的主题元数据；当原文逐页指定了不同标题且未要求可见展示主题时，不要求把主题重复塞进页内文字、增加封面或改变指定标题。"
                             "document_read中unit.editable仅表示当前机器人文本编辑接口是否支持该unit，不表示Office对象本身不可编辑。metadata.native_table_count来自实际Office结构；正数证明含原生可编辑表格，不能因聚合unit的editable:false把它误判成图片。零或缺失不能证明原生表格，不得把纯文本画格或截图当作原生表格。"
+                            "vision_image_bindings是Host核验的原file_id/version_id/source_sha256到实际provider规范化PNG视图normalized_view_sha256的对应关系，单独列出，不受tool_evidence文本截断影响。image_sha256也是规范化视图字节SHA，不能与原文件SHA直接比相等；RGB转换、EXIF方向和alpha合成后重新编码可改变字节。static_views=false仅表示不是GIF首帧，不表示未规范化。matches_candidate仅对照当前图像文件候选的精确身份；只有true能证明分析针对该候选图像文件。其它来源的分析可作输入材料，不能冒充当前候选图像的核验；输入图片问答没有输出图像文件时，可据有效来源绑定核对答复，不要求matches_candidate=true。缺旧绑定时不能仅凭相同标题或不同SHA推断已核验或图被调换。"
                             "音频ASR文本的标点不是声学证据，不得据此推断实际停顿、声线或自然度。"
                             "仍须依据真实音频解码、非静音和内容核验结果判断；不得把缺少相关证据自动当作通过。"
                             + (
@@ -1399,6 +1451,7 @@ class WorkToolkit:
                                         "answer": answer,
                                         "artifacts": excerpts,
                                         "tool_evidence": observations,
+                                        "vision_image_bindings": list(vision_bindings.values()),
                                         "research_source_metrics": research_metrics,
                                         "research_source_content": _research_source_content(
                                             research_sources, original_event.text, answer

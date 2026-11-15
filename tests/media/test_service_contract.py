@@ -126,6 +126,17 @@ async def test_media_scope_source_quote_order_and_actual_pixel_http(
                 media_context, (second, first), "Compare", route("vision")
             )
             assert result.sources == (second_source, media_source) and len(result.image_sha256) == 2
+            assert [
+                (binding.image_index, binding.file_id, binding.version_id, binding.source)
+                for binding in result.image_bindings
+            ] == [
+                (0, second.file_id, second.version_id, second_source),
+                (1, first.file_id, first.version_id, media_source),
+            ]
+            assert (
+                tuple(binding.normalized_view_sha256 for binding in result.image_bindings)
+                == result.image_sha256
+            )
             assert result.budget_receipts and set(budget.states.values()) == {"settled"}
             body = json.loads(captured[0].content)
             assert (

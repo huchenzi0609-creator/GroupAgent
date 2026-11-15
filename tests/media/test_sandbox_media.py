@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 
 from PIL import Image, ImageDraw, ImageFont
@@ -7,6 +8,25 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 from .conftest import png_fixture, wav_fixture
+from .test_vision_binding import source_png
+
+
+async def test_real_normalized_png_hashes_bind_original_and_provider_view(
+    isolated_worker, media_context
+):
+    original = source_png()
+    info, outputs = await isolated_worker.run(
+        media_context, "image_validate", (original,), outputs=("view.png",)
+    )
+    view = outputs[0]
+    assert info["source_sha256"] == hashlib.sha256(original).hexdigest()
+    assert info["preview_sha256"] == hashlib.sha256(view).hexdigest()
+    assert info["source_sha256"] != info["preview_sha256"] and original != view
+    assert info["byte_length"] == len(original)
+    assert info["alpha_composited_on_white"] and not info["static_first_frame"]
+    with Image.open(io.BytesIO(view)) as image:
+        assert image.mode == "RGB" and image.size == (48, 32)
+        assert info["pixel_sha256"] == hashlib.sha256(image.tobytes()).hexdigest()
 
 
 async def test_real_sparse_flow_diagram_ocr_preserves_actual_method(isolated_worker, media_context):

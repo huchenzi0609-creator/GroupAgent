@@ -27,6 +27,7 @@ from .models import (
     ProviderResponse,
     ProviderRoute,
     Transcript,
+    VisionImageBinding,
     VisionResult,
 )
 from .providers import CapabilityRegistry, MediaHTTPProvider
@@ -354,17 +355,50 @@ class MediaService:
             raise DomainError(
                 "invalid_media_request", "Vision requires a bounded prompt and one to ten images"
             )
-        views, labels, hashes, sources, static = [], [], [], [], []
+        views, labels, hashes, sources, static, bindings = [], [], [], [], [], []
         for index, reference in enumerate(references):
             content = await self._content(context, reference)
+            source_sha256 = hashlib.sha256(content).hexdigest()
+            if source_sha256 != reference.sha256:
+                raise DomainError(
+                    "media_reference_mismatch", "Image bytes differ from their reference"
+                )
             result, outputs = await self.worker.run(
                 context, "image_validate", (content,), outputs=("view.png",)
             )
             info = ImageInfo.model_validate(result)
+            if len(outputs) != 1:
+                raise DomainError(
+                    "worker_integrity_failed", "Image validation returned no unique view"
+                )
+            view_sha256 = hashlib.sha256(outputs[0]).hexdigest()
+            if (
+                info.source_sha256 != source_sha256
+                or info.byte_length != len(content)
+                or info.preview_sha256 != view_sha256
+            ):
+                raise DomainError(
+                    "worker_integrity_failed", "Image validation hashes differ from actual bytes"
+                )
             views.append(outputs[0])
-            hashes.append(hashlib.sha256(outputs[0]).hexdigest())
+            hashes.append(view_sha256)
             sources.append(reference.source)
             static.append(info.static_first_frame)
+            bindings.append(
+                VisionImageBinding(
+                    image_index=index,
+                    file_id=reference.file_id,
+                    version_id=reference.version_id,
+                    source=reference.source,
+                    source_sha256=source_sha256,
+                    normalized_view_sha256=view_sha256,
+                    normalized_pixel_sha256=info.pixel_sha256,
+                    width=info.width,
+                    height=info.height,
+                    static_first_frame=info.static_first_frame,
+                    alpha_composited_on_white=info.alpha_composited_on_white,
+                )
+            )
             labels.append(
                 f"Image {index + 1}; source_message={reference.source.source_message_id}; author={reference.source.member_id}; "
                 f"quoted_message={reference.source.quote_message_id}; view={'static GIF first frame' if info.static_first_frame else 'validated pixels'}"
@@ -388,6 +422,7 @@ class MediaService:
             provider=route.provider,
             model=route.model,
             request_id=response.request_id,
+            image_bindings=tuple(bindings),
             budget_receipts=(response.budget_reservation_id,)
             if response.budget_reservation_id
             else (),

@@ -129,14 +129,33 @@ class Transcript(MediaModel):
     untrusted_content: Literal[True] = True
 
 
+class VisionImageBinding(MediaModel):
+    """Host-verified immutable input and the actual normalized provider view."""
+
+    image_index: int = Field(ge=0, le=9)
+    file_id: str = Field(min_length=1)
+    version_id: str = Field(min_length=1)
+    source: MediaSource
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    normalized_view_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    normalized_pixel_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    static_first_frame: bool
+    alpha_composited_on_white: bool
+
+
 class VisionResult(MediaModel):
     text: str
     sources: tuple[MediaSource, ...]
+    # The normalized PNG bytes actually sent to the provider, not source files.
     image_sha256: tuple[str, ...]
+    # True for GIF first-frame views; False does not imply identical source bytes.
     static_views: tuple[bool, ...]
     provider: str
     model: str
     request_id: str
+    image_bindings: tuple[VisionImageBinding, ...] = Field(default=(), max_length=10)
     budget_receipts: tuple[str, ...] = ()
     untrusted_content: Literal[True] = True
 
