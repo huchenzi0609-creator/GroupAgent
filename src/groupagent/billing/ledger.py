@@ -149,9 +149,22 @@ def _units(value: dict[str, Decimal]) -> Jsonb:
     return Jsonb({key: str(amount) for key, amount in value.items()})
 
 
-def _reservation(row: dict[str, Any], *, is_new: bool = False) -> Reservation:
+def _limits_enabled(policy: dict[str, Any] | None) -> bool:
+    # Only an existing policy with both limits explicitly NULL is unlimited.
+    return policy is None or any(
+        policy[field] is not None for field in ("daily_limit", "total_limit")
+    )
+
+
+def _reservation(
+    row: dict[str, Any], *, is_new: bool = False, limits_enabled: bool = True
+) -> Reservation:
     return Reservation.model_validate(
-        {**{key: row[key] for key in Reservation.model_fields if key in row}, "is_new": is_new}
+        {
+            **{key: row[key] for key in Reservation.model_fields if key in row},
+            "is_new": is_new,
+            "limits_enabled": limits_enabled,
+        }
     )
 
 
@@ -165,7 +178,7 @@ class BudgetLedger:
         actor: ActorContext,
         *,
         currency: str,
-        daily_limit: Decimal,
+        daily_limit: Decimal | None,
         total_limit: Decimal | None = None,
         time_zone: str = "Asia/Shanghai",
         expected_revision: int | None = None,
@@ -175,7 +188,7 @@ class BudgetLedger:
         if currency not in {"CNY", "USD"}:
             raise DomainError("invalid_input", "Unsupported budget currency")
         ZoneInfo(time_zone)
-        limits = [daily_limit] + ([total_limit] if total_limit is not None else [])
+        limits = [value for value in (daily_limit, total_limit) if value is not None]
         if any(
             not value.is_finite() or value <= 0 or value.quantize(QUANTUM) != value
             for value in limits
@@ -209,7 +222,13 @@ class BudgetLedger:
                     (daily_limit, total_limit, time_zone, actor.group_id),
                 ).fetchone()
             assert row is not None
-            tx._audit("budget_configured", actor.group_id, currency=currency)
+            tx._audit(
+                "budget_configured",
+                actor.group_id,
+                currency=currency,
+                daily_limit=str(daily_limit) if daily_limit is not None else None,
+                total_limit=str(total_limit) if total_limit is not None else None,
+            )
             return int(row["revision"])
 
     def register_price(self, actor: ActorContext, price: PriceSnapshot) -> None:
@@ -570,7 +589,7 @@ class BudgetLedger:
                 (actor.group_id, key),
             ).fetchone()
             if old:
-                previous = _reservation(old)
+                previous = _reservation(old, limits_enabled=_limits_enabled(policy))
                 if (
                     previous.actor_id,
                     previous.operation,
@@ -612,7 +631,10 @@ class BudgetLedger:
             sums = self._budget_usage(tx, policy, day)
             if (
                 policy["blocked"]
-                or sums["daily"] + amount > policy["daily_limit"]
+                or (
+                    policy["daily_limit"] is not None
+                    and sums["daily"] + amount > policy["daily_limit"]
+                )
                 or (
                     policy["total_limit"] is not None
                     and sums["total"] + amount > policy["total_limit"]
@@ -647,7 +669,7 @@ class BudgetLedger:
                 amount=str(amount),
                 currency=price.currency,
             )
-            return _reservation(row, is_new=True)
+            return _reservation(row, is_new=True, limits_enabled=_limits_enabled(policy))
 
     @staticmethod
     def _payment_scope(tx: Any, work_id: str | None, source_event_id: str | None) -> None:
@@ -733,7 +755,10 @@ class BudgetLedger:
             sums = self._budget_usage(tx, policy, day, exclude_daily_id=identifier)
             if (
                 policy["blocked"]
-                or sums["daily"] + row["reserved_amount"] > policy["daily_limit"]
+                or (
+                    policy["daily_limit"] is not None
+                    and sums["daily"] + row["reserved_amount"] > policy["daily_limit"]
+                )
                 or (policy["total_limit"] is not None and sums["total"] > policy["total_limit"])
             ):
                 raise DomainError(
@@ -793,15 +818,16 @@ class BudgetLedger:
             )
         with self.store.transaction(actor) as tx:
             # Same ordering as reserve: budget policy before reservation.
-            tx.conn.execute(
-                "SELECT group_id FROM ga_budget_policy WHERE group_id=%s FOR UPDATE",
+            policy = tx.conn.execute(
+                "SELECT * FROM ga_budget_policy WHERE group_id=%s FOR UPDATE",
                 (actor.group_id,),
             ).fetchone()
+            limits_enabled = _limits_enabled(policy)
             row = self._owned(tx, identifier)
             if row["state"] == "settled":
                 if _reservation(row).actual_units != actual_units:
                     raise DomainError("idempotency_conflict", "Settled usage cannot be overwritten")
-                return _reservation(row)
+                return _reservation(row, limits_enabled=limits_enabled)
             if row["state"] not in {"inflight", "unknown"}:
                 raise DomainError("invalid_transition", "Only an attempted call can be settled")
             price_row = tx.conn.execute(
@@ -815,13 +841,13 @@ class BudgetLedger:
                 "UPDATE ga_budget_reservations SET state='settled',actual_amount=%s,actual_units=%s,evidence_ref=%s,overrun=%s,updated_at=clock_timestamp() WHERE id=%s RETURNING *",
                 (amount, _units(actual_units), evidence_ref, overrun, identifier),
             ).fetchone()
-            if overrun:
+            if overrun and limits_enabled:
                 tx.conn.execute(
                     "UPDATE ga_budget_policy SET blocked=true WHERE group_id=%s", (actor.group_id,)
                 )
             assert result is not None
             tx._audit("budget_settled", identifier, amount=str(amount), overrun=overrun)
-            return _reservation(result)
+            return _reservation(result, limits_enabled=limits_enabled)
 
     def report(self, actor: ActorContext) -> dict[str, Any]:
         with self.store.transaction(actor) as tx:

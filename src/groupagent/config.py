@@ -173,7 +173,22 @@ class SpendConfig(StrictModel):
     group_daily_limit: Annotated[Decimal | None, Field(gt=0, allow_inf_nan=False)] = None
     session_total_limit: Annotated[Decimal | None, Field(gt=0, allow_inf_nan=False)] = None
     pricing_snapshot_id: str | None = None
-    production_requires_explicit_limit: Literal[True] = True
+    # False is an explicit owner opt-in to an unbounded monetary policy when
+    # both limit fields are null. Missing ordinary production setup still fails.
+    production_requires_explicit_limit: bool = True
+
+    def configured_for_paid_calls(self) -> bool:
+        return bool(self.pricing_snapshot_id) and (
+            self.group_daily_limit is not None or not self.production_requires_explicit_limit
+        )
+
+    @property
+    def monetary_limits_disabled(self) -> bool:
+        return (
+            not self.production_requires_explicit_limit
+            and self.group_daily_limit is None
+            and self.session_total_limit is None
+        )
 
     @field_validator("pricing_snapshot_id")
     @classmethod
@@ -385,7 +400,7 @@ class AppConfig(StrictModel):
             blockers.append("group_disabled")
         if self.group.external_group_id.startswith("CONFIGURE"):
             blockers.append("group_not_configured")
-        if self.spend.group_daily_limit is None or not self.spend.pricing_snapshot_id:
+        if not self.spend.configured_for_paid_calls():
             blockers.append("spend_limit_or_price_snapshot_missing")
         if self.retention.owner_approval_required_before_production:
             blockers.append("retention_not_approved")

@@ -74,4 +74,6 @@ class Reservation(BillingModel):
     policy_revision: int
     created_at: datetime
     overrun: bool = False
+    # Read from the current locked policy, rather than stored on a charge.
+    limits_enabled: bool = True
     is_new: bool = False

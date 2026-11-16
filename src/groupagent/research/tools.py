@@ -109,7 +109,7 @@ def register_research_tools(
             settled = await asyncio.to_thread(
                 budget.settle, context.actor, reservation.id, {"calls": Decimal(1)}, evidence
             )
-            if settled.overrun:
+            if settled.overrun and settled.limits_enabled:
                 raise DomainError("budget_overrun", "Research exceeded its monetary reservation")
             return result.model_copy(update={"budget_receipt": reservation.id})
         except BaseException:

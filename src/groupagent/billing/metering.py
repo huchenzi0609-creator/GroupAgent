@@ -92,7 +92,7 @@ class MeteredModel:
                     },
                     "usage:" + hashlib.sha256(reply.model_dump_json().encode()).hexdigest(),
                 )
-                if settled.overrun:
+                if settled.overrun and settled.limits_enabled:
                     raise DomainError(
                         "budget_exhausted", "Provider usage exceeded the admitted amount"
                     )
@@ -148,5 +148,5 @@ class LedgerModelBudget:
             },
             "provider-usage:" + reservation_id,
         )
-        if result.overrun:
+        if result.overrun and result.limits_enabled:
             raise DomainError("budget_exhausted", "Provider usage exceeded its admission")
