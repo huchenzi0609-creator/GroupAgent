@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import io
 import json
+import posixpath
+import re
 import time
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
+from xml.etree import ElementTree
 
 from pptx import Presentation
 from pypdf import PdfReader
@@ -47,6 +51,87 @@ CASES = {
         "不需要搜索，也不要登记真实分工。"
     ),
 }
+
+
+def inspect_word_sources(content, source_provenances):
+    """Check real drawings, their immediately following captions and source bytes.
+
+    OpenXML namespace declarations are never counted as visible source links.
+    A correct URL above an image does not satisfy this case's below-image rule.
+    """
+    ns = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+    url_pattern = re.compile(r"https?://[^\s<>\"）)；，。]+")
+    bindings = []
+    all_urls = set()
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        relations = {
+            node.attrib["Id"]: node.attrib
+            for node in ElementTree.fromstring(archive.read("word/_rels/document.xml.rels"))
+        }
+        document = ElementTree.fromstring(archive.read("word/document.xml"))
+        paragraphs = document.findall(".//w:body/w:p", ns)
+
+        def paragraph_urls(paragraph):
+            text = "".join(node.text or "" for node in paragraph.findall(".//w:t", ns))
+            urls = set(url_pattern.findall(text))
+            for link in paragraph.findall(".//w:hyperlink", ns):
+                relation = relations.get(link.attrib.get("{" + ns["r"] + "}id"), {})
+                target = relation.get("Target", "")
+                if relation.get("TargetMode") == "External" and target.startswith(
+                    ("https://", "http://")
+                ):
+                    urls.add(target)
+            return text, urls
+
+        for index, paragraph in enumerate(paragraphs):
+            _, urls = paragraph_urls(paragraph)
+            all_urls.update(urls)
+            for image in paragraph.findall(".//a:blip", ns):
+                relation = relations[image.attrib["{" + ns["r"] + "}embed"]]
+                target = posixpath.normpath("word/" + relation["Target"])
+                embedded_sha = hashlib.sha256(archive.read(target)).hexdigest()
+                caption, caption_urls = (
+                    paragraph_urls(paragraphs[index + 1])
+                    if index + 1 < len(paragraphs)
+                    else ("", set())
+                )
+                matched_sources = []
+                for provenance in source_provenances:
+                    if provenance.get("media_metadata", {}).get("preview_sha256") != embedded_sha:
+                        continue
+                    public = provenance.get("public_image", {})
+                    source_urls = {
+                        public.get(key)
+                        for key in (
+                            "page_url",
+                            "page_final_url",
+                            "requested_url",
+                            "final_url",
+                        )
+                    } | {provenance.get("source_url")}
+                    matched_sources.extend(sorted(caption_urls & (source_urls - {None})))
+                bindings.append(
+                    {
+                        "embedded_path": target,
+                        "embedded_sha256": embedded_sha,
+                        "caption": caption,
+                        "matched_source_urls_below": matched_sources,
+                    }
+                )
+        image_count = sum(name.startswith("word/media/") for name in archive.namelist())
+    return {
+        "word_image_count": image_count,
+        "source_link_count": len(all_urls),
+        "visible_source_urls": sorted(all_urls),
+        "word_source_bindings": bindings,
+        "word_sources_below_images": len(bindings) == 2
+        and len(source_provenances) == 2
+        and all(binding["matched_source_urls_below"] for binding in bindings),
+    }
 
 
 def save(path, value):
@@ -217,16 +302,17 @@ async def run(args):
                             p.extract_text() or "" for p in pdf.pages
                         )
                     elif name == "memes_word" and version["format"] == "docx":
-                        with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                            entry["word_image_count"] = sum(
-                                n.startswith("word/media/") for n in archive.namelist()
-                            )
-                            xml = archive.read("word/document.xml").decode()
-                            entry["source_link_count"] = xml.count("https://") + xml.count(
-                                "http://"
-                            )
+                        sources = [
+                            app.dispatcher.artifacts.artifacts.get(
+                                scope, ref["file_id"], ref["version_id"]
+                            ).provenance
+                            for ref in version.get("provenance", {}).get("source_image_refs", [])
+                        ]
+                        entry.update(inspect_word_sources(content, sources))
                         entry["passed"] &= (
-                            entry["word_image_count"] >= 2 and entry["source_link_count"] >= 2
+                            entry["word_image_count"] == 2
+                            and entry["source_link_count"] >= 2
+                            and entry["word_sources_below_images"]
                         )
                     elif name == "pptx" and version["format"] == "pptx":
                         entry["slide_count"] = len(Presentation(io.BytesIO(content)).slides)

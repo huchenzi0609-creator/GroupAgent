@@ -65,7 +65,7 @@ class ImageInput(ArtifactReference):
     alt_text: str = Field(
         min_length=1,
         max_length=500,
-        description="Visible caption for the actual embedded image. Supply file_id and version_id from chart_render, a scoped image input or another image-producing tool; a caption alone does not embed pixels.",
+        description="Visible caption immediately BELOW this image in DOCX/PDF reports; include its associated source URL here when requested below the image. Markdown/PPTX use it as image description metadata. Pixels come from the exact file_id/version_id.",
     )
     width_inches: float = Field(
         default=5.5,
@@ -79,7 +79,7 @@ class SectionInput(ToolData):
     title: str = Field(min_length=1, max_length=180)
     paragraphs: tuple[str, ...] = Field(
         max_length=50,
-        description="Plain text paragraphs; empty strings intentionally reserve blank form-writing space. For .md, do not put fenced code, headings or pipe tables here; write complete Markdown with workspace_write_text then artifact_from_workspace instead.",
+        description="Plain text rendered BEFORE this section's tables/images/charts. Captions and source URLs requested below an image belong in that image's alt_text. Empty strings reserve blank writing space. For .md, do not put fenced code, headings or pipe tables here; write complete Markdown with workspace_write_text then artifact_from_workspace instead.",
     )
     tables: tuple[TableInput, ...] = Field(default=(), max_length=5)
     images: tuple[ImageInput, ...] = Field(

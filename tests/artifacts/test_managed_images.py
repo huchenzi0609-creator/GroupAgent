@@ -9,6 +9,7 @@ import os
 from dataclasses import replace
 
 import pytest
+from docx import Document
 from PIL import Image
 from pypdf import PdfReader
 
@@ -315,5 +316,107 @@ async def test_real_512mib_managed_pdf_with_two_chart_images_renders_and_validat
             with Image.open(io.BytesIO(preview)) as rendered:
                 rendered.load()
                 assert rendered.width > 500 and rendered.height > 500
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "with_urls,isolated",
+    [(False, False), (True, False), pytest.param(True, True, marks=pytest.mark.sandbox)],
+)
+async def test_docx_caption_follows_each_image_and_preserves_requested_source_url(
+    tmp_path, with_urls, isolated
+):
+    if isolated:
+        image = os.environ.get("GROUPAGENT_WORKER_IMAGE")
+        if not image:
+            pytest.skip("Requires immutable Docker worker; no provider calls")
+        worker = IsolatedMediaWorker(
+            DockerSandbox(
+                image,
+                docker_host=os.environ.get("GROUPAGENT_DOCKER_HOST"),
+                limits=SandboxLimits(memory_mb=512, workspace_mb=128, temp_mb=128, pids=128),
+            )
+        )
+    else:
+        worker = InProcessByteBuilder(tmp_path)
+    store, _, gateway, context = runtime(tmp_path, worker)
+    try:
+        images = await charts(gateway, context)
+        captions = ["图1 累计平方和", "图2 分组平方和"]
+        if with_urls:
+            captions = [
+                f"{caption}；来源：https://example.org/figure-{index + 1}"
+                for index, caption in enumerate(captions)
+            ]
+        result = await gateway.invoke(
+            "document_generate",
+            {
+                "name": "caption-order.docx",
+                "kind": "report",
+                "title": "图文来源顺序",
+                "sections": [
+                    {
+                        "title": "两幅图表",
+                        "paragraphs": ["说明文字在图表之前。"],
+                        "images": [
+                            {
+                                "file_id": item["file_id"],
+                                "version_id": item["version_id"],
+                                "alt_text": caption,
+                                "width_inches": 4.5,
+                            }
+                            for item, caption in zip(images, captions, strict=True)
+                        ],
+                    }
+                ],
+            },
+            context,
+        )
+        assert result.success, result
+        scope = ArtifactScope(context.group_id, context.work_id, context.actor.member_id)
+        version = store.get(scope, result.output["file_id"], result.output["version_id"])
+        raw = store.read(scope, version.file_id, version.version_id)
+        document = Document(io.BytesIO(raw))
+        paragraphs = document.paragraphs
+        image_positions = [
+            index
+            for index, paragraph in enumerate(paragraphs)
+            if paragraph._p.xpath(".//w:drawing")
+        ]
+        assert len(image_positions) == len(document.inline_shapes) == 2
+        assert paragraphs[image_positions[0] - 1].text == "说明文字在图表之前。"
+        for index, (position, caption, reference) in enumerate(
+            zip(image_positions, captions, images, strict=True)
+        ):
+            # Check the native OOXML body order, not flattened extracted text.
+            assert paragraphs[position + 1].text == caption
+            assert paragraphs[position + 1].style.name == "Caption"
+            picture = document.inline_shapes[index]
+            assert picture._inline.docPr.get("descr") == caption
+            relationship = picture._inline.xpath(".//a:blip")[0].embed
+            with Image.open(io.BytesIO(document.part.related_parts[relationship].blob)) as actual:
+                with Image.open(
+                    io.BytesIO(store.read(scope, reference["file_id"], reference["version_id"]))
+                ) as source:
+                    assert pixel_digest(actual) == pixel_digest(source)
+            if with_urls:
+                url = f"https://example.org/figure-{index + 1}"
+                assert url in paragraphs[position + 1].text
+                assert not any(url in paragraph.text for paragraph in paragraphs[: position + 1])
+        assert version.provenance["input_versions"] == [item["version_id"] for item in images]
+        if isolated:
+            validation = await gateway.invoke(
+                "document_validate",
+                {
+                    "file_id": version.file_id,
+                    "version_id": version.version_id,
+                    "expected_text": ["图文来源顺序", *captions],
+                },
+                replace(context, call_id="validate-captions", idempotency_key="validate-captions"),
+            )
+            assert validation.success, validation
+            assert validation.output["data"]["passed"] and validation.output["data"]["rendered"]
+        assert store.read(scope, version.file_id, version.version_id) == raw
     finally:
         store.close()
