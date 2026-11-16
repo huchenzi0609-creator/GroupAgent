@@ -15,7 +15,7 @@
 | PostgreSQL | 独立 Docker 16.16，socket-only、`--network=none`、192 MiB；当前启动脚本配置0.5 CPU，仅挂载自己的数据与 socket 目录 |
 | Docker broker | root 控制、代码与策略由 root 所有；复用已有固定 Python 3.11 镜像的小容器，`--network=none`、64 MiB、0.15 CPU |
 
-controller 内存硬上限1280 MiB、软限256 MiB，当前启动脚本CPU配额0.75；内存限额不预占对应 RAM。worker 自适应CPU已观测到约0.25—1.03核的配额调整，1.5核只是允许的上限，本轮未观测达到，不能当成实际使用量或吞吐保证。broker、PG与worker的限额分别核算；`server_2gb`保留`scoped`、单重型工作、128 MiB宿主余量和128 MiB传输余量，默认准入门槛768 MiB。准入取`MemAvailable`与controller可见cgroup headroom的较小值；游戏与client占用已体现在宿主余量中，不重复扣减RSS。
+controller 内存硬上限1280 MiB、软限256 MiB，当前启动脚本CPU配额0.75；内存限额不预占对应 RAM。worker 自适应CPU已观测到约0.25—1.03核的配额调整，1.5核只是允许上限。broker、PG与worker限额分别核算；`server_2gb`保留`scoped`及单重型工作。本机手工场景实测可用内存约759 MiB时，原768 MiB门槛令已生成结果反复排队；已通过[tune-pot-test2-memory.sh](tune-pot-test2-memory.sh)将宿主预留微调为96 MiB，保留128 MiB传输及512 MiB worker上限，当前门槛736 MiB。框架通用默认仍是128 MiB宿主预留，不能将此调参移用于未知负载主机。准入取`MemAvailable`与controller可见cgroup headroom的较小值；游戏与client占用已体现在宿主余量中，不重复扣减RSS。
 
 `pot-test2`（UID 994／GID 990）不加入 Docker 组。该 root 等效授权已被自动审批拒绝，当前方案使用受限 broker。**只有 broker 挂载 raw Docker socket**；controller 只连接受限 Unix socket。broker 严格限制固定镜像、群／作用域标签、容器名字、资源配额、无网络、只读根文件系统及允许的隔离字段，拒绝任意挂载或主机权限扩展。实际策略见 [pot_docker_proxy.py](pot_docker_proxy.py)，安装与启动脚本由主流程审核；这里不把代码存在当作运行验证通过。
 
@@ -28,6 +28,8 @@ client 重建或网络命名空间变化后，主流程须重新核对网络绑�
 本轮预算为原授权剩余额度的明确子分配，**不是新的 50 CNY**。原账本有效上界 17.266165 CNY，原付费入口已冻结；原 policy 50／50、revision 1 及既有 settled／unknown 记录保留，不伪结算。test_2 新组划拨 cap 20 CNY，合计有效上界不超过 **37.266165 CNY < 原 50 CNY**；绑定与冻结审计由主流程的可信 allocation manifest 记录。runner 不创建或重置预算，真实调用前仍由主流程核对费用与剩余额度。
 
 按用户最新范围，语音生成／TTS暂缓：目标机与配置样例均为`speech_reply_on_request=false`，不要求TTS路由，不新增语音生成调用；文字、附件与ASR保持启用。普通聊天不生成提前占位回执；名字及唯一、来源完整的已知记录可直接回答，其他问题仍由模型判断。回声凭原生接受回执提前过滤，撤回仍走隐私处理；完整问题句可跳过两秒合并等待，角色、参与策略与执行权限不变。受理重任务时说明已知的计算、研究或文件工作。
+
+不再发送固定的运行／校验定时播报。普通过程保持静默，真实缺参和明确阻碍使用持久状态中的具体原因；需要重发或费用核对时必须有对应证据。新受理工作的即时答复获得平台接受后才开始可能阻塞原生客户端的附件准备，避免后台读取挤占初次反馈。
 
 更新入口为[apply-pot-source-update.sh](apply-pot-source-update.sh)：先保存镜像、非秘密配置与源码，再在已核对的固定基础镜像上离线叠加源码；只切换controller／broker，进行应用lease健康检查，失败自动恢复原镜像与源码。群策略revision单调递增，不重置预算或历史回执。此入口只接受维护者审核的公开源码包，不用于用户附件。
 

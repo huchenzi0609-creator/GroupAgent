@@ -32,6 +32,32 @@ class NewWorkIntent:
     required_tool: str | None = None
 
 
+def public_image_request_count(
+    text: str, *, identity: BotIdentity = DEFAULT_IDENTITY
+) -> int | None:
+    """Recognize a standalone request for existing images, not image generation."""
+    main = main_request(text, identity=identity)
+    outside = _QUOTED_DATA.sub(" <quoted data> ", main)
+    if re.search(
+        r"不要|不用|不必|无需|假如|如果|假设|怎么|如何|解释|引用|转发|生成|绘制|制作|修改|提醒|认领|负责",
+        outside,
+    ):
+        return None
+    if not re.match(r"^(?:(?:联网|上网)\s*)?(?:找|寻找|搜索|搜|检索|下载|获取)", outside):
+        return None
+    if not re.search(r"图片|表情包|照片|壁纸|插画|\b(?:images?|pictures?|memes?)\b", outside, re.I):
+        return None
+    # References to an earlier object need the model's normal context resolution.
+    if re.search(
+        r"上次|之前|刚才|那些|那两|这两|这个|那个|附件|你发的|我发的|群里|群聊|群成员|聊天记录|相册|昨天|历史|我们|本项目|[?？]",
+        outside,
+    ):
+        return None
+    match = re.search(r"([0-9]{1,3}|[一二两三四五六七八九十])\s*(?:张|幅|个)", outside)
+    number = _page_count(match[1]) if match else 1
+    return number if number is not None and 1 <= number <= 10 else None
+
+
 _QUOTED_DATA = re.compile(r'```.*?```|“[^”]*”|『[^』]*』|「[^」]*」|"[^"\n]*"', re.S)
 _NEW_WORK_EXCLUSIONS = re.compile(
     r"如果|假如|假设|要是|除非|倘若|只有|仅供参考|只是.{0,4}(?:引用|转发)|不代表.{0,8}(?:授权|请求|指令)|"
@@ -159,6 +185,22 @@ def new_work_intent(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> N
     """
     if not text.strip() or len(text) > 6000:
         return None
+    if public_image_request_count(text, identity=identity) is not None:
+        document_formats = [
+            name
+            for pattern, name in (
+                (r"Word|docx", "docx"),
+                (r"PDF", "pdf"),
+                (r"PPTX?|幻灯片", "pptx"),
+                (r"Markdown|\.md\b", "md"),
+            )
+            if re.search(pattern, text, re.I)
+        ]
+        if len(document_formats) > 1:
+            return None
+        return NewWorkIntent(
+            ({"format": document_formats[0] if document_formats else "text"},), "web_image_import"
+        )
     main = main_request(text, identity=identity)
     main = re.sub(
         r"^(?:新建|创建|新开|另开)(?:一(?:个|项|份))?(?:独立(?:的)?)?"

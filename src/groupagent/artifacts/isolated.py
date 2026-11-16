@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
@@ -233,15 +234,42 @@ class IsolatedDocumentService:
         allowed_metadata = (
             {"title", "native_table_count"}
             if version.format == "pptx"
-            else {"native_table_count"}
+            else {
+                "native_table_count",
+                "embedded_image_count",
+                "distinct_embedded_image_count",
+                "embedded_image_sha256",
+            }
             if version.format == "docx"
             else set()
         )
         if not set(metadata).issubset(allowed_metadata) or (
-            "native_table_count" in metadata
-            and not re.fullmatch(r"0|[1-9][0-9]*", metadata["native_table_count"])
+            any(
+                key in metadata and not re.fullmatch(r"0|[1-9][0-9]*", metadata[key])
+                for key in (
+                    "native_table_count",
+                    "embedded_image_count",
+                    "distinct_embedded_image_count",
+                )
+            )
         ):
             raise DomainError("invalid_document", "Document worker returned invalid metadata")
+        if "embedded_image_sha256" in metadata:
+            try:
+                hashes = json.loads(metadata["embedded_image_sha256"])
+                if (
+                    not isinstance(hashes, list)
+                    or len(hashes) > 10
+                    or any(
+                        not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
+                        for value in hashes
+                    )
+                ):
+                    raise ValueError("invalid image digest list")
+            except (ValueError, TypeError):
+                raise DomainError(
+                    "invalid_document", "Document worker returned invalid image hashes"
+                ) from None
         return DocumentRead(
             file_id,
             version.version_id,

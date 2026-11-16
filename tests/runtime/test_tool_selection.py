@@ -21,6 +21,45 @@ from .conftest import source
 from .test_app import app_for, event
 from .test_toolkit_contract import toolkit_setup as toolkit_setup
 
+
+def test_public_image_research_keeps_import_and_delivery_tools_without_uploaded_inputs():
+    available = {
+        "request_input",
+        "web_search",
+        "web_fetch",
+        "web_image_candidates",
+        "web_image_import",
+        "artifact_deliver",
+    }
+    current = work(
+        "上网找两张卡通松鼠表情包并发出来",
+        research_required=True,
+        public_image_count=2,
+        outputs=[{"format": "text"}],
+    )
+    assert select_tools(current, [], available) == available - {"web_fetch"}
+
+
+def test_known_public_images_to_word_keeps_document_tools_without_searching_again():
+    current = work("把已找到的两张表情包放入Word并标注原始来源", outputs=[{"format": "docx"}])
+    inputs = [{"format": "jpeg", "public_image": {"page_url": "https://example.com/source"}}]
+    available = {
+        "document_generate",
+        "document_validate",
+        "artifact_deliver",
+        "image_analyze",
+        "web_search",
+        "web_fetch",
+        "web_image_import",
+    }
+    assert select_tools(current, inputs, available) == {
+        "document_generate",
+        "document_validate",
+        "artifact_deliver",
+        "image_analyze",
+    }
+
+
 CATALOG = frozenset(
     {
         "request_input",

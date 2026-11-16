@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from uuid import uuid4
 
 from psycopg.types.json import Jsonb
@@ -9,7 +10,7 @@ from groupagent.domain import ActorContext, DomainError, Role
 from groupagent.memory.common import BoundStore, Row, memory_lock, source_rows, topic_row
 from groupagent.memory.models import MemorySummary, SummaryInput
 from groupagent.memory.retrieval import visible_events
-from groupagent.memory.summarizers import Summarizer
+from groupagent.memory.summarizers import InvalidSummaryError, Summarizer
 from groupagent.persistence import PostgresStore
 
 
@@ -54,8 +55,14 @@ class CompactionMethods:
             raise DomainError("invalid_input", "Compaction budget or lease is invalid")
         if self.summarizer is None:
             raise DomainError("provider_unavailable", "An explicit summarizer provider is required")
+        # Providers that must echo source coverage reserve output space for it.
+        # Remaining sources stay behind the same atomic checkpoint for a later pass.
+        provider_limit = getattr(self.summarizer, "max_source_events", max_source_events)
+        if type(provider_limit) is int and provider_limit > 0:
+            max_source_events = min(max_source_events, provider_limit)
         token = uuid4().hex
         key = topic_id or "__group__"
+        failure_ref = "memory-compaction:" + sha256(key.encode()).hexdigest()
         with self.store.transaction(actor) as tx:
             epoch = memory_lock(tx)
             topic = topic_row(tx, topic_id)
@@ -121,20 +128,49 @@ class CompactionMethods:
                     for row in selected
                 ],
             )
+            # Hash-only retry state uses the existing audit journal; no raw
+            # messages or rejected model output are persisted as diagnostics.
+            window_hash = sha256(
+                json.dumps(
+                    {
+                        "request": request.model_dump(mode="json"),
+                        "epoch": epoch,
+                        "through_sequence": checkpoint["through_sequence"],
+                        "provider": type(self.summarizer).__qualname__,
+                        "configuration": getattr(self.summarizer, "configuration_key", ""),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+            last_failure = tx.conn.execute(
+                "SELECT details,created_at,clock_timestamp() AS now FROM ga_audit_events "
+                "WHERE group_id=%s AND action='memory_compaction_failed' AND resource_ref=%s "
+                "AND details->>'window_hash'=%s "
+                "AND created_at>clock_timestamp()-interval '2 hours' "
+                "ORDER BY created_at DESC,id DESC LIMIT 1",
+                (actor.group_id, failure_ref, window_hash),
+            ).fetchone()
+            failures = 0
+            if last_failure:
+                failures = int(last_failure["details"]["consecutive_failures"])
+                elapsed = (last_failure["now"] - last_failure["created_at"]).total_seconds()
+                if elapsed < last_failure["details"]["retry_after_seconds"]:
+                    # force bypasses the source-size trigger, never this cost
+                    # control. A changed source window/provider can retry now.
+                    return None
             tx.conn.execute(
                 "UPDATE ga_memory_checkpoints SET lease_token=%s,lease_until=clock_timestamp()+%s*interval '1 second' WHERE group_id=%s AND topic_key=%s",
                 (token, lease_seconds, actor.group_id, key),
             )
         try:
             draft = await self.summarizer.summarize(request)
-            if (
-                not draft.text.strip()
-                or len(draft.covered_event_ids) != len(source_ids)
-                or set(draft.covered_event_ids) != set(source_ids)
-            ):
-                raise DomainError(
-                    "invalid_summary", "Summary coverage does not match its source window"
-                )
+            if not draft.text.strip():
+                raise InvalidSummaryError("invalid_schema")
+            if len(draft.covered_event_ids) != len(source_ids) or set(
+                draft.covered_event_ids
+            ) != set(source_ids):
+                raise InvalidSummaryError("coverage_mismatch")
             with self.store.transaction(actor) as tx:
                 current_epoch = memory_lock(tx)
                 current = tx.conn.execute(
@@ -191,15 +227,41 @@ class CompactionMethods:
                     usage=json.loads(draft.model_dump_json())["usage"],
                 )
                 return MemorySummary.model_validate(summary)
-        except BaseException:
+        except BaseException as error:
             # Cancellation and provider failure cannot acknowledge source input.
             # A concurrent forget may already have revoked the token.
             try:
                 with self.store.transaction(actor) as tx:
-                    tx.conn.execute(
-                        "UPDATE ga_memory_checkpoints SET lease_token=NULL,lease_until=NULL WHERE group_id=%s AND topic_key=%s AND lease_token=%s",
+                    memory_lock(tx)
+                    released = tx.conn.execute(
+                        "UPDATE ga_memory_checkpoints SET lease_token=NULL,lease_until=NULL WHERE group_id=%s AND topic_key=%s AND lease_token=%s RETURNING topic_key",
                         (actor.group_id, key, token),
-                    )
+                    ).fetchone()
+                    if (
+                        released
+                        and isinstance(error, DomainError)
+                        and error.code == "invalid_summary"
+                    ):
+                        attempts = min(failures + 1, 3)
+                        details = {
+                            "window_hash": window_hash,
+                            "consecutive_failures": attempts,
+                            "retry_after_seconds": min(900 * 2 ** (attempts - 1), 3600),
+                            "source_count": len(source_ids),
+                            "estimated_input_tokens": request.estimated_tokens,
+                            "reason": (
+                                error.reason
+                                if isinstance(error, InvalidSummaryError)
+                                else error.code
+                            ),
+                        }
+                        if isinstance(error, InvalidSummaryError):
+                            details["finish_reason"] = error.finish_reason
+                            details["usage"] = error.usage
+                        output_capacity = getattr(self.summarizer, "max_output_tokens", None)
+                        if type(output_capacity) is int:
+                            details["max_output_tokens"] = output_capacity
+                        tx._audit("memory_compaction_failed", failure_ref, **details)
             except DomainError:
                 pass  # Revocation still prevents a stale commit; the bounded lease expires.
             raise

@@ -9,6 +9,7 @@ from pydantic import Field
 from groupagent.domain import DomainError
 from groupagent.tools import IdempotencyMode, ToolContext, ToolData, ToolDefinition, ToolGateway
 from groupagent.tools.models import ToolFailure
+from groupagent.vision_policy import FACE_ID_RESPONSE, requests_face_identification
 
 from .models import (
     Capability,
@@ -86,6 +87,8 @@ def register_media_tools(
         return route
 
     async def vision(arguments: VisionInput, context: ToolContext) -> VisionResult:
+        if requests_face_identification(arguments.prompt, image_context=True):
+            raise ToolFailure("face_identification_unavailable", FACE_ID_RESPONSE, no_effect=True)
         route = configured(arguments.route_id, Capability.VISION)
         references = tuple(
             service.load_ref(context, item.file_id, item.version_id) for item in arguments.images

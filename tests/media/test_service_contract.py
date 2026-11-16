@@ -143,13 +143,20 @@ async def test_media_scope_source_quote_order_and_actual_pixel_http(
                 len(
                     [
                         entry
-                        for entry in body["messages"][0]["content"]
+                        for entry in next(
+                            item for item in body["messages"] if item["role"] == "user"
+                        )["content"]
                         if entry["type"] == "image_url"
                     ]
                 )
                 == 2
             )
-            assert "quoted-original" in body["messages"][0]["content"][1]["text"]
+            assert (
+                "quoted-original"
+                in next(item for item in body["messages"] if item["role"] == "user")["content"][1][
+                    "text"
+                ]
+            )
             with pytest.raises(DomainError) as error:
                 await service.analyze_images(media_context, (first,), "Again", route("vision"))
             assert error.value.code == "provider_reconciliation_required" and len(captured) == 1

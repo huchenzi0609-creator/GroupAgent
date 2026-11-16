@@ -66,9 +66,12 @@ async def test_vision_sends_actual_ordered_pixels_and_association():
             ("message=one; author=alice; static view",),
         )
     body = json.loads(captured[0].content)
-    image = body["messages"][0]["content"][2]["image_url"]["url"]
+    assert body["messages"][0]["role"] == "system"
+    assert "Do not identify" in body["messages"][0]["content"]
+    user = next(item for item in body["messages"] if item["role"] == "user")
+    image = user["content"][2]["image_url"]["url"]
     assert base64.b64decode(image.split(",", 1)[1]) == pixels
-    assert "author=alice" in body["messages"][0]["content"][1]["text"]
+    assert "author=alice" in user["content"][1]["text"]
     assert result.text == "The score is 87." and result.usage["input_tokens"] == 400
     assert "synthetic-key" not in result.model_dump_json()
 

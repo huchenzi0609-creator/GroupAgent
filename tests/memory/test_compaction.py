@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from groupagent.domain import DomainError, EventKind
-from groupagent.memory import DeterministicFixtureSummarizer, MemoryService, SummaryDraft
+from groupagent.execution.models import ModelReply, TokenUsage
+from groupagent.memory import (
+    DeterministicFixtureSummarizer,
+    MemoryService,
+    ModelPortSummarizer,
+    SummaryDraft,
+)
 from groupagent.persistence import UnitOfWork
 
 pytestmark = pytest.mark.postgres
@@ -187,3 +194,163 @@ async def test_oversized_single_source_fails_without_truncation(memory, actor, e
         await memory.compact(actor, force=True, token_budget=100)
     assert caught.value.code == "context_too_large"
     assert memory.checkpoint(actor)["through_sequence"] == 0 and memory.summarizer.calls == []
+
+
+class InvalidSummaryProvider:
+    configuration_key = "synthetic-invalid-summary-v1"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def summarize(self, request):
+        self.calls += 1
+        raise DomainError("invalid_summary", "Synthetic failure; do not persist this message")
+
+
+async def test_invalid_window_cools_down_across_restart_without_advancing_or_losing_sources(
+    store, actor, emit
+):
+    source = emit(actor, "synthetic private source requiring preservation " * 100)
+    with store.transaction(actor) as tx:
+        task = tx.create_team_task("Keep this long-term responsibility", source_event_id=source.id)
+    provider = InvalidSummaryProvider()
+    memory = MemoryService(store, provider)
+    with pytest.raises(DomainError):
+        await memory.compact(actor, token_budget=4000, trigger_ratio=0.1)
+    restarted = MemoryService(store, provider)
+    assert await restarted.compact(actor, token_budget=4000, trigger_ratio=0.1) is None
+    assert await restarted.compact(actor, force=True) is None
+    assert provider.calls == 1
+    assert restarted.checkpoint(actor)["through_sequence"] == 0
+    assert [hit.id for hit in restarted.retrieve(actor, include_tasks=False)] == [source.id]
+    with store.transaction(actor) as tx:
+        assert tx.get_team_task(task.id) == task
+    with store.connect() as conn:
+        failures = conn.execute(
+            "SELECT details FROM ga_audit_events WHERE group_id=%s "
+            "AND action='memory_compaction_failed'",
+            (actor.group_id,),
+        ).fetchall()
+        assert len(failures) == 1
+        assert failures[0]["details"]["retry_after_seconds"] == 900
+        assert failures[0]["details"]["consecutive_failures"] == 1
+        assert source.text not in str(failures)
+        assert source.id not in str(failures)
+        assert "do not persist" not in str(failures)
+        assert (
+            conn.execute(
+                "SELECT count(*) AS n FROM ga_memory_summaries WHERE group_id=%s", (actor.group_id,)
+            ).fetchone()["n"]
+            == 0
+        )
+
+
+async def test_same_invalid_window_uses_bounded_exponential_backoff(store, actor, emit):
+    emit(actor, "synthetic source")
+    provider = InvalidSummaryProvider()
+    memory = MemoryService(store, provider)
+    for expected_seconds in (900, 1800, 3600, 3600):
+        with pytest.raises(DomainError):
+            await memory.compact(actor, force=True)
+        with store.connect() as conn:
+            failure = conn.execute(
+                "SELECT id,details FROM ga_audit_events WHERE group_id=%s "
+                "AND action='memory_compaction_failed' ORDER BY id DESC LIMIT 1",
+                (actor.group_id,),
+            ).fetchone()
+            assert failure["details"]["retry_after_seconds"] == expected_seconds
+            conn.execute(
+                "UPDATE ga_audit_events SET created_at=clock_timestamp()-interval '61 minutes' "
+                "WHERE id=%s",
+                (failure["id"],),
+            )
+    assert provider.calls == 4 and memory.checkpoint(actor)["through_sequence"] == 0
+
+
+async def test_changed_window_or_provider_configuration_can_recover_immediately(store, actor, emit):
+    emit(actor, "synthetic first source")
+    provider = InvalidSummaryProvider()
+    memory = MemoryService(store, provider)
+    with pytest.raises(DomainError):
+        await memory.compact(actor, force=True)
+    emit(actor, "synthetic newly available evidence")
+    with pytest.raises(DomainError):
+        await memory.compact(actor, force=True)
+    provider.configuration_key = "synthetic-fixed-summary-v2"
+    with pytest.raises(DomainError):
+        await memory.compact(actor, force=True)
+    assert provider.calls == 3
+    recovered = await MemoryService(store, DeterministicFixtureSummarizer()).compact(
+        actor, force=True
+    )
+    assert recovered is not None and len(recovered.source_event_ids) == 2
+
+
+async def test_output_capacity_chunks_sources_and_preserves_exact_checkpoint_mapping(
+    store, actor, emit
+):
+    class AliasEchoModel:
+        name = "synthetic-alias-echo"
+
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, query):
+            sources = json.loads(query.messages[1].content)["events"]
+            self.calls.append(sources)
+            return ModelReply(
+                text=json.dumps(
+                    {"text": "Synthetic summary", "covered_event_ids": [s["id"] for s in sources]}
+                ),
+                usage=TokenUsage(input_tokens=100, output_tokens=50),
+            )
+
+    model = AliasEchoModel()
+    summarizer = ModelPortSummarizer(model, max_output_tokens=128)
+    sources = [emit(actor, f"synthetic source {index}") for index in range(8)]
+    memory = MemoryService(store, summarizer)
+    first = await memory.compact(actor, force=True)
+    assert first is not None
+    assert first.source_event_ids == [
+        source.id for source in sources[: summarizer.max_source_events]
+    ]
+    assert memory.checkpoint(actor)["through_sequence"] == first.last_sequence
+    second = await memory.compact(actor, force=True)
+    assert second is not None
+    assert first.source_event_ids + second.source_event_ids == [source.id for source in sources]
+    assert memory.checkpoint(actor)["through_sequence"] == second.last_sequence
+    assert len(model.calls) == 2
+    assert all(source["id"].startswith("e") for window in model.calls for source in window)
+
+
+async def test_invalid_summary_diagnostics_keep_finish_usage_without_private_model_text(
+    store, actor, emit
+):
+    source = emit(actor, "synthetic private-source-marker")
+
+    class TruncatedModel:
+        name = "synthetic-truncated-summary"
+
+        async def complete(self, query):
+            return ModelReply(
+                text='{"text":"synthetic private-reply-marker"',
+                finish_reason="length",
+                usage=TokenUsage(input_tokens=200, output_tokens=1500),
+            )
+
+    memory = MemoryService(store, ModelPortSummarizer(TruncatedModel()))
+    with pytest.raises(DomainError):
+        await memory.compact(actor, force=True)
+    with store.connect() as conn:
+        details = conn.execute(
+            "SELECT details FROM ga_audit_events WHERE group_id=%s "
+            "AND action='memory_compaction_failed'",
+            (actor.group_id,),
+        ).fetchone()["details"]
+    assert details["reason"] == "incomplete_response" and details["finish_reason"] == "length"
+    assert details["usage"] == {"input_tokens": 200, "output_tokens": 1500}
+    assert details["max_output_tokens"] == 1500
+    assert details["source_count"] == 1
+    assert "private-source-marker" not in str(details)
+    assert "private-reply-marker" not in str(details)
+    assert source.id not in str(details)

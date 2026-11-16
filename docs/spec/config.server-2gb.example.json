@@ -25,7 +25,8 @@
     "durable_schedules": true,
     "video_analysis": false,
     "video_generation": false,
-    "realtime_voice_call": false
+    "realtime_voice_call": false,
+    "public_image_retrieval": true
   },
   "conversation": {
     "idle_batch_seconds": 2,
@@ -120,7 +121,7 @@
   "resources": {
     "profile": "server_2gb",
     "worker_memory_mb": 512,
-    "reserve_memory_mb": 128,
+    "reserve_memory_mb": 96,
     "transfer_memory_mb": 128,
     "worker_cpus": 0.75,
     "worker_cpu_shares": 128,

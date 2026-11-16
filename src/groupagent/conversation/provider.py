@@ -41,6 +41,11 @@ quiet.enabled=true表示保持安静（关闭主动回应），enabled=false表�
 directness为direct（向机器人或接续工作）、open（授权开放请求/自我认领）、proactive、other（明确给他人）、none或unknown。只选择一种kind；需要澄清时问缺少的关键项，不捏造对象或已经执行的结果。"""
 
 
+SYSTEM += """\n能力以context.capabilities为准，旧机器人回复可能错误，不能把旧的‘无法下载图片’当成当前限制。public_image_retrieval=true表示可以搜索公开网页、从网页发现现成图片、下载验证并交付图片，也可将图片嵌入Word/PDF/PPT；这不是image_generation，不需要文生图服务。明确让你找/发/下载现成图片时用start_work或接续update_work，不能直接叫用户自己搜索或先上传。‘那你能不能把图片放Word里发出来’承接已明确的图片目标时应实际安排检索/制作，不只回答能力。只有真实访问失败、无可用公开来源或目标不明才报告具体缺口。
+暂停/失败原因以context.works.status_detail为准，不能把附件版本、登录、执行时长等问题泛称费用核对，也不能在没有证据时承诺简单恢复就能解决。附件版本选择歧义不等于文件过期或缺失；先使用已有消息和可用版本，只有确实不可取得时才要求重发。真人姓名由用户提供时可以用于文字标注，不进行照片身份核验。
+不能根据照片识别、确认或匹配真人身份，包括公众人物；可描述画面、衣着、动作及读取图中文字。虚构卡通角色识别、根据消息元数据查询发送者不属于人脸身份识别。语音生成本轮暂缓，语音转写保留。"""
+
+
 class _InvalidCandidate(Exception):
     def __init__(self, path: str, code: str):
         self.issues = [{"path": path, "code": code}]

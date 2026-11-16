@@ -27,6 +27,17 @@ _AUDIO = frozenset({"wav", "mp3", "ogg", "flac", "m4a", "aac"})
 _IMAGE_TOOLS = frozenset({"request_input", "image_analyze", "media_ocr", "provider_ocr"})
 _AUDIO_TOOLS = frozenset({"request_input", "audio_transcribe"})
 _WEB_TOOLS = frozenset({"request_input", "web_search", "web_fetch", "browser_open"})
+_PUBLIC_IMAGE_TOOLS = frozenset(
+    {
+        "request_input",
+        "web_search",
+        "web_image_candidates",
+        "web_image_import",
+        "image_analyze",
+        "artifact_search",
+        "artifact_deliver",
+    }
+)
 _REMINDER_TOOLS = frozenset({"request_input"})
 _DOCUMENT_FORMATS = frozenset({"md", "docx", "pdf", "pptx"})
 _DOCUMENT_TOOLS = frozenset(
@@ -53,7 +64,7 @@ _DOCUMENT_TOOLS = frozenset(
     }
 )
 _MEDIA_REQUIREMENT = re.compile(
-    r"图片|图像|照片|插图|插画|语音|音频|转写|转录|视频|浏览器|image|photo|illustrat|audio|speech|transcrib|ocr|video|browser",
+    r"图片|图像|照片|表情包|壁纸|插图|插画|语音|音频|转写|转录|视频|浏览器|image|photo|meme|wallpaper|illustrat|audio|speech|transcrib|ocr|video|browser",
     re.I,
 )
 _TEAM_WRITES = frozenset({"team_task_create", "team_task_claim", "team_task_update"})
@@ -215,6 +226,36 @@ def select_tools(
     raw_formats = [ref.get("format") if isinstance(ref, Mapping) else None for ref in input_refs]
     formats = [value.casefold() if isinstance(value, str) else None for value in raw_formats]
     profile: frozenset[str] | None = None
+    declared_outputs = work.scope.get("outputs", [])
+    image_document = (
+        isinstance(declared_outputs, list)
+        and bool(declared_outputs)
+        and all(
+            isinstance(item, dict) and item.get("format") in _DOCUMENT_FORMATS
+            for item in declared_outputs
+        )
+    )
+    if (
+        image_document
+        and formats
+        and all(value in _IMAGE for value in formats)
+        and all(ref.get("public_image") for ref in input_refs)
+        and not research
+        and not business
+        and not requires_research(requirements)
+        and not _COMPUTE.search(requirements)
+    ):
+        image_document_tools = _DOCUMENT_TOOLS | _IMAGE_TOOLS
+        if required.issubset(image_document_tools):
+            return available & image_document_tools
+    if (
+        work.scope.get("public_image_count")
+        and text_only
+        and not input_refs
+        and not business
+        and required.issubset(_PUBLIC_IMAGE_TOOLS)
+    ):
+        return available & _PUBLIC_IMAGE_TOOLS
     if work.scope.get("research_message_only") is True and work.goal_revision == 1:
         if (
             not research
@@ -294,6 +335,7 @@ def select_tools(
             profile = _AUDIO_TOOLS
         elif (
             research
+            and not _MEDIA_REQUIREMENT.search(requirements)
             and not input_refs
             and not work.input_versions
             and not work.scope.get("attachment_event_ids")

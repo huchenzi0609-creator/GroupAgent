@@ -91,3 +91,75 @@ static-content sanitization. The tests verify rendered text/screenshot, blocked
 scripts and network attempts, and challenge detection. Broker URL/DNS/redirect,
 credential-forwarding and budget tests use deterministic HTTP/DNS fixtures;
 they do not establish live source coverage or permission to bypass website rules.
+
+## Existing public images (2026-11-16)
+
+`PublicImageService(media, resolver=..., client=None)` and
+`register_public_image_tools(gateway, service, source_factory=...)` add two
+separately granted tools. After the existing budgeted `web_search` finds a page,
+`web_image_candidates(page_url, limit=10)` extracts inert `img`/`srcset`, lazy
+image URLs, direct image links and Open Graph/Twitter metadata. It returns exact
+candidate URLs, page URL/hash, actual UTC access time, and explicitly unverified
+dimension hints. It does not execute scripts or fetch subresources. The next
+`web_image_import(candidate_id)` accepts only an ID observed by that same
+group/work/actor and returns a flat `PublicImageRef(MediaRef)`, with verified dimensions, usable
+for native image delivery or document generation with embedded images.
+Retrieving an existing public image is independent of the disabled external
+image-generation capability and adds no new provider or paid search path.
+
+The transport reuses the public-page broker's checked public DNS/IP pinning,
+standard-port URL policy, credential-free requests and redirect checks. Its two
+fixed content profiles accept HTML for discovery and JPEG/PNG/WebP/GIF for
+import. Private/ambiguous targets, credentials, non-image MIME, authentication
+denials, access challenges and encoded responses fail explicitly. Every redirect
+is checked again, including a public image CDN redirect. Owned HTTP clients close
+after each request operation. The default discovery cap is 1 MiB per page, six
+page attempts and 100 retained candidate IDs per execution; retained distinct
+images use the media service's configured byte/pixel/count limits (at most
+15 MiB, 40 MP and ten images). Download attempts have a separate cap of
+`min(12, max_images * 3)`: a MIME failure consumes one attempt without occupying a
+retained-image slot, so the four-image PoT profile can still find replacement
+images. Image imports run serially within the service and share the existing
+isolated worker. No generic binary-download tool is exposed.
+
+Untrusted image bytes go through `MediaService.ingest_image` and the existing
+`image_validate` sandbox operation before artifact registration. Declared MIME
+must match the worker's decoded format. Original bytes and SHA-256 remain intact;
+GIF metadata marks a static first-frame view. Host-built `public_image`
+provenance persists the requested/final image URLs, page URL/hash, retrieval time,
+actual MIME, dimensions and hash in a namespace that cannot replace the trusted
+media source or scope. Page metadata does not prove image relevance, high
+resolution or a reuse license.
+The result includes `page_citation` and `image_citation`, computed from the stored
+page/image UTC retrieval times. Discovery also reports the actual
+`html_bytes_received`. Direct observations use `ResearchSource` provider
+`public_http` and evidence kinds `public_image_page`/`public_image` when composed
+into the runtime's citation validator.
+
+The registrar restores candidate IDs and completed imports from
+`gateway.export_ledger(context.scope)`, using the engine's existing trusted
+checkpoint. Receipt types, successful tool names, scope fingerprint, page
+provenance, canonical public URLs, limits and exact reconstructed citation strings
+are checked before use. A restart or
+resource wait can continue with the issued ID; a different work/member or a
+model-written workspace cache cannot grant an import. Existing imported versions
+are checked against stored media references and reused instead of downloading
+again. Failed/revoked sources and changed artifact bytes still stop.
+Recovery counts confirmed HTTP/decoder failure codes toward attempt budgets;
+limit, admission and derivative recovery failures did not start another request.
+Budget exhaustion preserves valid earlier evidence and cached image reuse.
+Historical failed receipts are read as recorded and never rewritten.
+
+Tests in `tests/research/test_public_images.py` use synthetic fictional frog
+rasters, injected DNS and HTTP transports. They cover source/hash preservation,
+two-image Word structure, original formats, private/mixed/rebound DNS, redirect
+checks, absent credentials/cookies, chunked byte caps, MIME/pixel failures,
+inert discovery, work/actor scope, receipt recovery and source withdrawal. The
+RecordingGateway regression uses an in-memory registry fixture to check that two
+successful imports, MIME failures, final selections and historical limit/recovery
+errors survive repeated restoration. Separate tests verify replacement images,
+distinct-image cardinality and both page/download limits across restarts. The
+fixture worker calls the real decoder in process only for these generated test
+bytes; this is not new Docker isolation, live web coverage, rendered Word or
+native channel acceptance evidence. No live provider request or production data
+was used for this change.

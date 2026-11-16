@@ -87,6 +87,7 @@ class FeatureConfig(StrictModel):
     image_generation: Literal[False] = False
     document_editing: bool = True
     web_research: bool = True
+    public_image_retrieval: bool = True
     durable_schedules: bool = True
     video_analysis: Literal[False] = False
     video_generation: Literal[False] = False

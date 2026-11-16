@@ -58,7 +58,9 @@ async def test_normalized_view_is_bound_to_exact_original_and_actual_http_pixels
             body = json.loads(captured[0].content)
             image_url = next(
                 item["image_url"]["url"]
-                for item in body["messages"][0]["content"]
+                for item in next(
+                    message for message in body["messages"] if message["role"] == "user"
+                )["content"]
                 if item["type"] == "image_url"
             )
             view = base64.b64decode(image_url.split(",", 1)[1])

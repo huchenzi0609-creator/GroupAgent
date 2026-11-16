@@ -95,6 +95,7 @@ class WorkSupervisor:
         attachment_retry_seconds: float = 5,
         attachment_wait_seconds: float = 300,
         resource_ready: Callable[[], bool] | None = None,
+        work_ready: Callable[[WorkOrder], bool] | None = None,
         resource_retry_seconds: float = 5,
         execution_backend: str | None = None,
         release_attempt: Callable[[str, str], None | Awaitable[None]] | None = None,
@@ -130,6 +131,7 @@ class WorkSupervisor:
         self.attachment_retry_seconds = attachment_retry_seconds
         self.attachment_wait_seconds = attachment_wait_seconds
         self.resource_ready = resource_ready
+        self.work_ready = work_ready
         self.resource_retry_seconds = resource_retry_seconds
         self.execution_backend = execution_backend
         self.release_attempt = release_attempt
@@ -246,7 +248,9 @@ class WorkSupervisor:
                 if work.id in self._delivering or work.id in self._quiescence_owned:
                     continue
                 try:
-                    if self._resource_due(work):
+                    if self._resource_due(work) and (
+                        self.work_ready is None or self.work_ready(work)
+                    ):
                         eligible.append(work)
                 except DomainError as error:
                     try:
@@ -814,7 +818,12 @@ class WorkSupervisor:
                     metadata["next_retry_at"] = min(
                         deadline, now + timedelta(seconds=self.attachment_retry_seconds)
                     ).isoformat()
-            elif code in {"attachment_expired", "attachment_unavailable"}:
+            elif code in {
+                "attachment_expired",
+                "attachment_unavailable",
+                "ambiguous_attachment",
+                "face_identification_unavailable",
+            }:
                 target, metadata["stage"] = WorkState.WAITING_INPUT, "input_required"
             elif code == "auth_required":
                 target = WorkState.PAUSED
@@ -1004,6 +1013,8 @@ class WorkSupervisor:
                     "attachment_pending",
                     "attachment_expired",
                     "attachment_unavailable",
+                    "ambiguous_attachment",
+                    "face_identification_unavailable",
                     "auth_required",
                 }:
                     self._alert(str(self._preparation(owned.work)["error_code"]), work.id)

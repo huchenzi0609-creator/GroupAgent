@@ -22,6 +22,7 @@ from pydantic import BaseModel, JsonValue, SecretStr, ValidationError
 
 from groupagent.domain import DomainError, EventKind, GroupEvent
 
+from .attachments import preferred_attachment_variants
 from .models import (
     AgentWechatConfig,
     AttachmentContent,
@@ -926,27 +927,23 @@ class AgentWechatAdapter:
         assets = await self._assets(message)
         if any(self._is_video_asset(asset) for asset in assets):
             raise DomainError("unsupported_video", "Video attachments are never fetched")
-        if handle.asset_id is None:
-            priority = {
-                "original": 5,
-                "normal": 4,
-                "standard": 3,
-                "thumbnail": 2,
-                "encoded": 1,
-                "best": 0,
-            }
-            asset = max(
-                assets,
-                key=lambda value: (value.state == "available", priority[value.variant]),
-                default=None,
-            )
-        else:
-            asset = next((asset for asset in assets if asset.id == handle.asset_id), None)
-        if asset is None:
+        candidates = [
+            self._handle(message, asset)
+            for asset in assets
+            if (handle.asset_id is None or asset.id == handle.asset_id)
+            and (handle.variant == "best" or asset.variant == handle.variant)
+        ]
+        available = [value for value in candidates if value.availability == "available"]
+        choices = preferred_attachment_variants(available or candidates, handle.variant)
+        if not choices:
             raise DomainError(
                 "scope_denied", "Attachment is not listed under the scoped source message"
             )
-        fresh = self._handle(message, asset)
+        if len(choices) != 1:
+            raise DomainError(
+                "ambiguous_attachment", "Attachment metadata contains multiple matching assets"
+            )
+        fresh = choices[0]
         if fresh.kind != handle.kind:
             raise DomainError("scope_denied", "Attachment kind disagrees with its source message")
         return fresh

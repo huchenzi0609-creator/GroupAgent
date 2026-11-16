@@ -1,0 +1,113 @@
+"""Synthetic regressions for public images, honest diagnostics and first feedback."""
+
+import pytest
+
+from groupagent.domain import DomainError, WorkState
+
+from .test_app import app_for, event
+from .test_early_ack import intake, setup_chat
+
+pytestmark = pytest.mark.postgres
+
+
+async def test_existing_meme_request_starts_retrieval_without_image_generation(runtime_env):
+    env = runtime_env
+    app, model, _ = setup_chat(env)
+    request = event(env, "找两张“松鼠”的表情包给我，要清晰一点。")
+    try:
+        await intake(app, env, request)
+        result = await app.coordinator.process(request)
+        assert result.work_id and not model.requests
+        with env.store.transaction(env.actor) as tx:
+            work = tx.get_work(result.work_id)
+        assert work.scope["public_image_count"] == 2
+        assert work.scope["research_required"] is True
+        assert "web_image_import" in work.scope["required_tools"]
+        assert "上网找现成图片" in result.decision.response
+        assert not app.config.features.image_generation
+    finally:
+        await app.close()
+
+
+async def test_pause_question_uses_actual_preparation_error_instead_of_cost_guess(runtime_env):
+    env = runtime_env
+    app, model, _ = setup_chat(env)
+    source = event(env, "请分析刚发的图片配色。")
+    try:
+        await intake(app, env, source)
+        with env.store.transaction(env.actor) as tx:
+            work = tx.create_work("分析图片配色", source.id)
+            tx.transition_work(
+                work.id,
+                WorkState.PAUSED,
+                expected_revision=work.revision,
+                reason="ambiguous_attachment",
+            )
+        question = event(env, "为什么？是什么原因导致的暂停")
+        await intake(app, env, question)
+        result = await app.coordinator.process(question)
+        assert result.decision.reason_code == "durable_work_diagnostic"
+        assert "附件版本" in result.decision.response
+        assert "费用" not in result.decision.response and not model.requests
+        context = app.coordinator._context(env.actor, question)
+        assert context["works"][0]["status_detail"]["code"] == "ambiguous_attachment"
+    finally:
+        await app.close()
+
+
+async def test_true_attachment_ambiguity_waits_for_input_without_finance_pause(runtime_env):
+    env = runtime_env
+    app, _ = app_for(env, {})
+    request = event(env, "请分析图片。")
+    try:
+        await intake(app, env, request)
+        with env.store.transaction(env.actor) as tx:
+            work = tx.create_work("分析图片", request.id)
+
+        async def ambiguous(*args):
+            raise DomainError("ambiguous_attachment", "Synthetic two equal-quality assets")
+
+        app.supervisor.factory = ambiguous
+        result = await app.supervisor.run_once()
+        assert result.id == work.id and result.state == WorkState.WAITING_INPUT
+        assert app.notices.tick() == 1
+        with env.store.transaction(env.actor) as tx:
+            texts = [d.payload_ref for d in tx.list_delivery()]
+        assert texts and all("费用" not in text for text in texts)
+        assert any("附件版本" in text for text in texts)
+    finally:
+        await app.close()
+
+
+async def test_background_preparation_waits_until_useful_admission_is_accepted(runtime_env):
+    env = runtime_env
+    app, model, _ = setup_chat(env)
+    app.supervisor.work_ready = app._admission_delivered
+    request = event(env, "找两张“松鼠”的表情包给我。")
+    try:
+        await intake(app, env, request)
+        result = await app.coordinator.process(request)
+        assert result.work_id
+        assert await app.supervisor.tick() == 0
+        with env.store.transaction(env.actor) as tx:
+            assert tx.get_work(result.work_id).state == WorkState.QUEUED
+        assert await app.dispatcher.tick() == 1
+        assert await app.supervisor.tick() == 1
+    finally:
+        await app.close()
+
+
+async def test_person_identity_question_returns_an_explicit_boundary_without_starting_work(
+    runtime_env,
+):
+    env = runtime_env
+    app, model, _ = setup_chat(env)
+    request = event(env, "图片里这个男人是谁？")
+    try:
+        await intake(app, env, request)
+        result = await app.coordinator.process(request)
+        assert result.work_id is None and not model.requests
+        assert result.decision.reason_code == "face_identification_unavailable"
+        assert "描述画面" in result.decision.response
+    finally:
+        await app.close()

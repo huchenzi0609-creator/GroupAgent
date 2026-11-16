@@ -13,14 +13,16 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from psycopg.types.json import Jsonb
+from pydantic import AwareDatetime, BaseModel, Field
 
 from groupagent.artifacts import ArtifactScope, ArtifactStore, ArtifactVersion
 from groupagent.artifacts.isolated import IsolatedDocumentService
 from groupagent.billing import BudgetLedger
+from groupagent.channels.attachments import preferred_attachment_variants
 from groupagent.channels.models import AttachmentContent, AttachmentHandle
 from groupagent.domain import (
     ActorContext,
@@ -43,6 +45,8 @@ from groupagent.media import (
 from groupagent.memory.common import memory_lock, source_rows
 from groupagent.memory.members import MemberService
 from groupagent.persistence import PostgresStore, UnitOfWork
+from groupagent.research.images import _access_citation
+from groupagent.research.urls import parse_public_url
 from groupagent.tools import ToolContext, ToolScope
 
 from .artifacts import ArtifactRegistry
@@ -54,6 +58,22 @@ _IMAGE_FORMATS = {"png", "jpeg", "jpg", "gif", "webp"}
 _AUDIO_FORMATS = {"wav", "ogg", "mp3", "flac", "m4a", "aac"}
 _DOCUMENT_FORMATS = {"md", "docx", "pdf", "pptx"}
 _VIDEO_FORMATS = {"mp4", "mov", "mkv", "webm", "avi", "3gp", "m4v", "mpeg", "mpg"}
+
+
+class _PublicImageProvenance(BaseModel):
+    requested_url: str | None = Field(default=None, min_length=1, max_length=8192)
+    page_url: str | None = Field(default=None, min_length=1, max_length=8192)
+    page_final_url: str = Field(min_length=1, max_length=8192)
+    final_url: str = Field(min_length=1, max_length=8192)
+    page_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    page_retrieved_at: AwareDatetime
+    retrieved_at: AwareDatetime
+    content_type: Literal["image/png", "image/jpeg", "image/webp", "image/gif"]
+    discovery: Literal["img_src", "img_srcset", "open_graph", "twitter", "image_link"] | None = None
+    width: int = Field(gt=0, le=40_000_000, strict=True)
+    height: int = Field(gt=0, le=40_000_000, strict=True)
+    static_first_frame: bool = Field(strict=True)
 
 
 class AttachmentChannel(Protocol):
@@ -367,10 +387,9 @@ class InputProcessor:
             raise DomainError(
                 "attachment_unavailable", "No matching attachment exists for this source"
             )
-        available = [h for h in candidates if h.availability == "available"]
-        # Prefer an explicitly advertised original; do not pick an arbitrary asset.
-        originals = [h for h in available if h.variant == "original"]
-        choices = originals or available
+        choices = preferred_attachment_variants(
+            (h for h in candidates if h.availability == "available"), reference.variant
+        )
         if len(choices) != 1:
             if not choices:
                 pending = [h for h in candidates if h.availability == "pending"]
@@ -387,6 +406,11 @@ class InputProcessor:
                 "ambiguous_attachment", "Attachment metadata contains multiple matching assets"
             )
         handle = choices[0]
+        if reference.sha256 is not None and reference.sha256 != handle.sha256:
+            raise DomainError(
+                "attachment_version_conflict",
+                "Attachment bytes changed since this handle was issued",
+            )
         _reject_video(handle)
         self._check_handle_size(handle)
         if (
@@ -923,6 +947,49 @@ class InputProcessor:
                 )
             return self._source(tx, event_id, str(expected[event_id]))
 
+    @staticmethod
+    def _public_image_input(original: ArtifactVersion) -> dict[str, Any]:
+        """Expose bounded citations only from an authorized immutable image version."""
+        if (
+            original.format not in _IMAGE_FORMATS
+            or original.provenance.get("origin_kind") != "research"
+        ):
+            return {}
+        raw = original.provenance.get("public_image")
+        if raw is None:
+            return {}
+        try:
+            verified = _PublicImageProvenance.model_validate(raw)
+            if (
+                verified.sha256 != original.sha256
+                or verified.final_url != original.provenance.get("source_url")
+                or any(
+                    parse_public_url(url)[0] != url
+                    for url in (verified.page_final_url, verified.final_url)
+                )
+                or any(
+                    not isinstance(raw[key], str) or len(raw[key]) > 64
+                    for key in ("page_retrieved_at", "retrieved_at")
+                )
+            ):
+                raise ValueError("Stored image provenance differs")
+            provenance = {
+                key: raw[key]
+                for key in _PublicImageProvenance.model_fields
+                if key in raw and raw[key] is not None
+            }
+        except (DomainError, ValueError, KeyError, TypeError, AttributeError):
+            raise DomainError(
+                "public_image_evidence_invalid", "Stored image citation provenance is invalid"
+            ) from None
+        return {
+            "public_image": provenance,
+            "page_citation": _access_citation(verified.page_final_url, verified.page_retrieved_at),
+            "image_citation": _access_citation(
+                verified.final_url, verified.retrieved_at, image=True
+            ),
+        }
+
     async def _import_bytes(
         self,
         context: ToolContext,
@@ -937,7 +1004,9 @@ class InputProcessor:
         self._check_input_size(source.declared_kind, name, len(content))
         suffix = Path(name).suffix.lower().lstrip(".")
         if source.declared_kind == "image" or suffix in _IMAGE_FORMATS:
-            reference = await media.ingest_image(context, source, content)
+            reference = await media.ingest_image(
+                context, source, content, research_provenance=(extra or {}).get("public_image")
+            )
             return self.artifacts.get(media.scope(context), reference.file_id, reference.version_id)
         if source.declared_kind == "audio" or suffix in _AUDIO_FORMATS:
             reference = await media.ingest_audio(context, source, content)
@@ -1132,10 +1201,6 @@ class InputProcessor:
                 )
                 assert row is not None
                 cached = row["body"].get("imports", {}).get(cache_key)
-            if cached:
-                self.registry.read(context.actor, cached["version_id"])
-                imported.append(cached)
-                continue
             original_source = {
                 key: value
                 for key, value in original.provenance.items()
@@ -1163,6 +1228,34 @@ class InputProcessor:
                 raise DomainError(
                     "scope_violation", "Artifact source association does not match its catalog"
                 )
+            public_image = self._public_image_input(original)
+            if cached:
+                cached_version, cached_bytes = self.registry.read(
+                    context.actor, cached["version_id"]
+                )
+                if (
+                    (cached_version.group_id, cached_version.work_id, cached_version.created_by)
+                    != (context.group_id, current.id, context.actor.member_id)
+                    or cached_version.sha256 != original.sha256
+                    or hashlib.sha256(cached_bytes).hexdigest() != original.sha256
+                ):
+                    raise DomainError(
+                        "validation_failed",
+                        "Cached artifact input does not match its original version",
+                    )
+                imported.append(
+                    {
+                        "file_id": cached_version.file_id,
+                        "version_id": cached_version.version_id,
+                        "name": cached_version.name,
+                        "format": cached_version.format,
+                        "sha256": cached_version.sha256,
+                        "from_version": original_id,
+                        "untrusted_content": True,
+                        **public_image,
+                    }
+                )
+                continue
             version = await self._import_bytes(
                 context,
                 documents,
@@ -1170,7 +1263,11 @@ class InputProcessor:
                 source,
                 original.name,
                 content,
-                extra={"input_version_id": original_id, "source_event_ids": list(dependencies)},
+                extra={
+                    "input_version_id": original_id,
+                    "source_event_ids": list(dependencies),
+                    **public_image,
+                },
             )
             await asyncio.to_thread(self._work_guard, current, lease, context)
             self.registry.read(context.actor, original_id)
@@ -1182,8 +1279,10 @@ class InputProcessor:
                 "version_id": version.version_id,
                 "name": version.name,
                 "format": version.format,
+                "sha256": version.sha256,
                 "from_version": original_id,
                 "untrusted_content": True,
+                **public_image,
             }
             with self.store.transaction(context.actor) as tx:
                 memory_lock(tx)

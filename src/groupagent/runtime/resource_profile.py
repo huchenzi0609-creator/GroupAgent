@@ -48,6 +48,7 @@ def worker_tool_names(names: frozenset[str]) -> frozenset[str]:
             "audio_transcribe",
             "speech_synthesize",
             "browser_open",
+            "web_image_import",
             "artifact_import",
             "artifact_export",
             "artifact_from_workspace",

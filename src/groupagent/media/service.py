@@ -135,13 +135,20 @@ class MediaService:
         checks: tuple[str, ...],
         *,
         limitations: tuple[str, ...] = (),
+        research_provenance: dict[str, Any] | None = None,
     ) -> MediaRef:
         scope = await self._check(context, (source,))
         version = self.store.create(
             scope,
             name,
             content,
-            provenance={**source.model_dump(mode="json"), "media_metadata": metadata},
+            provenance={
+                **source.model_dump(mode="json"),
+                "media_metadata": metadata,
+                **(
+                    {"public_image": research_provenance} if research_provenance is not None else {}
+                ),
+            },
         )
         self.store.record_validation(
             scope,
@@ -162,9 +169,18 @@ class MediaService:
         return self.load_ref(context, version.file_id, version.version_id)
 
     async def ingest_image(
-        self, context: ToolContext, source: MediaSource, content: bytes
+        self,
+        context: ToolContext,
+        source: MediaSource,
+        content: bytes,
+        *,
+        research_provenance: dict[str, Any] | None = None,
     ) -> MediaRef:
         await self._check(context, (source,))
+        if research_provenance is not None and source.origin_kind != "research":
+            raise DomainError(
+                "media_provenance_invalid", "Public-image provenance requires a research source"
+            )
         if source.declared_kind not in {"image", "file"}:
             raise DomainError("unsupported_image", "Source is not an image attachment")
         self._image_bytes(content)
@@ -178,6 +194,33 @@ class MediaService:
         info = ImageInfo.model_validate(result)
         if info.source_sha256 != hashlib.sha256(content).hexdigest():
             raise DomainError("worker_integrity_failed", "Decoded source hash differs")
+        if research_provenance is not None:
+            if research_provenance.get("content_type") != info.mime_type:
+                raise DomainError(
+                    "public_image_content_type", "Public image MIME differs from its decoded format"
+                )
+            # Host-built metadata stays namespaced and cannot replace source,
+            # scope, decoded dimensions, or the actual stored byte hash.
+            research_provenance = {
+                key: research_provenance[key]
+                for key in (
+                    "requested_url",
+                    "page_url",
+                    "page_final_url",
+                    "page_sha256",
+                    "page_retrieved_at",
+                    "retrieved_at",
+                    "discovery",
+                )
+                if key in research_provenance
+            } | {
+                "final_url": source.source_url,
+                "content_type": info.mime_type,
+                "sha256": info.source_sha256,
+                "width": info.width,
+                "height": info.height,
+                "static_first_frame": info.static_first_frame,
+            }
         return await self._save(
             context,
             source,
@@ -188,6 +231,7 @@ class MediaService:
             limitations=("GIF analysis is a static first-frame view",)
             if info.static_first_frame
             else (),
+            research_provenance=research_provenance,
         )
 
     async def ingest_audio(

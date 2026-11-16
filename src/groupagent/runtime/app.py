@@ -98,6 +98,8 @@ class RuntimeApp:
             max_active_per_group=self.config.schedule.max_active_per_group,
             default_valid_days=self.config.schedule.default_valid_days,
         )
+        if self.config.runtime.channel == "agentwechat":
+            self.supervisor.work_ready = self._admission_delivered
         self.stop = asyncio.Event()
         self.instance_id = "runtime:" + uuid4().hex
         self._last_arrival = self._first_arrival = 0.0
@@ -135,6 +137,16 @@ class RuntimeApp:
         with self.store.transaction(actor):
             pass  # Revalidate membership and restore/policy fences on every use.
         return actor
+
+    def _admission_delivered(self, work) -> bool:
+        """Keep native attachment I/O behind the useful initial work response."""
+        with self.store.transaction(self.technical) as tx:
+            row = tx.conn.execute(
+                "SELECT state FROM ga_deliveries WHERE group_id=%s AND request_event_id=%s "
+                "AND idempotency_key=%s",
+                (tx.group_id, work.request_event_id, "reply:" + work.request_event_id + ":1"),
+            ).fetchone()
+        return row is None or row["state"] == "accepted"
 
     async def start(self) -> None:
         self._fence_application()
