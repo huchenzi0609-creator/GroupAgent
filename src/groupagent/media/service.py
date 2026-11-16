@@ -13,6 +13,7 @@ from typing import Any
 from groupagent.artifacts import ArtifactScope, ArtifactStore, ValidationRecord
 from groupagent.domain import DomainError
 from groupagent.tools import ToolContext
+from groupagent.tools.models import ToolFailure
 
 from .isolation import IsolatedMediaWorker
 from .models import (
@@ -27,10 +28,11 @@ from .models import (
     ProviderResponse,
     ProviderRoute,
     Transcript,
+    VisionBatchResult,
     VisionImageBinding,
     VisionResult,
 )
-from .providers import CapabilityRegistry, MediaHTTPProvider
+from .providers import CapabilityRegistry, MediaHTTPProvider, vision_request_bytes
 
 SourceGuard = Callable[[ToolContext, tuple[str, ...]], Awaitable[None]]
 
@@ -388,13 +390,13 @@ class MediaService:
             raise DomainError(
                 "provider_reconciliation_required",
                 "This paid call already has a durable reservation",
+                resource_ref=reservation.id,
             )
+        settled_usage = False
         try:
             if context.cancelled.is_set():
                 raise DomainError("cancelled", "Media work was cancelled")
             response = await call(provider)
-            if context.cancelled.is_set():
-                raise DomainError("cancelled", "Media work was cancelled")
             usage = {key: Decimal(str(value)) for key, value in response.usage.items()}
             if not usage or any(not value.is_finite() or value < 0 for value in usage.values()):
                 raise DomainError(
@@ -407,18 +409,68 @@ class MediaService:
                 usage,
                 route.provider + ":" + response.request_id,
             )
+            settled_usage = True
             if settled.overrun and settled.limits_enabled:
                 raise DomainError(
                     "budget_overrun", "Actual provider usage exceeded its reservation"
                 )
+            if context.cancelled.is_set():
+                raise DomainError("cancelled", "Media work was cancelled")
             return response.model_copy(update={"budget_reservation_id": reservation.id})
         except BaseException as error:
-            await asyncio.to_thread(
-                self.budget.unknown, context.actor, reservation.id, "media_call_incomplete"
-            )
+            if not settled_usage:
+                await asyncio.to_thread(
+                    self.budget.unknown, context.actor, reservation.id, "media_call_incomplete"
+                )
             if isinstance(error, DomainError) and error.resource_ref is None:
                 error.resource_ref = reservation.id
             raise
+
+    async def _vision_view(
+        self, context: ToolContext, reference: MediaRef, index: int
+    ) -> tuple[bytes, VisionImageBinding, str]:
+        content = await self._content(context, reference)
+        self._image_bytes(content)
+        source_sha256 = hashlib.sha256(content).hexdigest()
+        if source_sha256 != reference.sha256:
+            raise DomainError("media_reference_mismatch", "Image bytes differ from their reference")
+        result, outputs = await self.worker.run(
+            context,
+            "image_validate",
+            (content,),
+            parameters=self._image_parameters(),
+            outputs=("view.png",),
+        )
+        info = ImageInfo.model_validate(result)
+        if len(outputs) != 1:
+            raise DomainError("worker_integrity_failed", "Image validation returned no unique view")
+        view_sha256 = hashlib.sha256(outputs[0]).hexdigest()
+        if (
+            info.source_sha256 != source_sha256
+            or info.byte_length != len(content)
+            or info.preview_sha256 != view_sha256
+        ):
+            raise DomainError(
+                "worker_integrity_failed", "Image validation hashes differ from actual bytes"
+            )
+        binding = VisionImageBinding(
+            image_index=index,
+            file_id=reference.file_id,
+            version_id=reference.version_id,
+            source=reference.source,
+            source_sha256=source_sha256,
+            normalized_view_sha256=view_sha256,
+            normalized_pixel_sha256=info.pixel_sha256,
+            width=info.width,
+            height=info.height,
+            static_first_frame=info.static_first_frame,
+            alpha_composited_on_white=info.alpha_composited_on_white,
+        )
+        label = (
+            f"Image {index + 1}; source_message={reference.source.source_message_id}; author={reference.source.member_id}; "
+            f"quoted_message={reference.source.quote_message_id}; view={'static GIF first frame' if info.static_first_frame else 'validated pixels'}"
+        )
+        return outputs[0], binding, label
 
     async def analyze_images(
         self,
@@ -429,90 +481,165 @@ class MediaService:
     ) -> VisionResult:
         if (
             route.capability != Capability.VISION
-            or not 1 <= len(references) <= self.max_images
+            or not 1 <= len(references) <= 10
             or not prompt.strip()
             or len(prompt) > 8000
         ):
             raise DomainError(
-                "invalid_media_request", "Vision prompt or image count exceeds its configured limit"
+                "invalid_media_request", "Vision requires a prompt and one to ten ordered images"
             )
-        views, labels, hashes, sources, static, bindings = [], [], [], [], [], []
-        for index, reference in enumerate(references):
-            content = await self._content(context, reference)
-            self._image_bytes(content)
-            source_sha256 = hashlib.sha256(content).hexdigest()
-            if source_sha256 != reference.sha256:
-                raise DomainError(
-                    "media_reference_mismatch", "Image bytes differ from their reference"
-                )
-            result, outputs = await self.worker.run(
-                context,
-                "image_validate",
-                (content,),
-                parameters=self._image_parameters(),
-                outputs=("view.png",),
+        spec = self.registry.resolve(route)
+        batch_limit = min(self.max_images, spec.max_images)
+        sources = tuple(reference.source for reference in references)
+        await self._check(context, sources)
+        # Worker calls and provider batches are deliberately sequential. Only
+        # one bounded view set is retained, rather than all normalized images.
+        views: list[bytes] = []
+        labels: list[str] = []
+        indices: list[int] = []
+        bindings: list[VisionImageBinding] = []
+        batches: list[VisionBatchResult] = []
+
+        def view_prompt(image_indices: tuple[int, ...]) -> str:
+            if len(image_indices) == len(references):
+                return prompt
+            numbers = ", ".join(str(index + 1) for index in image_indices)
+            return (
+                prompt
+                + f"\n\nBounded view: this request contains only Images {numbers} of "
+                + f"{len(references)} ordered images. Report visible facts for these image "
+                + "numbers. Do not claim to have compared images outside this view."
             )
-            info = ImageInfo.model_validate(result)
-            if len(outputs) != 1:
-                raise DomainError(
-                    "worker_integrity_failed", "Image validation returned no unique view"
+
+        def result(complete: bool) -> VisionResult:
+            completed = {
+                index for batch in batches if batch.complete for index in batch.image_indices
+            }
+            bounded = len(references) > batch_limit or len(batches) > 1
+            text = "\n\n".join(
+                (
+                    "Images " + ", ".join(str(index + 1) for index in batch.image_indices) + ":\n"
+                    if bounded
+                    else ""
                 )
-            view_sha256 = hashlib.sha256(outputs[0]).hexdigest()
-            if (
-                info.source_sha256 != source_sha256
-                or info.byte_length != len(content)
-                or info.preview_sha256 != view_sha256
-            ):
-                raise DomainError(
-                    "worker_integrity_failed", "Image validation hashes differ from actual bytes"
+                + batch.text
+                for batch in batches
+                if batch.complete
+            )
+            if bounded and text:
+                text = (
+                    "Observations are scoped to each listed view; a joint visual comparison "
+                    "across views has not been performed.\n\n" + text
                 )
-            views.append(outputs[0])
-            hashes.append(view_sha256)
-            sources.append(reference.source)
-            static.append(info.static_first_frame)
-            bindings.append(
-                VisionImageBinding(
-                    image_index=index,
-                    file_id=reference.file_id,
-                    version_id=reference.version_id,
-                    source=reference.source,
-                    source_sha256=source_sha256,
-                    normalized_view_sha256=view_sha256,
-                    normalized_pixel_sha256=info.pixel_sha256,
-                    width=info.width,
-                    height=info.height,
-                    static_first_frame=info.static_first_frame,
-                    alpha_composited_on_white=info.alpha_composited_on_white,
+            return VisionResult(
+                text=text,
+                sources=tuple(binding.source for binding in bindings),
+                image_sha256=tuple(binding.normalized_view_sha256 for binding in bindings),
+                static_views=tuple(binding.static_first_frame for binding in bindings),
+                provider=route.provider,
+                model=route.model,
+                request_id=next((batch.request_id for batch in batches if batch.request_id), ""),
+                image_bindings=tuple(bindings),
+                budget_receipts=tuple(
+                    dict.fromkeys(receipt for batch in batches for receipt in batch.budget_receipts)
+                ),
+                analysis_scope="bounded_views" if bounded else "joint_view",
+                complete=complete,
+                requested_image_count=len(references),
+                unprocessed_image_indices=tuple(
+                    index for index in range(len(references)) if index not in completed
+                ),
+                batches=tuple(batches),
+            )
+
+        async def submit() -> None:
+            image_indices = tuple(indices)
+            batch_prompt = view_prompt(image_indices)
+            batch_index = len(batches)
+            response = None
+            try:
+                await self._check(context, sources)
+                response = await self._paid(
+                    context,
+                    route,
+                    "vision" if batch_index == 0 else f"vision-{batch_index}",
+                    {
+                        "input_tokens": Decimal(len(batch_prompt) * 2 + 4096 * len(views)),
+                        "output_tokens": Decimal(2048),
+                    },
+                    lambda provider: provider.vision(
+                        route, batch_prompt, tuple(views), tuple(labels)
+                    ),
+                )
+                await self._check(context, sources)
+            except DomainError as error:
+                receipt = response.budget_reservation_id if response else error.resource_ref
+                batches.append(
+                    VisionBatchResult(
+                        batch_index=batch_index,
+                        image_indices=image_indices,
+                        complete=False,
+                        request_id=response.request_id if response else None,
+                        budget_receipts=(receipt,) if receipt else (),
+                        error_code=error.code,
+                    )
+                )
+                raise
+            batches.append(
+                VisionBatchResult(
+                    batch_index=batch_index,
+                    image_indices=image_indices,
+                    complete=True,
+                    text=response.text,
+                    request_id=response.request_id,
+                    budget_receipts=(response.budget_reservation_id,)
+                    if response.budget_reservation_id
+                    else (),
                 )
             )
-            labels.append(
-                f"Image {index + 1}; source_message={reference.source.source_message_id}; author={reference.source.member_id}; "
-                f"quoted_message={reference.source.quote_message_id}; view={'static GIF first frame' if info.static_first_frame else 'validated pixels'}"
-            )
-        response = await self._paid(
-            context,
-            route,
-            "vision",
-            {
-                "input_tokens": Decimal(len(prompt) * 2 + 4096 * len(views)),
-                "output_tokens": Decimal(2048),
-            },
-            lambda provider: provider.vision(route, prompt, tuple(views), tuple(labels)),
-        )
-        await self._check(context, tuple(sources))
-        return VisionResult(
-            text=response.text,
-            sources=tuple(sources),
-            image_sha256=tuple(hashes),
-            static_views=tuple(static),
-            provider=route.provider,
-            model=route.model,
-            request_id=response.request_id,
-            image_bindings=tuple(bindings),
-            budget_receipts=(response.budget_reservation_id,)
-            if response.budget_reservation_id
-            else (),
-        )
+            views.clear()
+            labels.clear()
+            indices.clear()
+
+        try:
+            for index, reference in enumerate(references):
+                view, binding, label = await self._vision_view(context, reference, index)
+                candidate_indices = (*indices, index)
+                candidate_size = vision_request_bytes(
+                    route,
+                    view_prompt(candidate_indices),
+                    (*map(len, views), len(view)),
+                    (*labels, label),
+                )
+                if views and candidate_size > spec.max_request_bytes:
+                    await submit()
+                if (
+                    not views
+                    and vision_request_bytes(route, view_prompt((index,)), (len(view),), (label,))
+                    > spec.max_request_bytes
+                ):
+                    raise DomainError(
+                        "provider_input_limit",
+                        "One normalized image exceeds its reviewed route limit",
+                    )
+                views.append(view)
+                labels.append(label)
+                indices.append(index)
+                bindings.append(binding)
+                if len(views) == batch_limit:
+                    await submit()
+            if views:
+                await submit()
+        except DomainError as error:
+            if not batches:
+                raise
+            # A partial observation grants no exception to recall, current
+            # scope, policy or cancellation checks on the underlying evidence.
+            await self._check(context, sources)
+            failure = ToolFailure(error.code, error.message, output=result(False), no_effect=True)
+            failure.resource_ref = error.resource_ref
+            raise failure from error
+        return result(True)
 
     async def transcribe(
         self,

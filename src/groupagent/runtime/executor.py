@@ -1651,6 +1651,11 @@ class WorkSupervisor:
             "message": redacted[:1200],
             "truncated": len(redacted) > 1200,
         }
+        details = getattr(error, "details", None)
+        if isinstance(details, dict):
+            encoded = redact_credentials(json.dumps(details, ensure_ascii=False, default=str))
+            if len(encoded.encode()) <= 12000:
+                diagnostic["details"] = json.loads(encoded)
         feedback = (
             "Control-plane validation failed ("
             + error.code
@@ -1664,6 +1669,7 @@ class WorkSupervisor:
             and previous.get("error_code") == diagnostic["error_code"]
             and previous.get("message") == diagnostic["message"]
             and previous.get("goal_revision") == diagnostic["goal_revision"]
+            and previous.get("details") == diagnostic.get("details")
         )
         wait = count >= self.validation_repair_limit or repeated
         state = {

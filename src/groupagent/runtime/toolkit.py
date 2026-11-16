@@ -48,6 +48,12 @@ from groupagent.research import (
 )
 from groupagent.research.browser import ControlledBrowser, PublicPageBroker
 from groupagent.research.deepseek import DeepSeekResearchClient
+from groupagent.research.image_transforms import (
+    ImageTransformService,
+    register_image_transform_tools,
+    resolve_public_image,
+    validate_public_image_delivery,
+)
 from groupagent.research.images import ImageCandidatesOutput
 from groupagent.research.models import ResearchSource
 from groupagent.research.tools import register_browser_tool, register_research_tools
@@ -613,6 +619,7 @@ class WorkToolkit:
             speech_permission=lambda context: self._speech_permission(work, actor),
             critical_terms=lambda context: self._critical_terms(actor),
         )
+        register_image_transform_tools(gateway, ImageTransformService(media))
         register_compute_tools(gateway, worker.sandbox)
 
         async def adopt(arguments, context):
@@ -1277,11 +1284,8 @@ class WorkToolkit:
             documents, media, context, _ = self.services(work, lease, actor, workspace)
         else:
             documents, media, context = services
-        outputs = [
-            row
-            for row in self.registry.outputs(actor, work.id, lease.goal_revision)
-            if row["purpose"] == "result"
-        ]
+        produced = self.registry.outputs(actor, work.id, lease.goal_revision)
+        outputs = [row for row in produced if row["purpose"] == "result"]
         if work.scope.get("research_message_only") is True and work.goal_revision == 1 and outputs:
             raise DomainError(
                 "validation_failed",
@@ -1302,17 +1306,14 @@ class WorkToolkit:
             and requested_images > 0
             and not (required_formats & {"md", "docx", "pdf", "pptx"})
         ):
-            images = {
-                row["artifact"]["sha256"]
-                for row in outputs
-                if row["artifact"]["format"] in {"png", "jpeg", "jpg", "gif", "webp"}
-                and row["artifact"].get("provenance", {}).get("public_image")
-            }
-            if len(images) < requested_images:
-                raise DomainError(
-                    "validation_failed",
-                    "Deliver the requested number of distinct validated public images, not just links or a single duplicate",
-                )
+            validate_public_image_delivery(
+                self.artifacts,
+                ArtifactScope(actor.group_id, work.id, actor.member_id),
+                [ArtifactVersion(**row["artifact"]) for row in outputs],
+                required_count=requested_images,
+                required_formats={value for value in required_formats if isinstance(value, str)},
+                reusable=[ArtifactVersion(**row["artifact"]) for row in produced],
+            )
         if required_formats - actual_formats:
             raise DomainError(
                 "validation_failed",
@@ -1334,6 +1335,7 @@ class WorkToolkit:
         checks = {}
         drafts = []
         excerpts = []
+        retained_public_images = []
         for row in outputs:
             version = ArtifactVersion(**row["artifact"])
             matching = next(
@@ -1475,6 +1477,19 @@ class WorkToolkit:
                         "checks": validation.get("checks", []),
                     }
                 )
+                if version.format in {"png", "jpeg", "jpg", "webp", "gif"}:
+                    lineage = resolve_public_image(
+                        self.artifacts,
+                        ArtifactScope(actor.group_id, work.id, actor.member_id),
+                        version,
+                    )
+                    if lineage:
+                        retained_public_images.append((version, lineage))
+                        excerpts[-1]["public_image_source"] = {
+                            "source_sha256": lineage.source_sha256,
+                            "page_citation": lineage.page_citation,
+                            "image_citation": lineage.image_citation,
+                        }
             self.registry.validate_output(actor, lease, version.version_id, validation)
             checks["artifact:" + version.format] = (
                 "artifact-validation:" + version.version_id + ":" + validation["validation_id"]
@@ -1656,6 +1671,35 @@ class WorkToolkit:
                 source_urls.add(str(source["url"]))
                 research_sources.append(source)
             observations.append(tool_observation(receipt))
+        # A validated artifact retains its original image observation even when
+        # the current checkpoint no longer carries its discovery/import receipt.
+        # The page's historic body size is unknown here and is never fabricated.
+        for version, lineage in retained_public_images:
+            image_url = str(lineage.public_image["final_url"])
+            if any(
+                item.get("evidence_kind") == "public_image" and item.get("url") == image_url
+                for item in research_sources
+            ):
+                continue
+            research_sources.append(
+                ResearchSource(
+                    source_id="public-image:" + lineage.source_sha256,
+                    url=image_url,
+                    title=version.name,
+                    retrieved_at=datetime.fromisoformat(
+                        str(lineage.public_image["retrieved_at"]).replace("Z", "+00:00")
+                    ),
+                    citation=lineage.image_citation,
+                    provider="public_http",
+                    operation="fetch",
+                    evidence_kind="public_image",
+                    content_sha256=hashlib.sha256(b"").hexdigest(),
+                    content_bytes_received=lineage.versions[-1].size_bytes,
+                    content_bytes_returned=0,
+                    truncated_fields=("content",),
+                ).model_dump(mode="json")
+            )
+            source_urls.add(image_url)
         if work.scope.get("research_required"):
             full_answer = answer + "\n" + "\n".join(str(item.get("text", "")) for item in excerpts)
             if not source_urls or not any(url in full_answer for url in source_urls):
@@ -1732,9 +1776,12 @@ class WorkToolkit:
             ):
                 citations = list(
                     dict.fromkeys(
-                        str(source["citation"])
-                        for source in research_sources
-                        if source.get("evidence_kind") == "public_image_page"
+                        [
+                            str(source["citation"])
+                            for source in research_sources
+                            if source.get("evidence_kind") == "public_image_page"
+                        ]
+                        + [lineage.page_citation for _, lineage in retained_public_images]
                     )
                 )
                 answer = "图片已准备好。\n来源：\n" + "\n".join(citations[:5])

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -145,6 +145,20 @@ class VisionImageBinding(MediaModel):
     alpha_composited_on_white: bool
 
 
+class VisionBatchResult(MediaModel):
+    """One bounded provider view, using indices from the original ordered input."""
+
+    batch_index: int = Field(ge=0, le=9)
+    image_indices: tuple[Annotated[int, Field(ge=0, le=9)], ...] = Field(
+        min_length=1, max_length=10, description="Zero-based indices in the original ordered input."
+    )
+    complete: bool
+    text: str = ""
+    request_id: str | None = None
+    budget_receipts: tuple[str, ...] = ()
+    error_code: str | None = None
+
+
 class VisionResult(MediaModel):
     text: str
     sources: tuple[MediaSource, ...]
@@ -157,6 +171,13 @@ class VisionResult(MediaModel):
     request_id: str
     image_bindings: tuple[VisionImageBinding, ...] = Field(default=(), max_length=10)
     budget_receipts: tuple[str, ...] = ()
+    # Older receipts remain readable. A split call establishes observations only
+    # for the images in each view, never an invented joint visual comparison.
+    analysis_scope: Literal["joint_view", "bounded_views"] = "joint_view"
+    complete: bool = True
+    requested_image_count: int | None = Field(default=None, ge=1, le=10)
+    unprocessed_image_indices: tuple[Annotated[int, Field(ge=0, le=9)], ...] = ()
+    batches: tuple[VisionBatchResult, ...] = Field(default=(), max_length=10)
     untrusted_content: Literal[True] = True
 
 

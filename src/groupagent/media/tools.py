@@ -29,7 +29,11 @@ class FileReference(ToolData):
 
 
 class VisionInput(ToolData):
-    images: tuple[FileReference, ...] = Field(min_length=1, max_length=10)
+    images: tuple[FileReference, ...] = Field(
+        min_length=1,
+        max_length=10,
+        description="Ordered images; the host runs bounded sequential provider views automatically.",
+    )
     prompt: str = Field(min_length=1, max_length=8000)
     route_id: str
 
@@ -173,7 +177,7 @@ def register_media_tools(
     definitions = (
         (
             "image_analyze",
-            "Analyze actual validated pixels in the given ordered scoped images. GIF is explicitly a static first-frame view.",
+            "Analyze validated pixels in one to ten ordered scoped images. The host batches within route and memory limits. Split results contain indexed observations per bounded view, not a joint comparison across views; use complete, batches and unprocessed_image_indices to continue partial results. GIF uses its static first frame.",
             VisionInput,
             VisionResult,
             vision,
@@ -240,7 +244,7 @@ def register_media_tools(
                 max_artifact_bytes=25 * 1024 * 1024,
                 cost_meter="reserved_media_provider_usage",
                 idempotency_mode=IdempotencyMode.READ_ONLY
-                if name == "media_ocr"
+                if risk == "read_only"
                 else IdempotencyMode.RECONCILE_BEFORE_RETRY,
             )
         )

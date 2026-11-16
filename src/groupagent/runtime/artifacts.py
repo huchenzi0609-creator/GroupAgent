@@ -13,6 +13,7 @@ from psycopg.types.json import Jsonb
 from groupagent.artifacts import ArtifactScope, ArtifactStore, ArtifactVersion
 from groupagent.domain import ActorContext, DomainError, ExecutionLease, Role
 from groupagent.persistence import PostgresStore, UnitOfWork
+from groupagent.research.image_transforms import ImageTransformReceipt, resolve_public_image
 
 from .state import source_fingerprint
 
@@ -148,8 +149,15 @@ class ArtifactRegistry:
             )
 
     def _row(
-        self, tx: UnitOfWork, version_id: str, *, shared_required: bool = False
+        self,
+        tx: UnitOfWork,
+        version_id: str,
+        *,
+        shared_required: bool = False,
+        _lineage_seen: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
+        if version_id in _lineage_seen or len(_lineage_seen) >= 16:
+            raise DomainError("source_unavailable", "Artifact transform ancestry is invalid")
         row = tx.conn.execute(
             "SELECT *,clock_timestamp() AS now FROM ga_artifact_catalog WHERE group_id=%s AND version_id=%s",
             (tx.group_id, version_id),
@@ -160,11 +168,18 @@ class ArtifactRegistry:
             row["expires_at"] is not None and row["expires_at"] <= row["now"]
         ):
             raise DomainError("source_unavailable", "Artifact version is unavailable or expired")
-        if not row["shared"] and (
-            shared_required
-            or (
-                row["created_by"] != tx.actor.member_id
-                and tx.actor.role not in {Role.OWNER, Role.MAINTAINER}
+        # Recursing from an already-authorized derivative only verifies its
+        # dependency. It grants no read/share authority over the parent's bytes.
+        # Direct reads still apply this draft gate before any parent traversal.
+        if (
+            not _lineage_seen
+            and not row["shared"]
+            and (
+                shared_required
+                or (
+                    row["created_by"] != tx.actor.member_id
+                    and tx.actor.role not in {Role.OWNER, Role.MAINTAINER}
+                )
             )
         ):
             raise DomainError("permission_denied", "Draft artifact is not shared with this member")
@@ -200,6 +215,26 @@ class ArtifactRegistry:
                 raise DomainError(
                     "source_unavailable", "Artifact source has changed or was withdrawn"
                 )
+        version = ArtifactVersion(**row["body"])
+        if "image_transform" in version.provenance:
+            scope = ArtifactScope(version.group_id, version.work_id, version.created_by)
+            # Storage proves exact byte/worker lineage; catalog ancestry proves
+            # that privacy, source revisions and retention still authorize it.
+            resolve_public_image(self.artifacts, scope, version)
+            receipt = ImageTransformReceipt.model_validate(version.provenance["image_transform"])
+            parent = self._row(
+                tx, receipt.parent_version_id, _lineage_seen=_lineage_seen | {version_id}
+            )
+            if (parent["file_id"], parent["work_id"], parent["created_by"], parent["sha256"]) != (
+                receipt.parent_file_id,
+                receipt.parent_work_id,
+                receipt.parent_created_by,
+                receipt.parent_sha256,
+            ):
+                raise DomainError(
+                    "source_unavailable", "Artifact transform parent differs from its catalog"
+                )
+            self._check_stored_version(parent)
         return row
 
     def get(self, actor: ActorContext, version_id: str) -> ArtifactVersion:

@@ -13,11 +13,10 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from psycopg.types.json import Jsonb
-from pydantic import AwareDatetime, BaseModel, Field
 
 from groupagent.artifacts import ArtifactScope, ArtifactStore, ArtifactVersion
 from groupagent.artifacts.isolated import IsolatedDocumentService
@@ -45,8 +44,7 @@ from groupagent.media import (
 from groupagent.memory.common import memory_lock, source_rows
 from groupagent.memory.members import MemberService
 from groupagent.persistence import PostgresStore, UnitOfWork
-from groupagent.research.images import _access_citation
-from groupagent.research.urls import parse_public_url
+from groupagent.research.image_transforms import ImageTransformService, resolve_public_image
 from groupagent.tools import ToolContext, ToolScope
 
 from .artifacts import ArtifactRegistry
@@ -58,22 +56,6 @@ _IMAGE_FORMATS = {"png", "jpeg", "jpg", "gif", "webp"}
 _AUDIO_FORMATS = {"wav", "ogg", "mp3", "flac", "m4a", "aac"}
 _DOCUMENT_FORMATS = {"md", "docx", "pdf", "pptx"}
 _VIDEO_FORMATS = {"mp4", "mov", "mkv", "webm", "avi", "3gp", "m4v", "mpeg", "mpg"}
-
-
-class _PublicImageProvenance(BaseModel):
-    requested_url: str | None = Field(default=None, min_length=1, max_length=8192)
-    page_url: str | None = Field(default=None, min_length=1, max_length=8192)
-    page_final_url: str = Field(min_length=1, max_length=8192)
-    final_url: str = Field(min_length=1, max_length=8192)
-    page_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    page_retrieved_at: AwareDatetime
-    retrieved_at: AwareDatetime
-    content_type: Literal["image/png", "image/jpeg", "image/webp", "image/gif"]
-    discovery: Literal["img_src", "img_srcset", "open_graph", "twitter", "image_link"] | None = None
-    width: int = Field(gt=0, le=40_000_000, strict=True)
-    height: int = Field(gt=0, le=40_000_000, strict=True)
-    static_first_frame: bool = Field(strict=True)
 
 
 class AttachmentChannel(Protocol):
@@ -948,46 +930,19 @@ class InputProcessor:
             return self._source(tx, event_id, str(expected[event_id]))
 
     @staticmethod
-    def _public_image_input(original: ArtifactVersion) -> dict[str, Any]:
+    def _public_image_input(original: ArtifactVersion, store: ArtifactStore) -> dict[str, Any]:
         """Expose bounded citations only from an authorized immutable image version."""
-        if (
-            original.format not in _IMAGE_FORMATS
-            or original.provenance.get("origin_kind") != "research"
-        ):
+        if original.format not in _IMAGE_FORMATS:
             return {}
-        raw = original.provenance.get("public_image")
-        if raw is None:
+        scope = ArtifactScope(original.group_id, original.work_id, original.created_by)
+        lineage = resolve_public_image(store, scope, original)
+        if lineage is None:
             return {}
-        try:
-            verified = _PublicImageProvenance.model_validate(raw)
-            if (
-                verified.sha256 != original.sha256
-                or verified.final_url != original.provenance.get("source_url")
-                or any(
-                    parse_public_url(url)[0] != url
-                    for url in (verified.page_final_url, verified.final_url)
-                )
-                or any(
-                    not isinstance(raw[key], str) or len(raw[key]) > 64
-                    for key in ("page_retrieved_at", "retrieved_at")
-                )
-            ):
-                raise ValueError("Stored image provenance differs")
-            provenance = {
-                key: raw[key]
-                for key in _PublicImageProvenance.model_fields
-                if key in raw and raw[key] is not None
-            }
-        except (DomainError, ValueError, KeyError, TypeError, AttributeError):
-            raise DomainError(
-                "public_image_evidence_invalid", "Stored image citation provenance is invalid"
-            ) from None
+        provenance = lineage.public_image
         return {
             "public_image": provenance,
-            "page_citation": _access_citation(verified.page_final_url, verified.page_retrieved_at),
-            "image_citation": _access_citation(
-                verified.final_url, verified.retrieved_at, image=True
-            ),
+            "page_citation": lineage.page_citation,
+            "image_citation": lineage.image_citation,
         }
 
     async def _import_bytes(
@@ -1228,7 +1183,7 @@ class InputProcessor:
                 raise DomainError(
                     "scope_violation", "Artifact source association does not match its catalog"
                 )
-            public_image = self._public_image_input(original)
+            public_image = self._public_image_input(original, self.artifacts)
             if cached:
                 cached_version, cached_bytes = self.registry.read(
                     context.actor, cached["version_id"]
@@ -1243,6 +1198,24 @@ class InputProcessor:
                         "validation_failed",
                         "Cached artifact input does not match its original version",
                     )
+                cached_lineage = (
+                    resolve_public_image(
+                        self.artifacts,
+                        ArtifactScope(
+                            cached_version.group_id,
+                            cached_version.work_id,
+                            cached_version.created_by,
+                        ),
+                        cached_version,
+                    )
+                    if public_image
+                    else None
+                )
+                if public_image and cached_lineage is None:
+                    # Preserve the immutable legacy copy; the common trusted
+                    # import below produces a new verifiable input version.
+                    cached = None
+            if cached:
                 imported.append(
                     {
                         "file_id": cached_version.file_id,
@@ -1256,19 +1229,28 @@ class InputProcessor:
                     }
                 )
                 continue
-            version = await self._import_bytes(
-                context,
-                documents,
-                media,
-                source,
-                original.name,
-                content,
-                extra={
-                    "input_version_id": original_id,
-                    "source_event_ids": list(dependencies),
-                    **public_image,
-                },
-            )
+            if public_image:
+                ref = await ImageTransformService(media).copy_verified(
+                    context,
+                    original,
+                    content,
+                    source=source,
+                    source_event_ids=tuple(dependencies),
+                )
+                version = self.artifacts.get(media.scope(context), ref.file_id, ref.version_id)
+            else:
+                version = await self._import_bytes(
+                    context,
+                    documents,
+                    media,
+                    source,
+                    original.name,
+                    content,
+                    extra={
+                        "input_version_id": original_id,
+                        "source_event_ids": list(dependencies),
+                    },
+                )
             await asyncio.to_thread(self._work_guard, current, lease, context)
             self.registry.read(context.actor, original_id)
             self.registry.register(

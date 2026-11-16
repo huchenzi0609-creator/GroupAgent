@@ -446,12 +446,12 @@ async def test_wrong_route_can_be_repaired_without_an_uncertain_effect(
                 {**arguments, "route_id": "fixture-vision"},
                 replace(media_context, scope=scope, call_id="fixed", idempotency_key="fixed"),
             )
-            assert fixed.success and fixed.effect_state == EffectState.SUCCEEDED
+            assert fixed.success and fixed.effect_state == EffectState.NO_EFFECT
             assert len(calls) == 1 and set(budget.states.values()) == {"settled"}
 
 
 @pytest.mark.parametrize("code", ["provider_route_unconfigured", "provider_timeout"])
-async def test_same_error_code_after_route_preflight_remains_unknown(
+async def test_media_read_error_after_route_preflight_has_no_business_effect(
     tmp_path, media_context, media_source, monkeypatch, code
 ):
     with ArtifactStore(tmp_path / "store") as store:
@@ -478,7 +478,7 @@ async def test_same_error_code_after_route_preflight_remains_unknown(
             replace(media_context, scope=scope),
         )
         assert entered == [True] and result.error_code == code
-        assert result.effect_state == EffectState.UNKNOWN
+        assert result.effect_state == EffectState.NO_EFFECT
 
 
 async def test_fixture_budget_cannot_authorize_live_transport(
