@@ -63,3 +63,9 @@
 2026年11月15日首轮本地真实 worker 实验已完成 DOCX／PDF／PPTX 生成并渲染、离线 Chromium 共 4 项，4 PASS／36.34 秒。worker 实际限制为 512 MiB，最高 `memory_peak_bytes=357519360`（约 341 MiB），浏览器 `pids_peak=122`；原始计数留在 `runtime/pot-server/local-worker/*.json`，用例见[真实 worker 资源测试](../tests/sandbox/test_lowmem_profile.py)。这是 Linux arm64 worker 与合成小文件／网页的证据；macOS controller 的余量由固定夹具提供，不是整台 2GB 主机实测。后续图片／导入上限修复的最终镜像与源码复验由主流程另行绑定，不能把这轮结果视为目标 x86_64 整机通过。
 
 目标 x86_64 服务器另完成真实 cgroup v1 准入与共存 smoke：基线可用 982 MiB 时允许 512 MiB worker 预算；增加受限的 400 MiB 合成邻居后可用降至 602 MiB，准入拒绝；移除合成负载后恢复至 1010 MiB，再次允许。`coexistence-summary.json` 记录前后游戏 PM2 PID／启动时间相同、旧 client／bot 容器 ID 和 running 状态相同、合成探针已移除、供应商调用数 0、新版未部署；详细 JSON 保存在忽略目录 `runtime/pot-server/`。该 smoke 没有运行新版完整服务、PG 或真实微信链路。最大媒体／复杂 Office、长期负载与目标 x86_64 完整应用容量仍待验收，不能以两类隔离实验替代上线结论。
+
+## 2026-11-16 复杂工作步数适配
+
+目标测试实例的图文研究工作实际在继续取得资料和生成配图时触及原 24 轮限制。2GB 配置样例及专用维护脚本现在使用每工作 96 模型轮、160 工具调用；它们是有限的任务执行边界，不是 token 总额限制。仍使用单重型并发、原 1200 秒活跃时间、既有 worker/传输/宿主内存限制及原货币授权，不增加并发或预留内存。
+
+`tune-pot-test2-execution.sh` 仅更新专用测试实例的步数配置并提高策略版本，保留配置备份、健康检查与单调版本回滚；只重启 Pot controller。已经受理的工作仍受原预算快照约束，必须由可信维护者重新授权原目标后才能采用新步数上限，不能清零 checkpoint 用量或费用。此调整不自动续费、不扩大群或发送权限，也不恢复用户主动暂停及未知写操作。
