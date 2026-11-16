@@ -3,6 +3,12 @@
 from collections.abc import Mapping
 from typing import Any
 
+from pydantic import ValidationError
+
+from groupagent.domain import WorkOrder
+
+from .recovery import automatic_recovery_pending
+
 _REASONS = {
     "ambiguous_attachment": ("input", "同一条消息有多个附件版本，尚未确定应读取的版本。"),
     "attachment_pending": ("input", "附件还在下载，暂时没有取得可读取的内容。"),
@@ -44,6 +50,23 @@ def work_status_detail(work: Any) -> dict[str, str]:
     code = body.get("pause_reason") or preparation.get("error_code")
     if not isinstance(code, str):
         code = ""
+    try:
+        candidate = (
+            work
+            if isinstance(work, WorkOrder)
+            else WorkOrder.model_validate(
+                {key: value for key, value in body.items() if key in WorkOrder.model_fields}
+            )
+        )
+        recovering = automatic_recovery_pending(candidate)
+    except (ValidationError, TypeError, ValueError):
+        recovering = False
+    if recovering:
+        return {
+            "code": "background_processing",
+            "phase": "execution",
+            "message": "任务仍在后台处理，已有进度会保留。",
+        }
     phase, message = _REASONS.get(
         code, ("execution", "这项工作尚未完成，执行记录已保留，暂时没有更具体的可靠原因。")
     )

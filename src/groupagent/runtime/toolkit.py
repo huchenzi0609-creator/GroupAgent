@@ -1077,6 +1077,14 @@ class WorkToolkit:
             }
         )
         limits = self.config.execution
+
+        def cumulative_limit(current, original):
+            # The current explicit policy may remove a historical task cap.
+            # Numeric policies retain the stricter inherited numeric boundary.
+            if current is None:
+                return None
+            return current if original is None else min(current, original)
+
         request = ExecutionRequest(
             work_id=work.id,
             attempt_id=lease.attempt_id,
@@ -1088,7 +1096,9 @@ class WorkToolkit:
             trace_id=work.request_event_id,
             revision=work.goal_revision,
             budget=ExecutionBudget(
-                max_rounds=min(limits.max_model_rounds, original_limits.max_model_rounds),
+                max_rounds=cumulative_limit(
+                    limits.max_model_rounds, original_limits.max_model_rounds
+                ),
                 max_tokens=(
                     None
                     if limits.max_total_tokens is None
@@ -1096,8 +1106,10 @@ class WorkToolkit:
                     if original_limits.max_total_tokens is None
                     else min(limits.max_total_tokens, original_limits.max_total_tokens)
                 ),
-                max_tool_calls=min(limits.max_tool_calls, original_limits.max_tool_calls),
-                max_active_seconds=min(
+                max_tool_calls=cumulative_limit(
+                    limits.max_tool_calls, original_limits.max_tool_calls
+                ),
+                max_active_seconds=cumulative_limit(
                     limits.max_active_seconds, original_limits.max_active_seconds
                 ),
                 max_output_tokens=6000,

@@ -15,8 +15,8 @@ d = json.loads(Path(sys.argv[1]).read_text())
 if sys.argv[2] != 'restore':
     assert d['resources']['profile'] == 'server_2gb'
     assert d['execution']['max_total_tokens'] is None
-    d['execution']['max_model_rounds'] = 96
-    d['execution']['max_tool_calls'] = 160
+    for key in ('max_model_rounds', 'max_tool_calls', 'max_active_seconds', 'max_total_tokens'):
+        d['execution'][key] = None
 d['group']['policy_revision'] = max(d['group']['policy_revision'], current['group']['policy_revision']) + 1
 t = p.with_suffix('.execution-next.json')
 t.write_text(json.dumps(d, ensure_ascii=False, indent=2) + '\n')

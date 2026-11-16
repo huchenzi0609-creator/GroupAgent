@@ -4,14 +4,16 @@ import asyncio
 import hashlib
 import os
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from groupagent.artifacts import ArtifactStore
 from groupagent.artifacts.isolated import IsolatedDocumentService
-from groupagent.billing import BudgetLedger
+from groupagent.billing import BudgetLedger, PriceSnapshot
 from groupagent.channels.models import AttachmentContent, AttachmentHandle
 from groupagent.domain import (
     ActorContext,
@@ -41,6 +43,10 @@ from groupagent.resources import MemorySnapshot, ResourceDeferred, ResourceGover
 from groupagent.runtime.contracts import DeliveryDraft, PreparedExecution, ValidatedCandidate
 from groupagent.runtime.executor import WorkSupervisor
 from groupagent.runtime.inputs import InputProcessor
+from groupagent.runtime.recovery import (
+    RECOVERY_SCOPE_KEY,
+    automatic_recovery_pending,
+)
 from groupagent.runtime.state import RuntimeState
 from groupagent.scheduling.triggers import EventTriggerService
 from groupagent.tools import (
@@ -51,6 +57,7 @@ from groupagent.tools import (
     ToolScope,
     register_request_input_tool,
 )
+from groupagent.tools.models import EffectState, ToolReceipt
 
 pytestmark = pytest.mark.postgres
 
@@ -627,7 +634,9 @@ async def test_inflight_goal_change_pauses_without_resetting_unsafe_budget(env):
         await service.close()
 
 
-async def test_restart_reuses_safe_candidate_and_does_not_repeat_model_or_delivery(env):
+async def test_restart_reuses_safe_candidate_and_does_not_repeat_model_or_delivery(
+    env, resource_clock
+):
     work = new_work(env)
     first_factory = Factory()
     first = supervisor(env, first_factory)
@@ -636,6 +645,8 @@ async def test_restart_reuses_safe_candidate_and_does_not_repeat_model_or_delive
     second_factory = Factory()
     second = supervisor(env, second_factory)
     try:
+        assert await second.run_once() is None
+        advance_resources(resource_clock)
         result = await second.run_once()
         assert result.state == WorkState.DELIVERING
         assert len(second_factory.models) == 1 and not second_factory.models[0].requests
@@ -813,7 +824,9 @@ async def test_validation_heartbeat_is_persisted_but_delivery_wait_is_not_charge
         await service.close()
 
 
-async def test_expired_delivery_lease_recovers_candidate_without_rerunning_model(env):
+async def test_expired_delivery_lease_recovers_candidate_without_rerunning_model(
+    env, resource_clock
+):
     work = new_work(env)
     original = supervisor(env)
     await original.run_once()
@@ -825,6 +838,10 @@ async def test_expired_delivery_lease_recovers_candidate_without_rerunning_model
     factory = Factory()
     restarted = supervisor(env, factory)
     try:
+        lost = await restarted.run_once()
+        assert lost.state == WorkState.PAUSED and lost.pause_reason == "worker_lost"
+        assert await restarted.run_once() is None
+        advance_resources(resource_clock)
         result = await restarted.run_once()
         assert result.state == WorkState.DELIVERING
         assert len(factory.models) == 1 and not factory.models[0].requests
@@ -839,28 +856,373 @@ async def test_expired_delivery_lease_recovers_candidate_without_rerunning_model
         await restarted.close()
 
 
-async def test_exhausted_validation_repairs_fail_without_false_delivery(env):
+async def test_exhausted_validation_repairs_wait_then_recover_without_false_delivery(
+    env, resource_clock
+):
     work = new_work(env)
     validator = Validator(fail=100)
     factory = Factory()
     service = supervisor(env, factory, validator, validation_repair_limit=1)
     try:
         assert (await service.run_once()).state == WorkState.QUEUED
-        failed = await service.run_once()
-        assert failed.state == WorkState.FAILED and validator.calls == 2
+        waiting = await service.run_once()
+        assert waiting.state == WorkState.PAUSED and validator.calls == 2
+        assert automatic_recovery_pending(waiting)
         checkpoint = env.state.load_checkpoint(env.actor, work.id)
-        assert checkpoint.state == RunState.FAILED and checkpoint.candidate_text is None
+        assert checkpoint.state == RunState.PAUSED and checkpoint.candidate_text is None
         assert checkpoint.usage.rounds == 2 and checkpoint.usage.tokens == 60
         assert not deliveries(env, work.id)
-        # An explicit retry can produce a fresh candidate, but retains all spend.
-        with env.store.transaction(env.actor) as tx:
-            tx.transition_work(
-                work.id, WorkState.QUEUED, expected_revision=failed.revision, reason="retry"
-            )
+        assert await service.run_once() is None
+        assert len(factory.models) == 2
         validator.fail = 0
+        advance_resources(resource_clock)
         result = await service.run_once()
         assert result.state == WorkState.DELIVERING and len(factory.models) == 3
         assert env.state.load_checkpoint(env.actor, work.id).usage.rounds == 3
+    finally:
+        await service.close()
+
+
+def checkpoint_wait(env, reason="provider_unavailable", **checkpoint_changes):
+    """A synthetic stopped attempt with deliberately exhausted legacy numeric limits."""
+    work = new_work(env)
+    with env.store.transaction(env.actor) as tx:
+        lease = tx.claim_work(work.id, "synthetic-prior-worker")
+    checkpoint = EngineCheckpoint(
+        request=ExecutionRequest(
+            work_id=work.id,
+            attempt_id=lease.attempt_id,
+            actor=env.actor,
+            objective=work.goal,
+            workspace=env.root,
+            trace_id=work.request_event_id,
+            budget=ExecutionBudget(
+                max_rounds=1, max_tokens=1, max_tool_calls=1, max_active_seconds=1
+            ),
+        ),
+        revision=work.goal_revision,
+        state=RunState.PAUSED,
+        sequence=8,
+        messages=(ModelMessage(role="user", content=work.goal),),
+        usage=UsageTotals(rounds=500, tokens=100_000, tool_calls=1000, active_seconds=10_000),
+        safe_to_resume=True,
+        error_code=reason,
+        backend_state={"uncertain_model_usage": True, "model_recovery_pending": False},
+    ).model_copy(update=checkpoint_changes)
+    env.state.save_checkpoint(env.actor, lease, checkpoint)
+    with env.store.transaction(env.actor) as tx:
+        current = tx.get_work(work.id)
+        tx.transition_work(
+            work.id,
+            WorkState.PAUSED,
+            expected_revision=current.revision,
+            lease=lease,
+            reason=reason,
+        )
+    return work_state(env, work.id), checkpoint
+
+
+async def test_automatic_recovery_survives_restart_keeps_usage_and_unknown_fee_hold(
+    env, resource_clock
+):
+    work, previous = checkpoint_wait(env)
+    ledger = BudgetLedger(env.store, allow_test_prices=True)
+    ledger.configure(env.actor, currency="CNY", daily_limit=Decimal(50), total_limit=Decimal(50))
+    ledger.register_price(
+        env.actor,
+        PriceSnapshot(
+            id="synthetic-recovery-price",
+            provider="synthetic",
+            operation="text",
+            currency="CNY",
+            rates={"units": Decimal(1)},
+            source_url="fixture://not-a-commercial-price",
+            captured_at=datetime.now(UTC),
+            test_only=True,
+        ),
+    )
+    reservation = ledger.reserve(
+        env.actor,
+        "prior-uncertain-inference",
+        "text",
+        "synthetic-recovery-price",
+        {"units": Decimal(3)},
+    )
+    assert ledger.begin(env.actor, reservation.id)
+    ledger.unknown(env.actor, reservation.id)
+    with env.store.transaction(env.actor) as tx:
+        before = tx.conn.execute(
+            "SELECT * FROM ga_budget_reservations WHERE group_id=%s AND id=%s",
+            (env.actor.group_id, reservation.id),
+        ).fetchone()
+    initial_factory = Factory()
+    initial = supervisor(env, initial_factory)
+    assert await initial.run_once() is None
+    scheduled = work_state(env, work.id)
+    assert automatic_recovery_pending(scheduled)
+    assert not initial_factory.models
+    deadline = scheduled.scope[RECOVERY_SCOPE_KEY]["next_retry_at"]
+    await initial.close()
+
+    factory = Factory()
+    restarted = supervisor(env, factory)
+    try:
+        for _ in range(3):
+            assert await restarted.run_once() is None
+        assert work_state(env, work.id).scope[RECOVERY_SCOPE_KEY]["next_retry_at"] == deadline
+        assert not factory.models
+        advance_resources(resource_clock)
+        recovered = await restarted.run_once()
+        assert recovered.state == WorkState.DELIVERING and len(factory.models) == 1
+        current = env.state.load_checkpoint(env.actor, work.id)
+        assert current.usage.rounds == previous.usage.rounds + 1
+        assert current.usage.tokens == previous.usage.tokens + 30
+        assert current.usage.tool_calls == previous.usage.tool_calls
+        assert current.usage.active_seconds >= previous.usage.active_seconds
+        assert current.request.budget.max_rounds is None
+        assert current.request.budget.max_active_seconds is None
+        assert current.backend_state["uncertain_model_usage"] is True
+        with env.store.transaction(env.actor) as tx:
+            after = tx.conn.execute(
+                "SELECT * FROM ga_budget_reservations WHERE group_id=%s AND id=%s",
+                (env.actor.group_id, reservation.id),
+            ).fetchone()
+            policy = tx.conn.execute(
+                "SELECT daily_limit,total_limit FROM ga_budget_policy WHERE group_id=%s",
+                (env.actor.group_id,),
+            ).fetchone()
+        assert after == before and after["state"] == "unknown"
+        assert after["reserved_amount"] == Decimal(3)
+        assert policy == {"daily_limit": Decimal(50), "total_limit": Decimal(50)}
+        assert len(deliveries(env, work.id)) == 1
+        accept_pending(env, work.id)
+        await restarted.tick()
+        assert work_state(env, work.id).state == WorkState.COMPLETED
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["user_request", "auth_required", "input_required", "budget_exhausted", "effect_unknown"],
+)
+async def test_automatic_recovery_never_overrides_owner_input_billing_or_unknown_write_pause(
+    env, resource_clock, reason
+):
+    work, _ = checkpoint_wait(env, reason)
+    factory = Factory()
+    service = supervisor(env, factory)
+    try:
+        for _ in range(3):
+            advance_resources(resource_clock)
+            assert await service.run_once() is None
+        unchanged = work_state(env, work.id)
+        assert unchanged.state == WorkState.PAUSED and unchanged.pause_reason == reason
+        assert RECOVERY_SCOPE_KEY not in unchanged.scope and not factory.models
+    finally:
+        await service.close()
+
+
+async def test_owner_cancellation_still_wins_after_recovery_was_scheduled(env, resource_clock):
+    work, _ = checkpoint_wait(env)
+    factory = Factory()
+    service = supervisor(env, factory)
+    try:
+        assert await service.run_once() is None
+        cancel_work(env, work.id)
+        advance_resources(resource_clock)
+        assert await service.run_once() is None
+        assert work_state(env, work.id).state == WorkState.CANCELLED
+        assert not factory.models
+    finally:
+        await service.close()
+
+
+async def test_unknown_native_write_is_blocked_even_with_a_malformed_safe_checkpoint(
+    env, resource_clock
+):
+    receipt = ToolReceipt(
+        call_id="synthetic-native-write",
+        tool_name="synthetic-native-write",
+        idempotency_key="never-replay",
+        success=False,
+        effect_state=EffectState.UNKNOWN,
+    )
+    work, _ = checkpoint_wait(env, receipts=(receipt,))
+    factory = Factory()
+    service = supervisor(env, factory)
+    try:
+        for _ in range(3):
+            advance_resources(resource_clock)
+            assert await service.run_once() is None
+        blocked = work_state(env, work.id)
+        assert blocked.state == WorkState.PAUSED and blocked.pause_reason == "effect_unknown"
+        assert not automatic_recovery_pending(blocked) and not factory.models
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize("change", ["policy", "source", "identity"])
+async def test_every_retry_revalidates_current_policy_source_and_actor(env, resource_clock, change):
+    work, _ = checkpoint_wait(env)
+    initial = supervisor(env)
+    assert await initial.run_once() is None
+    await initial.close()
+    if change == "policy":
+        env.store.register_group(env.actor.group_id, policy_revision=2)
+        env.actor = env.actor.model_copy(update={"policy_revision": 2})
+        env.control = env.control.model_copy(update={"policy_revision": 2})
+    elif change == "source":
+        with env.store.transaction(env.actor) as tx:
+            tx.conn.execute(
+                "UPDATE ga_events SET memory_state='forgotten' WHERE group_id=%s AND id=%s",
+                (env.actor.group_id, work.request_event_id),
+            )
+    factory = Factory()
+    restarted = supervisor(env, factory)
+    if change == "identity":
+        restarted.resolve_actor = lambda member: env.actor.model_copy(update={"member_id": "other"})
+    try:
+        advance_resources(resource_clock)
+        assert await restarted.run_once() is None
+        blocked = work_state(env, work.id)
+        expected = {
+            "policy": "policy_changed",
+            "source": "source_unavailable",
+            "identity": "scope_violation",
+        }[change]
+        assert blocked.state == WorkState.PAUSED and blocked.pause_reason == expected
+        assert not automatic_recovery_pending(blocked) and not factory.models
+    finally:
+        await restarted.close()
+
+
+async def test_identical_validation_failures_back_off_across_restarts_until_fixed(
+    env, resource_clock
+):
+    work = new_work(env)
+    factory = Factory()
+    validator = Validator(fail=100)
+    first = supervisor(env, factory, validator, validation_repair_limit=0)
+    waiting = await first.run_once()
+    assert waiting.state == WorkState.PAUSED
+    first_metadata = waiting.scope[RECOVERY_SCOPE_KEY]
+    assert first_metadata["backoff_step"] == 0
+    await first.close()
+    second = supervisor(env, factory, validator, validation_repair_limit=0)
+    try:
+        assert await second.run_once() is None
+        advance_resources(resource_clock)
+        waiting = await second.run_once()
+        assert waiting.state == WorkState.PAUSED and validator.calls == 2
+        metadata = waiting.scope[RECOVERY_SCOPE_KEY]
+        assert metadata["backoff_step"] == 1 and metadata["consecutive_failures"] == 2
+        assert "tight loop" in metadata["strategy_instruction"]
+        for _ in range(3):
+            assert await second.run_once() is None
+        assert len(factory.models) == 2
+        validator.fail = 0
+        advance_resources(resource_clock)
+        delivered = await second.run_once()
+        assert delivered.state == WorkState.DELIVERING
+        checkpoint = env.state.load_checkpoint(env.actor, work.id)
+        assert checkpoint.usage.rounds == 3 and checkpoint.usage.tokens == 90
+        assert checkpoint.backend_state["validation_repairs"] == 1
+        assert len(deliveries(env, work.id)) == 1
+    finally:
+        await second.close()
+
+
+async def test_raw_validator_timeout_recovers_from_candidate_without_a_busy_loop_or_new_model(
+    env, resource_clock
+):
+    work = new_work(env)
+
+    class TimeoutOnce(Validator):
+        async def validate(self, *args):
+            if not self.calls:
+                self.calls += 1
+                raise TimeoutError("Synthetic transient validator timeout")
+            return await super().validate(*args)
+
+    factory = Factory()
+    service = supervisor(env, factory, TimeoutOnce())
+    try:
+        interrupted = await asyncio.wait_for(service.run_once(), 2)
+        assert interrupted.state == WorkState.PAUSED
+        assert interrupted.pause_reason == "dependency_timeout"
+        assert await service.run_once() is None
+        advance_resources(resource_clock)
+        recovered = await service.run_once()
+        assert recovered.state == WorkState.DELIVERING and len(factory.models) == 2
+        assert not factory.models[1].requests
+        assert env.state.load_checkpoint(env.actor, work.id).usage.rounds == 1
+        assert len(deliveries(env, work.id)) == 1
+    finally:
+        await service.close()
+
+
+async def test_preparation_dependency_can_restore_without_checkpoint_and_preserves_time(
+    env, resource_clock
+):
+    work = new_work(env)
+
+    class DependencyOnce(Factory):
+        def __init__(self):
+            super().__init__()
+            self.fail = True
+
+        async def __call__(self, *args):
+            if self.fail:
+                self.fail = False
+                raise DomainError("dependency_unavailable", "Synthetic temporary dependency")
+            return await super().__call__(*args)
+
+    factory = DependencyOnce()
+    first = supervisor(env, factory)
+    interrupted = await first.run_once()
+    floor = interrupted.scope["_runtime_preparation"]["usage_floor"]
+    assert interrupted.state == WorkState.PAUSED and floor > 0
+    assert await first.run_once() is None
+    await first.close()
+    restarted = supervisor(env, factory)
+    try:
+        advance_resources(resource_clock)
+        recovered = await restarted.run_once()
+        assert recovered.state == WorkState.DELIVERING
+        assert len(factory.models) == 1
+        assert env.state.load_checkpoint(env.actor, work.id).usage.active_seconds >= floor
+    finally:
+        await restarted.close()
+
+
+async def test_recovery_never_waives_unknown_input_reservation(env, resource_clock):
+    work, _ = checkpoint_wait(env, "preparation_timeout")
+    with env.store.transaction(env.actor) as tx:
+        tx.conn.execute(
+            "INSERT INTO ga_media_inputs(group_id,event_id,attachment_id,body) VALUES(%s,%s,%s,%s)",
+            (
+                env.actor.group_id,
+                work.request_event_id,
+                "synthetic-input",
+                Jsonb(
+                    {
+                        "state": "failed",
+                        "error_code": "provider_reconciliation_required",
+                        "reconciliation_reservation_id": "synthetic-held-unknown-input",
+                    }
+                ),
+            ),
+        )
+    factory = Factory()
+    service = supervisor(env, factory)
+    try:
+        advance_resources(resource_clock)
+        assert await service.run_once() is None
+        held = work_state(env, work.id)
+        assert held.state == WorkState.PAUSED
+        assert held.pause_reason == "provider_reconciliation_required"
+        assert not factory.models and not automatic_recovery_pending(held)
     finally:
         await service.close()
 

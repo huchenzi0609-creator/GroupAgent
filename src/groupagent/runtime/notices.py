@@ -9,6 +9,7 @@ from groupagent.memory.common import memory_lock
 from groupagent.persistence import PostgresStore, UnitOfWork
 
 from .contracts import ActorResolver
+from .recovery import is_automatic_recovery_reason
 from .work_status import work_status_detail
 
 
@@ -26,6 +27,16 @@ def check_notice(tx: UnitOfWork, intent_id: str) -> None:
     ):
         raise DomainError("source_unavailable", "Generic active-work notices are disabled")
     work = tx._work_row(row["work_id"])
+    if (
+        is_automatic_recovery_reason(work["pause_reason"])
+        and tx.get_delivery(intent_id).state.value == "pending"
+        and not tx.conn.execute(
+            "SELECT 1 FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s "
+            "AND state<>'pending' LIMIT 1",
+            (tx.group_id, intent_id),
+        ).fetchone()
+    ):
+        raise DomainError("source_unavailable", "Automatic recovery notices are silent")
     tx._check_work_source(work)
     state, revision, *_ = row["notice_key"].split(":")
     if work["state"] != state or str(work["goal_revision"]) != revision:
@@ -73,6 +84,8 @@ class NoticeService:
                         "cancelled",
                         "group_paused",
                     }:
+                        continue
+                    if is_automatic_recovery_reason(work.pause_reason):
                         continue
                     key = f"{work.state.value}:{work.goal_revision}"
                     if work.state == WorkState.WAITING_INPUT:

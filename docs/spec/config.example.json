@@ -52,10 +52,10 @@
     "output_file_bytes": 26214400
   },
   "execution": {
-    "max_model_rounds": 24,
+    "max_model_rounds": null,
     "max_total_tokens": null,
-    "max_tool_calls": 60,
-    "max_active_seconds": 1200,
+    "max_tool_calls": null,
+    "max_active_seconds": null,
     "max_subagents": 2,
     "max_concurrent_heavy_work": 1,
     "tool_timeout_seconds": 60,

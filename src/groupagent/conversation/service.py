@@ -630,8 +630,11 @@ class ConversationCoordinator(Coordinator):
                 )
             }
             projected["goal"] = str(projected["goal"])[:3000]
+            detail = work_status_detail(row)
+            if row["state"] == "paused" and detail["code"] == "background_processing":
+                projected["state"] = "queued"
             if row["state"] in {"paused", "waiting_input", "failed"}:
-                projected["status_detail"] = work_status_detail(row)
+                projected["status_detail"] = detail
             projected["acceptance_criteria"] = [
                 str(value)[:500] for value in projected["acceptance_criteria"]
             ]

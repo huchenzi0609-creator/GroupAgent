@@ -66,7 +66,9 @@ async def test_retry_limit_and_remaining_round_budget_are_not_reset(execution_re
     assert other.calls == 1 and result.error_code == "round_budget_exhausted"
 
 
-async def test_unknown_outcome_does_not_auto_retry(execution_request, gateway):
+async def test_unknown_model_usage_retains_charge_and_can_resume_after_pause(
+    execution_request, gateway
+):
     model = RejectingFakeModel(
         [DomainError("provider_unavailable", "Lost response", retryable=True)]
     )
@@ -76,7 +78,8 @@ async def test_unknown_outcome_does_not_auto_retry(execution_request, gateway):
     )
     result = await engine.wait(await engine.start(request))
     assert model.calls == 1 and result.state == RunState.PAUSED
-    assert result.usage.tokens > 0 and not result.checkpoint.safe_to_resume
+    assert result.usage.tokens > 0 and result.checkpoint.safe_to_resume
+    assert result.checkpoint.backend_state["uncertain_model_usage"] is True
 
 
 async def test_retry_backoff_is_cancelable_and_capped(execution_request, gateway):

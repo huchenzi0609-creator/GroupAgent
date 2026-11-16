@@ -112,7 +112,7 @@ async def test_live_recovery_keeps_unknown_reservation_and_does_not_replay_tools
     "outcomes",
     [[unavailable()] * 3, [unavailable(), ModelRejected(0)] * 2, [malformed()] * 3],
 )
-async def test_exhausted_live_recovery_remains_unsafe_and_cannot_restart(
+async def test_exhausted_inference_recovery_retains_unknown_fees_and_can_continue(
     execution_request, gateway, outcomes
 ):
     model = ModelSequence(outcomes)
@@ -120,12 +120,18 @@ async def test_exhausted_live_recovery_remains_unsafe_and_cannot_restart(
     engine = ScopedToolEngine(model, gateway, model_budget=budget)
     result = await engine.wait(await engine.start(retry_request(execution_request)))
     assert result.state == RunState.PAUSED and len(model.requests) == 3
-    assert result.usage.rounds == 3 and not result.checkpoint.safe_to_resume
+    assert result.usage.rounds == 3 and result.checkpoint.safe_to_resume
     assert result.usage.tokens == sum(budget.reserved.values())
     assert all(usage is None for usage in budget.settled.values())
-    with pytest.raises(DomainError) as failure:
-        await engine.resume(result.checkpoint, execution_request.actor, attempt_id="unsafe-restart")
-    assert failure.value.code == "recovery_required" and len(model.requests) == 3
+    restored_model = ModelSequence([final_reply()])
+    restored = ScopedToolEngine(restored_model, gateway, model_budget=budget)
+    continued = await restored.wait(
+        await restored.resume(result.checkpoint, execution_request.actor, attempt_id="funded-retry")
+    )
+    assert continued.state == RunState.CANDIDATE and continued.usage.rounds == 4
+    assert continued.usage.tokens == result.usage.tokens + 15
+    assert set(budget.reserved) == {"1", "2", "3", "4"}
+    assert all(budget.settled[key] is None for key in ("1", "2", "3"))
 
 
 @pytest.mark.parametrize("constraint", ["round", "token", "disabled"])
@@ -157,7 +163,7 @@ async def test_each_retry_rechecks_work_limits(
     result = await engine.wait(await engine.start(retry_request(execution_request, **limits)))
     assert result.error_code == expected and len(model.requests) == 1
     assert len(budget.reserved) == 1 and result.usage.rounds == 1
-    assert budget.settled == {"1": None} and not result.checkpoint.safe_to_resume
+    assert budget.settled == {"1": None} and result.checkpoint.safe_to_resume
 
 
 @pytest.mark.parametrize("stop", ["cancel", "time"])
@@ -177,9 +183,10 @@ async def test_live_recovery_wait_respects_cancel_and_active_deadline(
                 run.active_since = asyncio.get_running_loop().time() - 1201
 
     engine = ScopedToolEngine(model, gateway, event_sink=on_event)
-    result = await engine.wait(await engine.start(retry_request(execution_request)))
+    request = retry_request(execution_request, max_active_seconds=1200)
+    result = await engine.wait(await engine.start(request))
     assert result.error_code == ("cancelled" if stop == "cancel" else "time_budget_exhausted")
-    assert len(model.requests) == 1 and not result.checkpoint.safe_to_resume
+    assert len(model.requests) == 1 and result.checkpoint.safe_to_resume
 
 
 async def test_timeout_with_late_model_result_is_never_retried_or_dispatched(
@@ -274,7 +281,7 @@ async def test_host_harness_retries_only_model_and_preserves_previous_tool_recei
         ([malformed()] * 3, "invalid_model_response"),
     ],
 )
-async def test_host_harness_exhaustion_cannot_clear_unknown_recovery(
+async def test_host_harness_exhaustion_preserves_unknown_fees_without_execution_fence(
     execution_request, gateway, outcomes, expected
 ):
     model = ModelSequence(outcomes)
@@ -283,16 +290,13 @@ async def test_host_harness_exhaustion_cannot_clear_unknown_recovery(
     with pytest.raises(DomainError) as failure:
         await engine._relay_model(run, payload)
     assert failure.value.code == expected
-    assert len(model.requests) == run.usage.rounds == 3 and not run.safe_to_resume
+    assert len(model.requests) == run.usage.rounds == 3 and run.safe_to_resume
     assert run.usage.tokens == sum(budget.reserved.values())
-    assert run.backend_state["model_recovery_pending"] is True
+    assert run.backend_state["model_recovery_pending"] is False
+    assert run.backend_state["uncertain_model_usage"] is True
     assert all(value is None for value in budget.settled.values())
     await engine._finish(run, RunState.PAUSED, expected)
-    with pytest.raises(DomainError) as refused:
-        await engine.resume(
-            engine._checkpoint(run), execution_request.actor, attempt_id="unsafe-harness-restart"
-        )
-    assert refused.value.code == "recovery_required" and len(model.requests) == 3
+    assert engine._checkpoint(run).safe_to_resume and len(model.requests) == 3
 
 
 @pytest.mark.parametrize("backend", ["core", "harness"])
@@ -364,6 +368,131 @@ class SyntheticHarnessRunner:
 
     async def remove_container(self, *args):
         self.process.kill()
+
+
+async def test_finished_harness_can_resume_after_exhausted_inference_with_unknown_fees(
+    execution_request, gateway, monkeypatch
+):
+    """Native protocol fixture, with one durable write and separately charged recovery."""
+    first_process, second_process = SyntheticHarnessProcess(), SyntheticHarnessProcess()
+    processes = iter((first_process, second_process))
+
+    async def create_process(*args, **kwargs):
+        return next(processes)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    budget = RecordingBudget()
+    first_model = ModelSequence([write_reply("mcp__groupagent__"), *[unavailable()] * 3])
+    first = HarnessEngine(
+        first_model, gateway, SyntheticHarnessRunner(first_process), model_budget=budget
+    )
+
+    async def first_protocol():
+        initial = await first_process.commands.get()
+        tools = [
+            {
+                **tool,
+                "function": {
+                    **tool["function"],
+                    "name": "mcp__groupagent__" + tool["function"]["name"],
+                },
+            }
+            for tool in initial["tools"]
+        ]
+        payload = {"messages": [{"role": "user", "content": initial["prompt"]}], "tools": tools}
+        first_process.emit(
+            {"type": "request", "id": "first", "method": "model", "payload": payload}
+        )
+        reply = await first_process.commands.get()
+        call = reply["result"]["choices"][0]["message"]["tool_calls"][0]
+        first_process.emit(
+            {
+                "type": "request",
+                "id": "write",
+                "method": "tool",
+                "payload": {
+                    "name": "workspace_write_text",
+                    "arguments": json.loads(call["function"]["arguments"]),
+                },
+            }
+        )
+        await first_process.commands.get()
+        first_process.emit({"type": "request", "id": "lost", "method": "model", "payload": payload})
+        failure = await first_process.commands.get()
+        assert failure["error"] == "provider_unavailable"
+        first_process.emit(
+            {
+                "type": "finished",
+                "finish_reason": "error",
+                "text": None,
+                "sessions": "native-checkpoint-after-write",
+            }
+        )
+
+    protocol = asyncio.create_task(first_protocol())
+    paused = await asyncio.wait_for(
+        first.wait(await first.start(retry_request(execution_request))), 2
+    )
+    await protocol
+    assert paused.state == RunState.PAUSED and paused.error_code == "provider_unavailable"
+    assert paused.checkpoint.safe_to_resume and len(paused.receipts) == 1
+    assert paused.checkpoint.backend_state["uncertain_model_usage"] is True
+    assert all(budget.settled[key] is None for key in ("2", "3", "4"))
+
+    second_model = ModelSequence([final_reply()])
+    second = HarnessEngine(
+        second_model, gateway, SyntheticHarnessRunner(second_process), model_budget=budget
+    )
+
+    async def second_protocol():
+        initial = await second_process.commands.get()
+        assert initial["sessions"] == "native-checkpoint-after-write"
+        tools = [
+            {
+                **tool,
+                "function": {
+                    **tool["function"],
+                    "name": "mcp__groupagent__" + tool["function"]["name"],
+                },
+            }
+            for tool in initial["tools"]
+        ]
+        second_process.emit(
+            {
+                "type": "request",
+                "id": "continue",
+                "method": "model",
+                "payload": {
+                    "messages": [{"role": "user", "content": initial["prompt"]}],
+                    "tools": tools,
+                },
+            }
+        )
+        response = await second_process.commands.get()
+        second_process.emit(
+            {
+                "type": "finished",
+                "finish_reason": "completed",
+                "text": response["result"]["choices"][0]["message"]["content"],
+                "sessions": "native-checkpoint-complete",
+            }
+        )
+
+    protocol = asyncio.create_task(second_protocol())
+    result = await asyncio.wait_for(
+        second.wait(
+            await second.resume(
+                paused.checkpoint, execution_request.actor, attempt_id="fresh-funded-inference"
+            )
+        ),
+        2,
+    )
+    await protocol
+    assert result.state == RunState.CANDIDATE and len(result.receipts) == 1
+    assert len(second_model.requests) == 1 and result.usage.rounds == 5
+    assert result.usage.tokens == paused.usage.tokens + 15
+    assert all(budget.settled[key] is None for key in ("2", "3", "4"))
+    assert (execution_request.workspace / "once.txt").read_text() == "Synthetic content"
 
 
 @pytest.mark.parametrize("failure", [unavailable, malformed])
@@ -450,7 +579,7 @@ async def test_host_harness_finished_checkpoint_separates_unknown_fees_from_safe
     assert persisted.usage == result.usage and persisted.receipts == result.receipts
     assert persisted.backend_state == result.checkpoint.backend_state
     assert any(
-        not item.safe_to_resume and item.backend_state.get("model_recovery_pending") is True
+        not item.safe_to_resume and item.backend_state.get("uncertain_model_usage") is True
         for item in checkpoints[:-1]
     )
     assert len(result.receipts) == result.usage.tool_calls == 1
@@ -492,7 +621,7 @@ async def test_retry_reservation_denial_does_not_clear_the_previous_unknown_boun
     model = ModelSequence([unavailable(), final_reply()])
     engine = ScopedToolEngine(model, gateway, model_budget=budget)
     result = await engine.wait(await engine.start(retry_request(execution_request)))
-    assert result.error_code == "budget_exhausted" and not result.checkpoint.safe_to_resume
-    assert result.checkpoint.backend_state["model_recovery_pending"] is True
+    assert result.error_code == "budget_exhausted" and result.checkpoint.safe_to_resume
+    assert result.checkpoint.backend_state["model_recovery_pending"] is False
     assert len(model.requests) == result.usage.rounds == 1
     assert result.usage.tokens == budget.reserved["1"] and budget.settled["1"] is None

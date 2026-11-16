@@ -1377,7 +1377,8 @@ class UnitOfWork:
         if state == WorkState.COMPLETED:
             deliveries = self.conn.execute(
                 "SELECT state FROM ga_deliveries WHERE group_id = %s AND work_id = %s "
-                "AND goal_revision = %s",
+                "AND goal_revision = %s AND NOT (state = 'rejected' "
+                "AND reason IS NOT DISTINCT FROM 'candidate_superseded_before_dispatch')",
                 (self.group_id, work_id, row["goal_revision"]),
             ).fetchall()
             if not deliveries or any(

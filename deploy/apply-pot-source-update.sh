@@ -47,6 +47,18 @@ rollback() {
   trap - ERR
   systemctl stop pot-test2-container.service || true
   systemctl stop pot-test2-docker-proxy.service || true
+  # New nullable budgets/compressed checkpoints need the new reader. Preserve
+  # them and park heavy work before restoring an older executable. Foreground
+  # service can return; forward recovery uses the preserved state.
+  docker run --rm --pull=never --network=none --read-only --user=994:990 \
+    --cap-drop=ALL --security-opt=no-new-privileges:true \
+    --memory=256m --memory-swap=256m --pids-limit=32 \
+    --mount type=bind,src=/etc/pot-test2/config.json,dst=/etc/pot-test2/config.json,readonly \
+    --mount type=bind,src=/etc/pot-test2/database.dsn,dst=/etc/pot-test2/database.dsn,readonly \
+    --mount type=bind,src=/run/pot-test2-postgres,dst=/run/pot-test2-postgres,readonly \
+    --entrypoint python3 "$next" -I -m groupagent.runtime.rollback \
+    --config /etc/pot-test2/config.json --dsn-file /etc/pot-test2/database.dsn \
+    --confirmed-quiesced
   cp "$release/image.before" /opt/pot-test2/worker.iid
   mv /opt/pot-test2/app/src/groupagent "$release/source.failed"
   tar -xzf "$release/source.before.tar.gz" -C /opt/pot-test2/app
@@ -84,6 +96,8 @@ d = json.loads(p.read_text())
 d['runtime']['worker_image'] = sys.argv[1]
 d['runtime']['early_ack_enabled'] = False
 d['features']['speech_reply_on_request'] = False
+for key in ('max_model_rounds', 'max_tool_calls', 'max_active_seconds', 'max_total_tokens'):
+    d['execution'][key] = None
 d['group']['policy_revision'] += 1
 temporary = p.with_suffix('.next.json')
 temporary.write_text(json.dumps(d, ensure_ascii=False, indent=2) + '\n')

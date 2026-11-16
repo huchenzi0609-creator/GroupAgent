@@ -66,7 +66,7 @@ async def test_tool_loop_returns_candidate_and_ordered_typed_events(
     "budget,expected",
     [
         (ExecutionBudget(max_tokens=1), "token_budget_exhausted"),
-        (ExecutionBudget(max_input_bytes=10), "input_budget_exhausted"),
+        (ExecutionBudget(max_input_bytes=10), "model_context_too_large"),
     ],
 )
 async def test_request_budget_is_checked_before_any_model_call(
@@ -82,10 +82,19 @@ async def test_request_budget_is_checked_before_any_model_call(
 
 
 async def test_tool_batch_budget_is_checked_before_side_effects(execution_request, gateway) -> None:
-    model = ScriptedFakeModel([call(path="must-not-exist.txt", text="x")])
+    reply = call(path="must-not-exist.txt", text="x")
+    reply = reply.model_copy(
+        update={
+            "tool_calls": (
+                reply.tool_calls[0],
+                reply.tool_calls[0].model_copy(update={"id": "second-call"}),
+            )
+        }
+    )
+    model = ScriptedFakeModel([reply])
     engine = ScopedToolEngine(model, gateway)
     execution_request = execution_request.model_copy(
-        update={"budget": ExecutionBudget(max_tool_calls=0)}
+        update={"budget": ExecutionBudget(max_tool_calls=1)}
     )
     result = await engine.wait(await engine.start(execution_request))
     assert result.error_code == "tool_budget_exhausted"
@@ -245,18 +254,22 @@ async def test_unauthorized_control_and_stale_revision_rejected(execution_reques
     await engine.wait(run_id)
 
 
-async def test_model_timeout_is_bounded_and_checkpoint_cannot_replay_request(
+async def test_quiesced_model_timeout_retains_usage_and_allows_new_funded_attempt(
     execution_request, gateway
 ):
     execution_request = execution_request.model_copy(
-        update={"budget": ExecutionBudget(model_timeout_seconds=0.01)}
+        update={"budget": ExecutionBudget(model_timeout_seconds=0.01, additional_retry_limit=0)}
     )
     engine = ScopedToolEngine(ScriptedFakeModel([answer()], delay_seconds=100), gateway)
     result = await asyncio.wait_for(engine.wait(await engine.start(execution_request)), 0.5)
     assert result.state == RunState.PAUSED and result.error_code == "model_timeout"
-    assert result.usage.tokens > 0 and not result.checkpoint.safe_to_resume
-    with pytest.raises(DomainError, match="reconciliation"):
-        await engine.resume(result.checkpoint, execution_request.actor, attempt_id="retry")
+    assert result.usage.tokens > 0 and result.checkpoint.safe_to_resume
+    restored = ScopedToolEngine(ScriptedFakeModel([answer()]), gateway)
+    resumed = await restored.wait(
+        await restored.resume(result.checkpoint, execution_request.actor, attempt_id="retry")
+    )
+    assert resumed.state == RunState.CANDIDATE
+    assert resumed.usage.tokens == result.usage.tokens + 30
 
 
 async def test_safe_resume_restores_tool_ledger_without_repeating_write(execution_request, gateway):

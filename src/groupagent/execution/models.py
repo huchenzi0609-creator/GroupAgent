@@ -18,14 +18,14 @@ class EngineData(BaseModel):
 
 
 class ExecutionBudget(EngineData):
-    max_rounds: int = Field(default=24, ge=1, le=1000)
-    # None disables the per-work cumulative token stop. Each API request still
-    # has a response-size parameter and reserves conservative monetary usage.
+    # None disables cumulative work limits. Per-call resource bounds and
+    # conservative monetary admission remain in force for every request.
+    max_rounds: int | None = Field(default=None, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
-    max_tool_calls: int = Field(default=60, ge=0)
-    max_active_seconds: float = Field(default=1200, gt=0)
+    max_tool_calls: int | None = Field(default=None, ge=1)
+    max_active_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     max_output_tokens: int = Field(default=4096, ge=1, le=65_536)
-    model_timeout_seconds: float = Field(default=60, gt=0)
+    model_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
     max_input_bytes: int = Field(default=1_000_000, ge=1)
     additional_retry_limit: int = Field(default=2, ge=0, le=5)
     max_retry_after_seconds: float = Field(default=30, ge=0, le=60)

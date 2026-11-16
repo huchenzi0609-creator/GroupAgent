@@ -50,9 +50,10 @@ async def test_unknown_provider_usage_does_not_refund_reservation(execution_requ
     model = ScriptedFakeModel([], delay_seconds=100)
     engine = ScopedToolEngine(model, gateway, model_budget=budget)
     request = execution_request.model_copy(
-        update={"budget": ExecutionBudget(model_timeout_seconds=0.01)}
+        update={"budget": ExecutionBudget(model_timeout_seconds=0.01, additional_retry_limit=0)}
     )
     result = await engine.wait(await engine.start(request))
     assert result.error_code == "model_timeout"
     assert budget.settlements == [("synthetic-reservation", None)]
-    assert not result.checkpoint.safe_to_resume
+    assert result.checkpoint.safe_to_resume
+    assert result.checkpoint.backend_state["uncertain_model_usage"] is True

@@ -568,6 +568,28 @@ async def test_execution_retry_policy_cannot_exceed_original_work_grant(
     assert run.prepared.request.budget.additional_retry_limit == effective
 
 
+async def test_current_unlimited_policy_overrides_legacy_cumulative_caps(toolkit_setup):
+    setup = toolkit_setup
+    env = setup.env
+    event = source(env)
+    with env.store.transaction(env.actor) as tx:
+        work = tx.create_work(
+            "Synthetic continued work",
+            event.id,
+            budget={"max_model_rounds": 24, "max_tool_calls": 60, "max_active_seconds": 1200},
+        )
+        lease = tx.claim_work(work.id, "synthetic-continued-work", ttl_seconds=300)
+        work = tx.get_work(work.id)
+    workspace = env.root / work.id
+    workspace.mkdir()
+    prepared = await setup.toolkit.prepare(work, lease, env.actor, workspace)
+    assert prepared.request.budget.max_rounds is None
+    assert prepared.request.budget.max_tool_calls is None
+    assert prepared.request.budget.max_active_seconds is None
+    assert prepared.request.budget.max_tokens is None
+    assert work.budget["max_model_rounds"] == 24  # Historical grant stays auditable.
+
+
 @pytest.mark.parametrize("configured,failures,expected_calls", [(0, 1, 1), (5, 2, 3)])
 async def test_semantic_model_retries_respect_original_grant_and_keep_unknown_charges(
     toolkit_setup, configured, failures, expected_calls

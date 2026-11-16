@@ -126,10 +126,10 @@ class LimitsConfig(StrictModel):
 
 
 class ExecutionConfig(StrictModel):
-    max_model_rounds: PositiveInt = 24
+    max_model_rounds: PositiveInt | None = None
     max_total_tokens: PositiveInt | None = None
-    max_tool_calls: PositiveInt = 60
-    max_active_seconds: PositiveInt = 1200
+    max_tool_calls: PositiveInt | None = None
+    max_active_seconds: PositiveInt | None = None
     max_subagents: Annotated[int, Field(strict=True, ge=0)] = 2
     max_concurrent_heavy_work: PositiveInt = 1
     tool_timeout_seconds: PositiveInt = 60
