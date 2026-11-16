@@ -27,16 +27,19 @@ async def run(args):
     if args.output.exists():
         raise RuntimeError("Use a new preflight output path; preserve earlier evidence")
     config = AppConfig.model_validate_json(args.config.read_text())
-    allocation = json.loads(args.allocation.read_text())
-    assert allocation["source_paid_entry_frozen"] is True
-    assert Decimal(allocation["source_upper_cny"]) + Decimal(
-        allocation["allocated_cap_cny"]
-    ) <= Decimal(allocation["parent_limit_cny"])
-    assert (
-        hashlib.sha256(config.group.internal_id.encode()).hexdigest()
-        == allocation["target_group_sha256"]
-    )
-    assert config.spend.session_total_limit == Decimal(allocation["allocated_cap_cny"])
+    assert config.spend.configured_for_paid_calls()
+    if not config.spend.monetary_limits_disabled:
+        assert args.allocation is not None, "Capped testing requires its allocation manifest"
+        allocation = json.loads(args.allocation.read_text())
+        assert allocation["source_paid_entry_frozen"] is True
+        assert Decimal(allocation["source_upper_cny"]) + Decimal(
+            allocation["allocated_cap_cny"]
+        ) <= Decimal(allocation["parent_limit_cny"])
+        assert (
+            hashlib.sha256(config.group.internal_id.encode()).hexdigest()
+            == allocation["target_group_sha256"]
+        )
+        assert config.spend.session_total_limit == Decimal(allocation["allocated_cap_cny"])
     secrets = load_secret_file(
         args.secrets, frozenset({"DEEPSEEK_API_KEY", "GROUPAGENT_CHANNEL_TOKEN"})
     )
@@ -124,6 +127,7 @@ async def run(args):
             "group_messages_sent": 0,
             "model_checked": False,
             "upstream_item_purge_supported": False,
+            "monetary_limits_disabled": config.spend.monetary_limits_disabled,
         }
         if args.check_model:
             reply = await MeteredModel(
@@ -153,8 +157,9 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("config", "dsn", "secrets", "allocation", "output"):
+    for name in ("config", "dsn", "secrets", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--allocation", type=Path)
     parser.add_argument("--check-model", action="store_true")
     asyncio.run(run(parser.parse_args()))
 

@@ -583,10 +583,20 @@ async def live_phase(args, report: Report):
             (actor.group_id,),
         ).fetchone()
     require(
-        policy and policy["currency"] == "CNY" and policy["total_limit"] is not None,
+        policy
+        and policy["currency"] == "CNY"
+        and (
+            config.spend.monetary_limits_disabled
+            and policy["daily_limit"] is None
+            and policy["total_limit"] is None
+            or not config.spend.monetary_limits_disabled
+            and policy["total_limit"] is not None
+        ),
         "existing_budget_required",
     )
-    if args.budget_allocation_file:
+    if config.spend.monetary_limits_disabled:
+        report.body["budget_authorization"] = "owner_configured_unlimited"
+    elif args.budget_allocation_file:
         report.body["budget_allocation"] = allocation_check(
             read_object(args.budget_allocation_file), actor.group_id, policy["total_limit"]
         )

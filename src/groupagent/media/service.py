@@ -407,7 +407,7 @@ class MediaService:
                 usage,
                 route.provider + ":" + response.request_id,
             )
-            if settled.overrun:
+            if settled.overrun and settled.limits_enabled:
                 raise DomainError(
                     "budget_overrun", "Actual provider usage exceeded its reservation"
                 )

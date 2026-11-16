@@ -671,8 +671,8 @@ def build_app(
             raise ConfigError(
                 "Live channel needs explicit send authorization and authenticated bot member identity"
             )
-    if config.spend.group_daily_limit is None or not config.spend.pricing_snapshot_id:
-        raise ConfigError("A monetary limit and verified price snapshot are required")
+    if not config.spend.pricing_snapshot_id or not config.spend.configured_for_paid_calls():
+        raise ConfigError("An explicit monetary policy and verified price snapshot are required")
     secrets = load_secret_file(
         secrets_file, frozenset({"DEEPSEEK_API_KEY", "GROUPAGENT_CHANNEL_TOKEN"})
     )

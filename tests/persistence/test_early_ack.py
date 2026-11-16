@@ -29,7 +29,7 @@ def store() -> PostgresStore:
     if not dsn:
         pytest.skip("Set GROUPAGENT_TEST_DSN for real PostgreSQL early ACK tests")
     result = PostgresStore(dsn)
-    assert result.migrate() == 14
+    assert result.migrate() == 15
     return result
 
 
