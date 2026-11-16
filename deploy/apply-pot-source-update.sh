@@ -25,8 +25,36 @@ assert actual==m['product_source_sha256'], 'Source differs from accepted release
 assert hashlib.sha256((root/'uv.lock').read_bytes()).hexdigest()==m['lock_sha256']
 print('accepted_source_manifest_verified')
 PY
+# The trusted archive contains public code only. umask 077 plus extraction's
+# --no-same-permissions otherwise leaves 0600/0700 package files/directories,
+# unreadable to the controller's fixed non-root UID after COPY and host swap.
+chmod -R a+rX "$release/source/src/groupagent"
+if test -d "$release/source/deps"; then
+  chmod -R a+rX "$release/source/deps"
+fi
 previous=$(cat "$release/image.before")
 [[ "$previous" =~ ^sha256:[a-f0-9]{64}$ ]]
+# Prove the actual non-root runtime can read the public package before stopping
+# the existing sender. Bind only public package trees, never release backups.
+public_mounts=(--mount "type=bind,src=$release/source/src/groupagent,dst=/groupagent,readonly")
+if test -d "$release/source/deps"; then
+  public_mounts+=(--mount "type=bind,src=$release/source/deps,dst=/public-deps,readonly")
+fi
+docker run --rm --pull=never --network=none --read-only --user=994:990 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --memory=128m --memory-swap=128m --cpus=0.25 --pids-limit=32 \
+  "${public_mounts[@]}" --entrypoint python3 "$previous" -I -c '
+import json,os,sys
+from pathlib import Path
+roots=[Path("/groupagent")]
+if Path("/public-deps").is_dir(): roots.append(Path("/public-deps"))
+files=[p for root in roots for p in root.rglob("*") if p.is_file()]
+for p in files:
+ with p.open("rb") as f: f.read(1)
+sys.path[:0]=["/public-deps","/"]
+from groupagent.execution.kernel import AgentKernel
+print(json.dumps({"uid":os.getuid(),"gid":os.getgid(),"public_files_read":len(files),"source_dependency_import":True}))
+' > "$release/nonroot-public-read.json"
 old_container=$(docker inspect --format '{{.Id}}' pot-test2)
 # Capture the exact old reader's canonical JSON BEFORE normalizing legacy config.
 docker exec pot-test2 python3 -I -c 'from pathlib import Path; from groupagent.config import AppConfig; print(AppConfig.model_validate_json(Path("/etc/pot-test2/config.json").read_text()).model_dump_json())' > "$release/config.before.canonical.json"
