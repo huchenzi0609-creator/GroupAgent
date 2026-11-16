@@ -11,7 +11,7 @@ from typing import Any, NoReturn
 
 from pydantic import ValidationError
 
-from groupagent.coordinator import Decision
+from groupagent.coordinator import DECISION_CONTRACT_ERRORS, Decision
 from groupagent.domain import DomainError, GroupEvent
 from groupagent.execution.models import ModelMessage, ModelRequest
 from groupagent.execution.ports import ModelPort
@@ -197,8 +197,20 @@ def reference_catalog(context: dict[str, Any], projection: dict[str, Any]) -> di
     }
 
 
-def decision_schema() -> dict[str, Any]:
+def decision_schema(catalog: dict[str, Any] | None = None) -> dict[str, Any]:
     schema = Decision.model_json_schema()
+    if catalog is not None:
+        for field, collection in (
+            ("input_event_ids", "attachment_event_ids"),
+            ("input_versions", "file_versions"),
+        ):
+            allowed = sorted(
+                {value for value in catalog.get(collection, []) if isinstance(value, str)}
+            )
+            if allowed:
+                schema["properties"][field]["items"] = {"type": "string", "enum": allowed}
+            else:
+                schema["properties"][field]["maxItems"] = 0
     action = ACTION_ADAPTER.json_schema()
     timing = timing_contract.json_schema()
     definitions = schema.setdefault("$defs", {})
@@ -752,7 +764,7 @@ class ModelDecisionProvider:
         public.update(identity.context())
         public.update(
             time_resolution=temporal.to_dict(),
-            reference_catalog={key: value for key, value in catalog.items() if value},
+            reference_catalog=catalog,
         )
         if intent is not None:
             public["interaction_intent"] = {
@@ -782,7 +794,7 @@ class ModelDecisionProvider:
             + "\n"
             + _context_guidance(context, projection)
             + "\nDecision schema:\n"
-            + json.dumps(decision_schema(), ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(decision_schema(catalog), ensure_ascii=False, separators=(",", ":"))
         )
         messages = [
             ModelMessage(role="system", content=system),
@@ -821,7 +833,9 @@ class ModelDecisionProvider:
                 elif isinstance(error, ValidationError):
                     issues = [
                         {
-                            "path": _safe_error_path(item["loc"]),
+                            "path": DECISION_CONTRACT_ERRORS[item["type"]][0]
+                            if item["type"] in DECISION_CONTRACT_ERRORS
+                            else _safe_error_path(item["loc"]),
                             "code": item["type"],
                         }
                         for item in error.errors(

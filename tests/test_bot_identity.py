@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from groupagent.config import RuntimeConfig
+from groupagent.config import AppConfig, GroupConfig, RuntimeConfig
 from groupagent.conversation.intent import explicitly_requires_execution, new_work_intent
 from groupagent.conversation.participation import fast_observe, owner_assignment_request
 from groupagent.conversation.provider import ModelDecisionProvider
@@ -96,11 +96,33 @@ def test_english_word_and_identifier_substrings_are_not_bot_calls(name):
 )
 def test_pot_control_calls_are_immediate_without_a_model(text):
     ctx = context(
-        _works=[{"id": "work", "revision": 3, "requester_id": "self", "state": "running"}]
+        _focus_work_id="work",
+        _works=[
+            {
+                "id": "work",
+                "group_id": "synthetic-group",
+                "goal": "Current work",
+                "revision": 3,
+                "requester_id": "self",
+                "state": "running",
+            }
+        ],
     )
-    candidate = ConversationCoordinator._fast_control(None, source(text), ctx)
+    coordinator = ConversationCoordinator.__new__(ConversationCoordinator)
+    coordinator.config = AppConfig(
+        group=GroupConfig(
+            enabled=True,
+            internal_id="synthetic-group",
+            external_group_id="synthetic@chatroom",
+            owner_ids=["synthetic-owner"],
+        )
+    )
+    candidate = coordinator._fast_control(source(text), ctx)
     assert candidate and candidate.kind == "control_work"
-    assert candidate.target_work_id == "work" and candidate.expected_revision == 3
+    resolved = coordinator._resolve_work_set(
+        coordinator.actor(source(text)), source(text), candidate, ctx
+    )
+    assert resolved.ids == ("work",) and resolved.refs[0].revision == 3
 
 
 @pytest.mark.parametrize(

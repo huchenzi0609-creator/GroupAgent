@@ -7,7 +7,7 @@ never actor identity, role, group scope or a successful delivery receipt.
 
 from __future__ import annotations
 
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, NoReturn, Protocol
 
 from pydantic import (
     BaseModel,
@@ -16,11 +16,50 @@ from pydantic import (
     JsonValue,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from groupagent.config import AppConfig
 from groupagent.control import WorkCapability, WorkSelector
 from groupagent.domain import ActorContext, DomainError, EventKind, GroupEvent, Role, WorkState
 from groupagent.persistence import PostgresStore
+
+DECISION_CONTRACT_ERRORS = {
+    "decision_action_kind": ("action", "Immediate actions require command or legacy reply"),
+    "decision_action_required": ("action", "An immediate command requires an action"),
+    "decision_response_required": ("response", "A reply or clarification requires text"),
+    "decision_goal_required": ("goal", "Starting or updating work requires a goal"),
+    "decision_capabilities_kind": (
+        "work_capabilities",
+        "Capability plans require start or update work",
+    ),
+    "decision_image_count_kind": (
+        "public_image_count",
+        "Image counts require start or update work",
+    ),
+    "decision_selector_kind": ("work_selector", "Selectors require work control or query"),
+    "decision_target_required": ("target_work_id", "Updating work requires an exact target"),
+    "decision_revision_required": (
+        "expected_revision",
+        "Updating work requires its current revision",
+    ),
+    "decision_control_required": ("control", "Work control requires an operation"),
+    "decision_query_goal_forbidden": ("goal", "A work query cannot revise the goal"),
+    "decision_query_control_forbidden": ("control", "A work query cannot control execution"),
+    "decision_reference_conflict": (
+        "work_selector",
+        "Do not mix a selector and a legacy exact target",
+    ),
+    "decision_reference_required": (
+        "work_selector",
+        "Work control or query requires a resource reference",
+    ),
+}
+
+
+def _invalid_decision(code: str) -> NoReturn:
+    # Fixed codes and messages contain no candidate input or inferred identity.
+    _, message = DECISION_CONTRACT_ERRORS[code]
+    raise PydanticCustomError(code, message)
 
 
 class Decision(BaseModel):
@@ -62,38 +101,39 @@ class Decision(BaseModel):
     @model_validator(mode="after")
     def coherent(self) -> Decision:
         if self.action is not None and self.kind not in {"reply", "command"}:
-            raise ValueError("Immediate actions use command; legacy reply actions remain readable")
+            _invalid_decision("decision_action_kind")
         if self.kind == "command" and self.action is None:
-            raise ValueError("An immediate command requires an action")
+            _invalid_decision("decision_action_required")
         if self.kind in {"reply", "clarify"} and not (self.response and self.response.strip()):
-            raise ValueError("A reply needs text")
+            _invalid_decision("decision_response_required")
         if self.kind in {"start_work", "update_work"} and not (self.goal and self.goal.strip()):
-            raise ValueError("Work needs a goal")
-        if self.kind not in {"start_work", "update_work"} and (
-            self.work_capabilities or self.public_image_count is not None
-        ):
-            raise ValueError("Work capability plans belong only to starting or updating work")
+            _invalid_decision("decision_goal_required")
+        if self.kind not in {"start_work", "update_work"}:
+            if self.work_capabilities:
+                _invalid_decision("decision_capabilities_kind")
+            if self.public_image_count is not None:
+                _invalid_decision("decision_image_count_kind")
         if self.work_selector is not None and self.kind not in {"control_work", "query_work"}:
-            raise ValueError("Work selectors belong only to control commands or work queries")
-        if self.kind == "update_work" and not (self.target_work_id and self.expected_revision):
-            raise ValueError("Work changes need an exact work and revision")
+            _invalid_decision("decision_selector_kind")
+        if self.kind == "update_work":
+            if not self.target_work_id:
+                _invalid_decision("decision_target_required")
+            if self.expected_revision is None:
+                _invalid_decision("decision_revision_required")
         if self.kind == "control_work" and self.control is None:
-            raise ValueError("Control action missing")
-        if self.kind == "query_work" and (self.goal is not None or self.control is not None):
-            raise ValueError(
-                "Work queries select resources; the backend supplies their current state"
-            )
+            _invalid_decision("decision_control_required")
+        if self.kind == "query_work":
+            if self.goal is not None:
+                _invalid_decision("decision_query_goal_forbidden")
+            if self.control is not None:
+                _invalid_decision("decision_query_control_forbidden")
         if self.kind in {"control_work", "query_work"}:
             legacy_target = self.target_work_id is not None or self.expected_revision is not None
             if self.work_selector is not None:
                 if legacy_target:
-                    raise ValueError(
-                        "A work reference cannot mix a selector with a legacy exact target"
-                    )
+                    _invalid_decision("decision_reference_conflict")
             elif not (self.target_work_id and self.expected_revision):
-                raise ValueError(
-                    "Work control or query needs a selector or an exact work and revision"
-                )
+                _invalid_decision("decision_reference_required")
         return self
 
 

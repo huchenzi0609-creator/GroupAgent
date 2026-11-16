@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from groupagent.conversation.provider import ModelDecisionProvider
+from groupagent.conversation.provider import ModelDecisionProvider, decision_schema
 from groupagent.conversation.timeparse import normalize_time, shift_timing
 from groupagent.domain import DomainError, EventKind, GroupEvent
 from groupagent.execution.models import ModelReply, TokenUsage
@@ -30,6 +30,104 @@ class FixtureModel:
             text=result if isinstance(result, str) else json.dumps(result, ensure_ascii=False),
             usage=TokenUsage(input_tokens=100, output_tokens=50),
         )
+
+
+@pytest.mark.parametrize(
+    "invalid,path,code",
+    [
+        ({"kind": "start_work"}, "goal", "decision_goal_required"),
+        (
+            {
+                "kind": "start_work",
+                "goal": "Synthetic goal",
+                "action": {"op": "claim_task", "title": "Synthetic"},
+            },
+            "action",
+            "decision_action_kind",
+        ),
+        ({"kind": "command"}, "action", "decision_action_required"),
+        (
+            {"kind": "update_work", "goal": "Synthetic goal", "target_work_id": "work-report"},
+            "expected_revision",
+            "decision_revision_required",
+        ),
+        (
+            {"kind": "start_work", "goal": "Synthetic goal", "work_selector": {"basis": "focus"}},
+            "work_selector",
+            "decision_selector_kind",
+        ),
+    ],
+)
+async def test_coherence_repairs_receive_safe_specific_field_paths_and_codes(
+    environment, invalid, path, code
+):
+    model = FixtureModel(
+        {
+            "reason_code": "synthetic_contract",
+            "directness": "direct",
+            "confidence": 0.95,
+            **invalid,
+        },
+        decision("reply", response="Synthetic repaired candidate"),
+    )
+    provider = ModelDecisionProvider(model)
+    result = await provider.decide(environment.event, environment.context)
+    assert result.kind == "reply" and len(model.requests) == 2
+    assert provider.diagnostics[0]["issues"] == [{"path": path, "code": code}]
+    repair = model.requests[1].messages[-1].content
+    assert path in repair and code in repair
+
+
+async def test_empty_attachment_and_file_catalogs_remain_explicit_during_repair(environment):
+    event = environment.event.model_copy(
+        update={"text": "Find a few public pictures for a synthetic example"}
+    )
+    context = {
+        **environment.context,
+        "works": [],
+        "files": [],
+        "recent_messages": [],
+        "model_event": {"id": event.id, "text": event.text, "attachments": []},
+    }
+    valid = decision(
+        "start_work",
+        goal=event.text,
+        work_capabilities=["public_images"],
+        public_image_count=3,
+    )
+    model = FixtureModel(
+        {**valid, "input_event_ids": [event.id]},
+        {**valid, "input_versions": ["unavailable-synthetic-version"]},
+        valid,
+    )
+    provider = ModelDecisionProvider(model)
+    result = await provider.decide(event, context)
+    assert result.input_event_ids == result.input_versions == []
+    assert [item["issues"][0]["code"] for item in provider.diagnostics] == [
+        "select_authorized_attachment_event",
+        "select_available_file_version",
+    ]
+    for request in model.requests:
+        catalog = json.loads(request.messages[1].content)["context"]["reference_catalog"]
+        assert catalog["attachment_event_ids"] == catalog["file_versions"] == []
+        assert event.id in catalog["source_event_ids"]
+        schema = json.loads(request.messages[0].content.split("Decision schema:\n", 1)[1])
+        assert schema["properties"]["input_event_ids"]["maxItems"] == 0
+        assert schema["properties"]["input_versions"]["maxItems"] == 0
+
+
+def test_catalog_specific_input_schema_is_bounded_without_changing_static_compatibility():
+    dynamic = decision_schema(
+        {"attachment_event_ids": ["synthetic-b", "synthetic-a"], "file_versions": ["version-a"]}
+    )
+    assert dynamic["properties"]["input_event_ids"]["items"] == {
+        "type": "string",
+        "enum": ["synthetic-a", "synthetic-b"],
+    }
+    assert dynamic["properties"]["input_versions"]["items"]["enum"] == ["version-a"]
+    static = decision_schema()
+    assert static["properties"]["input_event_ids"]["items"] == {"type": "string"}
+    assert static["properties"]["input_versions"]["maxItems"] == 20
 
 
 def decision(kind="reply", **values):
