@@ -14,6 +14,33 @@ as **static first frame**. Original bytes, source message/member/quote IDs,
 sequence and hashes remain associated. Image metadata is not an image input to
 vision: the provider receives the actual normalized pixels.
 
+`image_analyze` accepts one to ten ordered artifact references. `max_images`
+on `MediaService` bounds the **active provider view**, independently of the
+inbound attachment policy. The service takes the smaller of that limit and the
+reviewed route's image limit, then splits further to fit its JSON/base64 byte
+limit before reserving provider cost. With the 2 GB profile's four-image view,
+five retrieved images run as four plus one. Decoding and provider calls remain
+sequential under the existing worker/resource admission; per-image byte and
+pixel caps still apply. The service retains only the current bounded view and,
+when checking its byte limit, at most one next candidate, rather than retaining
+the whole collection of normalized images.
+
+Every `VisionResult.image_bindings` entry keeps its original zero-based input
+index, file/version/source identity, original hash and actual normalized-view
+hash. `batches` records the exact image indices, provider request and budget
+receipts for each view. A single view can support joint visual reasoning;
+multiple views return `analysis_scope="bounded_views"` and indexed observations.
+They do not establish a joint visual comparison across views. GIF remains a
+static first-frame view in both cases.
+
+If a later view fails, the tool receipt has `success=false`, `complete=false`,
+the completed observations, a failed batch with any reserved-cost receipt, and
+`unprocessed_image_indices`. The agent can continue those remaining images in a
+new bounded inspection call. It must not present the partial result as complete
+or ask the user to split an otherwise valid collection. Replaying the same call
+key never repeats HTTP; a new call creates a distinct cost attempt and does not
+erase an earlier unknown charge. No hidden provider-result journal is implied.
+
 Audio ingestion accepts supported audio-only containers up to 25 MiB/600 seconds,
 checks streams, fully decodes and normalizes to mono 16 kHz PCM. Long audio is
 split into at most six bounded ASR requests. A video declaration, filename/MIME
@@ -54,7 +81,12 @@ Every paid operation needs an explicit `ProviderRoute.price_id` and durable
 budget ledger. Operations are `media.vision`, `media.asr`, `media.tts` and
 `media.ocr`. A new reservation and successful `begin` must precede HTTP.
 Success settles reported usage and saves the receipt ID. Unknown outcomes keep
-the reservation; replay cannot silently call again. Fixture budgets are accepted
+the reservation; replay cannot silently call again. Known returned usage is
+settled even when cancellation arrives with the response. Vision, cloud/local
+OCR and ASR are declared `read_only`/`READ_ONLY`: billing uncertainty does not
+claim an uncertain external business write or require user reconciliation of a
+business effect. Cancellation during HTTP retains the charge reservation and
+stops subsequent views. Fixture budgets are accepted
 only with an explicit mock HTTP transport. There is no implicit free production
 mode or inference that a text API supports all modalities.
 

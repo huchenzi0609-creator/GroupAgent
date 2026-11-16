@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "family": "public_image_retrieval_and_delivery",
+  "evidence_kind": "synthetic_sources_and_inline_codecs",
+  "delivery_cases": [
+    {
+      "id": "IMGWF-001-two-png",
+      "request": "找两张奶蛙表情包，直接交付两张有来源的 PNG 图片。",
+      "count": 2,
+      "source_format": "jpeg",
+      "output_format": "png"
+    },
+    {
+      "id": "IMGWF-002-five-png",
+      "request": "找五张奶蛙表情包，直接交付五张有来源的 PNG 图片。",
+      "count": 5,
+      "source_format": "jpeg",
+      "output_format": "png"
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "IMGWF-003-bounded-views",
+      "requirement": "Five images use bounded ordered views; a provider batch limit never becomes an unknown business effect."
+    },
+    {
+      "id": "IMGWF-004-partial-read",
+      "requirement": "A later read failure preserves completed facts and all cost receipts; retry remaining inputs without manual confirmation."
+    },
+    {
+      "id": "IMGWF-005-source-identity",
+      "requirement": "Two encodings of one original source count once; missing PNG is reported as a format constraint, not a duplicate guess."
+    },
+    {
+      "id": "IMGWF-006-revoked-source",
+      "requirement": "Converted and copied artifacts remain dependent on original source authorization and revocation."
+    },
+    {
+      "id": "IMGWF-007-safe-resume",
+      "requirement": "Reconcile failed inspections only from exact trusted read metadata and durable evidence; unknown external writes remain fenced."
+    },
+    {
+      "id": "IMGWF-008-user-quantity",
+      "requirement": "A fixed count requires bound human-request evidence. A planner-selected quantity never becomes a hard delivery requirement; an image follow-up preserves the actual requested count."
+    },
+    {
+      "id": "IMGWF-009-asynchronous-delivery",
+      "requirement": "A positively tracked queued or running send remains delivery in progress. Reconcile its existing native job without replay or candidate revalidation; genuine unknown outcomes remain fenced."
+    }
+  ]
+}

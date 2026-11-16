@@ -40,6 +40,10 @@ _PUBLIC_IMAGES = (
     "Retrieve existing images with web_search, web_image_candidates, and web_image_import. Use the actual candidate resource instead of guessing URLs. Check real pixels and dimensions, preserve source citations, and stop once the requested distinct images are ready. Existing imported public_image file/version pairs can be reused directly in a document.",
 )
 
+_IMAGE_FILES = (
+    "Use image_convert to change an existing scoped image's format. Its trusted output retains verifiable source ancestry for later validation and reuse.",
+)
+
 _COMPUTE = (
     "Use reproducible computation for calculations and charts. Installed libraries include Pillow, python-docx, python-pptx, pypdf and reportlab; use chart_render for supported charts and Pillow for custom drawings. Do not install packages over the network. Complete a necessary content/visual check once, then select the result.",
 )
@@ -60,6 +64,8 @@ def build_tool_profile(tool_names: Iterable[str]) -> ToolProfile:
         contributions.append(("images", _IMAGES))
     if names & {"web_image_candidates", "web_image_import"}:
         contributions.append(("public_images", _PUBLIC_IMAGES))
+    if "image_convert" in names:
+        contributions.append(("image_files", _IMAGE_FILES))
     if names & {"python_compute", "process_run", "shell_command", "chart_render"}:
         contributions.append(("compute", _COMPUTE))
     if "audio_transcribe" in names:
@@ -86,9 +92,16 @@ def names_for_capabilities(capabilities: Iterable[str], available: Iterable[str]
             "web_image_candidates",
             "web_image_import",
             "image_analyze",
+            "image_convert",
             "artifact_deliver",
         },
-        "image_analysis": {"image_analyze", "media_ocr", "provider_ocr", "document_extract_image"},
+        "image_analysis": {
+            "image_analyze",
+            "image_convert",
+            "media_ocr",
+            "provider_ocr",
+            "document_extract_image",
+        },
         "audio_transcription": {"audio_transcribe"},
         "compute": {
             "python_compute",

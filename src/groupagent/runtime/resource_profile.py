@@ -54,6 +54,7 @@ def worker_tool_names(names: frozenset[str]) -> frozenset[str]:
             "process_run",
             "shell_command",
             "image_analyze",
+            "image_convert",
             "media_ocr",
             "provider_ocr",
             "audio_transcribe",

@@ -66,6 +66,7 @@ from .actions import (
 )
 from .commands import is_task_declaration
 from .context import ContextBuilder, ContextQuery
+from .image_requirements import is_public_image_work, normalize_image_quantity
 from .intent import (
     explicitly_requires_execution,
     main_request,
@@ -1599,10 +1600,18 @@ class ConversationCoordinator(Coordinator):
                                 request_text,
                             )
                         )
-                        public_images = (
-                            public_image_request_count(request_text, identity=self.identity)
-                            or decision.public_image_count
+                        quantity = normalize_image_quantity(
+                            tx,
+                            event,
+                            requester_id=actor.member_id,
+                            authorized=snapshot["source_fingerprints"],
+                            count=decision.public_image_count,
+                            evidence=decision.public_image_count_evidence,
+                            image_work="public_images" in decision.work_capabilities
+                            or decision.public_image_count is not None,
+                            identity=self.identity,
                         )
+                        public_images = quantity.count
                         research_required = (
                             requires_research(request_text)
                             or public_images is not None
@@ -1708,7 +1717,8 @@ class ConversationCoordinator(Coordinator):
                                 "speech_requested": speech_requested,
                                 "delivery_artifacts": delivery_artifacts,
                                 "research_required": research_required,
-                                "public_image_count": public_images,
+                                **quantity.fields(),
+                                "planner_public_image_count": decision.public_image_count,
                                 "work_capabilities": list(decision.work_capabilities),
                                 "required_tools": [str(name) for name in required_tools],
                                 "team_task_write_allowed": team_write,
@@ -1761,13 +1771,31 @@ class ConversationCoordinator(Coordinator):
                             OutputRequirement.model_validate(value).model_dump(mode="json")
                             for value in decision.outputs
                         ]
+                        previous_work = tx.get_work(decision.target_work_id or "")
+                        quantity = normalize_image_quantity(
+                            tx,
+                            event,
+                            requester_id=actor.member_id,
+                            authorized=context["_snapshot"]["source_fingerprints"],
+                            count=decision.public_image_count,
+                            evidence=decision.public_image_count_evidence,
+                            previous=previous_work,
+                            image_work=is_public_image_work(previous_work)
+                            or "public_images" in decision.work_capabilities,
+                            identity=self.identity,
+                        )
+                        quantity_sources = dict(context["_snapshot"]["source_fingerprints"])
+                        if quantity.evidence is not None:
+                            quantity_sources[quantity.evidence.event_id] = tx.event_fingerprint(
+                                quantity.evidence.event_id
+                            )
                         work = tx.revise_work(
                             decision.target_work_id or "",
                             decision.goal or "",
                             expected_revision=decision.expected_revision or 0,
                             acceptance_criteria=decision.acceptance_criteria or None,
                             input_versions=decision.input_versions or None,
-                            source_fingerprints=context["_snapshot"]["source_fingerprints"],
+                            source_fingerprints=quantity_sources,
                             source_task_revisions=context["_snapshot"].get(
                                 "source_task_revisions", {}
                             ),
@@ -1791,11 +1819,18 @@ class ConversationCoordinator(Coordinator):
                             else None,
                         )
                         work_id = work.id
-                        if decision.work_capabilities or decision.public_image_count is not None:
+                        if (
+                            decision.work_capabilities
+                            or is_public_image_work(previous_work)
+                            or decision.public_image_count is not None
+                            or decision.public_image_count_evidence is not None
+                        ):
                             scope = dict(work.scope)
-                            scope["work_capabilities"] = list(decision.work_capabilities)
+                            if decision.work_capabilities:
+                                scope["work_capabilities"] = list(decision.work_capabilities)
+                            scope.update(quantity.fields())
                             if decision.public_image_count is not None:
-                                scope["public_image_count"] = decision.public_image_count
+                                scope["planner_public_image_count"] = decision.public_image_count
                             if set(decision.work_capabilities) & {
                                 "public_research",
                                 "public_images",

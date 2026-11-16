@@ -174,7 +174,7 @@ async def test_existing_images_are_rechecked_before_vision_or_ocr_payment(
             assert not inline_worker.calls
 
 
-async def test_vision_image_count_cannot_expand_via_existing_artifact_references(
+async def test_vision_total_image_count_cannot_expand_past_schema_limit(
     tmp_path, media_context, media_source, inline_worker
 ):
     with ArtifactStore(tmp_path / "store") as store:
@@ -182,7 +182,7 @@ async def test_vision_image_count_cannot_expand_via_existing_artifact_references
         reference = await service.ingest_image(media_context, media_source, png())
         inline_worker.calls.clear()
         with pytest.raises(DomainError) as error:
-            await service.analyze_images(media_context, (reference,) * 5, "Read", route("vision"))
+            await service.analyze_images(media_context, (reference,) * 11, "Read", route("vision"))
         assert error.value.code == "invalid_media_request" and not inline_worker.calls
 
 

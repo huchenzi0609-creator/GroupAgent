@@ -135,7 +135,11 @@ class ScopedToolEngine:
             if (
                 current.scope.group_id == request.actor.group_id
                 and current.scope.work_id == request.work_id
-                and (current.state == RunState.RUNNING or current.finishing)
+                and (
+                    current.state == RunState.RUNNING
+                    or current.finishing
+                    or not self.is_quiescent(current.request.attempt_id)
+                )
             ):
                 raise DomainError("work_busy", "This work already has an active execution")
         if self._occupied_slots() >= self._max_concurrent_runs:
@@ -149,6 +153,8 @@ class ScopedToolEngine:
             trace_id=request.trace_id,
         )
         self.gateway.bind_scope(scope)
+        if not self.gateway.is_quiescent(scope):
+            raise DomainError("work_busy", "A previous tool has not acknowledged termination")
         run = _Run(
             request=request,
             scope=scope,

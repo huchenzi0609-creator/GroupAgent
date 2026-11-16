@@ -62,6 +62,14 @@ def _invalid_decision(code: str) -> NoReturn:
     raise PydanticCustomError(code, message)
 
 
+class RequirementEvidence(BaseModel):
+    """A candidate citation; the host checks the actual authorized human source."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    event_id: str = Field(min_length=1, max_length=256)
+    quote: str = Field(min_length=1, max_length=2000)
+
+
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     kind: Literal[
@@ -96,7 +104,14 @@ class Decision(BaseModel):
         max_length=8,
         description="Requested capability families for this work plan, not permission or tool grants. The backend intersects the plan with trusted configuration and authorization.",
     )
-    public_image_count: int | None = Field(default=None, ge=1, le=10, strict=True)
+    public_image_count: int | None = Field(
+        default=None,
+        ge=1,
+        le=10,
+        strict=True,
+        description="An explicit user-requested image quantity only; omit when unspecified. Never choose a planning target here.",
+    )
+    public_image_count_evidence: RequirementEvidence | None = None
 
     @model_validator(mode="after")
     def coherent(self) -> Decision:
@@ -111,7 +126,7 @@ class Decision(BaseModel):
         if self.kind not in {"start_work", "update_work"}:
             if self.work_capabilities:
                 _invalid_decision("decision_capabilities_kind")
-            if self.public_image_count is not None:
+            if self.public_image_count is not None or self.public_image_count_evidence is not None:
                 _invalid_decision("decision_image_count_kind")
         if self.work_selector is not None and self.kind not in {"control_work", "query_work"}:
             _invalid_decision("decision_selector_kind")

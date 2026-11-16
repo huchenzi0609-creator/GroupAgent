@@ -824,9 +824,8 @@ async def test_validation_heartbeat_is_persisted_but_delivery_wait_is_not_charge
         await service.close()
 
 
-async def test_expired_delivery_lease_recovers_candidate_without_rerunning_model(
-    env, resource_clock
-):
+@pytest.mark.public_image_workflow
+async def test_expired_delivery_lease_recovers_supervision_without_model_or_validation(env):
     work = new_work(env)
     original = supervisor(env)
     await original.run_once()
@@ -838,13 +837,9 @@ async def test_expired_delivery_lease_recovers_candidate_without_rerunning_model
     factory = Factory()
     restarted = supervisor(env, factory)
     try:
-        lost = await restarted.run_once()
-        assert lost.state == WorkState.PAUSED and lost.pause_reason == "worker_lost"
-        assert await restarted.run_once() is None
-        advance_resources(resource_clock)
         result = await restarted.run_once()
         assert result.state == WorkState.DELIVERING
-        assert len(factory.models) == 1 and not factory.models[0].requests
+        assert not factory.models and restarted.validator.calls == 0
         assert len(deliveries(env, work.id)) == 1
         await original.close()  # Its stale lease must not pause the new owner.
         assert work_state(env, work.id).state == WorkState.DELIVERING

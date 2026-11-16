@@ -7,6 +7,7 @@ import json
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from groupagent.conversation.image_requirements import IMAGE_QUANTITY_INSTRUCTION
 from groupagent.domain import ActorContext, WorkOrder
 from groupagent.execution.models import ModelMessage, ModelRequest
 from groupagent.security import redact_credentials
@@ -22,9 +23,13 @@ _CORE = (
 )
 
 
-def review_request(payload: dict[str, Any], tool_names: Iterable[str]) -> ModelRequest:
+def review_request(
+    payload: dict[str, Any], tool_names: Iterable[str], *, public_image_workflow: bool = False
+) -> ModelRequest:
     names = frozenset(tool_names)
     guidance = [_CORE]
+    if public_image_workflow:
+        guidance.append(IMAGE_QUANTITY_INSTRUCTION)
     if payload.get("research_source_content") or names & {"web_search", "web_fetch", "web_read"}:
         guidance.append(
             "研究事实与额外旁注都须有实际来源或正确推导；默认、建议和示例不代表唯一必需。"

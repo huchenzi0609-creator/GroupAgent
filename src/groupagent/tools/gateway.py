@@ -42,6 +42,12 @@ class _PreparedTool:
     arguments: Any
 
 
+def tool_call_fingerprint(name: str, arguments: dict[str, Any]) -> str:
+    """The exact model proposal identity used by the durable tool ledger."""
+    encoded = json.dumps(arguments, sort_keys=True, allow_nan=False).encode("utf-8")
+    return hashlib.sha256(name.encode("utf-8") + b"\0" + encoded).hexdigest()
+
+
 def _failure(
     name: str,
     context: ToolContext,
@@ -446,10 +452,10 @@ class ToolGateway:
         if isinstance(prepared, ToolReceipt):
             return prepared
         definition, effective_context = prepared.definition, prepared.context
-        encoded, validated = prepared.encoded, prepared.arguments
+        validated = prepared.arguments
 
         key = (context.group_id, context.work_id, context.idempotency_key)
-        fingerprint = hashlib.sha256(name.encode("utf-8") + b"\0" + encoded).hexdigest()
+        fingerprint = tool_call_fingerprint(name, arguments)
         previous = self._ledger.get(key)
         if previous:
             if previous[0] != fingerprint:
@@ -653,15 +659,42 @@ class ToolGateway:
 
     def restore_ledger(self, scope: ToolScope, entries: tuple[ToolLedgerEntry, ...]) -> None:
         self._check_scope(scope)
+        if not self.is_quiescent(scope):
+            raise DomainError("work_busy", "A previous tool has not acknowledged termination")
         restored: dict[tuple[str, str, str], tuple[str, ToolReceipt]] = {}
         for entry in entries:
             if entry.receipt.effect_state == EffectState.UNKNOWN:
                 raise DomainError("recovery_required", "An unknown effect requires reconciliation")
             key = (scope.group_id, scope.work_id, entry.receipt.idempotency_key)
             value = (entry.fingerprint, entry.receipt)
-            if key in self._ledger and self._ledger[key] != value:
-                raise DomainError("idempotency_conflict", "Recovered tool ledger differs")
+            previous = self._ledger.get(key)
+            if previous is not None and previous != value:
+                # Explicit read reconciliation may update an existing gateway
+                # as well as a fresh one. Retain the exact failed call and its
+                # result; only its business-effect classification can change.
+                old = previous[1]
+                reconciled_read = (
+                    previous[0] == entry.fingerprint
+                    and self.is_read_only(old.tool_name)
+                    and not old.success
+                    and old.effect_state == EffectState.UNKNOWN
+                    and bool(old.error_code)
+                    and old.error_code != "tool_in_progress"
+                    and entry.receipt
+                    == old.model_copy(update={"effect_state": EffectState.NO_EFFECT})
+                )
+                if not reconciled_read:
+                    raise DomainError("idempotency_conflict", "Recovered tool ledger differs")
             if key in restored and restored[key] != value:
                 raise DomainError("idempotency_conflict", "Recovered tool keys conflict")
             restored[key] = value
+        if any(
+            key[:2] == (scope.group_id, scope.work_id)
+            and receipt.effect_state == EffectState.UNKNOWN
+            and key not in restored
+            for key, (_, receipt) in self._ledger.items()
+        ):
+            raise DomainError(
+                "recovery_required", "An unrecorded unknown action requires reconciliation"
+            )
         self._ledger.update(restored)

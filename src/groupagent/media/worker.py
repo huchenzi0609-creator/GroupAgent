@@ -57,6 +57,17 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
         )
         local_path(outputs[0]).write_bytes(preview)
         return metadata.model_dump(mode="json")
+    if operation == "image_convert":
+        from groupagent.research.image_transforms import convert_image
+
+        conversion_result, converted = convert_image(
+            _input(request),
+            output_format=params["format"],
+            max_bytes=params.get("max_bytes", 15 * 1024 * 1024),
+            max_pixels=params.get("max_pixels", 40_000_000),
+        )
+        local_path(outputs[0]).write_bytes(converted)
+        return conversion_result
     if operation == "audio_validate":
         audio_metadata, normalized = inspect_audio(_input(request), normalize=True)
         local_path(outputs[0]).write_bytes(normalized)
