@@ -207,7 +207,10 @@ def test_member_cannot_widen_to_group_or_mix_another_members_exact_work():
             resolve_work_selection(who, event(who), selector, candidates)
         assert error.value.code == "permission_denied"
     assert resolve_work_selection(
-        who, event(who), WorkSelector(basis="query", quantifier="all"), candidates
+        who,
+        event(who),
+        WorkSelector(basis="query", quantifier="all", requester_scope="self"),
+        candidates,
     ).ids == ("mine",)
 
 
@@ -258,7 +261,7 @@ def test_public_group_queries_do_not_require_mutation_authority_or_role_forgery(
 
 def test_readonly_does_not_expand_mine_or_bypass_group_source_and_completeness():
     who = actor(Role.OBSERVER)
-    selector = WorkSelector(basis="query", quantifier="all")
+    selector = WorkSelector(basis="query", quantifier="all", requester_scope="self")
     assert resolve_work_selection(
         who,
         event(who),

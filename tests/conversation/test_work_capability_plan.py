@@ -79,7 +79,6 @@ def test_live_schema_requests_work_plan_without_changing_selector_or_output_cont
     assert schema["$defs"]["WorkSelector"]["required"] == [
         "basis",
         "states",
-        "requester_scope",
         "quantifier",
     ]
     work_branch = next(

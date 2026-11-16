@@ -36,9 +36,9 @@ class WorkSelector(BaseModel):
         max_length=len(WorkState),
         description="Preserve every requested target-state restriction; an empty set means no state restriction. The requested operation is separate from the target state.",
     )
-    requester_scope: Literal["self", "any"] = Field(
-        default="self",
-        description="Filter the original TASK REQUESTER: self means work initiated by the current member; any means no requester filter. Referring to a set I selected does not imply I initiated its tasks. This filter grants no control authority.",
+    requester_scope: Literal["any", "self"] = Field(
+        default="any",
+        description="Optional filter on the original task requester. Omit for any requester; use self only when the current request explicitly limits work to that initiated by the current member. Authorization is checked separately and must not silently narrow the requested resource set.",
     )
     quantifier: Literal["one", "all"] = "one"
     ids: tuple[_WorkId, ...] = Field(default=(), max_length=1000)
