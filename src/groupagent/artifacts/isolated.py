@@ -11,7 +11,7 @@ from typing import Any
 from groupagent.domain import DomainError
 from groupagent.security import redact_credentials
 from groupagent.tools import ToolContext
-from groupagent.tools.models import ToolFailure
+from groupagent.tools.models import ToolFailure, ToolFailureDisposition, ToolFailureOrigin
 
 from .failures import document_input_phase
 from .models import (
@@ -62,7 +62,7 @@ class IsolatedDocumentService:
 
     @staticmethod
     def _format(name: str, *, media: bool = False) -> str:
-        with document_input_phase():
+        with document_input_phase(origin=ToolFailureOrigin.ARGUMENTS):
             return document_format(name, media=media)
 
     def _get(
@@ -84,11 +84,12 @@ class IsolatedDocumentService:
             return await self.worker.run(context, operation, inputs, **kwargs)
 
     async def _scope(self, context: ToolContext) -> ArtifactScope:
-        if context.group_id != context.actor.group_id or context.cancelled.is_set():
-            raise DomainError("cancelled", "Document work has no active scoped context")
-        if self.policy_guard:
-            await self.policy_guard(context)
-        return ArtifactScope(context.group_id, context.work_id, context.actor.member_id)
+        with document_input_phase(origin=ToolFailureOrigin.AUTHORIZATION):
+            if context.group_id != context.actor.group_id or context.cancelled.is_set():
+                raise DomainError("cancelled", "Document work has no active scoped context")
+            if self.policy_guard:
+                await self.policy_guard(context)
+            return ArtifactScope(context.group_id, context.work_id, context.actor.member_id)
 
     async def generate(
         self,
@@ -102,7 +103,7 @@ class IsolatedDocumentService:
 
         await self._scope(context)
         format_name = self._format(name)
-        with document_input_phase():
+        with document_input_phase(origin=ToolFailureOrigin.ARGUMENTS):
             if (format_name == "pptx") != isinstance(document, Deck):
                 raise DomainError(
                     "unsupported_format", "Report/deck kind does not match its output extension"
@@ -304,6 +305,8 @@ class IsolatedDocumentService:
                 "version_conflict",
                 "Field expected_version_id is stale; read the current version before retrying. No artifact version was published.",
                 no_effect=True,
+                origin=ToolFailureOrigin.PRECONDITION,
+                disposition=ToolFailureDisposition.REPAIR,
             )
         _, outputs = await self._run(
             context,
@@ -479,6 +482,8 @@ class IsolatedDocumentService:
                 "version_conflict",
                 "Field expected_version_id is stale; read the current version before retrying. No artifact version was published.",
                 no_effect=True,
+                origin=ToolFailureOrigin.PRECONDITION,
+                disposition=ToolFailureDisposition.REPAIR,
             )
         image = self._read(scope, image_file_id, image_version_id)
         _, outputs = await self._run(
