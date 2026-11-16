@@ -199,14 +199,18 @@ async def run(args):
                 formats = []
                 for row in outputs:
                     version = row["body"]
+                    formats.append(version["format"])
+                    if not entry["passed"]:
+                        continue  # Retain incomplete drafts as evidence, never claim validation.
                     scope = ArtifactScope(group, rows[0]["id"], version["created_by"])
                     content = app.dispatcher.artifacts.artifacts.read(
                         scope, version["file_id"], version["version_id"]
                     )
-                    formats.append(version["format"])
                     assert row["validation"] and row["validation"].get("passed")
                     if name == "illustrated_pdf" and version["format"] == "pdf":
                         pdf = PdfReader(io.BytesIO(content))
+                        entry["page_count"] = len(pdf.pages)
+                        entry["passed"] &= len(pdf.pages) <= 2
                         entry["pdf_image_count"] = sum(len(p.images) for p in pdf.pages)
                         entry["passed"] &= entry["pdf_image_count"] >= 2
                         entry["passed"] &= "338350" in "".join(

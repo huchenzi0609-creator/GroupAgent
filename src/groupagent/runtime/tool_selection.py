@@ -229,6 +229,30 @@ def authorized_tools(
     return authorized
 
 
+def _planned_capabilities(work: WorkOrder) -> frozenset[WorkCapability]:
+    raw = work.scope.get("work_capabilities", [])
+    if not isinstance(raw, list) or len(raw) > 8:
+        raise DomainError("invalid_input", "Stored work capability plan is invalid")
+    try:
+        return frozenset(TypeAdapter(list[WorkCapability]).validate_python(raw, strict=True))
+    except ValidationError:
+        raise DomainError("invalid_input", "Stored work capability plan is invalid") from None
+
+
+def research_evidence_required(work: WorkOrder) -> bool:
+    """Use the semantic plan, retaining the old flag only for no-plan work.
+
+    Older records always stored default empty capability arrays. A nonempty valid
+    plan is the authoritative execution intent; stale lexical flags cannot turn a
+    compute/document task into a web-research task. This changes evidence duties,
+    never the source/role tool allowlist.
+    """
+    capabilities = _planned_capabilities(work)
+    if capabilities:
+        return bool(capabilities & {"public_research", "public_images"})
+    return work.scope.get("research_required") is True
+
+
 def select_tools(
     work: WorkOrder,
     input_refs: Sequence[Mapping[str, Any]],
@@ -245,13 +269,8 @@ def select_tools(
     """
     available = _names(registered_names)
     required = _required(work, available)
-    raw = work.scope.get("work_capabilities", [])
-    if not isinstance(raw, list) or len(raw) > 8:
-        raise DomainError("invalid_input", "Stored work capability plan is invalid")
-    try:
-        capabilities = set(TypeAdapter(list[WorkCapability]).validate_python(raw, strict=True))
-    except ValidationError:
-        raise DomainError("invalid_input", "Stored work capability plan is invalid") from None
+    planned = _planned_capabilities(work)
+    capabilities = set(planned)
     outputs = work.scope.get("outputs", [])
     if isinstance(outputs, list) and any(
         isinstance(item, dict) and item.get("format") in _DOCUMENT_FORMATS for item in outputs
@@ -268,10 +287,7 @@ def select_tools(
             capabilities.add("audio_transcription")
         elif format_name in _DOCUMENT_FORMATS:
             capabilities.add("documents")
-    if (
-        work.scope.get("research_required") is True
-        or work.scope.get("research_message_only") is True
-    ):
+    if not planned and research_evidence_required(work):
         capabilities.add("public_research")
     if is_public_image_work(work):
         capabilities.add("public_images")

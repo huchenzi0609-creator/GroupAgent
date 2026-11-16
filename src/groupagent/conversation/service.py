@@ -72,7 +72,6 @@ from .intent import (
     new_work_intent,
     public_image_request_count,
     requests_speech_reply,
-    requires_research,
     task_write_request,
 )
 from .participation import fast_observe, outside_quotes, policy_intent, verified_human_addressee
@@ -1890,25 +1889,23 @@ class ConversationCoordinator(Coordinator):
                             identity=self.identity,
                         )
                         public_images = quantity.count
-                        research_required = (
-                            requires_research(request_text)
-                            or public_images is not None
-                            or bool(
-                                set(decision.work_capabilities)
-                                & {"public_research", "public_images"}
-                            )
+                        # The semantic plan describes required execution evidence.
+                        # Mentioning search in a negative clause or quoted example
+                        # cannot manufacture an extra research obligation.
+                        research_required = public_images is not None or bool(
+                            set(decision.work_capabilities) & {"public_research", "public_images"}
                         )
                         if public_images and not self.config.features.public_image_retrieval:
                             raise DomainError(
                                 "feature_disabled", "Public image retrieval is disabled"
                             )
                         direct_fetch = bool(
-                            re.match(
+                            research_required
+                            and re.match(
                                 r"(?:真正|实际|现在|直接)?(?:读取|打开|查看|访问).{0,20}https?://",
                                 main_request(request_text, identity=self.identity),
                             )
                         )
-                        research_required = research_required or direct_fetch
                         if research_required and not self.config.features.web_research:
                             raise DomainError("feature_disabled", "Web research is disabled")
                         required_tools = []
@@ -1939,7 +1936,9 @@ class ConversationCoordinator(Coordinator):
                             required_tools.append("speech_synthesize")
                         if direct_fetch:
                             required_tools.append("web_fetch")
-                        if re.match(r"(?:联网)?(?:检索|搜索|上网.{0,3}查)", main):
+                        if research_required and re.match(
+                            r"(?:联网)?(?:检索|搜索|上网.{0,3}查)", main
+                        ):
                             required_tools.append("web_search")
                         team_write = task_write_request(request_text, identity=self.identity)
                         team_targets = [

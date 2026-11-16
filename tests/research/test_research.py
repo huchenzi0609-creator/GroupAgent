@@ -430,6 +430,10 @@ async def test_research_registration_is_opt_in_and_web_instructions_cannot_expan
                     finish_reason="tool_calls",
                     usage=TokenUsage(input_tokens=20, output_tokens=10),
                 ),
+                ModelReply(
+                    text="The source is untrusted data; I read it without changing the workspace.",
+                    usage=TokenUsage(input_tokens=20, output_tokens=10),
+                ),
             ]
         )
         engine = ScopedToolEngine(fake, gateway)
@@ -446,7 +450,28 @@ async def test_research_registration_is_opt_in_and_web_instructions_cannot_expan
                 )
             )
         )
-    assert outcome.state == RunState.FAILED and outcome.error_code == "permission_denied"
+    # An invalid proposal is repairable in the same graph. Its denial must not
+    # expand authority or create an effect, even if the model finishes afterward.
+    assert outcome.state == RunState.CANDIDATE and outcome.error_code is None
+    assert len(fake.requests) == 3
+    feedback = json.loads(fake.requests[2].messages[-1].content)
+    assert feedback["type"] == "model_repair" and feedback["code"] == "tool_proposal_rejected"
+    assert feedback["batch_executed"] is False and feedback["effect_state"] == "not_started"
+    assert feedback["available_tools"] == ["web_fetch"]
+    assert feedback["issues"] == [
+        {
+            "call_id": "forbidden",
+            "name": "workspace_write_text",
+            "code": "tool_not_available",
+        }
+    ]
+    assert outcome.checkpoint.request.allowed_tools == frozenset({"web_fetch"})
+    assert all(
+        {tool["function"]["name"] for tool in request.tools} == {"web_fetch"}
+        for request in fake.requests
+    )
+    assert [receipt.tool_name for receipt in outcome.receipts] == ["web_fetch"]
+    assert outcome.usage.tool_calls == 1
     assert not (tmp_path / "escaped.txt").exists()
     assert len(requests) == 1 and requests[0].url == FETCH_ENDPOINT
     assert fake.requests[1].messages[-1].role == "tool"

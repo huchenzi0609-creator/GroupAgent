@@ -13,6 +13,7 @@ import json
 import math
 import os
 import time
+import traceback
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -71,6 +72,7 @@ from .recovery import (
     safe_recovery_checkpoint,
 )
 from .state import RuntimeState
+from .text import visible_text
 
 T = TypeVar("T")
 _CLOSED = {WorkState.COMPLETED, WorkState.CANCELLED, WorkState.FAILED}
@@ -100,6 +102,7 @@ class _Owned:
     stage_task: asyncio.Task | None = None
     released: bool = False
     quiesced: bool = False
+    phase: str = "preparation"
 
 
 class WorkSupervisor:
@@ -211,6 +214,50 @@ class WorkSupervisor:
         except Exception:
             # Policy revocation also applies to diagnostics; never use admin SQL
             # to bypass it merely to emit an alert.
+            pass
+
+    def _record_exception(
+        self,
+        actor: ActorContext,
+        work_id: str,
+        error: Exception,
+        owned: _Owned | None,
+    ) -> None:
+        """Keep a bounded diagnostic without exception repr, locals or credentials."""
+        frames = []
+        for frame in traceback.extract_tb(error.__traceback__)[-12:]:
+            parts = Path(frame.filename).parts
+            filename = (
+                "/".join(parts[parts.index("groupagent") :])
+                if "groupagent" in parts
+                else Path(frame.filename).name
+            )
+            frames.append({"file": filename, "line": frame.lineno, "function": frame.name[:120]})
+        message = visible_text(redact_credentials(str(error)))[:1600]
+        if owned is not None:
+            message = message.replace(str(owned.workspace), "[workspace]")
+        diagnostic: dict[str, Any] = {
+            "error_code": "execution_failed",
+            "exception_type": type(error).__module__ + "." + type(error).__qualname__,
+            "message": message,
+            "stage": owned.phase if owned is not None else "claim",
+            "attempt_id": owned.lease.attempt_id if owned is not None else None,
+            "frames": frames,
+        }
+        try:
+            with self.store.transaction(actor) as tx:
+                current = tx.get_work(work_id)
+                tx._audit("execution_exception", work_id, **diagnostic)
+                if owned is not None:
+                    tx.assert_lease(owned.lease)
+                    tx.conn.execute(
+                        "UPDATE ga_work_orders SET scope=jsonb_set(scope,%s,%s),revision=revision+1 "
+                        "WHERE group_id=%s AND id=%s",
+                        (["_runtime_failure"], Jsonb(diagnostic), actor.group_id, current.id),
+                    )
+        except Exception:
+            # Diagnostics cannot replace the original fault or bypass a revoked
+            # identity/lease when the failure itself is in persistence.
             pass
 
     @staticmethod
@@ -1712,6 +1759,7 @@ class WorkSupervisor:
                 )
             checkpoint = self._tag_backend(checkpoint, prepared.engine)
             checkpoint = self._recovery_instruction(checkpoint, work)
+            owned.phase = "execution"
             if checkpoint and checkpoint.state == RunState.CANDIDATE:
                 snapshot = self._snapshot(checkpoint)
                 self.state.save_checkpoint(
@@ -1780,6 +1828,10 @@ class WorkSupervisor:
                         and snapshot.checkpoint.input_request is not None
                     ):
                         question = snapshot.checkpoint.input_request.model_dump(mode="json")
+                        question["question"] = visible_text(question["question"])
+                        question["required_inputs"] = [
+                            visible_text(value) for value in question["required_inputs"]
+                        ]
                         question.update(
                             goal_revision=current.goal_revision, attempt_id=lease.attempt_id
                         )
@@ -1813,6 +1865,7 @@ class WorkSupervisor:
                     work.id, WorkState.VALIDATING, expected_revision=current.revision, lease=lease
                 )
             validation_started = time.monotonic()
+            owned.phase = "validation"
             owned.validation_started = validation_started
             owned.validation_base = snapshot.usage
 
@@ -1846,6 +1899,7 @@ class WorkSupervisor:
             self.state.load_checkpoint(
                 actor, work.id
             )  # Revalidate source fingerprints after rendering.
+            owned.phase = "delivery"
             with self.store.transaction(actor) as tx:
                 current = tx.get_work(work.id)
                 for name, evidence in candidate.checks.items():
@@ -1911,7 +1965,8 @@ class WorkSupervisor:
                     pass
             self._alert(exc.code, initial.id)
             return self._get(self.control_actor, initial.id)
-        except Exception:
+        except Exception as exc:
+            self._record_exception(actor or self.control_actor, initial.id, exc, owned)
             if owned:
                 self._preserve_validation_time(owned)
                 await self._stop_engine(owned)

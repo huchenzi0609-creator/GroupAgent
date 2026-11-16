@@ -27,7 +27,11 @@ from groupagent.domain import (
     WorkOrder,
 )
 from groupagent.runtime.tool_profiles import names_for_capabilities
-from groupagent.runtime.tool_selection import authorized_tools, select_tools
+from groupagent.runtime.tool_selection import (
+    authorized_tools,
+    research_evidence_required,
+    select_tools,
+)
 from groupagent.scheduling import AtTiming, EveryTiming, Scheduler
 from groupagent.scheduling.triggers import EventTriggerService
 from groupagent.tools import ToolContext, ToolScope
@@ -357,7 +361,7 @@ def test_derived_request_fingerprint_is_complete_for_registry_registration(runti
         ("读取https://example.org并整理成Markdown。", True),
     ],
 )
-async def test_work_research_scope_and_selector_share_positive_request_rule(
+async def test_semantic_research_plan_sets_evidence_requirement_without_parsing_prose(
     runtime_env, text, expected
 ):
     env = runtime_env
@@ -372,6 +376,7 @@ async def test_work_research_scope_and_selector_share_positive_request_rule(
                 directness="direct",
                 confidence=1,
                 outputs=[{"format": "md"}],
+                work_capabilities=["public_research", "documents"] if expected else ["documents"],
             )
         },
     )
@@ -482,7 +487,7 @@ def test_declared_output_is_an_initial_document_profile_not_an_authorization_bou
     "scope",
     [
         {"research_required": True},
-        {"research_message_only": True},
+        {"research_message_only": True, "research_required": True},
         {"public_image_count": 2},
     ],
 )
@@ -753,3 +758,38 @@ def test_orphan_or_non_occurrence_reminder_marker_is_not_notification_authority(
     assert {"python_compute", "document_generate", "web_search"} <= allowed
     assert not allowed & (TEAM_WRITES | SCHEDULE_WRITES)
     assert select_tools(current, [], allowed) == BASE
+
+
+@pytest.mark.parametrize(
+    "capabilities,legacy_flag,expected",
+    [
+        (["compute", "documents"], True, False),
+        (["documents"], True, False),
+        (["public_research", "documents"], False, True),
+        (["public_images"], False, True),
+        ([], True, True),
+        ([], False, False),
+    ],
+)
+def test_semantic_research_evidence_plan_overrides_stale_lexical_flag(
+    capabilities, legacy_flag, expected
+):
+    current = work(
+        "不根据这句话判定是否必须搜索",
+        work_capabilities=capabilities,
+        research_required=legacy_flag,
+        schedule_creation_allowed=False,
+    )
+    assert research_evidence_required(current) is expected
+    allowed = admitted(current)
+    visible = select_tools(current, [], allowed)
+    assert ("web_fetch" in visible) is (expected and "public_images" not in capabilities)
+    assert admitted(current) == admitted(work("另一个目标", schedule_creation_allowed=False))
+
+
+def test_invalid_semantic_research_plan_cannot_silently_fall_back_to_old_flag():
+    with pytest.raises(DomainError) as error:
+        research_evidence_required(
+            work(work_capabilities=["unregistered_capability"], research_required=True)
+        )
+    assert error.value.code == "invalid_input"

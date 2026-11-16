@@ -385,9 +385,10 @@ class WorkFacts:
             }:
                 continue
             item = {"format": value["format"]}
-            units = value.get("exact_units")
-            if type(units) is int and 1 <= units <= 200:
-                item["exact_units"] = units
+            for unit_kind in ("exact_units", "min_units", "max_units"):
+                units = value.get(unit_kind)
+                if type(units) is int and 1 <= units <= 200:
+                    item[unit_kind] = units
             expected = value.get("expected_text", [])
             if isinstance(expected, list):
                 item["expected_text"] = [

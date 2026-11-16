@@ -51,6 +51,7 @@ from groupagent.tools import (
     ToolGateway,
     ToolReceipt,
     ToolScope,
+    register_request_input_tool,
     register_workspace_tools,
 )
 from groupagent.tools.compute import register_compute_tools
@@ -345,6 +346,95 @@ async def test_slow_external_receipt_inspection_does_not_starve_other_authorized
         assert held.state == WorkState.PAUSED and RECONCILIATION_SCOPE_KEY in held.scope
         assert env.state.load_checkpoint(env.actor, uncertain.id) == original
         assert not deliveries(env, uncertain.id)
+    finally:
+        await service.close()
+
+
+async def test_unexpected_validation_exception_retains_safe_diagnostic_and_candidate(env):
+    work = new_work(env)
+    secret = "sk-" + "synthetic_only_secret_" * 3
+
+    class UnexpectedValidator(Validator):
+        async def validate(self, *args):
+            if self.fail:
+                raise RuntimeError("Synthetic parser exception " + secret + "\x00trace")
+            return await super().validate(*args)
+
+    validator = UnexpectedValidator(fail=1)
+    factory = Factory()
+    service = supervisor(env, factory, validator)
+    try:
+        interrupted = await service.run_once()
+        assert interrupted.state == WorkState.QUEUED
+        failure = interrupted.scope["_runtime_failure"]
+        assert (
+            failure["stage"] == "validation"
+            and failure["exception_type"] == "builtins.RuntimeError"
+        )
+        assert failure["frames"] and secret not in failure["message"]
+        assert "\x00" not in failure["message"] and "\\u0000" in failure["message"]
+        with env.store.transaction(env.actor) as tx:
+            audit = tx.conn.execute(
+                "SELECT details FROM ga_audit_events WHERE group_id=%s AND resource_ref=%s AND action='execution_exception'",
+                (tx.group_id, work.id),
+            ).fetchone()["details"]
+        assert audit == failure
+        assert env.state.load_checkpoint(env.actor, work.id).state == RunState.CANDIDATE
+        validator.fail = 0
+        due_now(env, work.id)
+        delivered = await service.run_once()
+        assert delivered.state == WorkState.DELIVERING and len(deliveries(env, work.id)) == 1
+        assert len(factory.models) == 2 and not factory.models[1].requests
+    finally:
+        await service.close()
+
+
+async def test_essential_question_uses_visible_scope_text_and_keeps_original_checkpoint(env):
+    work = new_work(env)
+    raw = "请提供来源\x00文件。\n保留换行"
+
+    async def factory(current, lease, actor, workspace):
+        gateway = ToolGateway()
+        register_request_input_tool(gateway)
+        model = ScriptedFakeModel(
+            [
+                ModelReply(
+                    tool_calls=(
+                        ModelToolCall(
+                            id="question",
+                            name="request_input",
+                            arguments={"question": raw, "required_inputs": ["source\x00file"]},
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                    usage=TokenUsage(input_tokens=2, output_tokens=2),
+                )
+            ]
+        )
+        return PreparedExecution(
+            LangGraphEngine(model, gateway),
+            ExecutionRequest(
+                work_id=current.id,
+                attempt_id=lease.attempt_id,
+                actor=actor,
+                objective=current.goal,
+                workspace=workspace,
+                trace_id=current.request_event_id,
+                revision=current.goal_revision,
+                allowed_tools=gateway.registered_names,
+            ),
+        )
+
+    service = supervisor(env, factory)
+    try:
+        waiting = await service.run_once()
+        assert waiting.state == WorkState.WAITING_INPUT
+        question = waiting.scope["_runtime_input_request"]
+        assert question["question"] == "请提供来源\\u0000文件。\n保留换行"
+        assert question["required_inputs"] == ["source\\u0000file"]
+        checkpoint = env.state.load_checkpoint(env.actor, work.id)
+        assert checkpoint.input_request.question == raw
+        assert checkpoint.input_request.required_inputs == ("source\x00file",)
     finally:
         await service.close()
 

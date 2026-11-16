@@ -24,6 +24,7 @@ from groupagent.billing import BudgetLedger
 from groupagent.billing.metering import LedgerModelBudget, MeteredModel
 from groupagent.config import AppConfig, ExecutionConfig
 from groupagent.control import WorkCapability
+from groupagent.conversation.actions import OutputRequirement
 from groupagent.conversation.image_requirements import (
     IMAGE_QUANTITY_INSTRUCTION,
     is_public_image_work,
@@ -91,8 +92,9 @@ from .resource_profile import worker_limits, worker_tool_names
 from .review import review_fingerprint, review_request, tool_observation
 from .scheduling_tools import register_scheduling_tools
 from .team_tools import register_team_tools
+from .text import visible_text
 from .tool_profiles import instructions_for_tools, names_for_capabilities
-from .tool_selection import authorized_tools, select_tools
+from .tool_selection import authorized_tools, research_evidence_required, select_tools
 
 
 def _original_request_context(event: GroupEvent) -> dict[str, JsonValue]:
@@ -1438,13 +1440,20 @@ class WorkToolkit:
                         "validation_failed",
                         record.failure_summary or "Document content or rendered layout failed",
                     )
-                if (
-                    matching.get("exact_units") is not None
-                    and record.page_count != matching["exact_units"]
-                ):
+                requirement = OutputRequirement.model_validate(
+                    {
+                        "format": version.format,
+                        **{
+                            key: matching[key]
+                            for key in ("exact_units", "min_units", "max_units")
+                            if key in matching
+                        },
+                    }
+                )
+                if not requirement.accepts_unit_count(record.page_count):
                     raise DomainError(
                         "validation_failed",
-                        "Page or slide count differs from the accepted requirement",
+                        "Measured page/slide count differs from the accepted exact/min/max requirement",
                     )
                 validation = record.to_dict()
                 excerpts.append(
@@ -1702,7 +1711,7 @@ class WorkToolkit:
                 ).model_dump(mode="json")
             )
             source_urls.add(image_url)
-        if work.scope.get("research_required"):
+        if research_evidence_required(work):
             full_answer = answer + "\n" + "\n".join(str(item.get("text", "")) for item in excerpts)
             if not source_urls or not any(url in full_answer for url in source_urls):
                 raise DomainError(
@@ -1782,7 +1791,7 @@ class WorkToolkit:
                     dict.fromkeys(lineage.page_citation for _, lineage in retained_public_images)
                 )
                 answer = "图片已准备好。\n来源：\n" + "\n".join(citations)
-        answer = redact_credentials(answer)
+        answer = visible_text(redact_credentials(answer))
         drafts.insert(
             0,
             DeliveryDraft(

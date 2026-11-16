@@ -10,7 +10,9 @@ from pydantic import (
     JsonValue,
     TypeAdapter,
     field_validator,
+    model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from .quiet import validate_windows
 
@@ -150,9 +152,60 @@ ACTION_ADAPTER: TypeAdapter[Action] = TypeAdapter(Action)
 
 class OutputRequirement(ActionData):
     format: Literal["text", "md", "docx", "pdf", "pptx", "png", "jpeg", "wav", "ogg"]
-    exact_units: int | None = Field(default=None, ge=1, le=200)
+    exact_units: int | None = Field(
+        default=None,
+        ge=1,
+        le=200,
+        strict=True,
+        description="An explicitly required exact page/slide count. Do not use for an upper/lower bound or an estimate; use min_units/max_units instead. Omit when count is unspecified.",
+    )
+    min_units: int | None = Field(
+        default=None,
+        ge=1,
+        le=200,
+        strict=True,
+        description="An explicitly required minimum page/slide count (at least). May accompany max_units; never combine with exact_units.",
+    )
+    max_units: int | None = Field(
+        default=None,
+        ge=1,
+        le=200,
+        strict=True,
+        description="An explicitly required maximum page/slide count (at most). A shorter valid document satisfies this bound; never turn it into an exact count or combine with exact_units.",
+    )
     expected_text: list[Annotated[str, Field(max_length=1000)]] = Field(
         default_factory=list,
         max_length=30,
         description="User-required visible text snippets only. Title declaration delimiters such as 《Title》 or quotation marks name Title; omit those delimiter characters unless explicitly requested as literal content. A PPTX topic/theme is document title metadata, not automatically visible slide text when different per-slide titles are explicitly given. Do not turn metadata naming or inferred summaries into extra visible-text requirements.",
     )
+
+    @model_validator(mode="after")
+    def coherent_units(self) -> OutputRequirement:
+        if self.exact_units is not None and (
+            self.min_units is not None or self.max_units is not None
+        ):
+            raise PydanticCustomError(
+                "exact_units_conflicts_with_range",
+                "Choose an exact count or minimum/maximum bounds",
+            )
+        if (
+            self.min_units is not None
+            and self.max_units is not None
+            and self.min_units > self.max_units
+        ):
+            raise PydanticCustomError(
+                "min_units_exceeds_max_units", "Minimum count cannot exceed maximum count"
+            )
+        return self
+
+    def accepts_unit_count(self, count: int | None) -> bool:
+        """Compare measured pages/slides to the accepted, typed requirement."""
+        if all(value is None for value in (self.exact_units, self.min_units, self.max_units)):
+            return True
+        if type(count) is not int or count < 1:
+            return False
+        return (
+            (self.exact_units is None or count == self.exact_units)
+            and (self.min_units is None or count >= self.min_units)
+            and (self.max_units is None or count <= self.max_units)
+        )

@@ -23,6 +23,8 @@ from groupagent.tools.gateway import tool_call_fingerprint
 from groupagent.tools.models import EffectState, ToolReceipt
 from groupagent.tools.paths import open_parent, scoped_path
 
+from .checkpoint_codec import serialize_runtime_model
+
 RECOVERY_SCOPE_KEY = "_runtime_recovery"
 RECONCILIATION_SCOPE_KEY = "_runtime_reconciliation"
 AUTOMATIC_RECOVERY_CODES = frozenset(
@@ -63,7 +65,7 @@ RECONCILIATION_CODES = frozenset(
 
 def checkpoint_digest(checkpoint: EngineCheckpoint) -> str:
     """Bind host evidence to exactly one preserved checkpoint, without exposing it."""
-    return hashlib.sha256(checkpoint.model_dump_json().encode()).hexdigest()
+    return hashlib.sha256(serialize_runtime_model(checkpoint)).hexdigest()
 
 
 @dataclass(frozen=True)

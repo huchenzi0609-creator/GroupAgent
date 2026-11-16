@@ -98,6 +98,7 @@ async def admitted(setup, text, *, outputs=None, input_versions=()):
         input_versions=list(input_versions),
         directness="direct",
         confidence=1,
+        work_capabilities=["public_research"],
     )
 
     class ExplicitProvider:

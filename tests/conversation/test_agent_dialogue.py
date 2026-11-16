@@ -510,3 +510,85 @@ async def test_forget_inside_open_turn_drops_pre_forget_receipts_and_old_model_t
         assert body["agent_context_revoked"] and not body["agent_pending_response"]
         assert [receipt["tool_call_id"] for receipt in body["action_receipts"]] == ["forget"]
         assert all(marker not in delivery.payload_ref for delivery in tx.list_delivery())
+
+
+@pytest.mark.parametrize("web_enabled", [False, True])
+async def test_upper_bound_pdf_and_program_diagrams_do_not_gain_exact_pages_or_research(
+    conversation_env,
+    web_enabled,
+):
+    env = conversation_env
+    env.coordinator.config = env.coordinator.config.model_copy(
+        update={
+            "features": env.coordinator.config.features.model_copy(
+                update={"web_research": web_enabled}
+            )
+        }
+    )
+    text = (
+        "Pot，请制作一份PDF，解释给定数值并放两张程序绘制的示意图。两页以内，不需要搜索或插画服务。"
+    )
+
+    def accepted(model_request):
+        observed = last_observation(model_request)
+        assert observed["status"] == "committed"
+        with env.store.transaction(env.actor) as tx:
+            current = tx.get_work(observed["result"]["work_id"])
+            output = current.scope["outputs"][0]
+            assert output["max_units"] == 2 and output.get("exact_units") is None
+            assert current.scope["work_capabilities"] == ["compute", "documents"]
+            assert current.scope["research_required"] is False
+            assert not set(current.scope["required_tools"]) & {"web_search", "web_fetch"}
+            assert current.acceptance_criteria == ["总页数不超过2页", "用程序绘制两张示意图"]
+        return reply("已安排在两页以内完成PDF和两张程序图，不会追加搜索要求。")
+
+    _, result = await turn(
+        env,
+        text,
+        ScriptedModel(
+            call(
+                "start_work",
+                {
+                    "goal": text,
+                    "work_capabilities": ["compute", "documents"],
+                    "outputs": [{"format": "pdf", "max_units": 2}],
+                    "acceptance_criteria": ["总页数不超过2页", "用程序绘制两张示意图"],
+                },
+            ),
+            accepted,
+        ),
+    )
+    assert (
+        result.work_id
+        and result.decision.response == "已安排在两页以内完成PDF和两张程序图，不会追加搜索要求。"
+    )
+
+    def explain_bound(model_request):
+        observed = last_observation(model_request)
+        output = observed["facts"][0]["requirements"]["required_outputs"][0]
+        assert output["max_units"] == 2 and output.get("exact_units") is None
+        return reply("上限是2页；内容完整并通过检查的1页PDF也符合要求，并不要求凑满2页。")
+
+    _, checked = await turn(
+        env,
+        "Pot，这份PDF的页数上限是多少？",
+        ScriptedModel(
+            call(
+                "read_work_facts",
+                {
+                    "selector": {
+                        "basis": "ids",
+                        "ids": [result.work_id],
+                        "states": [],
+                        "quantifier": "one",
+                    }
+                },
+            ),
+            explain_bound,
+        ),
+    )
+    assert (
+        checked.decision.response
+        == "上限是2页；内容完整并通过检查的1页PDF也符合要求，并不要求凑满2页。"
+    )
+    assert len(work_rows(env)) == 1 and work_rows(env)[0].state == WorkState.QUEUED
