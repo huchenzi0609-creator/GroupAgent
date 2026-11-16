@@ -93,5 +93,21 @@ async def test_quiet_keeps_accepted_work_running(runtime_env):
     await app.process_pending(batched=False)
     with env.store.transaction(env.actor) as tx:
         assert tx.get_work(work.id).state == WorkState.QUEUED
+        policy = tx.conn.execute(
+            "SELECT quiet,quiet_since_sequence FROM ga_conversation_policy "
+            "WHERE group_id=%s AND subject_id='*'",
+            (tx.group_id,),
+        ).fetchone()
+        sequence = tx.conn.execute(
+            "SELECT sequence FROM ga_events WHERE group_id=%s AND id=%s",
+            (tx.group_id, value.id),
+        ).fetchone()["sequence"]
+        assert policy["quiet"] and policy["quiet_since_sequence"] == sequence
+        decision = tx.get_decision(value.id)["result"]
+        assert decision["decision"]["kind"] == "observe"
+        assert decision["action_result"] == {"policy_subject": "*"}
+        assert tx.list_delivery() == []
     assert app.coordinator.current_mode() == "natural"
+    assert await app.dispatcher.tick() == 0
+    assert not list((env.channel.root / "outgoing").glob("*.json"))
     await app.close()

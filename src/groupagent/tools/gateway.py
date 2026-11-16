@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from pydantic import ValidationError
@@ -32,6 +32,33 @@ from .models import (
     ToolScope,
 )
 from .paths import scoped_path
+
+
+@dataclass(frozen=True)
+class _PreparedTool:
+    definition: ToolDefinition[Any, Any]
+    context: ToolContext
+    encoded: bytes
+    arguments: Any
+
+
+def _failure(
+    name: str,
+    context: ToolContext,
+    code: str,
+    effect: EffectState = EffectState.NOT_STARTED,
+    message: str = "The tool did not complete",
+) -> ToolReceipt:
+    return ToolReceipt(
+        call_id=context.call_id,
+        tool_name=name,
+        idempotency_key=context.idempotency_key,
+        success=False,
+        effect_state=effect,
+        error_code=code,
+        message=message,
+    )
+
 
 _INPUT_ERROR_TYPES = frozenset(
     {
@@ -153,6 +180,36 @@ class ToolGateway:
             name for name, definition in self._tools.items() if definition.control_kind
         )
 
+    def is_read_only(self, name: str) -> bool:
+        """Trusted business-effect classification, independent of a model's claim."""
+        definition = self._tools.get(name)
+        return definition is not None and (
+            definition.risk_class == "read_only"
+            and definition.idempotency_mode == IdempotencyMode.READ_ONLY
+            and not definition.control_kind
+            and not definition.may_request_input
+        )
+
+    def is_concurrency_safe(self, name: str) -> bool:
+        """Only reviewed public reads may overlap; this grants no authority.
+
+        Worker-admitted tools keep the existing serial resource-deferral path.
+        A model output or a tool's name cannot declare its execution class.
+        """
+        definition = self._tools.get(name)
+        if definition is None or not (
+            self.is_read_only(name)
+            and definition.concurrency_safe is True
+            and "public_web" in definition.resource_scopes
+            and not definition.toolset_loader
+        ):
+            return False
+        if self._resource_admission is not None:
+            governor, _, names = self._resource_admission
+            if governor.policy.enabled and name in names:
+                return False
+        return True
+
     def normalize_arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Pure schema normalization for adapters; this does not authorize invocation."""
         definition = self._tools.get(name)
@@ -220,9 +277,14 @@ class ToolGateway:
                 raise DomainError("scope_violation", "Workspaces must not overlap between works")
         self._scopes[key] = scope
 
-    def describe(self, scope: ToolScope) -> tuple[dict[str, Any], ...]:
+    def describe(
+        self, scope: ToolScope, visible_tools: frozenset[str] | None = None
+    ) -> tuple[dict[str, Any], ...]:
         self._check_scope(scope)
-        return tuple(self._tools[name].describe() for name in sorted(scope.allowed_tools))
+        names = (
+            scope.allowed_tools if visible_tools is None else scope.allowed_tools & visible_tools
+        )
+        return tuple(self._tools[name].describe() for name in sorted(names))
 
     def _check_scope(self, scope: ToolScope) -> None:
         if self._scopes.get((scope.group_id, scope.work_id)) != scope:
@@ -254,7 +316,7 @@ class ToolGateway:
             raise DomainError("cancelled", "This execution was cancelled")
         return replace(context, scope=replace(context.scope, actor=actor))
 
-    async def _required_evidence(self, result: ToolReceipt, context: ToolContext) -> ToolReceipt:
+    async def _trusted_metadata(self, result: ToolReceipt, context: ToolContext) -> ToolReceipt:
         definition = self._tools.get(result.tool_name)
         evidence = set()
         if (
@@ -275,25 +337,44 @@ class ToolGateway:
                 except Exception:
                     continue
                 evidence.add(name)
-        return result.model_copy(update={"required_tool_evidence": frozenset(evidence)})
+        loaded = set()
+        if (
+            result.success
+            and result.effect_state in {EffectState.SUCCEEDED, EffectState.NO_EFFECT}
+            and definition is not None
+            and definition.toolset_loader is True
+        ):
+            requested = (result.output or {}).get("tool_names")
+            if isinstance(requested, (list, tuple)):
+                candidates = {
+                    name
+                    for name in requested
+                    if isinstance(name, str)
+                    and name in context.scope.allowed_tools
+                    and name in self._tools
+                }
+                for name in sorted(candidates):
+                    try:
+                        await self.authorize(name, context)
+                    except Exception:
+                        continue
+                    loaded.add(name)
+        return result.model_copy(
+            update={
+                "required_tool_evidence": frozenset(evidence),
+                "loaded_tools": frozenset(loaded),
+            }
+        )
 
-    async def invoke(
+    async def _prepare(
         self, name: str, arguments: dict[str, Any], context: ToolContext
-    ) -> ToolReceipt:
+    ) -> _PreparedTool | ToolReceipt:
         def receipt(
             code: str,
             effect: EffectState = EffectState.NOT_STARTED,
             message: str = "The tool did not complete",
         ) -> ToolReceipt:
-            return ToolReceipt(
-                call_id=context.call_id,
-                tool_name=name,
-                idempotency_key=context.idempotency_key,
-                success=False,
-                effect_state=effect,
-                error_code=code,
-                message=message,
-            )
+            return _failure(name, context, code, effect, message)
 
         validating_arguments = False
         try:
@@ -332,6 +413,41 @@ class ToolGateway:
         except Exception:
             return receipt("policy_unavailable")
 
+        return _PreparedTool(definition, effective_context, encoded, validated)
+
+    async def preflight(
+        self, name: str, arguments: dict[str, Any], context: ToolContext
+    ) -> ToolReceipt | None:
+        """Check current authority/schema/size without a ledger entry or handler.
+
+        The invocation must still recheck current authority before execution;
+        preflight is not a reusable permission token.
+        """
+        prepared = await self._prepare(name, arguments, context)
+        if isinstance(prepared, ToolReceipt):
+            return prepared
+        if context.deadline_monotonic is not None and (
+            context.deadline_monotonic <= asyncio.get_running_loop().time()
+        ):
+            return _failure(name, context, "time_budget_exhausted")
+        return None
+
+    async def invoke(
+        self, name: str, arguments: dict[str, Any], context: ToolContext
+    ) -> ToolReceipt:
+        def receipt(
+            code: str,
+            effect: EffectState = EffectState.NOT_STARTED,
+            message: str = "The tool did not complete",
+        ) -> ToolReceipt:
+            return _failure(name, context, code, effect, message)
+
+        prepared = await self._prepare(name, arguments, context)
+        if isinstance(prepared, ToolReceipt):
+            return prepared
+        definition, effective_context = prepared.definition, prepared.context
+        encoded, validated = prepared.encoded, prepared.arguments
+
         key = (context.group_id, context.work_id, context.idempotency_key)
         fingerprint = hashlib.sha256(name.encode("utf-8") + b"\0" + encoded).hexdigest()
         previous = self._ledger.get(key)
@@ -339,7 +455,7 @@ class ToolGateway:
             if previous[0] != fingerprint:
                 return receipt("idempotency_conflict")
             replay = previous[1].model_copy(update={"call_id": context.call_id, "replayed": True})
-            return await self._required_evidence(replay, context)
+            return await self._trusted_metadata(replay, context)
         if context.cancelled.is_set():
             return receipt("cancelled")
         if context.deadline_monotonic is not None and (
@@ -476,7 +592,7 @@ class ToolGateway:
                     # Retain capacity until it actually ends, not just until the
                     # gateway's cancellation grace or execution timeout expires.
                     task.add_done_callback(lambda _finished: reservation.release())
-        result = await self._required_evidence(result, context)
+        result = await self._trusted_metadata(result, context)
         if (
             result.control is not None
             and not result.success

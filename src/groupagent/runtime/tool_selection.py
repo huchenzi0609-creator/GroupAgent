@@ -26,11 +26,12 @@ _IMAGE = frozenset({"png", "jpg", "jpeg", "webp", "gif"})
 _AUDIO = frozenset({"wav", "mp3", "ogg", "flac", "m4a", "aac"})
 _IMAGE_TOOLS = frozenset({"request_input", "image_analyze", "media_ocr", "provider_ocr"})
 _AUDIO_TOOLS = frozenset({"request_input", "audio_transcribe"})
-_WEB_TOOLS = frozenset({"request_input", "web_search", "web_fetch", "browser_open"})
+_WEB_TOOLS = frozenset({"request_input", "web_search", "web_fetch", "web_read", "browser_open"})
 _PUBLIC_IMAGE_TOOLS = frozenset(
     {
         "request_input",
         "web_search",
+        "web_read",
         "web_image_candidates",
         "web_image_import",
         "image_analyze",

@@ -65,7 +65,11 @@ async def test_automatic_recovery_has_no_notice_and_is_presented_as_background_w
                 (["_runtime_recovery"], Jsonb(metadata), env.actor.group_id, work.id),
             )
         assert app.notices.tick() == 0
-        context = app.coordinator._context(env.actor, request)
+        # A new goal must not inherit an unrelated waiting job as its agenda.
+        assert app.coordinator._context(env.actor, request)["works"] == []
+        status = event(env, "这项工作现在怎么样？", reply_to=request.id)
+        await intake(app, env, status)
+        context = app.coordinator._context(env.actor, status)
         assert context["works"][0]["state"] == "queued"
         assert context["works"][0]["status_detail"]["code"] == "background_processing"
         with env.store.transaction(env.actor) as tx:

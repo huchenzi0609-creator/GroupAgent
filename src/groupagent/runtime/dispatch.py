@@ -6,14 +6,13 @@ import asyncio
 import hashlib
 import time
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
 from typing import Literal, Protocol
 from uuid import uuid4
 
 from groupagent.channels import ChannelReceipt
-from groupagent.conversation.quiet import is_quiet
+from groupagent.conversation.policy import delivery_admission_in_tx, retire_delivery_in_tx
 from groupagent.domain import ActorContext, DeliveryIntent, DeliveryState, DomainError
-from groupagent.identity import DEFAULT_BOT_BADGE, without_bot_badge
+from groupagent.identity import DEFAULT_BOT_BADGE, BotIdentity, without_bot_badge
 
 from .artifacts import ArtifactRegistry
 from .contracts import ActorResolver, ProcessLease
@@ -83,6 +82,8 @@ class Dispatcher:
         after_submit: Callable[[DeliveryIntent, int], Awaitable[None]] | None = None,
         time_zone: str = "Asia/Shanghai",
         quiet_hours: list[str] | None = None,
+        participation_mode: str = "natural",
+        identity: BotIdentity | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not badge.strip():
@@ -95,6 +96,8 @@ class Dispatcher:
         self._lease: ProcessLease | None = None
         self._after_submit = after_submit
         self.time_zone, self.quiet_hours = time_zone, quiet_hours or []
+        self.participation_mode = participation_mode
+        self.identity = identity or BotIdentity(badge=badge)
         self._clock, self._retry_at, self._channel_failures = clock, 0.0, 0
 
     async def tick(self, *, limit: int = 20) -> int:
@@ -316,7 +319,7 @@ class Dispatcher:
         *,
         unknown: bool = False,
         expected_payload_ref: str | None = None,
-    ) -> None:
+    ) -> bool:
         state = "unknown" if unknown else "submitted"
         message_id = job_id = None
         if receipt is not None:
@@ -334,6 +337,20 @@ class Dispatcher:
             message_id, job_id = receipt.platform_message_id, receipt.job_id or receipt.send_id
         with self.state.store.transaction(actor) as tx:
             if receipt is None and not unknown:
+                admission = delivery_admission_in_tx(
+                    tx,
+                    tx.get_delivery(intent_id),
+                    self.identity,
+                    time_zone=self.time_zone,
+                    quiet_hours=self.quiet_hours,
+                    default_mode=self.participation_mode,
+                )
+                if not admission.allowed:
+                    if admission.retire:
+                        retire_delivery_in_tx(tx, intent_id, reason=admission.reason_code)
+                    else:
+                        self._release_unsubmitted_in_tx(tx, intent_id)
+                    return False
                 check_notice(tx, intent_id)
                 current = tx._lock_delivery_work(intent_id)
                 if (
@@ -382,7 +399,7 @@ class Dispatcher:
             if old["state"] == "accepted":
                 if state != "accepted" or old["platform_message_id"] != message_id:
                     raise DomainError("idempotency_conflict", "Accepted receipt cannot change")
-                return
+                return True
             tx.conn.execute(
                 "UPDATE ga_delivery_parts SET state=%s,platform_message_id=%s,platform_job_id=%s,reason=COALESCE(%s,reason),updated_at=clock_timestamp() WHERE group_id=%s AND intent_id=%s AND position=%s",
                 (
@@ -432,35 +449,33 @@ class Dispatcher:
                                 "INSERT INTO ga_delivery_bundles(group_id,bundle_id,intent_id,position) VALUES(%s,%s,%s,%s)",
                                 (tx.group_id, bundle["bundle_id"], notice.id, position["n"]),
                             )
+        return True
+
+    @staticmethod
+    def _release_unsubmitted_in_tx(tx, intent_id: str) -> None:
+        tx.conn.execute(
+            "UPDATE ga_deliveries d SET state='pending',claim_expires_at=NULL,"
+            "revision=revision+1,updated_at=clock_timestamp() WHERE d.group_id=%s AND d.id=%s "
+            "AND d.state IN ('dispatching','unknown') AND NOT EXISTS "
+            "(SELECT 1 FROM ga_delivery_parts p WHERE p.group_id=d.group_id AND p.intent_id=d.id "
+            "AND p.state IN ('submitted','unknown'))",
+            (tx.group_id, intent_id),
+        )
 
     async def _dispatch(self, actor: ActorContext, intent: DeliveryIntent) -> bool:
         with self.state.store.transaction(actor) as tx:
-            notice = tx.conn.execute(
-                "SELECT work_id FROM ga_progress_notices WHERE group_id=%s AND intent_id=%s",
-                (tx.group_id, intent.id),
-            ).fetchone()
-            work_id = intent.work_id or (notice["work_id"] if notice else None)
-            scope = tx.get_work(work_id).scope if work_id else {}
-            autonomous = bool(
-                scope.get("origin_schedule_id") or scope.get("origin_trigger_rule_id") or notice
+            admission = delivery_admission_in_tx(
+                tx,
+                intent,
+                self.identity,
+                time_zone=self.time_zone,
+                quiet_hours=self.quiet_hours,
+                default_mode=self.participation_mode,
             )
-            if intent.request_event_id:
-                autonomous = autonomous or bool(
-                    tx.conn.execute(
-                        "SELECT 1 FROM ga_participation_log WHERE group_id=%s AND event_id=%s AND proactive",
-                        (tx.group_id, intent.request_event_id),
-                    ).fetchone()
-                )
-            if autonomous:
-                policies = tx.conn.execute(
-                    "SELECT * FROM ga_conversation_policy WHERE group_id=%s AND subject_id IN ('*',%s)",
-                    (tx.group_id, actor.member_id),
-                ).fetchall()
-                if any(
-                    row["subject_id"] == "*" and row["mode"] in {"paused", "disabled"}
-                    for row in policies
-                ) or is_quiet(policies, datetime.now(UTC), self.time_zone, self.quiet_hours):
-                    return False
+            if not admission.allowed:
+                if admission.retire:
+                    retire_delivery_in_tx(tx, intent.id, reason=admission.reason_code)
+                return False
             predecessor = tx.conn.execute(
                 "SELECT 1 FROM ga_delivery_bundles b JOIN ga_delivery_bundles earlier ON earlier.group_id=b.group_id AND earlier.bundle_id=b.bundle_id AND earlier.position<b.position JOIN ga_deliveries d ON d.group_id=earlier.group_id AND d.id=earlier.intent_id WHERE b.group_id=%s AND b.intent_id=%s AND d.state NOT IN ('accepted','rejected') LIMIT 1",
                 (actor.group_id, intent.id),
@@ -491,7 +506,10 @@ class Dispatcher:
                     break
                 # Persist 'submitted' before the external call. A crash here
                 # is reconciled by key; no new random send key is invented.
-                self._record(actor, intent.id, part, None, expected_payload_ref=intent.payload_ref)
+                if not self._record(
+                    actor, intent.id, part, None, expected_payload_ref=intent.payload_ref
+                ):
+                    return False
                 self._fence()
                 kind, value, data = payloads[part["position"]]
                 if kind == "text":
@@ -595,6 +613,27 @@ class Dispatcher:
             if receipt is not None:
                 self._record(actor, intent.id, part, receipt)
         parts = self._parts(actor, intent.id)
+        with self.state.store.transaction(actor) as tx:
+            admission = delivery_admission_in_tx(
+                tx,
+                tx.get_delivery(intent.id),
+                self.identity,
+                time_zone=self.time_zone,
+                quiet_hours=self.quiet_hours,
+                default_mode=self.participation_mode,
+            )
+            if not admission.allowed:
+                if admission.retire:
+                    retire_delivery_in_tx(tx, intent.id, reason=admission.reason_code)
+                else:
+                    self._release_unsubmitted_in_tx(tx, intent.id)
+                current = tx.get_delivery(intent.id)
+                if current.state in {DeliveryState.ACCEPTED, DeliveryState.REJECTED}:
+                    return current.state == DeliveryState.ACCEPTED
+                if not parts or any(
+                    part["state"] in {"pending", "submitted", "unknown"} for part in parts
+                ):
+                    return False
         # After earlier submitted parts are positively accepted, only proven
         # unsubmitted parts may continue with the exact same stored keys.
         if (

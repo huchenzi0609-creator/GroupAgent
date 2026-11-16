@@ -7,18 +7,17 @@ import json
 import math
 import re
 from collections.abc import Awaitable, Callable
-from contextlib import ExitStack
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
-from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
 from pydantic import JsonValue, ValidationError
 
-from groupagent.channels.models import AgentWechatConfig, stable_key
 from groupagent.config import AppConfig
+from groupagent.control import ResolvedWorkSet, WorkSelector
 from groupagent.coordinator import (
     CoordinationResult,
     Coordinator,
@@ -27,6 +26,7 @@ from groupagent.coordinator import (
     ObserveOnlyProvider,
 )
 from groupagent.domain import (
+    WORK_TRANSITIONS,
     ActorContext,
     DomainError,
     EventKind,
@@ -37,7 +37,6 @@ from groupagent.domain import (
 )
 from groupagent.identity import BotIdentity, control_request
 from groupagent.memory import MemberService, MemoryService
-from groupagent.memory.retrieval import visible_events
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
 from groupagent.runtime.input_selection import canonicalize_input_selection
@@ -65,6 +64,8 @@ from .actions import (
     TaskBatch,
     UpdateTask,
 )
+from .commands import is_task_declaration
+from .context import ContextBuilder, ContextQuery
 from .intent import (
     explicitly_requires_execution,
     main_request,
@@ -74,8 +75,9 @@ from .intent import (
     requires_research,
     task_write_request,
 )
-from .participation import fast_observe, outside_quotes, policy_intent
-from .quiet import is_quiet
+from .participation import fast_observe, outside_quotes, policy_intent, verified_human_addressee
+from .policy import apply_quiet_barrier_in_tx, ingress_admission, interpret_policy
+from .references import resolve_work_selection
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
 _ERRORS = {
@@ -83,11 +85,12 @@ _ERRORS = {
     "permission_denied": "你目前没有这项操作的权限；可以处理自己的任务，其他分工请由负责人调整。",
     "ambiguous_reference": "有多个可能的对象，请说清楚是哪一项。",
     "not_found": "暂时没有找到对应记录，请补充任务或文件名称。",
-    "version_conflict": "这项记录刚有更新，请以最新记录为准。",
+    "version_conflict": "相关工作刚有变化，这次没有修改；请以最新状态为准。",
     "quota_exceeded": "这项操作超出了当前额度，我先保留现有安排。",
     "source_unavailable": "相关内容已不可用，我不会继续引用或处理它。",
     "unsupported_schedule": "目前支持一次性、按小时、每日或每周的安排。",
     "invalid_input": "这项操作还缺少清楚的时间或对象，请补充一下。",
+    "selection_incomplete": "对象范围尚未完整确定，这次没有执行修改。",
 }
 
 
@@ -194,628 +197,20 @@ class ConversationCoordinator(Coordinator):
         return bool(intent and intent.subject == "group" and intent.operation == "participation")
 
     def _context(self, actor: ActorContext, event: GroupEvent) -> dict[str, Any]:
-        topic_id = None
-        quoted_work_id = None
-        quoted_work_source = None
-        if event.reply_to:
-            with self.store.transaction(actor) as tx:
-                quoted_message_id = None
-                direct_work = tx.conn.execute(
-                    "SELECT id FROM ga_work_orders WHERE group_id=%s AND request_event_id=%s",
-                    (tx.group_id, event.reply_to),
-                ).fetchone()
-                if direct_work:
-                    quoted_work_id = direct_work["id"]
-                    quoted_work_source = event.reply_to
-                try:
-                    quoted = tx.get_event(event.reply_to)
-                except DomainError as error:
-                    if error.code != "not_found":
-                        raise
-                else:
-                    quoted_message_id = quoted.platform_message_id
-                if (
-                    quoted_message_id is None
-                    and event.trusted_actor_origin == "agentwechat_authenticated_message_metadata"
-                    and event.channel_account_id == self.config.runtime.channel_account_id
-                ):
-                    binding = AgentWechatConfig(
-                        base_url=self.config.runtime.channel_base_url,
-                        account_id=self.config.runtime.channel_account_id,
-                        external_group_id=self.config.group.external_group_id,
-                        internal_group_id=actor.group_id,
-                        source_epoch=self.config.runtime.source_epoch,
-                    )
-                    for part in event.attachments:
-                        mid = part.get("server_id")
-                        if (
-                            part.get("kind") == "quote"
-                            and isinstance(mid, str)
-                            and event.reply_to
-                            == str(uuid5(NAMESPACE_URL, stable_key(binding, mid, server=True)))
-                        ):
-                            quoted_message_id = mid
-                            break
-                if quoted_message_id:
-                    found = tx.conn.execute(
-                        "SELECT COALESCE(d.work_id,n.work_id,w.id) AS work_id FROM ga_deliveries d "
-                        "LEFT JOIN ga_delivery_parts p ON p.group_id=d.group_id AND p.intent_id=d.id "
-                        "LEFT JOIN ga_progress_notices n ON n.group_id=d.group_id AND n.intent_id=d.id "
-                        "LEFT JOIN ga_work_orders w ON w.group_id=d.group_id AND w.request_event_id=d.request_event_id "
-                        "WHERE d.group_id=%s AND ((d.state='accepted' AND d.platform_message_id=%s) "
-                        "OR (p.state='accepted' AND p.platform_message_id=%s)) LIMIT 1",
-                        (tx.group_id, quoted_message_id, quoted_message_id),
-                    ).fetchone()
-                    if found and found["work_id"]:
-                        linked_work = tx.get_work(found["work_id"])
-                        if not linked_work.scope.get("privacy_redacted"):
-                            quoted_work_id = linked_work.id
-                            quoted_work_source = linked_work.request_event_id
-                            candidate_topic = linked_work.scope.get("topic_id")
-                            if isinstance(candidate_topic, str):
-                                topic_id = candidate_topic
-        current_topics = self.memory.topics_for_event(actor, event.id)
-        if any(topic.visibility == "participants" for topic in current_topics):
-            raise DomainError("permission_denied", "A group reply cannot expose a restricted topic")
-        if len(current_topics) == 1:
-            topic_id = current_topics[0].id
-        if event.reply_to:
-            try:
-                linked = self.memory.topics_for_event(actor, event.reply_to)
-                if any(topic.visibility == "participants" for topic in linked):
-                    raise DomainError(
-                        "permission_denied", "A group reply cannot expose a restricted quote"
-                    )
-                if len(linked) == 1:
-                    topic_id = linked[0].id
-            except DomainError as error:
-                if error.code == "permission_denied":
-                    raise
-        with self.store.transaction(actor) as tx, ExitStack() as reads:
-            self.memory.prepare_in_tx(tx)
-            reads.enter_context(tx.context_event_reads())
-            if tx.get_event(event.id) != event:
-                raise DomainError(
-                    "memory_changed",
-                    "Canonical message changed before context construction",
-                    retryable=True,
-                )
-            recent = visible_events(
-                tx, topic_id=topic_id, limit=24, newest_first=True, public_only=True
+        query = ContextQuery.from_event(event, self.identity)
+        if control_request(event.text, identity=self.identity) is not None:
+            query = replace(
+                query, new_request=False, continuation=True, resources=query.resources | {"works"}
             )
-            canonical_recent = {row["id"]: tx.get_event(row["id"]) for row in recent}
-            current_sources = [event.id] + [row["id"] for row in recent]
-            if quoted_work_source and self.memory.in_tx(tx).source_available(
-                actor, quoted_work_source
-            ):
-                current_sources.append(quoted_work_source)
-            if event.reply_to and self.memory.in_tx(tx).source_available(actor, event.reply_to):
-                current_sources.append(event.reply_to)
-            snapshot = self.memory.snapshot_in_tx(
-                tx,
-                "",
-                topic_id=topic_id,
-                limit=30,
-                source_event_ids=list(dict.fromkeys(current_sources)),
-            )
-            # Query meaningful nouns as well as recent context; full question
-            # strings must not be treated as an exact database phrase.
-            terms = re.findall(
-                r"[A-Za-z][A-Za-z0-9_-]{1,30}|主题|截止|分工|负责人|进度|参考文献|方案|结论|决定|报告|资料|提醒",
-                event.text,
-            )
-            hits = {(item["kind"], item["id"]): item for item in snapshot["items"]}
-            for term in list(dict.fromkeys(terms))[:3]:
-                extra = self.memory.snapshot_in_tx(tx, term, topic_id=topic_id, limit=10)
-                snapshot["source_fingerprints"].update(extra["source_fingerprints"])
-                hits.update({(item["kind"], item["id"]): item for item in extra["items"]})
-            snapshot["items"] = list(hits.values())[:50]
-            private_topics = {
-                row["id"]
-                for row in tx.conn.execute(
-                    "SELECT id FROM ga_memory_topics WHERE group_id=%s AND visibility='participants'",
-                    (actor.group_id,),
-                ).fetchall()
-            }
-            private_events = {
-                row["event_id"]
-                for row in tx.conn.execute(
-                    "SELECT r.event_id FROM ga_topic_events r JOIN ga_memory_topics t ON t.group_id=r.group_id AND t.id=r.topic_id WHERE r.group_id=%s AND t.visibility='participants'",
-                    (actor.group_id,),
-                ).fetchall()
-            }
-            if (
-                event.id in private_events
-                or event.reply_to in private_events
-                or quoted_work_source in private_events
-            ):
-                raise DomainError(
-                    "permission_denied", "Restricted evidence cannot enter a group reply"
-                )
-            snapshot["items"] = [
-                item
-                for item in snapshot["items"]
-                if item.get("topic_id") not in private_topics
-                and not any(ref["event_id"] in private_events for ref in item["source_refs"])
-            ]
-            admitted_sources = set(current_sources) - private_events
-            admitted_task_ids: set[str] = set()
-            bounded_items = []
-            context_incomplete = False
-            for item in snapshot["items"]:
-                closure = {ref["event_id"] for ref in item["source_refs"]}
-                logical = set(item.get("source_task_revisions", {}))
-                if len(admitted_sources | closure) > 350 or len(admitted_task_ids | logical) > 100:
-                    context_incomplete = True
-                    continue
-                admitted_sources.update(closure)
-                admitted_task_ids.update(logical)
-                bounded_items.append(item)
-            snapshot["items"] = bounded_items
-            for item in snapshot["items"]:
-                if item["kind"] in {"fact", "decision"}:
-                    fact = tx.conn.execute(
-                        "SELECT revision,predicate,value FROM ga_memory_facts WHERE group_id=%s AND id=%s AND state='active'",
-                        (tx.group_id, item["id"]),
-                    ).fetchone()
-                    if fact:
-                        item.update(fact)
-            consumed = set(current_sources) | {
-                ref["event_id"] for item in snapshot["items"] for ref in item["source_refs"]
-            }
-            snapshot["source_fingerprints"] = {
-                key: value
-                for key, value in snapshot["source_fingerprints"].items()
-                if key in consumed and key not in private_events
-            }
-            member_rows = self.members.in_tx(tx).list(actor, include_left=True)
-            member_ids = sorted(
-                {member.member_id for member in member_rows}
-                | {event.actor_id}
-                | {row["actor_id"] for row in recent}
-            )
-            aliases = {
-                f"member_{index + 1}": member_id for index, member_id in enumerate(member_ids)
-            }
-            inverse = {value: key for key, value in aliases.items()}
-            works = [
-                w.model_dump(mode="json")
-                for w in tx.list_work(limit=30, active_first=True, newest_first=True)
-                if not w.scope.get("privacy_redacted")
-                and w.request_event_id not in private_events
-                and not _scope_sources(w.scope) & private_events
-                and tx.get_event(w.request_event_id).content_state == "active"
-            ]
-            for work in works:
-                work["_requested_at"] = tx.get_event(
-                    work["request_event_id"]
-                ).occurred_at.isoformat()
-                if work["pause_reason"] == "effect_unknown":
-                    checkpoint = tx.conn.execute(
-                        "SELECT body->'receipts' AS receipts FROM ga_runtime_checkpoints "
-                        "WHERE group_id=%s AND work_id=%s ORDER BY saved_at DESC LIMIT 1",
-                        (tx.group_id, work["id"]),
-                    ).fetchone()
-                    if checkpoint:
-                        failures = [r for r in checkpoint["receipts"] or [] if not r.get("success")]
-                        if failures:
-                            work["_runtime_failure"] = {
-                                key: failures[-1].get(key) for key in ("tool_name", "error_code")
-                            }
-            control_works = list(works)
-            follow_up = bool(
-                re.search(
-                    r"刚才|刚刚|那份|那项|之前|上次|继续|进度|状态|暂停|停止|取消|恢复|重试|哪些工作|改成|改短|修改",
-                    event.text,
-                )
-            )
-            if topic_id is None and quoted_work_id is None:
-                if re.search(r"新建|独立工作|单独做|单独生成", event.text):
-                    works = []
-                else:
-                    works = [
-                        row
-                        for row in works
-                        if row["state"] not in {"completed", "cancelled", "failed"} or follow_up
-                    ][:10]
-            topic_events = (
-                {
-                    row["event_id"]
-                    for row in tx.conn.execute(
-                        "SELECT event_id FROM ga_topic_events WHERE group_id=%s AND topic_id=%s",
-                        (actor.group_id, topic_id),
-                    ).fetchall()
-                }
-                if topic_id
-                else None
-            )
-            tasks = [
-                task.model_dump(mode="json")
-                for task in tx.list_team_tasks(limit=100)
-                if task.content_state == "active"
-                and not set(task.source_event_ids) & private_events
-                and not any(
-                    tx.get_event(identifier).content_state in {"forgotten", "recalled"}
-                    for identifier in task.source_event_ids
-                )
-                and (topic_events is None or bool(set(task.source_event_ids) & topic_events))
-            ]
-            rules = [
-                rule.model_dump(mode="json")
-                for rule in self.scheduler.in_tx(tx).list(actor)
-                if not rule.scope.get("privacy_redacted")
-                and not _scope_sources(rule.scope) & private_events
-                and rule.scope.get("topic_id") not in private_topics
-                and not any(
-                    tx.get_event(source).content_state in {"forgotten", "recalled"}
-                    for source in _scope_sources(rule.scope)
-                )
-            ]
-            topics = tx.conn.execute(
-                "SELECT t.id,t.title,t.visibility,o.source_event_ids FROM ga_memory_topics t LEFT JOIN ga_topic_origins o ON o.group_id=t.group_id AND o.topic_id=t.id WHERE t.group_id=%s AND t.visibility='group' ORDER BY t.created_at DESC LIMIT 30",
-                (actor.group_id,),
-            ).fetchall()
-            topics = [
-                topic
-                for topic in topics
-                if (
-                    topic["id"] == topic_id
-                    or topic["id"] in {row["scope"].get("topic_id") for row in works}
-                )
-                and not any(
-                    getattr(tx.get_event(identifier), "content_state", "active") != "active"
-                    or any(
-                        part.get("reason") in {"forgotten", "recalled"}
-                        for part in tx.get_event(identifier).attachments
-                    )
-                    for identifier in (topic["source_event_ids"] or [])
-                )
-            ]
-            bounded_topics = []
-            for topic in topics:
-                if (
-                    len(set(snapshot["source_fingerprints"]) | set(topic["source_event_ids"] or []))
-                    > 400
-                ):
-                    context_incomplete = True
-                    continue
-                bounded_topics.append(topic)
-                for identifier in topic["source_event_ids"] or []:
-                    snapshot["source_fingerprints"][identifier] = tx.event_fingerprint(identifier)
-            topics = bounded_topics
-            if topic_id and topic_id not in {topic["id"] for topic in topics}:
-                topics.append(
-                    {
-                        "id": topic_id,
-                        "title": "当前讨论",
-                        "visibility": "group",
-                        "source_event_ids": [event.id],
-                    }
-                )
-            visible_topic_ids = {topic["id"] for topic in topics}
-            works = [
-                work
-                for work in works
-                if (
-                    work["scope"].get("topic_id") is None
-                    or work["scope"].get("topic_id") in visible_topic_ids
-                )
-                and (topic_id is None or work["scope"].get("topic_id") == topic_id)
-            ]
-            retained_context = set()
-            admitted_rows: dict[str, list[dict[str, Any]]] = {"tasks": [], "works": [], "rules": []}
-            for kind, rows in (("tasks", tasks), ("works", works), ("rules", rules)):
-                for row in rows:
-                    closure = _scope_sources(row.get("scope", {}))
-                    closure.update(_strings(row.get("source_event_ids")))
-                    source = row.get("request_event_id")
-                    if isinstance(source, str):
-                        closure.add(source)
-                    logical = (
-                        {row["id"]}
-                        if kind == "tasks"
-                        else set(row.get("scope", {}).get("source_task_revisions", {}))
-                    )
-                    if (
-                        len(set(snapshot["source_fingerprints"]) | closure) > 400
-                        or len(admitted_task_ids | logical) > 100
-                    ):
-                        context_incomplete = True
-                        continue
-                    if any(
-                        tx.get_event(identifier).content_state in {"forgotten", "recalled"}
-                        for identifier in closure
-                    ):
-                        continue
-                    snapshot["source_fingerprints"].update(
-                        {identifier: tx.event_fingerprint(identifier) for identifier in closure}
-                    )
-                    admitted_rows[kind].append(row)
-                    admitted_task_ids.update(logical)
-            tasks, works, rules = (
-                admitted_rows["tasks"],
-                admitted_rows["works"],
-                admitted_rows["rules"],
-            )
-            for task in tasks:
-                for identifier in task["source_event_ids"]:
-                    snapshot["source_fingerprints"][identifier] = tx.event_fingerprint(identifier)
-                    if tx.get_event(identifier).content_state == "expired":
-                        retained_context.add(identifier)
-            for row in works + rules:
-                sources = _scope_sources(row["scope"])
-                original = row.get("request_event_id")
-                if isinstance(original, str):
-                    sources.add(original)
-                for identifier in sources:
-                    snapshot["source_fingerprints"][identifier] = tx.event_fingerprint(identifier)
-            snapshot["retained_context_source_ids"] = sorted(retained_context)
-            task_ids = set()
-            for item in snapshot["items"]:
-                task_ids.update(item.get("source_task_revisions", {}))
-            task_ids.update(task["id"] for task in tasks)
-            for row in works + rules:
-                task_ids.update(row.get("scope", {}).get("source_task_revisions", {}))
-            snapshot["source_task_revisions"] = {
-                identifier: tx.get_team_task(identifier).revision for identifier in task_ids
-            }
-            policies = tx.conn.execute(
-                "SELECT * FROM ga_conversation_policy WHERE group_id=%s AND subject_id IN ('*',%s)",
-                (actor.group_id, actor.member_id),
-            ).fetchall()
-
-        identity_fields = {
-            "actor_id",
-            "member_id",
-            "owner_id",
-            "requester_id",
-            "creator_id",
-            "created_by",
-            "author_id",
-            "subject_id",
-            "requester_member_id",
-        }
-
-        def alias_value(value, field_name=None):
-            if isinstance(value, str):
-                return inverse.get(value, value) if field_name in identity_fields else value
-            if isinstance(value, list):
-                return [alias_value(item, field_name) for item in value]
-            if isinstance(value, dict):
-                return {key: alias_value(item, key) for key, item in value.items()}
-            return value
-
-        memory_items = []
-        for item in snapshot["items"]:
-            text = item["text"]
-            memory_items.append(
-                {
-                    key: value
-                    for key, value in {
-                        **item,
-                        "text": text[:2500],
-                        "context_excerpt_truncated": len(text) > 2500,
-                        "source_event_ids": [ref["event_id"] for ref in item["source_refs"][:20]],
-                        "source_refs_truncated": len(item["source_refs"]) > 20,
-                    }.items()
-                    if key
-                    in {
-                        "kind",
-                        "id",
-                        "text",
-                        "topic_id",
-                        "revision",
-                        "predicate",
-                        "value",
-                        "context_excerpt_truncated",
-                        "source_event_ids",
-                        "source_refs_truncated",
-                    }
-                }
-            )
-        public_works = []
-        for row in works:
-            projected = {
-                key: row[key]
-                for key in (
-                    "id",
-                    "requester_id",
-                    "request_event_id",
-                    "goal",
-                    "state",
-                    "revision",
-                    "goal_revision",
-                    "input_versions",
-                    "acceptance_criteria",
-                )
-            }
-            projected["goal"] = str(projected["goal"])[:3000]
-            detail = work_status_detail(row)
-            if row["state"] == "paused" and detail["code"] == "background_processing":
-                projected["state"] = "queued"
-            if row["state"] in {"paused", "waiting_input", "failed"}:
-                projected["status_detail"] = detail
-            projected["acceptance_criteria"] = [
-                str(value)[:500] for value in projected["acceptance_criteria"]
-            ]
-            projected["scope"] = {
-                key: value
-                for key, value in row["scope"].items()
-                if key in {"topic_id", "outputs", "delivery_artifacts", "speech_requested"}
-            }
-            question = row["scope"].get("_runtime_input_request")
-            if (
-                isinstance(question, dict)
-                and row["state"] == "waiting_input"
-                and question.get("goal_revision") == row["goal_revision"]
-            ):
-                projected["waiting_question"] = question.get("question")
-            public_works.append(projected)
-        public_tasks = [
-            {
-                key: row[key]
-                for key in (
-                    "id",
-                    "title",
-                    "owner_id",
-                    "created_by",
-                    "status",
-                    "progress",
-                    "due_at",
-                    "revision",
-                )
-                if key in row
-            }
-            for row in tasks
-        ]
-        public_rules = [
-            {
-                key: row[key]
-                for key in (
-                    "id",
-                    "creator_id",
-                    "title",
-                    "goal",
-                    "state",
-                    "timing",
-                    "time_zone",
-                    "next_due_at",
-                    "valid_until",
-                    "revision",
-                )
-            }
-            for row in rules
-        ]
-        payload = {
-            "now": self.clock().astimezone(ZoneInfo(self.config.group.time_zone)).isoformat(),
-            "group_time_zone": self.config.group.time_zone,
-            "role": actor.role.value,
-            "read_only": actor.role in {Role.OBSERVER, Role.MAINTAINER},
-            "capabilities": {
-                **self.config.features.model_dump(mode="json"),
-                "public_image_retrieval": self.config.features.public_image_retrieval
-                and self.config.features.web_research,
-            },
-            "requester_member_id": inverse[actor.member_id],
-            "members": [
-                {
-                    "member_id": member.member_id,
-                    "name": member.display_name,
-                    "name_source": member.name_source,
-                    "membership_state": member.membership_state,
-                    "revision": member.revision,
-                    "updated_at": member.updated_at.isoformat(),
-                }
-                for member in member_rows
-            ],
-            "works": public_works,
-            "tasks": public_tasks,
-            "schedules": public_rules,
-            "topics": [{key: row[key] for key in ("id", "title", "visibility")} for row in topics],
-            "memory": memory_items,
-            "summaries_are_lossy": True,
-            "context_incomplete": context_incomplete,
-            "quoted_work_id": quoted_work_id
-            if quoted_work_id in {w["id"] for w in works}
-            else None,
-            "recent_messages": [
-                {
-                    "id": row["id"],
-                    "actor_id": row["actor_id"],
-                    "kind": row["kind"],
-                    "occurred_at": tx_event.occurred_at.isoformat(),
-                    "text": tx_event.text[:4000],
-                    "reply_to": tx_event.reply_to,
-                    "attachments": tx_event.attachments,
-                }
-                for row in reversed(recent)
-                for tx_event in [canonical_recent[row["id"]]]
-            ],
-            "model_event": {
-                "id": event.id,
-                "actor_id": event.actor_id,
-                "kind": event.kind.value,
-                "text": event.text,
-                "occurred_at": event.occurred_at.astimezone(
-                    ZoneInfo(self.config.group.time_zone)
-                ).isoformat(),
-                "reply_to": event.reply_to,
-                "attachments": event.attachments,
-            },
-        }
-        payload = alias_value(payload)
-        payload.update(self.identity.context())
-        payload.update(
-            {
-                "_snapshot": snapshot,
-                "_aliases": aliases,
-                "_policies": policies,
-                "_topic_id": topic_id,
-                "_works": works,
-                "_control_works": control_works,
-                "_tasks": tasks,
-                "_rules": rules,
-                "_quoted_work_id": quoted_work_id,
-            }
-        )
-        if self.artifacts:
-            candidates = self.artifacts.list(actor, limit=30, public_context=True)
-            if quoted_work_id:
-                bound_files = self.artifacts.list(
-                    actor, limit=20, public_context=True, work_id=quoted_work_id
-                )
-                by_version = {row["version_id"]: row for row in bound_files + candidates}
-                candidates = list(by_version.values())
-            files = []
-            with self.store.transaction(actor) as tx, ExitStack() as reads:
-                self.memory.prepare_in_tx(tx)
-                reads.enter_context(tx.context_event_reads())
-                self.memory.assert_snapshot_in_tx(tx, snapshot)
-                retained = set(snapshot.get("artifact_retained_source_ids", []))
-                metadata_versions = []
-                for candidate in candidates:
-                    fingerprints, expired = self.artifacts.consume_in_tx(
-                        tx, candidate["version_id"]
-                    )
-                    file_tasks = self.artifacts.task_sources_in_tx(tx, candidate["version_id"])
-                    if (
-                        len(set(snapshot["source_fingerprints"]) | set(fingerprints)) > 400
-                        or len(set(snapshot["source_task_revisions"]) | set(file_tasks)) > 100
-                    ):
-                        payload["context_incomplete"] = True
-                        continue
-                    snapshot["source_fingerprints"].update(fingerprints)
-                    snapshot["source_task_revisions"].update(file_tasks)
-                    retained.update(expired)
-                    metadata_versions.append(candidate["version_id"])
-                    files.append(candidate)
-                snapshot["artifact_retained_source_ids"] = sorted(retained)
-                snapshot["context_artifact_versions"] = metadata_versions
-            payload["files"] = files
-
-        # Bound the actual serialized model context as well as provenance fanout.
-        # Drop complete optional entries; the canonical database remains intact.
-        def public_bytes():
-            return len(
-                json.dumps(
-                    {key: value for key, value in payload.items() if not key.startswith("_")},
-                    ensure_ascii=False,
-                    default=str,
-                ).encode()
-            )
-
-        for key, minimum in (
-            ("memory", 0),
-            ("recent_messages", 2),
-            ("files", 0),
-            ("works", 1),
-            ("schedules", 1),
-            ("tasks", 1),
-        ):
-            while public_bytes() > 90_000 and len(payload.get(key, [])) > minimum:
-                payload[key].pop(0 if key == "recent_messages" else -1)
-                payload["context_incomplete"] = True
-        return payload
+        return ContextBuilder(
+            self.config,
+            self.store,
+            self.memory,
+            self.members,
+            self.scheduler,
+            self.artifacts,
+            self.clock,
+        ).build(actor, event, query)
 
     def _fast_new_work(self, event: GroupEvent, context: dict) -> Decision | None:
         if (
@@ -827,6 +222,7 @@ class ConversationCoordinator(Coordinator):
             or context.get("role") not in {"owner", "member"}
             or context.get("read_only")
             or fast_observe(event, context) is not None
+            or verified_human_addressee(event.text, context) is not None
             or policy_intent(event, context) is not None
         ):
             return None
@@ -846,6 +242,20 @@ class ConversationCoordinator(Coordinator):
                 "完成原始请求中的全部内容与约束，以真实执行、产物验证和必需投递回执结案。"
             ],
             outputs=list(intent.outputs),
+            work_capabilities=(
+                ["public_images"]
+                if intent.required_tool == "web_image_import"
+                else ["compute"]
+                if intent.required_tool in {"python_compute", "process_run"}
+                else ["documents"]
+                if any(
+                    item.get("format") in {"md", "docx", "pdf", "pptx"} for item in intent.outputs
+                )
+                else []
+            ),
+            public_image_count=public_image_request_count(event.text, identity=identity)
+            if intent.required_tool == "web_image_import"
+            else None,
             directness="direct" if addressed else "open",
             confidence=1,
         )
@@ -884,54 +294,6 @@ class ConversationCoordinator(Coordinator):
             kind="reply",
             reason_code="refreshed_roster",
             response=text,
-            directness="direct",
-            confidence=1,
-        )
-
-    def _fast_diagnostic_reply(self, event: GroupEvent, context: dict) -> Decision | None:
-        if event.kind != EventKind.TEXT or event.attachments or len(event.text) > 240:
-            return None
-        plain = outside_quotes(event.text)
-        if plain != event.text.strip():
-            return None
-        specific = bool(re.search(r"出现什么问题|出了什么问题|是超时问题还是预算问题", plain))
-        if not specific and not (
-            re.search(r"为什么|为何|原因|why", plain, re.I)
-            and re.search(r"暂停|停了|失败|没完成|没结果|卡住|停止|paused|failed", plain, re.I)
-        ):
-            return None
-        if re.search(r"恢复|重试|取消|重新|继续执行|生成|下载|删除", plain):
-            return None
-        wording = self.identity.strip_address(plain)
-        wording = re.sub(r"[\s，,。?？!！;；:：]", "", wording)
-        wording = re.sub(
-            r"为什么|为何|是什么原因|原因是什么|是什么|导致|这项|这次|刚才|任务|工作|照片|图片|处理|暂停|停了|停止|失败|没完成|没结果|卡住|具体|真实|原因|告诉我|请|直接|说|一下|已|被|会|了|的",
-            "",
-            wording,
-        )
-        if wording and not specific:
-            return None  # An unrelated conceptual question still needs the router.
-        states = {"paused"} if "暂停" in plain else {"paused", "waiting_input", "failed"}
-        works = [
-            w
-            for w in context["_works"]
-            if w["state"] in states
-            and (context["role"] == "owner" or w["requester_id"] == event.actor_id)
-        ]
-        quoted = context.get("_quoted_work_id")
-        if quoted:
-            works = [w for w in works if w["id"] == quoted]
-        elif works:
-            latest = max(context["_works"], key=lambda w: w.get("_requested_at", ""))
-            works = [w for w in works if w["id"] == latest["id"]]
-        if len(works) != 1:
-            return None
-        work = works[0]
-        context["_diagnostic_work_revision"] = (work["id"], work["revision"])
-        return Decision(
-            kind="reply",
-            reason_code="durable_work_diagnostic",
-            response=work_status_detail(work)["message"],
             directness="direct",
             confidence=1,
         )
@@ -1103,46 +465,104 @@ class ConversationCoordinator(Coordinator):
             confidence=1,
         )
 
+    def _resolve_work_set(self, actor, event, decision, context) -> ResolvedWorkSet:
+        readonly = decision.kind == "query_work"
+        selector = decision.work_selector
+        if selector is None:
+            selector = WorkSelector(
+                basis="ids",
+                ids=(decision.target_work_id or "",),
+                requester_scope="any" if readonly or actor.role == Role.OWNER else "self",
+            )
+        if not readonly:
+            target = {
+                "cancel": WorkState.CANCELLED,
+                "pause": WorkState.PAUSED,
+                "resume": WorkState.QUEUED,
+                "retry": WorkState.QUEUED,
+            }[decision.control or "pause"]
+            eligible = (
+                {WorkState.PAUSED}
+                if decision.control == "resume"
+                else {WorkState.FAILED}
+                if decision.control == "retry"
+                else {
+                    state
+                    for state, transitions in WORK_TRANSITIONS.items()
+                    if target in transitions
+                }
+            )
+            if selector.states and not set(selector.states).issubset(eligible):
+                raise DomainError(
+                    "invalid_transition", "The selected states cannot accept this command"
+                )
+            selector = selector.model_copy(
+                update={"states": selector.states or tuple(sorted(eligible))}
+            )
+        resolved = resolve_work_selection(
+            actor,
+            event,
+            selector,
+            context.get("_control_works", context.get("_works", [])),
+            focus_id=context.get("_focus_work_ids") or context.get("_focus_work_id"),
+            quoted_id=context.get("_quoted_work_id"),
+            candidates_complete=context.get("_control_works_complete", True),
+            readonly=readonly,
+        )
+        if (
+            decision.work_selector is None
+            and resolved.refs[0].revision != decision.expected_revision
+        ):
+            raise DomainError("version_conflict", "The exact work reference is stale")
+        return resolved
+
     def _fast_control(self, event: GroupEvent, context: dict) -> Decision | None:
         if event.kind not in {EventKind.TEXT, EventKind.QUOTE}:
             return None
         command = control_request(event.text, identity=BotIdentity.from_context(context))
         if command is None:
             return None
-        works = [
-            work
-            for work in context.get("_control_works", context["_works"])
-            if (work["requester_id"] == event.actor_id or context["role"] == "owner")
-            and work["state"] not in {"completed", "failed", "cancelled"}
-        ]
-        if event.reply_to:
-            quoted = [
-                work
-                for work in works
-                if work["request_event_id"] == event.reply_to
-                or work["id"] == context.get("_quoted_work_id")
-            ]
-            # An explicit quote never falls back to an unrelated work owned by
-            # the speaker, even when only one such work is running.
-            works = quoted
-        if len(works) != 1:
-            return Decision(
-                kind="clarify",
-                reason_code="ambiguous_control",
-                response="你想停哪一项任务？告诉我任务名称即可。",
-                directness="direct",
-                confidence=1,
-            )
-        work = works[0]
-        return Decision(
+        selector = WorkSelector(
+            basis="quote" if event.reply_to else "focus",
+            requester_scope="any" if context.get("role") == "owner" else "self",
+        )
+        # A short control has no independent definition of 'this work'. Both
+        # fast and model paths use the same source-bound reference resolver.
+        decision = Decision(
             kind="control_work",
             reason_code="explicit_local_control",
-            target_work_id=work["id"],
-            expected_revision=work["revision"],
+            work_selector=selector,
             control="pause" if command in {"暂停", "先停一下", "停一下"} else "cancel",
             directness="direct",
             confidence=1,
         )
+        try:
+            self._resolve_work_set(self.actor(event), event, decision, context)
+        except DomainError:
+            return Decision(
+                kind="clarify",
+                reason_code="ambiguous_control",
+                response="你想停止哪一项工作？可以引用它或说出名称。",
+                directness="direct",
+                confidence=1,
+            )
+        return decision
+
+    @staticmethod
+    def _work_status(work) -> str:
+        if work.state == WorkState.PAUSED:
+            return work_status_detail(work)["message"]
+        return {
+            WorkState.QUEUED: "已排队，尚未开始执行。",
+            WorkState.RUNNING: "正在处理。",
+            WorkState.WAITING_INPUT: "还缺少必要资料。",
+            WorkState.WAITING_EXTERNAL: "正在等待外部服务。",
+            WorkState.VALIDATING: "正在检查结果。",
+            WorkState.DELIVERING: "正在交付结果。",
+            WorkState.COMPLETED: "已完成。",
+            WorkState.CANCELLED: "已取消。",
+            WorkState.FAILED: "执行失败，已有记录保留。",
+        }[work.state]
 
     def _gate(
         self, tx: UnitOfWork, event: GroupEvent, decision: Decision, context: dict
@@ -1150,6 +570,8 @@ class ConversationCoordinator(Coordinator):
         observed = fast_observe(event, context)
         if observed is not None:
             return observed
+        if verified_human_addressee(event.text, context) is not None:
+            decision = decision.model_copy(update={"directness": "other"})
         write = decision.action is not None or decision.kind in {
             "start_work",
             "update_work",
@@ -1197,7 +619,7 @@ class ConversationCoordinator(Coordinator):
                     directness=decision.directness,
                     confidence=1,
                 )
-        if decision.action and any(
+        if write and any(
             item.get("kind") == "audio_transcription" and item.get("needs_clarification")
             for item in event.attachments
         ):
@@ -1208,12 +630,10 @@ class ConversationCoordinator(Coordinator):
                 directness="direct",
                 confidence=1,
             )
-        owner_assignment = (
-            tx.actor.role == Role.OWNER
-            and decision.action
-            and decision.action.get("op") in {"assign_task", "task_batch"}
+        declaration = is_task_declaration(
+            decision.action, tx.actor.role, tx.actor.member_id, context.get("_tasks", [])
         )
-        if decision.directness in {"other", "none"} and not owner_assignment:
+        if decision.directness in {"other", "none"} and not declaration:
             return Decision(kind="observe", reason_code="not_addressed_to_agent")
         if write and decision.confidence < 0.85:
             return Decision(
@@ -1250,28 +670,22 @@ class ConversationCoordinator(Coordinator):
             "open",
         }:
             return Decision(kind="observe", reason_code="natural_participation_disabled")
-        policies = tx.conn.execute(
-            "SELECT * FROM ga_conversation_policy WHERE group_id=%s AND subject_id IN ('*',%s) FOR UPDATE",
-            (tx.group_id, tx.actor.member_id),
-        ).fetchall()
         is_policy_command = decision.action and decision.action.get("op") in {
             "quiet",
             "participation",
         }
         if not is_policy_command and decision.kind != "control_work":
-            mode = next(
-                (p["mode"] for p in policies if p["subject_id"] == "*"),
-                self.config.group.participation_mode,
+            admission = ingress_admission(
+                tx,
+                event,
+                self.identity,
+                time_zone=self.config.group.time_zone,
+                quiet_hours=self.config.group.quiet_hours,
+                now=now,
+                default_mode=self.config.group.participation_mode,
             )
-            if mode in {"paused", "disabled"}:
-                return Decision(kind="observe", reason_code="group_paused")
-            if mode == "on_request" and decision.directness not in {"direct", "open"}:
-                return Decision(kind="observe", reason_code="on_request_mode")
-            quiet = is_quiet(
-                policies, now, self.config.group.time_zone, self.config.group.quiet_hours
-            )
-            if quiet and decision.directness not in {"direct"}:
-                return Decision(kind="observe", reason_code="quiet_policy")
+            if not admission.allowed:
+                return Decision(kind="observe", reason_code=admission.reason_code)
         if decision.directness == "proactive" and decision.kind in {
             "reply",
             "clarify",
@@ -1745,12 +1159,25 @@ class ConversationCoordinator(Coordinator):
                     "UPDATE ga_conversation_policy SET quiet=%s,quiet_until=%s,quiet_hours=%s,revision=revision+1 WHERE group_id=%s AND subject_id=%s",
                     (action.enabled, action.until, action.hours or [], tx.group_id, subject),
                 )
+                if action.enabled:
+                    apply_quiet_barrier_in_tx(tx, event, subject)
                 text = (
                     "我先保持安静；你明确叫我时，我仍会回应。"
                     if action.enabled
                     else "我恢复参与讨论了。"
                 )
             else:
+                intended = interpret_policy(
+                    event, tx.actor, self.identity, time_zone=self.config.group.time_zone
+                )
+                if (
+                    intended is None
+                    or intended.operation != "participation"
+                    or intended.transition != action.mode
+                ):
+                    raise DomainError(
+                        "invalid_input", "A whole-group mode needs an explicit policy request"
+                    )
                 tx.conn.execute(
                     "UPDATE ga_conversation_policy SET mode=%s,revision=revision+1 WHERE group_id=%s AND subject_id='*'",
                     (action.mode, tx.group_id),
@@ -1799,6 +1226,89 @@ class ConversationCoordinator(Coordinator):
             }, "已保存这位成员的姓名例外，群昵称仍优先使用。"
         raise DomainError("invalid_input", "Unknown conversation action")
 
+    def _policy_turn(self, tx: UnitOfWork, event: GroupEvent) -> CoordinationResult | None:
+        intent = interpret_policy(
+            event, tx.actor, self.identity, time_zone=self.config.group.time_zone
+        )
+        if intent is None:
+            return None
+        recipient_context = {
+            **self.identity.context(),
+            "requester_member_id": tx.actor.member_id,
+            "members": [
+                {
+                    "member_id": member.member_id,
+                    "name": member.display_name,
+                    "name_source": member.name_source,
+                    "membership_state": member.membership_state,
+                }
+                for member in self.members.in_tx(tx).list(tx.actor)
+            ],
+        }
+        if verified_human_addressee(event.text, recipient_context) is not None:
+            return None
+        if tx.actor.role not in {Role.OWNER, Role.MEMBER}:
+            decision = Decision(
+                kind="reply",
+                reason_code="read_only_scope",
+                response="当前角色只能查询，不能修改参与设置。",
+                directness="direct",
+                confidence=1,
+            )
+            outcome = None
+        else:
+            proposed = Decision(
+                kind="reply",
+                reason_code="participation_command",
+                response="调整参与设置。",
+                action=intent.action(),
+                directness="direct",
+                confidence=1,
+            )
+            try:
+                with tx.conn.transaction():
+                    outcome, text = self._apply_action(tx, event, proposed, {})
+                # Silence is a committed command, not a conversational promise.
+                # Activating it intentionally does not generate an acknowledgement.
+                decision = (
+                    Decision(kind="observe", reason_code="quiet_enabled", confidence=1)
+                    if intent.operation == "quiet" and intent.transition == "pause_proactive"
+                    else Decision(
+                        kind="reply",
+                        reason_code="participation_command_applied",
+                        response=text,
+                        directness="direct",
+                        confidence=1,
+                    )
+                )
+            except (DomainError, ValidationError) as error:
+                code = error.code if isinstance(error, DomainError) else "invalid_input"
+                decision = Decision(
+                    kind="reply",
+                    reason_code=code,
+                    response=_ERRORS.get(code, "参与设置暂未更新。"),
+                    directness="direct",
+                    confidence=1,
+                )
+                outcome = None
+        delivery = tx.enqueue_reply(event.id, decision.response) if decision.response else None
+        result = CoordinationResult(
+            event_id=event.id,
+            decision=decision,
+            delivery_id=delivery.id if delivery else None,
+            action_result=outcome,
+        )
+        tx.record_decision(
+            event.id,
+            {
+                "kind": decision.kind,
+                "result": result.model_dump(mode="json"),
+                "source_event_ids": [event.id],
+                "source_fingerprints": {event.id: tx.event_fingerprint(event.id)},
+            },
+        )
+        return result
+
     async def process(self, event: GroupEvent) -> CoordinationResult:
         self.execution_guard()
         actor = self.actor(event)
@@ -1839,6 +1349,51 @@ class ConversationCoordinator(Coordinator):
                     event.id, {"kind": "ignore", "result": result.model_dump(mode="json")}
                 )
                 return result
+            if self.config.group.bot_member_id == event.actor_id:
+                if not self.config.group.shared_account:
+                    result = CoordinationResult(
+                        event_id=event.id,
+                        decision=Decision(kind="ignore", reason_code="unshared_bot_account"),
+                    )
+                    tx.record_decision(
+                        event.id, {"kind": "ignore", "result": result.model_dump(mode="json")}
+                    )
+                    return result
+                if (
+                    control_request(event.text, identity=self.identity) is None
+                    and tx.conn.execute(
+                        "SELECT 1 FROM ga_delivery_parts WHERE group_id=%s AND state IN ('submitted','unknown') LIMIT 1",
+                        (tx.group_id,),
+                    ).fetchone()
+                ):
+                    raise DomainError(
+                        "echo_reconciliation_pending",
+                        "Awaiting send identity reconciliation",
+                        retryable=True,
+                    )
+            policy_result = self._policy_turn(tx, event)
+            if policy_result is not None:
+                self.execution_guard(tx)
+                return policy_result
+            if event.kind not in {EventKind.SYSTEM, EventKind.MEMBERSHIP, EventKind.RECALL}:
+                admission = ingress_admission(
+                    tx,
+                    event,
+                    self.identity,
+                    time_zone=self.config.group.time_zone,
+                    quiet_hours=self.config.group.quiet_hours,
+                    now=self.clock(),
+                    default_mode=self.config.group.participation_mode,
+                )
+                if not admission.allowed:
+                    result = CoordinationResult(
+                        event_id=event.id,
+                        decision=Decision(kind="observe", reason_code=admission.reason_code),
+                    )
+                    tx.record_decision(
+                        event.id, {"kind": "observe", "result": result.model_dump(mode="json")}
+                    )
+                    return result
         if event.kind == EventKind.RECALL:
             self.memory.recall(self.service_actor, event.id, now=self.clock())
         context = self._context(actor, event)
@@ -1848,21 +1403,6 @@ class ConversationCoordinator(Coordinator):
                 context = self._context(actor, event)
                 context["roster_status"] = roster_status
         fast_admitted = False
-        if self.config.group.bot_member_id == event.actor_id and not echo:
-            if not self.config.group.shared_account:
-                echo = True
-            elif self._fast_control(event, context) is None:
-                with self.store.transaction(actor) as tx:
-                    pending = tx.conn.execute(
-                        "SELECT 1 FROM ga_delivery_parts WHERE group_id=%s AND state IN ('submitted','unknown') LIMIT 1",
-                        (actor.group_id,),
-                    ).fetchone()
-                if pending:
-                    raise DomainError(
-                        "echo_reconciliation_pending",
-                        "Same-account input awaits send identity reconciliation",
-                        retryable=True,
-                    )
         if echo:
             decision = Decision(kind="ignore", reason_code="verified_bot_receipt")
         elif (event.kind == EventKind.AUDIO and not self.config.features.audio_transcription) or (
@@ -1916,8 +1456,6 @@ class ConversationCoordinator(Coordinator):
                 if immediate is None:
                     immediate = self._fast_roster_reply(event, context)
                 if immediate is None:
-                    immediate = self._fast_diagnostic_reply(event, context)
-                if immediate is None:
                     immediate = self._fast_visual_boundary(event, context)
                 if immediate is None:
                     immediate = self._fast_identity_reply(event, context)
@@ -1938,9 +1476,6 @@ class ConversationCoordinator(Coordinator):
                     update={"duplicate": True}
                 )
             self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
-            diagnostic = context.get("_diagnostic_work_revision")
-            if diagnostic and tx.get_work(diagnostic[0]).revision != diagnostic[1]:
-                raise DomainError("memory_changed", "Work status changed before its explanation")
             if (
                 context.get("_exact_fact_reply")
                 and self._fast_fact_reply(event, context, actor, tx=tx) != decision
@@ -1958,6 +1493,7 @@ class ConversationCoordinator(Coordinator):
                 decision = Decision(kind="ignore", reason_code="verified_bot_receipt")
             decision = self._gate(tx, event, decision, context)
             work_id = delivery_id = None
+            controlled_work_ids: list[str] = []
             action_result = None
             original_snapshot = deepcopy(context["_snapshot"])
             try:
@@ -1966,8 +1502,26 @@ class ConversationCoordinator(Coordinator):
                 with tx.conn.transaction():
                     if decision.action is not None:
                         action_payload = decision.action
+                        silent_declaration = decision.directness in {
+                            "other",
+                            "none",
+                        } and is_task_declaration(
+                            action_payload, actor.role, actor.member_id, context.get("_tasks", [])
+                        )
                         action_result, text = self._apply_action(tx, event, decision, context)
-                        decision = decision.model_copy(update={"kind": "reply", "response": text})
+                        if action_payload.get("op") == "quiet" and action_payload.get("enabled"):
+                            decision = Decision(
+                                kind="observe", reason_code="quiet_enabled", confidence=1
+                            )
+                        elif silent_declaration:
+                            decision = Decision(
+                                kind="observe",
+                                reason_code="task_declaration_recorded",
+                                directness=decision.directness,
+                                confidence=decision.confidence,
+                            )
+                        else:
+                            decision = decision.model_copy(update={"response": text})
                         if action_payload.get("op") == "forget":
                             context["_snapshot"]["source_fingerprints"] = {
                                 event.id: tx.event_fingerprint(event.id)
@@ -2045,11 +1599,17 @@ class ConversationCoordinator(Coordinator):
                                 request_text,
                             )
                         )
-                        public_images = public_image_request_count(
-                            request_text, identity=self.identity
+                        public_images = (
+                            public_image_request_count(request_text, identity=self.identity)
+                            or decision.public_image_count
                         )
                         research_required = (
-                            requires_research(request_text) or public_images is not None
+                            requires_research(request_text)
+                            or public_images is not None
+                            or bool(
+                                set(decision.work_capabilities)
+                                & {"public_research", "public_images"}
+                            )
                         )
                         if public_images and not self.config.features.public_image_retrieval:
                             raise DomainError(
@@ -2065,6 +1625,8 @@ class ConversationCoordinator(Coordinator):
                         if research_required and not self.config.features.web_research:
                             raise DomainError("feature_disabled", "Web research is disabled")
                         required_tools = []
+                        if "public_images" in decision.work_capabilities or public_images:
+                            required_tools.append("web_image_import")
                         main = main_request(request_text, identity=self.identity)
                         if re.match(
                             r"(?:真正|实际|现在|直接)?(?:用|使用)(?:受控的?)?\s*[Pp]ython", main
@@ -2147,6 +1709,7 @@ class ConversationCoordinator(Coordinator):
                                 "delivery_artifacts": delivery_artifacts,
                                 "research_required": research_required,
                                 "public_image_count": public_images,
+                                "work_capabilities": list(decision.work_capabilities),
                                 "required_tools": [str(name) for name in required_tools],
                                 "team_task_write_allowed": team_write,
                                 "team_task_authorization_event_id": event.id,
@@ -2228,6 +1791,20 @@ class ConversationCoordinator(Coordinator):
                             else None,
                         )
                         work_id = work.id
+                        if decision.work_capabilities or decision.public_image_count is not None:
+                            scope = dict(work.scope)
+                            scope["work_capabilities"] = list(decision.work_capabilities)
+                            if decision.public_image_count is not None:
+                                scope["public_image_count"] = decision.public_image_count
+                            if set(decision.work_capabilities) & {
+                                "public_research",
+                                "public_images",
+                            }:
+                                scope["research_required"] = True
+                            tx.conn.execute(
+                                "UPDATE ga_work_orders SET scope=%s WHERE group_id=%s AND id=%s",
+                                (Jsonb(scope), tx.group_id, work.id),
+                            )
                         if attachment_ids:
                             scope = dict(work.scope)
                             scope["attachment_event_ids"] = list(
@@ -2249,30 +1826,92 @@ class ConversationCoordinator(Coordinator):
                         decision = decision.model_copy(
                             update={"response": "已更新同一项工作的要求，旧结果不会覆盖新目标。"}
                         )
-                    elif decision.kind == "control_work":
-                        target = {
-                            "cancel": WorkState.CANCELLED,
-                            "pause": WorkState.PAUSED,
-                            "resume": WorkState.QUEUED,
-                            "retry": WorkState.QUEUED,
-                        }[decision.control or "pause"]
-                        work = tx.transition_work(
-                            decision.target_work_id or "",
-                            target,
-                            expected_revision=decision.expected_revision or 0,
-                            reason="retry" if decision.control == "retry" else "user_request",
-                        )
-                        work_id = work.id
-                        decision = decision.model_copy(
-                            update={
-                                "response": {
-                                    "pause": "已暂停后续执行。已发出的内容会保留记录。",
-                                    "cancel": "已停止后续执行。已发出的内容无法自动撤回。",
-                                    "resume": "已恢复排队，仍遵守原来的范围和预算。",
-                                    "retry": "已安排重试，原有费用和执行记录会保留。",
-                                }[decision.control or "pause"]
+                    elif decision.kind in {"control_work", "query_work"}:
+                        resolved = self._resolve_work_set(actor, event, decision, context)
+                        selected = []
+                        for ref in resolved.refs:
+                            row = tx._work_row(ref.id)
+                            if row["revision"] != ref.revision or row["state"] != ref.state.value:
+                                raise DomainError(
+                                    "version_conflict", "A selected work changed before the command"
+                                )
+                            work = tx.get_work(ref.id)
+                            tx._check_work_source(row)
+                            source = tx.get_event(work.request_event_id)
+                            context["_snapshot"]["source_fingerprints"][source.id] = (
+                                tx.event_fingerprint(source.id)
+                            )
+                            selected.append(work)
+                        if decision.kind == "query_work":
+                            if len(selected) == 1:
+                                text = self._work_status(selected[0])
+                            else:
+                                text = "\n".join(
+                                    f"{index + 1}. {item.goal[:48]}：{self._work_status(item)}"
+                                    for index, item in enumerate(selected)
+                                )
+                            action_result = {
+                                "work_ids": list(resolved.ids),
+                                "states": [item.state.value for item in selected],
                             }
-                        )
+                            work_id = selected[0].id if len(selected) == 1 else None
+                            decision = Decision(
+                                kind="reply",
+                                reason_code="work_status_query",
+                                response=text,
+                                directness="direct",
+                                confidence=1,
+                            )
+                        else:
+                            target = {
+                                "cancel": WorkState.CANCELLED,
+                                "pause": WorkState.PAUSED,
+                                "resume": WorkState.QUEUED,
+                                "retry": WorkState.QUEUED,
+                            }[decision.control or "pause"]
+                            for work in selected:
+                                if (
+                                    decision.control in {"resume", "retry"}
+                                    and work.policy_revision != actor.policy_revision
+                                ):
+                                    # The user's current scoped command reauthorizes the same
+                                    # immutable goal under the current policy; it resets nothing.
+                                    tx.conn.execute(
+                                        "UPDATE ga_work_orders SET policy_revision=%s WHERE group_id=%s AND id=%s AND revision=%s",
+                                        (
+                                            actor.policy_revision,
+                                            actor.group_id,
+                                            work.id,
+                                            work.revision,
+                                        ),
+                                    )
+                                tx.transition_work(
+                                    work.id,
+                                    target,
+                                    expected_revision=work.revision,
+                                    reason="retry"
+                                    if decision.control == "retry"
+                                    else "user_request",
+                                )
+                                controlled_work_ids.append(work.id)
+                            action_result = {
+                                "work_ids": controlled_work_ids,
+                                "control": decision.control,
+                                "selected_states": [item.state.value for item in selected],
+                            }
+                            work_id = selected[0].id if len(selected) == 1 else None
+                            verb = {
+                                "cancel": "取消",
+                                "pause": "暂停",
+                                "resume": "恢复排队",
+                                "retry": "安排重试",
+                            }[decision.control or "pause"]
+                            text = (
+                                f"已{verb}这项工作。"
+                                if len(selected) == 1
+                                else f"已{verb}{len(selected)}项匹配的工作。"
+                            )
+                            decision = decision.model_copy(update={"response": text})
             except (DomainError, ValidationError) as error:
                 context["_snapshot"] = original_snapshot
                 code = error.code if isinstance(error, DomainError) else "invalid_input"
@@ -2287,6 +1926,23 @@ class ConversationCoordinator(Coordinator):
                 )
                 work_id = None
                 action_result = None
+                controlled_work_ids = []
+            if decision.response and decision.kind not in {"ignore", "observe"}:
+                admission = ingress_admission(
+                    tx,
+                    event,
+                    self.identity,
+                    time_zone=self.config.group.time_zone,
+                    quiet_hours=self.config.group.quiet_hours,
+                    now=self.clock(),
+                    default_mode=self.config.group.participation_mode,
+                )
+                if not admission.allowed:
+                    decision = (
+                        decision.model_copy(update={"response": None})
+                        if decision.kind not in {"reply", "clarify"}
+                        else Decision(kind="observe", reason_code=admission.reason_code)
+                    )
             if decision.response and decision.kind not in {"ignore", "observe"}:
                 delivery = tx.enqueue_reply(
                     event.id,
@@ -2295,13 +1951,14 @@ class ConversationCoordinator(Coordinator):
                 )
                 delivery_id = delivery.id
                 tx.conn.execute(
-                    "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason,created_at) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                    "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason,created_at,invocation_root_event_id) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                     (
                         actor.group_id,
                         event.id,
                         decision.directness == "proactive",
                         decision.reason_code,
                         self.clock(),
+                        admission.invocation_root_event_id,
                     ),
                 )
             result = CoordinationResult(
@@ -2310,6 +1967,7 @@ class ConversationCoordinator(Coordinator):
                 work_id=work_id,
                 delivery_id=delivery_id,
                 action_result=action_result,
+                controlled_work_ids=controlled_work_ids,
             )
             tx.record_decision(
                 event.id,

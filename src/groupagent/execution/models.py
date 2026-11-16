@@ -38,6 +38,7 @@ class ExecutionRequest(EngineData):
     objective: str = Field(min_length=1, max_length=200_000)
     workspace: Path
     allowed_tools: frozenset[str] = frozenset()
+    visible_tools: frozenset[str] | None = None
     required_tools: frozenset[str] = frozenset()
     revision: int = Field(default=1, ge=1)
     budget: ExecutionBudget = Field(default_factory=ExecutionBudget)
@@ -47,6 +48,8 @@ class ExecutionRequest(EngineData):
     def check_required_tools(self) -> ExecutionRequest:
         if not self.required_tools.issubset(self.allowed_tools):
             raise ValueError("Required tools must be in the allowlist")
+        if self.visible_tools is not None and not self.visible_tools.issubset(self.allowed_tools):
+            raise ValueError("Visible tools must be in the allowlist")
         return self
 
 

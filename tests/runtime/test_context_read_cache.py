@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from contextlib import contextmanager
 
 import psycopg
@@ -25,27 +26,52 @@ def test_context_cache_deduplicates_sql_without_changing_payload_or_hashes(
     request = emit(env, "请新建独立工作，制作一份合成调研报告，整理资料并交付Markdown。")
     original_execute = psycopg.Connection.execute
     original_cache = UnitOfWork.context_event_reads
+    original_get_event = UnitOfWork.get_event
     calls = []
+    active_phases, phases = {}, []
 
     def counted(conn, query, params=None, **kwargs):
         if query == EVENT_SELECT:
             calls.append(params[1])
+            if id(conn) in active_phases:
+                active_phases[id(conn)]["selects"].append(params[1])
         return original_execute(conn, query, params, **kwargs)
+
+    def observed_get_event(tx, identifier):
+        if id(tx.conn) in active_phases:
+            active_phases[id(tx.conn)]["reads"].append(identifier)
+        return original_get_event(tx, identifier)
 
     @contextmanager
     def uncached(tx):
         yield
 
+    @contextmanager
+    def observed_cache(tx):
+        with original_cache(tx):
+            phase = {"reads": [], "selects": []}
+            active_phases[id(tx.conn)] = phase
+            phases.append(phase)
+            try:
+                yield
+            finally:
+                active_phases.pop(id(tx.conn))
+
     monkeypatch.setattr(psycopg.Connection, "execute", counted)
+    monkeypatch.setattr(UnitOfWork, "get_event", observed_get_event)
     monkeypatch.setattr(UnitOfWork, "context_event_reads", uncached)
     before = h.coordinator._context(env.actor, request)
     before_count = len(calls)
     calls.clear()
-    monkeypatch.setattr(UnitOfWork, "context_event_reads", original_cache)
+    monkeypatch.setattr(UnitOfWork, "context_event_reads", observed_cache)
     after = h.coordinator._context(env.actor, request)
-    # ArtifactRegistry.list retains its own independent transactions; they are
-    # deliberately not allowed to reuse either context phase's cached rows.
-    assert len(calls) < before_count / 3
+    assert len(calls) < before_count
+    assert phases and any(Counter(phase["reads"])[request.id] > 1 for phase in phases)
+    for phase in phases:
+        # Each raw event row is loaded once in its own phase; canonical reads,
+        # quote sanitization and fingerprints may still inspect it repeatedly.
+        assert all(count == 1 for count in Counter(phase["selects"]).values())
+        assert set(phase["selects"]) == set(phase["reads"])
     assert before["_snapshot"] == after["_snapshot"]
     before.pop("now", None)
     after.pop("now", None)

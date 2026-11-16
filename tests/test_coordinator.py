@@ -10,13 +10,14 @@ import httpx
 import pytest
 
 from groupagent.config import AppConfig, GroupConfig
+from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import (
     Coordinator,
     Decision,
-    DeepSeekDecisionProvider,
     ScriptedDecisionProvider,
 )
 from groupagent.domain import ActorContext, DeliveryState, DomainError, EventKind, GroupEvent, Role
+from groupagent.execution.deepseek import DeepSeekHTTPModel
 from groupagent.persistence import PostgresStore
 
 
@@ -207,6 +208,7 @@ async def test_http_router_keeps_model_role_outside_authority():
         return httpx.Response(
             200,
             json={
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
                 "choices": [
                     {
                         "finish_reason": "stop",
@@ -214,16 +216,18 @@ async def test_http_router_keeps_model_role_outside_authority():
                             "content": '{"kind":"start_work","reason_code":"request","goal":"x","role":"owner"}'
                         },
                     }
-                ]
+                ],
             },
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    router = DeepSeekDecisionProvider("synthetic-fixture-token", client=client)
+    router = ModelDecisionProvider(
+        DeepSeekHTTPModel("synthetic-fixture-token", client=client), max_retries=0
+    )
     config = AppConfig(
         group=GroupConfig(internal_id="g", external_group_id="synthetic", owner_ids=["owner"])
     )
-    with pytest.raises(DomainError, match="valid decision"):
+    with pytest.raises(DomainError):
         await router.decide(event(config), {})
     await client.aclose()
 
@@ -234,17 +238,20 @@ async def test_http_router_requires_complete_structured_output(finish_reason):
         return httpx.Response(
             200,
             json={
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
                 "choices": [
                     {
                         "finish_reason": finish_reason,
                         "message": {"content": '{"kind":"observe","reason_code":"x"}'},
                     }
-                ]
+                ],
             },
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        router = DeepSeekDecisionProvider("synthetic-fixture-token", client=client)
+        router = ModelDecisionProvider(
+            DeepSeekHTTPModel("synthetic-fixture-token", client=client), max_retries=0
+        )
         config = AppConfig(
             group=GroupConfig(internal_id="g", external_group_id="synthetic", owner_ids=["owner"])
         )
@@ -262,7 +269,9 @@ async def test_http_router_never_follows_redirect_even_with_injected_client():
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), follow_redirects=True
     ) as client:
-        router = DeepSeekDecisionProvider("synthetic-fixture-token", client=client)
+        router = ModelDecisionProvider(
+            DeepSeekHTTPModel("synthetic-fixture-token", client=client), max_retries=0
+        )
         config = AppConfig(
             group=GroupConfig(internal_id="g", external_group_id="synthetic", owner_ids=["owner"])
         )

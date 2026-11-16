@@ -1366,12 +1366,33 @@ def evaluate_interaction_participation(
             return []
 
         def fetchone(self):
-            return {"n": 0} if "ga_participation_log" in self.query else None
+            if self.query.lstrip().startswith("SELECT count(*)"):
+                return {"n": 0}
+            if self.query.lstrip().startswith("SELECT epoch "):
+                return {"epoch": 1}
+            if self.query.lstrip().startswith("SELECT sequence "):
+                return {"sequence": 1}
+            return None
 
     class ReadOnlyPolicies:
         def execute(self, query, params=()):
+            # Simulate the real gate's snapshot lock/epoch initialization only;
+            # this fixture has no database or mutable business resources.
+            if query.startswith(
+                (
+                    "SELECT pg_advisory_xact_lock(",
+                    "INSERT INTO ga_memory_epochs(group_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                )
+            ):
+                return Cursor(query)
             if not query.lstrip().startswith("SELECT") or not any(
-                table in query for table in ("ga_conversation_policy", "ga_participation_log")
+                table in query
+                for table in (
+                    "ga_conversation_policy",
+                    "ga_participation_log",
+                    "ga_memory_epochs",
+                    "ga_events",
+                )
             ):
                 raise AssertionError(
                     "Offline gate evaluation cannot write or access other resources"
@@ -1421,7 +1442,12 @@ def evaluate_interaction_participation(
         decision = Decision.model_validate(row["decision"])
         coordinator.identity = BotIdentity.from_context(context)
         effective = coordinator._gate(
-            SimpleNamespace(actor=actor, group_id=actor.group_id, conn=ReadOnlyPolicies()),
+            SimpleNamespace(
+                actor=actor,
+                group_id=actor.group_id,
+                conn=ReadOnlyPolicies(),
+                is_bot_message=lambda _message_id: False,
+            ),
             event,
             decision,
             context,

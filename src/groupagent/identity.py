@@ -16,6 +16,16 @@ DEFAULT_BOT_BADGE = "【Pot】"
 LEGACY_BOT_ALIASES = ("机器人", "机器人组长", "组长", "小伴")
 
 
+def trusted_name_source(source: object) -> bool:
+    """Canonical roster evidence plus older adapter/fixture spellings."""
+    return isinstance(source, str) and source in {
+        "room_display_name",
+        "roomDisplayName",
+        "roster",
+        "owner_confirmed",
+    }
+
+
 def _literal_name(name: str) -> str:
     # Python's Unicode \b would reject "Pot帮我". Only ASCII word characters
     # join an ASCII name, so spot/potato/Pot_1 are not accidental bot calls.

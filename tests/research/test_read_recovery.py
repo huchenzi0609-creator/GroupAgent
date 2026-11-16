@@ -218,7 +218,15 @@ async def test_failed_read_allows_another_source_and_partial_candidate(
     failed, successful = outcome.receipts
     assert failed.error_code == error_code and failed.effect_state == EffectState.NO_EFFECT
     assert successful.success
-    assert list(budget.reservations.values()) == ["unknown"] * (request_count - 1) + ["settled"]
+    # Independent reads may settle between retries of the failed source. Assert
+    # each real attempt's identity/state rather than an incidental insertion order.
+    expected = {
+        f"{scope.work_id}:unavailable:web.{first_operation}": "unknown",
+        f"{scope.work_id}:available:web.fetch": "settled",
+    }
+    for number in range(1, request_count - 1):
+        expected[f"{scope.work_id}:unavailable:web.{first_operation}:retry:{number}"] = "unknown"
+    assert budget.reservations == expected
     assert error_code in model.requests[-1].messages[-2].content
 
 

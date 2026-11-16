@@ -725,7 +725,7 @@ async def test_page_challenge_encoding_and_size_are_bounded(tmp_path, image_cont
                 assert failure.value.code == code
 
 
-async def test_discovery_attempts_have_a_small_execution_limit(tmp_path, image_context):
+async def test_explicit_discovery_quota_still_limits_execution_attempts(tmp_path, image_context):
     observed = []
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(
@@ -742,6 +742,7 @@ async def test_discovery_attempts_have_a_small_execution_limit(tmp_path, image_c
                 MediaService(store, InlineSyntheticImageWorker()),
                 resolver=public_resolver,
                 client=http,
+                max_discovery_attempts=6,
             )
             for index in range(6):
                 assert not (
@@ -1039,7 +1040,9 @@ async def test_failed_imports_and_delivery_selection_do_not_poison_successful_re
             media = MediaService(store, worker, max_images=4)
 
             def fresh_gateway(entries=()):
-                service = PublicImageService(media, resolver=public_resolver, client=http)
+                service = PublicImageService(
+                    media, resolver=public_resolver, client=http, max_images=4
+                )
                 gateway = RecordingGateway(policy, registry, store, context.actor, lease)
                 register_public_image_tools(gateway, service, source_factory=output_source)
                 gateway.register(
@@ -1217,7 +1220,13 @@ async def test_http_attempt_limit_is_separate_from_retained_images_and_survives_
 
             def fresh_gateway(entries=()):
                 gateway = ToolGateway()
-                service = PublicImageService(media, resolver=public_resolver, client=http)
+                service = PublicImageService(
+                    media,
+                    resolver=public_resolver,
+                    client=http,
+                    max_images=4,
+                    max_download_attempts=12,
+                )
                 register_public_image_tools(gateway, service, source_factory=output_source)
                 gateway.bind_scope(image_context.scope)
                 gateway.restore_ledger(image_context.scope, entries)
@@ -1313,7 +1322,12 @@ async def test_page_limit_receipts_preserve_cached_images_and_remain_page_limits
 
             def fresh_gateway(entries=()):
                 gateway = ToolGateway()
-                service = PublicImageService(media, resolver=public_resolver, client=http)
+                service = PublicImageService(
+                    media,
+                    resolver=public_resolver,
+                    client=http,
+                    max_discovery_attempts=6,
+                )
                 register_public_image_tools(gateway, service, source_factory=output_source)
                 gateway.bind_scope(image_context.scope)
                 gateway.restore_ledger(image_context.scope, entries)
@@ -1386,7 +1400,7 @@ async def test_duplicate_image_bytes_do_not_spend_an_additional_retained_image_s
     async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
         with ArtifactStore(tmp_path / "artifacts") as store:
             media = MediaService(store, InlineSyntheticImageWorker(), max_images=2)
-            service = PublicImageService(media, resolver=public_resolver, client=http)
+            service = PublicImageService(media, resolver=public_resolver, client=http, max_images=2)
             result = await service.candidates(image_context, "https://source.example.com/page")
             candidates = {
                 item.image_url.rsplit("/", 1)[-1]: item.candidate_id for item in result.candidates
@@ -1402,3 +1416,180 @@ async def test_duplicate_image_bytes_do_not_spend_an_additional_retained_image_s
                 )
             assert failure.value.code == "public_image_import_limit"
     assert len(observed) == 4
+
+
+async def test_default_imports_can_replace_bad_candidates_and_return_ten_with_batch_four(
+    tmp_path, image_context
+):
+    class SerialFixtureWorker(InlineSyntheticImageWorker):
+        def __init__(self):
+            super().__init__()
+            self.active = self.peak = 0
+
+        async def run(self, *args, **kwargs):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                await asyncio.sleep(0)
+                return await super().run(*args, **kwargs)
+            finally:
+                self.active -= 1
+
+    worker, observed = SerialFixtureWorker(), []
+    fixtures = {
+        f"/image-{index}.png": frog_fixture(
+            size=(320, 240), color=(index * 19, 255 - index * 17, index * 11)
+        )
+        for index in range(10)
+    }
+
+    def response(request):
+        observed.append(request.url.path)
+        if request.url.path == "/page":
+            html = '<img src="/bad.png">' + "".join(f'<img src="{path}">' for path in fixtures)
+            return httpx.Response(200, content=html.encode(), headers={"Content-Type": "text/html"})
+        if request.url.path == "/bad.png":
+            return httpx.Response(
+                200, content=b"not an image", headers={"Content-Type": "text/html"}
+            )
+        return httpx.Response(
+            200, content=fixtures[request.url.path], headers={"Content-Type": "image/png"}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+        with ArtifactStore(tmp_path / "artifacts") as store:
+            media = MediaService(store, worker, max_images=4)
+            service = PublicImageService(media, resolver=public_resolver, client=http)
+            assert (
+                service.max_images
+                is service.max_import_attempts
+                is service.max_discovery_attempts
+                is None
+            )
+            discovery = await service.candidates(
+                image_context, "https://source.example.com/page", limit=20
+            )
+            candidates = {
+                item.image_url.rsplit("/", 1)[-1]: item.candidate_id
+                for item in discovery.candidates
+            }
+            for _ in range(13):
+                with pytest.raises(DomainError) as failed:
+                    await service.import_image(
+                        image_context, candidates["bad.png"], source(image_context)
+                    )
+                assert failed.value.code == "public_image_content_type"
+            refs = await asyncio.gather(
+                *(
+                    service.import_image(
+                        image_context, candidates[f"image-{index}.png"], source(image_context)
+                    )
+                    for index in range(10)
+                )
+            )
+            assert len({ref.sha256 for ref in refs}) == 10 and media.max_images == 4
+            assert worker.peak == 1 and len(worker.calls) == 10
+            assert not service._retained_image_hashes
+    assert len(observed) == 24  # One page, thirteen failed candidates, ten validated images.
+
+
+async def test_resident_metadata_lru_rehydrates_evicted_targets_without_http_or_decode(
+    tmp_path, image_context, monkeypatch
+):
+    monkeypatch.setattr("groupagent.research.images._PAGE_CACHE_SIZE", 2)
+    monkeypatch.setattr("groupagent.research.images._CANDIDATE_CACHE_SIZE", 3)
+    monkeypatch.setattr("groupagent.research.images._IMPORT_CACHE_SIZE", 2)
+    worker, observed = InlineSyntheticImageWorker(), []
+    pixels = frog_fixture(size=(320, 240))
+
+    def response(request):
+        observed.append(request.url.path)
+        if request.url.path.startswith("/page-"):
+            page = request.url.path.rsplit("-", 1)[-1]
+            html = "".join(f'<img src="/image-{page}-{index}.png">' for index in range(5))
+            return httpx.Response(200, content=html.encode(), headers={"Content-Type": "text/html"})
+        return httpx.Response(200, content=pixels, headers={"Content-Type": "image/png"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+        with ArtifactStore(tmp_path / "artifacts") as store:
+            media = MediaService(store, worker, max_images=4)
+
+            def fresh(entries=()):
+                service = PublicImageService(media, resolver=public_resolver, client=http)
+                gateway = ToolGateway()
+                register_public_image_tools(gateway, service, source_factory=output_source)
+                gateway.bind_scope(image_context.scope)
+                gateway.restore_ledger(image_context.scope, entries)
+                return service, gateway
+
+            sequence = 0
+
+            async def invoke(gateway, name, arguments):
+                nonlocal sequence
+                sequence += 1
+                return await gateway.invoke(
+                    name,
+                    arguments,
+                    replace(
+                        image_context,
+                        call_id=f"lru-call-{sequence}",
+                        idempotency_key=f"lru-key-{sequence}",
+                    ),
+                )
+
+            service, gateway = fresh()
+            first_page = first_import = None
+            for index in range(8):  # More than the former six-page cumulative limit.
+                page = await invoke(
+                    gateway,
+                    "web_image_candidates",
+                    {
+                        "page_url": f"https://source.example.com/page-{index}",
+                        "limit": 20,
+                    },
+                )
+                assert page.success and len(page.output["candidates"]) == 5
+                imported = await invoke(
+                    gateway,
+                    "web_image_import",
+                    {
+                        "candidate_id": page.output["candidates"][0]["candidate_id"],
+                    },
+                )
+                assert imported.success
+                if index == 0:
+                    first_page, first_import = page, imported
+                assert len(service._pages) <= 2 and len(service._candidates) <= 3
+                assert len(service._imported) <= 2 and not service._retained_image_hashes
+            assert len(observed) == 16 and len(worker.calls) == 8
+
+            service, recovered = fresh(gateway.export_ledger(image_context.scope))
+            page_again = await invoke(
+                recovered,
+                "web_image_candidates",
+                {
+                    "page_url": "https://source.example.com/page-0",
+                    "limit": 20,
+                },
+            )
+            reused = await invoke(
+                recovered,
+                "web_image_import",
+                {
+                    "candidate_id": first_page.output["candidates"][0]["candidate_id"],
+                },
+            )
+            assert page_again.success and page_again.output == first_page.output
+            assert reused.success and reused.output == first_import.output
+            assert len(observed) == 16 and len(worker.calls) == 8
+            assert len(service._pages) <= 2 and len(service._candidates) <= 3
+            assert len(service._imported) <= 2
+
+
+@pytest.mark.parametrize("name", ["max_images", "max_download_attempts", "max_discovery_attempts"])
+@pytest.mark.parametrize("value", [0, True])
+def test_optional_image_quotas_require_explicit_positive_integers(tmp_path, name, value):
+    with ArtifactStore(tmp_path / "artifacts") as store:
+        media = MediaService(store, InlineSyntheticImageWorker())
+        with pytest.raises(ValueError, match="Optional public-image quotas"):
+            PublicImageService(media, **{name: value})

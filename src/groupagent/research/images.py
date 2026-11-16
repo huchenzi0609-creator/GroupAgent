@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html.parser import HTMLParser
-from typing import Literal
+from typing import Literal, TypeVar
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
@@ -37,6 +37,28 @@ from groupagent.tools.models import ToolLedgerEntry
 
 from .browser import FetchedHTML, PublicPageBroker
 from .urls import Resolver, parse_public_url, system_resolver
+
+_PAGE_CACHE_SIZE = 6
+_CANDIDATE_CACHE_SIZE = 100
+_IMPORT_CACHE_SIZE = 100
+CacheKey = TypeVar("CacheKey")
+CacheValue = TypeVar("CacheValue")
+
+
+def _cache(
+    values: dict[CacheKey, CacheValue], key: CacheKey, value: CacheValue, capacity: int
+) -> None:
+    """Bound resident metadata without turning cache capacity into a task quota."""
+    values.pop(key, None)
+    values[key] = value
+    while len(values) > capacity:
+        values.pop(next(iter(values)))
+
+
+def _mark_attempt(values: set[CacheKey], value: CacheKey, quota: int | None) -> None:
+    if quota is not None and len(values) < quota:
+        values.add(value)
+
 
 # These errors arise after the image/page request pipeline has started. A
 # limit, scope, receipt-validation or resource-admission error is not a request.
@@ -296,6 +318,9 @@ class PublicImageService:
         max_image_bytes: int | None = None,
         max_html_bytes: int = 1024 * 1024,
         timeout_seconds: float = 25,
+        max_images: int | None = None,
+        max_download_attempts: int | None = None,
+        max_discovery_attempts: int | None = None,
     ) -> None:
         self.media, self.resolver, self.client = media, resolver, client
         requested_image_bytes = (
@@ -309,9 +334,17 @@ class PublicImageService:
             or not 0 < timeout_seconds <= 60
         ):
             raise ValueError("Public image limits exceed the reviewed bounded profile")
+        if any(
+            value is not None and (type(value) is not int or value <= 0)
+            for value in (max_images, max_download_attempts, max_discovery_attempts)
+        ):
+            raise ValueError("Optional public-image quotas must be positive integers")
         self.max_image_bytes = min(requested_image_bytes, media.max_image_bytes)
-        self.max_images = media.max_images
-        self.max_import_attempts = min(12, self.max_images * 3)
+        # MediaService.max_images bounds one resident analysis batch, not all
+        # images a work may discover/import over its lifetime.
+        self.max_images = max_images
+        self.max_import_attempts = max_download_attempts
+        self.max_discovery_attempts = max_discovery_attempts
         self.max_html_bytes, self.timeout_seconds = max_html_bytes, timeout_seconds
         self._candidates: dict[str, tuple[tuple[str, str, str], PublicImageCandidate]] = {}
         self._pages: dict[tuple[str, str, str, str], ImageCandidatesOutput] = {}
@@ -362,13 +395,17 @@ class PublicImageService:
         cache_key = (*scope, canonical)
         if cache_key in self._pages:
             cached = self._pages[cache_key]
+            _cache(self._pages, cache_key, cached, _PAGE_CACHE_SIZE)
             return cached.model_copy(
                 update={
                     "candidates": cached.candidates[:limit],
                     "truncated": cached.truncated or len(cached.candidates) > limit,
                 }
             )
-        if self._pages_started >= 6 or len(self._candidates) >= 100:
+        if (
+            self.max_discovery_attempts is not None
+            and self._pages_started >= self.max_discovery_attempts
+        ):
             raise DomainError(
                 "public_image_discovery_limit",
                 "This execution has reached its public image discovery limit",
@@ -395,7 +432,7 @@ class PublicImageService:
             if url in seen:
                 continue
             seen.add(url)
-            if len(output) >= 20 or len(self._candidates) >= 100:
+            if len(output) >= 20:
                 parser.truncated = True
                 continue
             candidate = PublicImageCandidate(
@@ -410,7 +447,9 @@ class PublicImageService:
                 claimed_width=item.width,
                 claimed_height=item.height,
             )
-            self._candidates[candidate.candidate_id] = (scope, candidate)
+            _cache(
+                self._candidates, candidate.candidate_id, (scope, candidate), _CANDIDATE_CACHE_SIZE
+            )
             output.append(candidate)
         result = ImageCandidatesOutput(
             scope_fingerprint=self._scope_fingerprint(scope),
@@ -425,7 +464,7 @@ class PublicImageService:
             filtered_candidate_count=filtered,
             truncated=parser.truncated,
         )
-        self._pages[cache_key] = result
+        _cache(self._pages, cache_key, result, _PAGE_CACHE_SIZE)
         return result.model_copy(
             update={
                 "candidates": result.candidates[:limit],
@@ -441,6 +480,7 @@ class PublicImageService:
                 "public_image_candidate_unknown",
                 "Discover an image candidate in this work before importing it",
             )
+        _cache(self._candidates, candidate_id, entry, _CANDIDATE_CACHE_SIZE)
         return entry[1]
 
     def _public_reference(self, context: ToolContext, reference: MediaRef) -> PublicImageRef:
@@ -474,7 +514,12 @@ class PublicImageService:
         )
 
     def restore_candidates(
-        self, context: ToolContext, entries: tuple[ToolLedgerEntry, ...]
+        self,
+        context: ToolContext,
+        entries: tuple[ToolLedgerEntry, ...],
+        *,
+        candidate_id: str | None = None,
+        page_url: str | None = None,
     ) -> None:
         """Restore only a host gateway's scoped ledger, never model/workspace JSON.
 
@@ -483,12 +528,19 @@ class PublicImageService:
         existing trusted checkpoint restores that ledger before tool execution.
         """
         scope = self._scope(context)
-        pages: set[tuple[str, str]] = set()
-        failed_pages: set[str] = set()
-        failed_imports: set[str] = set()
-        imported: dict[str, PublicImageRef] = {}
+        page_attempts: set[tuple[str, ...]] = set()
+        import_attempts: set[tuple[str, str]] = set()
         restored_candidates = dict(self._candidates)
         restored_imported = dict(self._imported)
+        restored_pages = dict(self._pages)
+        retained = set(self._retained_image_hashes)
+        target_candidate = None
+        target_page = None
+        target_import = None
+        try:
+            canonical_page = parse_public_url(page_url)[0] if page_url else None
+        except DomainError:
+            canonical_page = None  # candidates() retains its existing friendly URL error.
         for entry in entries:
             receipt = entry.receipt
             if receipt.tool_name not in {"web_image_candidates", "web_image_import"}:
@@ -500,33 +552,26 @@ class PublicImageService:
                     receipt.tool_name == "web_image_candidates"
                     and receipt.error_code in _PAGE_ATTEMPT_FAILURES
                 ):
-                    failed_pages.add(receipt.idempotency_key)
+                    _mark_attempt(
+                        page_attempts,
+                        ("failed", receipt.idempotency_key),
+                        self.max_discovery_attempts,
+                    )
                 elif (
                     receipt.tool_name == "web_image_import"
                     and receipt.error_code in _IMPORT_ATTEMPT_FAILURES
                 ):
-                    failed_imports.add(receipt.idempotency_key)
+                    _mark_attempt(
+                        import_attempts,
+                        ("failed", receipt.idempotency_key),
+                        self.max_import_attempts,
+                    )
                 continue
             if receipt.effect_state not in {EffectState.SUCCEEDED, EffectState.NO_EFFECT}:
                 raise DomainError(
                     "public_image_evidence_invalid", "Image receipt has no confirmed result"
                 )
             if receipt.tool_name == "web_image_import":
-                try:
-                    reference = PublicImageRef.model_validate(receipt.output)
-                except ValueError:
-                    raise DomainError(
-                        "public_image_evidence_invalid", "Image receipt result is invalid"
-                    ) from None
-                if (
-                    reference.source.group_id,
-                    reference.source.work_id,
-                    reference.source.member_id,
-                ) != scope or reference.source.origin_kind != "research":
-                    raise DomainError(
-                        "public_image_evidence_invalid", "Image receipt belongs to another scope"
-                    )
-                imported[reference.version_id] = reference
                 continue
             try:
                 result = ImageCandidatesOutput.model_validate(receipt.output)
@@ -535,6 +580,8 @@ class PublicImageService:
                 for url in (result.requested_url, result.final_url):
                     if parse_public_url(url)[0] != url:
                         raise ValueError("Noncanonical page URL")
+                if result.citation != _access_citation(result.final_url, result.retrieved_at):
+                    raise ValueError("Page citation differs from its observation")
                 for candidate in result.candidates:
                     if (
                         candidate.page_url != result.requested_url
@@ -547,16 +594,62 @@ class PublicImageService:
                     existing = restored_candidates.get(candidate.candidate_id)
                     if existing is not None and existing != (scope, candidate):
                         raise ValueError("Candidate identity conflict")
-                    if existing is None and len(restored_candidates) >= 100:
-                        raise ValueError("Too many restored candidates")
-                    restored_candidates[candidate.candidate_id] = (scope, candidate)
+                    if candidate.candidate_id == candidate_id:
+                        if target_candidate is not None and target_candidate != (scope, candidate):
+                            raise ValueError("Target candidate identity conflict")
+                        target_candidate = (scope, candidate)
+                    _cache(
+                        restored_candidates,
+                        candidate.candidate_id,
+                        (scope, candidate),
+                        _CANDIDATE_CACHE_SIZE,
+                    )
             except (DomainError, ValueError):
                 raise DomainError(
                     "public_image_evidence_invalid", "Candidate receipt provenance is invalid"
                 ) from None
-            pages.add((result.requested_url, result.html_sha256))
+            _cache(restored_pages, (*scope, result.requested_url), result, _PAGE_CACHE_SIZE)
+            if result.requested_url == canonical_page and (
+                target_page is None or result.retrieved_at >= target_page.retrieved_at
+            ):
+                target_page = result
+            _mark_attempt(
+                page_attempts,
+                ("page", result.requested_url, result.html_sha256, result.retrieved_at.isoformat()),
+                self.max_discovery_attempts,
+            )
+        if target_candidate is not None:
+            _cache(
+                restored_candidates,
+                target_candidate[1].candidate_id,
+                target_candidate,
+                _CANDIDATE_CACHE_SIZE,
+            )
+        if target_page is not None:
+            _cache(
+                restored_pages, (*scope, target_page.requested_url), target_page, _PAGE_CACHE_SIZE
+            )
         artifact_scope = ArtifactScope(*scope)
-        for reference in imported.values():
+        # Stream imports in a second pass: the bounded candidate frame is now
+        # complete, including an old requested ID pinned after LRU eviction.
+        for entry in entries:
+            receipt = entry.receipt
+            if not receipt.success or receipt.tool_name != "web_image_import":
+                continue
+            try:
+                reference = PublicImageRef.model_validate(receipt.output)
+            except ValueError:
+                raise DomainError(
+                    "public_image_evidence_invalid", "Image receipt result is invalid"
+                ) from None
+            if (
+                reference.source.group_id,
+                reference.source.work_id,
+                reference.source.member_id,
+            ) != scope or reference.source.origin_kind != "research":
+                raise DomainError(
+                    "public_image_evidence_invalid", "Image receipt belongs to another scope"
+                )
             actual = self.media.load_ref(context, reference.file_id, reference.version_id)
             if self._public_reference(context, actual) != reference:
                 raise DomainError(
@@ -565,24 +658,31 @@ class PublicImageService:
                 )
             version = self.media.store.get(artifact_scope, reference.file_id, reference.version_id)
             provenance = version.provenance.get("public_image", {})
-            for candidate_id, (candidate_scope, candidate) in restored_candidates.items():
+            for identifier, (candidate_scope, candidate) in restored_candidates.items():
                 if (
                     candidate_scope == scope
                     and candidate.image_url == provenance.get("requested_url")
                     and candidate.page_sha256 == provenance.get("page_sha256")
                 ):
-                    restored_imported[candidate_id] = actual
+                    _cache(restored_imported, identifier, actual, _IMPORT_CACHE_SIZE)
+                    if identifier == candidate_id:
+                        target_import = actual
+            if self.max_images is not None and len(retained) < self.max_images:
+                retained.add(reference.sha256)
+            _mark_attempt(
+                import_attempts, ("imported", reference.version_id), self.max_import_attempts
+            )
+        if candidate_id is not None and target_import is not None:
+            _cache(restored_imported, candidate_id, target_import, _IMPORT_CACHE_SIZE)
         self._candidates = restored_candidates
         self._imported = restored_imported
-        self._retained_image_hashes.update(reference.sha256 for reference in imported.values())
+        self._pages = restored_pages
+        self._retained_image_hashes = retained
         # Budget exhaustion stops new requests; it does not invalidate previously
         # successful immutable evidence or block reuse after a configuration
         # change. Repeated/legacy failed limit receipts remain untouched.
-        self._pages_started = max(self._pages_started, min(6, len(pages) + len(failed_pages)))
-        self._import_attempts_started = max(
-            self._import_attempts_started,
-            min(self.max_import_attempts, len(imported) + len(failed_imports)),
-        )
+        self._pages_started = max(self._pages_started, len(page_attempts))
+        self._import_attempts_started = max(self._import_attempts_started, len(import_attempts))
 
     async def import_image(
         self, context: ToolContext, candidate_id: str, source: MediaSource
@@ -614,13 +714,17 @@ class PublicImageService:
         if candidate_id in self._imported:
             reference = self._imported[candidate_id]
             await self.media._content(context, reference)
+            _cache(self._imported, candidate_id, reference, _IMPORT_CACHE_SIZE)
             return self._public_reference(context, reference)
-        if len(self._retained_image_hashes) >= self.max_images:
+        if self.max_images is not None and len(self._retained_image_hashes) >= self.max_images:
             raise DomainError(
                 "public_image_import_limit",
                 "This execution has reached its configured retained-image limit; use the imported images",
             )
-        if self._import_attempts_started >= self.max_import_attempts:
+        if (
+            self.max_import_attempts is not None
+            and self._import_attempts_started >= self.max_import_attempts
+        ):
             raise DomainError(
                 "public_image_attempt_limit",
                 "This execution has exhausted its public image download attempts; use the imported images or report completed results",
@@ -660,8 +764,9 @@ class PublicImageService:
                 "discovery": candidate.discovery,
             },
         )
-        self._imported[candidate_id] = reference
-        self._retained_image_hashes.add(reference.sha256)
+        _cache(self._imported, candidate_id, reference, _IMPORT_CACHE_SIZE)
+        if self.max_images is not None and len(self._retained_image_hashes) < self.max_images:
+            self._retained_image_hashes.add(reference.sha256)
         return self._public_reference(context, reference)
 
 
@@ -674,11 +779,19 @@ def register_public_image_tools(
     async def candidates(
         arguments: ImageCandidatesInput, context: ToolContext
     ) -> ImageCandidatesOutput:
-        service.restore_candidates(context, gateway.export_ledger(context.scope))
+        service.restore_candidates(
+            context,
+            gateway.export_ledger(context.scope),
+            page_url=arguments.page_url,
+        )
         return await service.candidates(context, arguments.page_url, limit=arguments.limit)
 
     async def import_image(arguments: ImageImportInput, context: ToolContext) -> PublicImageRef:
-        service.restore_candidates(context, gateway.export_ledger(context.scope))
+        service.restore_candidates(
+            context,
+            gateway.export_ledger(context.scope),
+            candidate_id=arguments.candidate_id,
+        )
         candidate = service.candidate(context, arguments.candidate_id)
         source = await source_factory(context, candidate.image_url)
         return await service.import_image(context, arguments.candidate_id, source)

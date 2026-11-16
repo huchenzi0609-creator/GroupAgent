@@ -54,7 +54,9 @@ def public_image_request_count(
     ):
         return None
     match = re.search(r"([0-9]{1,3}|[一二两三四五六七八九十])\s*(?:张|幅|个)", outside)
-    number = _page_count(match[1]) if match else 1
+    # An unspecified quantity belongs to semantic interpretation, not a silent
+    # singular default in the fast admission path.
+    number = _page_count(match[1]) if match else None
     return number if number is not None and 1 <= number <= 10 else None
 
 

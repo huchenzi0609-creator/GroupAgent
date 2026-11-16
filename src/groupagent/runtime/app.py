@@ -24,8 +24,8 @@ from groupagent.billing.prices import deepseek_20261114
 from groupagent.channels import AgentWechatAdapter, AgentWechatConfig, MemberRecord
 from groupagent.channels.local import LocalChannel
 from groupagent.config import AppConfig, ConfigError
-from groupagent.conversation.intent import explicitly_requires_execution, new_work_intent
-from groupagent.conversation.participation import outside_quotes
+from groupagent.conversation.intent import new_work_intent
+from groupagent.conversation.policy import policy_intent, trusted_invocation_in_tx
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import CoordinationResult, Decision
@@ -58,7 +58,7 @@ from .dispatch import Dispatcher
 from .executor import WorkSupervisor
 from .inputs import InputProcessor
 from .notices import NoticeService
-from .resource_profile import worker_limits
+from .resource_profile import controller_resources_ready, worker_limits
 from .roster import RosterRefresher
 from .state import RuntimeState
 from .toolkit import WorkToolkit
@@ -100,7 +100,7 @@ class RuntimeApp:
             default_valid_days=self.config.schedule.default_valid_days,
         )
         if self.config.runtime.channel == "agentwechat":
-            self.supervisor.work_ready = self._admission_delivered
+            self.supervisor.work_ready = self._foreground_ready
         self.stop = asyncio.Event()
         self.instance_id = "runtime:" + uuid4().hex
         self._last_arrival = self._first_arrival = 0.0
@@ -143,15 +143,19 @@ class RuntimeApp:
             pass  # Revalidate membership and restore/policy fences on every use.
         return actor
 
-    def _admission_delivered(self, work) -> bool:
-        """Keep native attachment I/O behind the useful initial work response."""
+    def _foreground_ready(self, work) -> bool:
+        """Give the initial reply a head start without making speech a work dependency."""
         with self.store.transaction(self.technical) as tx:
             row = tx.conn.execute(
-                "SELECT state FROM ga_deliveries WHERE group_id=%s AND request_event_id=%s "
+                "SELECT state,created_at FROM ga_deliveries WHERE group_id=%s AND request_event_id=%s "
                 "AND idempotency_key=%s",
                 (tx.group_id, work.request_event_id, "reply:" + work.request_event_id + ":1"),
             ).fetchone()
-        return row is None or row["state"] == "accepted"
+        return (
+            row is None
+            or row["state"] in {"accepted", "rejected"}
+            or (datetime.now(UTC) - row["created_at"]).total_seconds() >= 2
+        )
 
     async def start(self) -> None:
         self._fence_application()
@@ -409,35 +413,16 @@ class RuntimeApp:
             pass
 
     def _bypass_batch(self, event: GroupEvent) -> bool:
-        if event.kind != EventKind.TEXT or event.reply_to or event.attachments:
-            return False
-        if new_work_intent(event.text, identity=self.identity) is not None:
-            return True  # Preserve the existing independent-work admission path.
-        plain = outside_quotes(event.text)
-        if not plain or plain != event.text.strip() or len(plain) > 1200:
-            return False
-        request = self.identity.strip_address(plain)
-        if explicitly_requires_execution(plain, identity=self.identity):
-            return False
-        if request == plain and not re.search(r"[?？]", request):
-            return False
-        if re.search(
-            r"文件|文档|附件|图片|截图|音频|语音|视频|生成|制作|导出|交付|下载|上传|删除|修改|"
-            r"分配|安排|提醒|忽略|绕过|越权|密钥|密码|"
-            r"(?<![A-Za-z0-9_])(?:PDF|DOCX|PPTX?|Markdown|WAV|MP3|PNG|JPEG|Shell|secret|password|prompt)(?![A-Za-z0-9_])",
-            request,
-            re.I,
+        """Prioritize an existing admission or trusted invocation, without grants."""
+        if (
+            event.kind == EventKind.TEXT
+            and not event.reply_to
+            and not event.attachments
+            and new_work_intent(event.text, identity=self.identity) is not None
         ):
-            return False
-        return (
-            re.search(
-                r"[?？]|什么|啥|怎么|为何|为什么|解释|说明|讲讲|告诉我|叫什么|是谁|多少|区别|吗|"
-                r"\b(?:what|how|why|who|explain|describe)\b",
-                request,
-                re.I,
-            )
-            is not None
-        )
+            return True
+        with self.store.transaction(self.technical) as tx:
+            return trusted_invocation_in_tx(tx, event, self.identity) is not None
 
     async def process_pending(self, *, controls_only: bool = False, batched: bool = True) -> int:
         events = self._ready_events()
@@ -445,7 +430,20 @@ class RuntimeApp:
             event
             for event in events
             if event.kind in {EventKind.TEXT, EventKind.QUOTE}
-            and control_request(event.text, identity=self.identity) is not None
+            and (
+                control_request(event.text, identity=self.identity) is not None
+                or policy_intent(
+                    event,
+                    {
+                        **self.identity.context(),
+                        "role": "owner"
+                        if event.actor_id in self.config.group.owner_ids
+                        else "member",
+                        "group_time_zone": self.config.group.time_zone,
+                    },
+                )
+                is not None
+            )
         ]
         if controls:
             await self._process(controls[0])
@@ -469,8 +467,8 @@ class RuntimeApp:
         identities = [
             event
             for event in events
-            if self._bypass_batch(event)
-            and self.coordinator._fast_identity_reply(event, self.identity.context()) is not None
+            if self.coordinator._fast_identity_reply(event, self.identity.context()) is not None
+            and self._bypass_batch(event)
         ]
         if identities:
             # A verified name response performs no model/tool call, so it can
@@ -515,7 +513,7 @@ class RuntimeApp:
             self._processing
             or self.supervisor.active_work_id is not None
             or self.worker_governor is None
-            or not self.worker_governor.ready(self.config.resources.worker_memory_mb)
+            or not controller_resources_ready(self.worker_governor)
         ):
             # No additional model/cleanup load while a foreground or isolated
             # job is active. Expiry is also enforced on reads until the next pass.
@@ -910,7 +908,7 @@ def build_app(
         lease_seconds=config.execution.lease_seconds,
         heartbeat_seconds=config.execution.heartbeat_seconds,
         cancel_grace_seconds=config.execution.cancel_grace_seconds,
-        resource_ready=(lambda: worker_governor.ready(config.resources.worker_memory_mb))
+        resource_ready=(lambda: controller_resources_ready(worker_governor))
         if config.resources.enabled
         else None,
         resource_retry_seconds=config.resources.retry_seconds,
@@ -927,6 +925,8 @@ def build_app(
         chunk_characters=config.runtime.message_chunk_characters,
         time_zone=config.group.time_zone,
         quiet_hours=config.group.quiet_hours,
+        participation_mode=config.group.participation_mode,
+        identity=BotIdentity.from_runtime(config.runtime),
     )
     app = RuntimeApp(
         coordinator,

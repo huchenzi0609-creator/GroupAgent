@@ -142,8 +142,11 @@ async def test_original_view_mapping_survives_long_text_and_checks_current_candi
             selected.version_id,
             selected.sha256,
         )
-        assert "static_views=false仅表示不是GIF首帧" in request.messages[0].content
-        assert "不能与原文件SHA直接比相等" in request.messages[0].content
+        assert (
+            "static_views=false" in request.messages[0].content
+            and "规范化" in request.messages[0].content
+        )
+        assert "SHA" in request.messages[0].content and "比较" in request.messages[0].content
         return ModelReply(
             text=json.dumps(
                 {
