@@ -47,6 +47,18 @@ def work_status_detail(work: Any) -> dict[str, str]:
     phase, message = _REASONS.get(
         code, ("execution", "这项工作尚未完成，执行记录已保留，暂时没有更具体的可靠原因。")
     )
+    failure = body.get("_runtime_failure", {})
+    if code == "effect_unknown" and failure.get("tool_name") in {"web_search", "web_fetch"}:
+        cause = failure.get("error_code")
+        if cause == "page_unavailable":
+            phase, message = (
+                "research",
+                "读取资料时，一处来源网页无法访问；已查到的内容和进度仍然保留。",
+            )
+        elif cause == "research_timeout":
+            phase, message = "research", "读取网络资料时请求超时，已有资料和进度仍然保留。"
+        elif cause in {"budget_exhausted", "budget_not_configured"}:
+            phase, message = _REASONS[cause]
     if code in {
         "model_round_limit",
         "tool_call_limit",

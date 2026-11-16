@@ -12,6 +12,7 @@ from .models import (
     EventBatch,
     MemberPage,
     MemberRecord,
+    MemberRefreshReceipt,
     TransferReceipt,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "EventBatch",
     "MemberPage",
     "MemberRecord",
+    "MemberRefreshReceipt",
     "TransferReceipt",
 ]

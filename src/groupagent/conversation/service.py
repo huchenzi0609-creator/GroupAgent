@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -164,6 +164,10 @@ class ConversationCoordinator(Coordinator):
         self.artifacts, self.clock = artifacts, clock or (lambda: datetime.now(UTC))
         self.identity = BotIdentity.from_runtime(config.runtime)
         self.execution_guard: Callable[..., None] = lambda *args: None
+        self.refresh_roster: (
+            Callable[[ActorContext, GroupEvent, dict[str, Any]], Awaitable[dict[str, Any] | None]]
+            | None
+        ) = None
         self.service_actor = ActorContext(
             group_id=config.group.internal_id,
             member_id="service:conversation",
@@ -382,6 +386,22 @@ class ConversationCoordinator(Coordinator):
                 and not _scope_sources(w.scope) & private_events
                 and tx.get_event(w.request_event_id).content_state == "active"
             ]
+            for work in works:
+                work["_requested_at"] = tx.get_event(
+                    work["request_event_id"]
+                ).occurred_at.isoformat()
+                if work["pause_reason"] == "effect_unknown":
+                    checkpoint = tx.conn.execute(
+                        "SELECT body->'receipts' AS receipts FROM ga_runtime_checkpoints "
+                        "WHERE group_id=%s AND work_id=%s ORDER BY saved_at DESC LIMIT 1",
+                        (tx.group_id, work["id"]),
+                    ).fetchone()
+                    if checkpoint:
+                        failures = [r for r in checkpoint["receipts"] or [] if not r.get("success")]
+                        if failures:
+                            work["_runtime_failure"] = {
+                                key: failures[-1].get(key) for key in ("tool_name", "error_code")
+                            }
             control_works = list(works)
             follow_up = bool(
                 re.search(
@@ -681,6 +701,7 @@ class ConversationCoordinator(Coordinator):
                     "name_source": member.name_source,
                     "membership_state": member.membership_state,
                     "revision": member.revision,
+                    "updated_at": member.updated_at.isoformat(),
                 }
                 for member in member_rows
             ],
@@ -826,13 +847,55 @@ class ConversationCoordinator(Coordinator):
             confidence=1,
         )
 
+    def _fast_roster_reply(self, event: GroupEvent, context: dict) -> Decision | None:
+        status = context.get("roster_status")
+        if not isinstance(status, dict) or re.search(
+            r"生成|制作|整理成|分配|分工|写入|文件|PDF|Word|PPT", event.text, re.I
+        ):
+            return None
+        if not status.get("fresh"):
+            text = (
+                "这次群资料刷新还没有成功，暂时只能看到已有记录，不能据此判断你是否设置了群昵称。"
+            )
+        elif not re.search(r"群成员|名单|群里|有哪些|有谁|所有人", event.text) and re.search(
+            r"我的|我.{0,6}(?:昵称|设置)|群昵称|再看看|现在", event.text
+        ):
+            member = next(
+                (m for m in context["members"] if m["member_id"] == context["requester_member_id"]),
+                None,
+            )
+            if member and member["name_source"] == "room_display_name":
+                text = f"现在能看见了，你的群昵称是「{member['name']}」。"
+            else:
+                text = "刚刷新了群资料，微信接口仍未返回你的群昵称；这不代表你没有设置。"
+        else:
+            members = [m for m in context["members"] if m["membership_state"] != "left"]
+            names = [m["name"] for m in members if m["name_source"] == "room_display_name"]
+            text = f"刚刷新了群资料，当前可读取到 {len(members)} 位成员。"
+            if names:
+                text += "群昵称：" + "、".join(names[:30]) + "。"
+            unknown = len(members) - len(names)
+            if unknown:
+                text += f"其中 {unknown} 位的群昵称尚未由微信接口返回。"
+        return Decision(
+            kind="reply",
+            reason_code="refreshed_roster",
+            response=text,
+            directness="direct",
+            confidence=1,
+        )
+
     def _fast_diagnostic_reply(self, event: GroupEvent, context: dict) -> Decision | None:
         if event.kind != EventKind.TEXT or event.attachments or len(event.text) > 240:
             return None
         plain = outside_quotes(event.text)
-        if plain != event.text.strip() or not re.search(r"为什么|为何|原因|why", plain, re.I):
+        if plain != event.text.strip():
             return None
-        if not re.search(r"暂停|停了|失败|没完成|没结果|卡住|停止|paused|failed", plain, re.I):
+        specific = bool(re.search(r"出现什么问题|出了什么问题|是超时问题还是预算问题", plain))
+        if not specific and not (
+            re.search(r"为什么|为何|原因|why", plain, re.I)
+            and re.search(r"暂停|停了|失败|没完成|没结果|卡住|停止|paused|failed", plain, re.I)
+        ):
             return None
         if re.search(r"恢复|重试|取消|重新|继续执行|生成|下载|删除", plain):
             return None
@@ -843,7 +906,7 @@ class ConversationCoordinator(Coordinator):
             "",
             wording,
         )
-        if wording:
+        if wording and not specific:
             return None  # An unrelated conceptual question still needs the router.
         states = {"paused"} if "暂停" in plain else {"paused", "waiting_input", "failed"}
         works = [
@@ -855,6 +918,9 @@ class ConversationCoordinator(Coordinator):
         quoted = context.get("_quoted_work_id")
         if quoted:
             works = [w for w in works if w["id"] == quoted]
+        elif works:
+            latest = max(context["_works"], key=lambda w: w.get("_requested_at", ""))
+            works = [w for w in works if w["id"] == latest["id"]]
         if len(works) != 1:
             return None
         work = works[0]
@@ -1773,6 +1839,11 @@ class ConversationCoordinator(Coordinator):
         if event.kind == EventKind.RECALL:
             self.memory.recall(self.service_actor, event.id, now=self.clock())
         context = self._context(actor, event)
+        if self.refresh_roster is not None and not echo:
+            roster_status = await self.refresh_roster(actor, event, context)
+            if roster_status is not None:
+                context = self._context(actor, event)
+                context["roster_status"] = roster_status
         fast_admitted = False
         if self.config.group.bot_member_id == event.actor_id and not echo:
             if not self.config.group.shared_account:
@@ -1839,6 +1910,8 @@ class ConversationCoordinator(Coordinator):
                 )
             else:
                 immediate = self._fast_control(event, context)
+                if immediate is None:
+                    immediate = self._fast_roster_reply(event, context)
                 if immediate is None:
                     immediate = self._fast_diagnostic_reply(event, context)
                 if immediate is None:

@@ -24,6 +24,7 @@ class IntakeResult:
     skipped_count: int
     cursor: str
     acknowledged: bool
+    roster_updates: tuple[ChannelCursor, ...] = ()
 
 
 class IntakePort(Protocol):
@@ -139,6 +140,7 @@ class ChannelIntake:
             skipped_count=len(batch.skipped) + rejected_count,
             cursor=batch.next_cursor.serialize(),
             acknowledged=True,
+            roster_updates=batch.roster_updates,
         )
 
     async def process_pending(self, *, limit: int = 100) -> list[CoordinationResult]:

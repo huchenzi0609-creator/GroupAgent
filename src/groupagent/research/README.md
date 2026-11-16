@@ -35,8 +35,9 @@ Search additionally shares a 16,000-byte UTF-8 budget across all returned titles
 snippets, summaries and content, divided equally among admitted results; original
 prefixes carry explicit truncation markers while URLs, timestamps and provenance
 are retained, and the normalized-output hard limit still applies.
-There are no implicit retries. Timeout, rate-limit, authentication, insufficient
-balance, unavailable-page and policy errors remain distinct and sanitized.
+The low-level client performs no implicit retries. Timeout, rate-limit,
+authentication, insufficient balance, unavailable-page and policy errors remain
+distinct and sanitized.
 `cost_meter` identifies provider request accounting; read-only does not mean free.
 Daily monetary budgets remain a control-plane responsibility.
 
@@ -61,10 +62,29 @@ The production registrar now requires
 `register_research_tools(gateway, client, budget=ledger,
 price_ids={"search": ..., "fetch": ...})`. Each real operation reserves and begins
 before HTTP, then settles one `calls` unit under `web.search` or `web.fetch`.
-Failure or cancellation keeps an unknown reservation. Stable attempt keys and
-the gateway's durable receipt prevent automatic duplicate paid calls. The older
+Failure or cancellation keeps an unknown reservation. The registrar retries only
+transient timeout, rate-limit and provider-unavailable read failures, with one
+additional attempt by default and a hard maximum of two additional attempts.
+Each retry rechecks current authorization and public URL policy, reserves and
+begins a distinct `:retry:N` budget attempt, and retains every earlier unknown
+fee. Backoff and requests share the work deadline; budget denial, cancellation,
+revocation, unavailable pages and permanent provider errors stop that read.
+Public reads use `READ_ONLY` execution receipts: an unavailable source is safe for
+the model to replace or omit while producing an explicitly partial result, even
+when its provider charge remains unknown. Mutable tools retain their separate
+reconciliation fences. Stable attempt keys and the gateway's durable receipt
+prevent automatic duplicate paid calls after replay. The older
 budget-free registrar form remains only for an explicit mock HTTP transport.
 A read-only tool grant is not an exemption from the monetary budget.
+
+Read recovery validation on 2026-11-16: 225 offline research/gateway/engine tests
+passed, plus 22 isolated PostgreSQL research/billing tests. Synthetic HTTP cases
+cover transient recovery, 404 and empty-page replacement, replay, current-policy
+revocation, deadlines and denied retry funding. Real PostgreSQL verifies that an
+unknown fee survives restart, a separately funded retry settles independently,
+and daily 50 CNY / total 20 CNY fixture caps remain unchanged. Existing mutable
+tool uncertainty fences are included in the offline suite. Ruff and research
+mypy passed. These checks made no real provider request or native channel send.
 
 `PublicPageBroker(allowed_hosts, resolver=..., client=...)` provides a separate
 controlled host fetch for public HTML. Every redirect needs an approved host and

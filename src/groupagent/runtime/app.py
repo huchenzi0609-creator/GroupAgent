@@ -59,6 +59,7 @@ from .executor import WorkSupervisor
 from .inputs import InputProcessor
 from .notices import NoticeService
 from .resource_profile import worker_limits
+from .roster import RosterRefresher
 from .state import RuntimeState
 from .toolkit import WorkToolkit
 
@@ -108,6 +109,10 @@ class RuntimeApp:
         self._tasks: list[asyncio.Task] = []
         self._application_lease: ProcessLease | None = None
         self.coordinator.execution_guard = self._fence_application
+        self.roster = RosterRefresher(
+            coordinator.members, channel, self.technical, self._fence_application
+        )
+        self.coordinator.refresh_roster = self.roster.query
         self.notices = NoticeService(
             self.store,
             self.technical,
@@ -195,6 +200,7 @@ class RuntimeApp:
         self._fence_application()
         batch = await self.intake.poll_once()
         self._fence_application()
+        self.roster.changed(batch.roster_updates)
         if batch.event_ids:
             now = time.monotonic()
             if not self._first_arrival:
@@ -588,6 +594,7 @@ class RuntimeApp:
                 for fn, seconds in (
                     (intake_and_controls, self.config.runtime.poll_seconds),
                     (self.process_pending, self.config.runtime.poll_seconds),
+                    (self.roster.sync_pending, self.config.runtime.poll_seconds),
                     (self.execute_tick, self.config.runtime.poll_seconds),
                     (self.dispatcher.tick, self.config.runtime.poll_seconds),
                     (self.maintenance, self.config.resources.maintenance_interval_seconds),
