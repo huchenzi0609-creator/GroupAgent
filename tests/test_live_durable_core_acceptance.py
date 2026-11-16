@@ -66,3 +66,27 @@ def test_correct_url_with_wrong_embedded_source_bytes_is_rejected():
     checked = runner.inspect_word_sources(result.getvalue(), sources)
     assert checked["source_link_count"] == 2
     assert not checked["word_sources_below_images"]
+
+
+@pytest.mark.parametrize("timestamp", ["（访问时间 UTC：2026-11-17）", "(accessed 2026-11-17)"])
+def test_caption_source_url_stops_before_parenthesized_access_time(timestamp):
+    document = Document()
+    sources = []
+    for index, color in enumerate(("red", "blue")):
+        png = io.BytesIO()
+        Image.new("RGB", (10 + index, 10), color).save(png, format="PNG")
+        content = png.getvalue()
+        url = f"https://example.org/image-{index}.png"
+        document.add_picture(io.BytesIO(content))
+        document.add_paragraph("Source: " + url + timestamp)
+        sources.append(
+            {
+                "media_metadata": {"preview_sha256": hashlib.sha256(content).hexdigest()},
+                "public_image": {"page_url": url},
+            }
+        )
+    result = io.BytesIO()
+    document.save(result)
+    checked = runner.inspect_word_sources(result.getvalue(), sources)
+    assert checked["source_link_count"] == 2
+    assert checked["word_sources_below_images"]

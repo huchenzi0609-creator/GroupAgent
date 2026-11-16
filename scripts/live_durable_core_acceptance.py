@@ -64,7 +64,7 @@ def inspect_word_sources(content, source_provenances):
         "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
         "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     }
-    url_pattern = re.compile(r"https?://[^\s<>\"）)；，。]+")
+    url_pattern = re.compile(r"https?://[^\s<>\"（）()；，。]+")
     bindings = []
     all_urls = set()
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
