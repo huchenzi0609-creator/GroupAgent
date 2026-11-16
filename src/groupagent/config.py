@@ -216,9 +216,15 @@ class ModelRoutes(StrictModel):
 
 
 class EngineConfig(StrictModel):
-    candidate: Literal["deepseek_harness"] = "deepseek_harness"
+    candidate: Literal["langgraph"] = "langgraph"
     approved_runtime_version: str | None = None
     extra_session_log_upload: Literal[False] = False
+
+    @field_validator("candidate", mode="before")
+    @classmethod
+    def migrate_candidate(cls, value: Any) -> Any:
+        # Read existing configuration without keeping a second execution path.
+        return "langgraph" if value == "deepseek_harness" else value
 
 
 class ResourceConfig(StrictModel):
@@ -266,7 +272,7 @@ class RuntimeConfig(StrictModel):
     channel_account_id: str = "local-account"
     source_epoch: str = "local-v1"
     allow_live_send: bool = False
-    engine: Literal["harness", "scoped"] = "harness"
+    engine: Literal["langgraph"] = "langgraph"
     worker_image: str | None = None
     harness_image: str | None = None
     docker_host: str | None = None
@@ -283,6 +289,11 @@ class RuntimeConfig(StrictModel):
     semantic_validation: bool = True
     local_member_names: dict[str, str] = Field(default_factory=dict)
     pg_bin_dir: str | None = None
+
+    @field_validator("engine", mode="before")
+    @classmethod
+    def migrate_engine(cls, value: Any) -> Any:
+        return "langgraph" if value in ("harness", "scoped") else value
 
     @field_validator("broker_control_socket")
     @classmethod
@@ -365,7 +376,7 @@ class AppConfig(StrictModel):
                     if isinstance(raw_runtime, RuntimeConfig)
                     else dict(raw_runtime)
                 )
-                runtime.setdefault("engine", "scoped")
+                runtime.setdefault("engine", "langgraph")
                 value["runtime"] = runtime
                 raw_limits = value.get("limits", {})
                 limits = (
@@ -388,10 +399,8 @@ class AppConfig(StrictModel):
 
     @model_validator(mode="after")
     def resource_contract(self) -> AppConfig:
-        if self.resources.enabled and (
-            self.runtime.engine != "scoped" or self.execution.max_concurrent_heavy_work != 1
-        ):
-            raise ValueError("The 2GB profile requires scoped execution and one active heavy work")
+        if self.resources.enabled and self.execution.max_concurrent_heavy_work != 1:
+            raise ValueError("The 2GB profile requires one active heavy work")
         return self
 
     def production_blockers(self) -> list[str]:

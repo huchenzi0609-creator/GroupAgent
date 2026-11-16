@@ -27,3 +27,20 @@ def test_empty_profile_contains_no_unavailable_tool_workflows():
     profile = build_tool_profile([])
     assert profile.tool_names == frozenset() and profile.families == ()
     assert "web_fetch" not in "\n".join(profile.instructions)
+
+
+def test_catalog_guidance_explains_discovery_without_expanding_authority():
+    profile = build_tool_profile({"request_input", "memory_search", "tool_catalog"})
+    text = "\n".join(profile.instructions)
+    assert profile.families == ("discovery",)
+    assert "tool_catalog" in text and "cannot grant permissions" in text
+    assert "document_generate" not in text and "Pillow" not in text
+
+
+def test_read_business_tools_remain_discoverable_without_write_grants():
+    from groupagent.runtime.tool_profiles import names_for_capabilities
+
+    available = {"request_input", "team_members", "team_tasks", "schedule_list"}
+    loaded = names_for_capabilities(["team_tasks", "scheduling"], available)
+    assert loaded == available
+    assert not loaded & {"team_task_create", "schedule_create"}

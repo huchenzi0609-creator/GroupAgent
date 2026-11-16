@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import time
@@ -177,11 +176,6 @@ async def run(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--worker-image", required=True)
-    parser.add_argument("--harness-image", required=True)
-    parser.add_argument("--docker-host", required=True)
-    parser.add_argument("--cases", type=int, default=1, choices=[1, 2, 3])
-    parser.add_argument("--timeout", type=int, default=240)
-    asyncio.run(run(parser.parse_args()))
+    raise SystemExit(
+        "This historical Harness acceptance entry point is retired. Use scripts/live_durable_core_acceptance.py; it retains accounting without goal budgets."
+    )

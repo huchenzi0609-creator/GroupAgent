@@ -89,6 +89,22 @@ class ModelReply(EngineData):
     needs_input: bool = False
 
 
+class PendingModelSettlement(EngineData):
+    """A quiesced inference charge, distinct from an unknown business effect."""
+
+    reservation_id: str = Field(min_length=1)
+    round_number: int = Field(ge=1)
+    reserved_tokens: int = Field(ge=0)
+    usage: TokenUsage | None = None
+    reply: ModelReply | None = None
+
+    @model_validator(mode="after")
+    def matching_reply_usage(self) -> PendingModelSettlement:
+        if self.reply is not None and self.reply.usage != self.usage:
+            raise ValueError("A retained reply must match its metered usage")
+        return self
+
+
 class RunState(StrEnum):
     RUNNING = "running"
     CANDIDATE = "candidate"

@@ -86,10 +86,12 @@ async def test_request_input_stops_batch_and_resumes_same_budget(execution_reque
 
 async def test_ungranted_request_input_cannot_pause_work(execution_request, gateway):
     register_request_input_tool(gateway)
-    engine = ScopedToolEngine(ScriptedFakeModel([question_reply()]), gateway)
+    model = ScriptedFakeModel([question_reply(), answer()])
+    engine = ScopedToolEngine(model, gateway)
     result = await engine.wait(await engine.start(execution_request))
-    assert result.state == RunState.FAILED and result.error_code == "permission_denied"
-    assert result.checkpoint.input_request is None and result.receipts[0].control is None
+    assert result.state == RunState.CANDIDATE
+    assert result.checkpoint.input_request is None and result.receipts == ()
+    assert "tool_not_available" in model.requests[1].messages[-1].content
 
 
 class Empty(ToolData):

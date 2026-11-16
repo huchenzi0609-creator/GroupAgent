@@ -18,6 +18,8 @@ from groupagent.execution import ModelReply, ScriptedFakeModel, TokenUsage
 from groupagent.memory import MemberService, MemoryService
 from groupagent.scheduling import EveryTiming, Scheduler
 
+from .foreground_model_fixture import candidate_reply, natural_reply
+
 pytestmark = pytest.mark.postgres
 
 
@@ -25,13 +27,7 @@ def harness(env, *, response="合成夹具答复"):
     model = ScriptedFakeModel(
         [
             ModelReply(
-                text=Decision(
-                    kind="reply",
-                    reason_code="fixture_reply",
-                    response=response,
-                    directness="direct",
-                    confidence=1,
-                ).model_dump_json(),
+                text=response,
                 usage=TokenUsage(input_tokens=1, output_tokens=1),
             )
             for _ in range(5)
@@ -610,12 +606,7 @@ async def test_realistic_completed_history_keeps_router_payload_bounded_and_new_
         confidence=1,
     )
     model = ScriptedFakeModel(
-        [
-            ModelReply(
-                text=value.model_dump_json(), usage=TokenUsage(input_tokens=1, output_tokens=1)
-            )
-            for value in (reply, action)
-        ]
+        [candidate_reply(reply), candidate_reply(action), natural_reply("独立合成说明已经排队。")]
     )
     provider = ModelDecisionProvider(model)
     h.coordinator.provider_factory = lambda actor, event: provider
@@ -642,11 +633,11 @@ async def test_realistic_completed_history_keeps_router_payload_bounded_and_new_
             f"router_payload_{index}_composition", json.dumps(measured, ensure_ascii=False)
         )
         assert measured["total_utf8_bytes"] <= 140_000, measured
-        assert len(model.requests) == index + 1
+        assert len(model.requests) == (1 if index == 0 else 3)
         assert model_payload(model)["event"]["id"] == request.id
         assert result.decision.kind == ("reply" if index == 0 else "start_work")
         replay = await h.coordinator.process(request)
-        assert replay.duplicate and len(model.requests) == index + 1
+        assert replay.duplicate and len(model.requests) == (1 if index == 0 else 3)
         context = h.coordinator._context(env.actor, request)
         # Only preexisting work/file rows are checked here; the new job has its own
         # decision provenance, asserted below after the second input commits.

@@ -68,7 +68,6 @@ from .commands import is_task_declaration
 from .context import ContextBuilder, ContextQuery
 from .image_requirements import is_public_image_work, normalize_image_quantity
 from .intent import (
-    explicitly_requires_execution,
     main_request,
     new_work_intent,
     public_image_request_count,
@@ -565,46 +564,6 @@ class ConversationCoordinator(Coordinator):
         }
         if event.kind == EventKind.FORWARDED and write:
             return Decision(kind="observe", reason_code="forwarded_data_not_authority")
-        if (
-            decision.kind == "reply"
-            and decision.action is None
-            and decision.directness in {"direct", "open"}
-        ):
-            requested_execution = event.kind in {
-                EventKind.TEXT,
-                EventKind.QUOTE,
-            } and explicitly_requires_execution(event.text, identity=self.identity)
-            unsupported = bool(re.search(r"(?:无法|不能|不支持|没有权限)", decision.response or ""))
-            if requested_execution and not unsupported:
-                formats: list[dict[str, JsonValue]] = []
-                for pattern, format_name in (
-                    (r"Word|docx", "docx"),
-                    (r"PPT|pptx|幻灯片", "pptx"),
-                    (r"PDF|pdf", "pdf"),
-                    (r"Markdown|markdown|\.md", "md"),
-                ):
-                    if re.search(pattern, event.text):
-                        formats.append({"format": format_name})
-                decision = Decision(
-                    kind="start_work",
-                    reason_code="actual_execution_required",
-                    goal=event.text,
-                    directness=decision.directness,
-                    confidence=decision.confidence,
-                    outputs=formats,
-                )
-                write = True
-            elif re.search(
-                r"(?:已经|已)(?:成功)?(?:执行|运行|生成并发送|发送邮件|发邮件|付款|支付|上传到|提交到)",
-                decision.response or "",
-            ):
-                decision = Decision(
-                    kind="reply",
-                    reason_code="unverified_effect_claim",
-                    response="目前没有这项操作已完成的执行凭证，我不能把它说成已经完成。",
-                    directness=decision.directness,
-                    confidence=1,
-                )
         if write and any(
             item.get("kind") == "audio_transcription" and item.get("needs_clarification")
             for item in event.attachments
@@ -1295,6 +1254,272 @@ class ConversationCoordinator(Coordinator):
         )
         return result
 
+    @staticmethod
+    def _model_aliases(value: Any, context: dict[str, Any], field: str | None = None) -> Any:
+        """Keep stable channel member IDs on the host side of the model boundary."""
+        identity_fields = {
+            "actor_id",
+            "member_id",
+            "owner_id",
+            "requester_id",
+            "creator_id",
+            "created_by",
+            "author_id",
+            "subject_id",
+            "requester_member_id",
+        }
+        inverse = {identifier: alias for alias, identifier in context.get("_aliases", {}).items()}
+        if isinstance(value, str):
+            if field not in identity_fields:
+                return value
+            aliases = context.setdefault("_aliases", {})
+            if value in aliases or value == "*":
+                return value
+            if value not in inverse:
+                alias = "member_" + str(len(aliases) + 1)
+                while alias in aliases:
+                    alias = "member_" + str(int(alias.removeprefix("member_")) + 1)
+                aliases[alias] = value
+                inverse[value] = alias
+            return inverse[value]
+        if isinstance(value, list):
+            return [ConversationCoordinator._model_aliases(item, context, field) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: ConversationCoordinator._model_aliases(item, context, key)
+                for key, item in value.items()
+            }
+        return value
+
+    def _bind_agent_tools(
+        self, actor: ActorContext, event: GroupEvent, context: dict[str, Any]
+    ) -> None:
+        async def read_facts(selector: WorkSelector, include_evidence: bool) -> dict[str, Any]:
+            if context.get("_agent_context_revoked"):
+                raise DomainError("source_unavailable", "This turn consumed a withdrawn source")
+            candidate = Decision(
+                kind="query_work",
+                reason_code="agent_fact_read",
+                work_selector=selector,
+                directness="direct",
+                confidence=1,
+            )
+            with self.store.transaction(actor, trace_id=event.id) as tx:
+                self.memory.prepare_in_tx(tx)
+                self.execution_guard(tx)
+                self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
+                if tx.get_event(event.id).content_state != "active":
+                    raise DomainError("source_unavailable", "The human request was withdrawn")
+                observed = query_work_in_tx(tx, event, candidate, context, WorkFacts(self.store))
+                rows = observed["facts"]
+                context["_last_work_fact_read"] = observed
+                context["_work_fact_source_ids"] = sorted(
+                    set(context.get("_work_fact_source_ids", []))
+                    | WorkFacts.source_dependencies_in_tx(tx, tuple(row["id"] for row in rows))
+                )
+                for row in rows:
+                    source_id = row["request_event_id"]
+                    context["_snapshot"]["source_fingerprints"][source_id] = tx.event_fingerprint(
+                        source_id
+                    )
+                # A read can reveal a valid reference that was not in the small
+                # initial prompt. It grants visibility, never mutation permission.
+                for name in ("_works", "_control_works"):
+                    current = {row["id"]: row for row in context.get(name, [])}
+                    current.update({row["id"]: row for row in rows})
+                    context[name] = list(current.values())
+                public = self._model_aliases(observed, context)
+                current = {row["id"]: row for row in context.get("works", [])}
+                current.update({row["id"]: row for row in public["facts"]})
+                context["works"] = list(current.values())
+                if include_evidence:
+                    public["inspection"] = {
+                        "scope": "recorded_execution_validation_artifact_and_delivery_evidence",
+                        "performed": True,
+                        "work_resumed": False,
+                        "artifact_contents_opened": False,
+                    }
+                return public
+
+        async def apply_action(candidate: Decision, tool_call_id: str) -> dict[str, Any]:
+            if context.get("_agent_context_revoked"):
+                return {"status": "rejected", "code": "source_unavailable", "committed": False}
+            try:
+                result = self._apply_decision(
+                    actor, event, candidate, context, tool_call_id=tool_call_id
+                )
+            except DomainError as error:
+                return {"status": "rejected", "code": error.code, "committed": False}
+            context["_agent_applied"] = True
+            accepted = bool(result.work_id or result.action_result is not None)
+            # Successful reads never enter this function. A prior closed turn is
+            # not evidence that a different candidate was committed.
+            if result.duplicate:
+                with self.store.transaction(actor, trace_id=event.id) as tx:
+                    prior: dict[str, Any] = tx.get_decision(event.id) or {}
+                digest = hashlib.sha256(candidate.model_dump_json().encode()).hexdigest()
+                accepted = (
+                    any(
+                        receipt.get("candidate_sha256") == digest
+                        for receipt in prior.get("action_receipts", [])
+                    )
+                    and accepted
+                )
+            return {
+                "status": "committed" if accepted else "rejected",
+                "committed": accepted,
+                "replayed": result.duplicate,
+                "tool_call_id": tool_call_id,
+                "host_message": result.decision.response,
+                "result": self._model_aliases(result.model_dump(mode="json"), context),
+            }
+
+        context["_read_work_facts"] = read_facts
+        context["_apply_business_action"] = apply_action
+
+    def _finish_agent_response_in_tx(
+        self,
+        tx: UnitOfWork,
+        event: GroupEvent,
+        body: dict[str, Any],
+        *,
+        decision: Decision | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> CoordinationResult:
+        """Close a committed turn exactly once, including after interrupted inference."""
+        previous = CoordinationResult.model_validate(body["result"])
+        if not body.get("agent_pending_response"):
+            return previous.model_copy(update={"duplicate": True})
+        if body.get("agent_context_revoked"):
+            # The running model still has its pre-forget transcript. Only the
+            # source-free committed host acknowledgement may cross this boundary.
+            decision = None
+        self.memory.prepare_in_tx(tx)
+        self.execution_guard(tx)
+        snapshot = context["_snapshot"] if context is not None else body.get("agent_snapshot", {})
+        try:
+            self.memory.assert_snapshot_in_tx(tx, snapshot)
+            if tx.get_event(event.id).content_state != "active":
+                raise DomainError("source_unavailable", "The request was withdrawn")
+        except DomainError as error:
+            # Committed actions remain facts. Revoked context cannot authorize a
+            # delayed reply, even if inference had already produced its text.
+            final = Decision(kind="observe", reason_code=error.code, confidence=1)
+        else:
+            if decision is not None and decision.kind in {"observe", "ignore"}:
+                final = decision
+            else:
+                text = decision.response if decision is not None else None
+                if text is None:
+                    acknowledgements = [
+                        receipt.get("result", {}).get("decision", {}).get("response")
+                        for receipt in body.get("action_receipts", [])
+                    ]
+                    text = "\n".join(dict.fromkeys(value for value in acknowledgements if value))
+                final = (
+                    previous.decision.model_copy(update={"response": text})
+                    if text and previous.decision.kind not in {"ignore", "observe"}
+                    else Decision(kind="observe", reason_code="agent_turn_silent", confidence=1)
+                )
+        admission = ingress_admission(
+            tx,
+            event,
+            self.identity,
+            time_zone=self.config.group.time_zone,
+            quiet_hours=self.config.group.quiet_hours,
+            now=self.clock(),
+            default_mode=self.config.group.participation_mode,
+        )
+        if not admission.allowed:
+            final = Decision(kind="observe", reason_code=admission.reason_code, confidence=1)
+        delivery_id = previous.delivery_id
+        if final.response and final.kind not in {"ignore", "observe"}:
+            delivery = tx.enqueue_reply(
+                event.id,
+                final.response,
+                read_only_authorized=tx.actor.role.value in self.config.group.read_only_qa_roles,
+            )
+            delivery_id = delivery.id
+            tx.conn.execute(
+                "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason,created_at,invocation_root_event_id) "
+                "VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (
+                    tx.group_id,
+                    event.id,
+                    final.directness == "proactive",
+                    final.reason_code,
+                    self.clock(),
+                    admission.invocation_root_event_id,
+                ),
+            )
+        controlled = list(
+            dict.fromkeys(
+                identifier
+                for receipt in body.get("action_receipts", [])
+                for identifier in receipt.get("result", {}).get("controlled_work_ids", [])
+            )
+        )
+        associated = list(
+            dict.fromkeys(
+                identifier
+                for receipt in body.get("action_receipts", [])
+                for identifier in [receipt.get("result", {}).get("work_id")]
+                if isinstance(identifier, str) and identifier
+            )
+        )
+        associated = list(dict.fromkeys([*associated, *controlled]))
+        action_result = previous.action_result
+        if associated:
+            associated_values: list[JsonValue] = [identifier for identifier in associated]
+            action_result = {**(action_result or {}), "work_ids": associated_values}
+        associated_work_id = associated[0] if len(associated) == 1 else previous.work_id
+        result = previous.model_copy(
+            update={
+                "decision": final,
+                "delivery_id": delivery_id,
+                "controlled_work_ids": controlled,
+                "work_id": associated_work_id,
+                "action_result": action_result,
+            }
+        )
+        body = {
+            **body,
+            "kind": final.kind,
+            "result": result.model_dump(mode="json"),
+            "agent_pending_response": False,
+        }
+        if context is not None:
+            body["source_event_ids"] = sorted(
+                set(body.get("source_event_ids", []))
+                | set(context.get("_work_fact_source_ids", []))
+                | set(context["_snapshot"]["source_fingerprints"])
+            )
+            body["source_fingerprints"] = {
+                **body.get("source_fingerprints", {}),
+                **context["_snapshot"]["source_fingerprints"],
+            }
+        tx.conn.execute(
+            "UPDATE ga_decisions SET body=%s WHERE group_id=%s AND event_id=%s",
+            (Jsonb(body), tx.group_id, event.id),
+        )
+        return result
+
+    def _finish_agent_response(
+        self,
+        actor: ActorContext,
+        event: GroupEvent,
+        *,
+        decision: Decision | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> CoordinationResult:
+        with self.store.transaction(actor, trace_id=event.id) as tx:
+            body = tx.get_decision(event.id)
+            if body is None:
+                raise DomainError("not_found", "No committed agent action can be finalized")
+            return self._finish_agent_response_in_tx(
+                tx, event, body, decision=decision, context=context
+            )
+
     async def process(self, event: GroupEvent) -> CoordinationResult:
         self.execution_guard()
         actor = self.actor(event)
@@ -1310,6 +1535,8 @@ class ConversationCoordinator(Coordinator):
                 )
             previous = tx.get_decision(event.id)
             if previous:
+                if previous.get("agent_pending_response"):
+                    return self._finish_agent_response_in_tx(tx, event, previous)
                 return CoordinationResult.model_validate(previous["result"]).model_copy(
                     update={"duplicate": True}
                 )
@@ -1438,6 +1665,7 @@ class ConversationCoordinator(Coordinator):
                     kind="observe", reason_code="group_paused"
                 )
             else:
+                provider = self.provider_factory(actor, event)
                 immediate = self._fast_control(event, context)
                 if immediate is None:
                     immediate = self._fast_roster_reply(event, context)
@@ -1447,20 +1675,71 @@ class ConversationCoordinator(Coordinator):
                     immediate = self._fast_identity_reply(event, context)
                 if immediate is None:
                     immediate = self._fast_fact_reply(event, context, actor)
-                if immediate is None:
-                    immediate = self._fast_new_work(event, context)
-                    fast_admitted = immediate is not None
-                decision = immediate or await self.provider_factory(actor, event).decide(
-                    event, context
-                )
+                if getattr(provider, "uses_agent_kernel", False):
+                    self._bind_agent_tools(actor, event, context)
+                else:
+                    if immediate is None:
+                        immediate = self._fast_new_work(event, context)
+                        fast_admitted = immediate is not None
+                try:
+                    decision = immediate or await provider.decide(event, context)
+                except Exception:
+                    if context.get("_agent_applied"):
+                        return self._finish_agent_response(actor, event, context=context)
+                    raise
+        if context.get("_agent_applied"):
+            return self._finish_agent_response(actor, event, decision=decision, context=context)
+        return self._apply_decision(actor, event, decision, context, fast_admitted=fast_admitted)
+
+    def _apply_decision(
+        self,
+        actor: ActorContext,
+        event: GroupEvent,
+        decision: Decision,
+        context: dict[str, Any],
+        *,
+        fast_admitted: bool = False,
+        tool_call_id: str | None = None,
+    ) -> CoordinationResult:
+        """The single typed write boundary, also used by foreground graph tools.
+
+        Tool actions persist a receipt before returning to the model. They leave
+        delivery pending, so no database transaction spans model inference.
+        """
         with self.store.transaction(actor, trace_id=event.id) as tx:
             self.memory.prepare_in_tx(tx)
             self.execution_guard(tx)
-            previous = tx.get_decision(event.id)
+            previous: dict[str, Any] | None = tx.get_decision(event.id)
+            candidate_digest = hashlib.sha256(decision.model_dump_json().encode()).hexdigest()
             if previous:
-                return CoordinationResult.model_validate(previous["result"]).model_copy(
-                    update={"duplicate": True}
-                )
+                if tool_call_id and previous.get("agent_pending_response"):
+                    for receipt in previous.get("action_receipts", []):
+                        if receipt.get("tool_call_id") == tool_call_id:
+                            if receipt.get("candidate_sha256") != candidate_digest:
+                                raise DomainError(
+                                    "invalid_input", "A tool call ID cannot change its action"
+                                )
+                            return CoordinationResult.model_validate(receipt["result"]).model_copy(
+                                update={"duplicate": True}
+                            )
+                        if receipt.get("candidate_sha256") == candidate_digest:
+                            # Bind a second call ID to the same receipt as well;
+                            # it must never be reusable for a different action.
+                            previous["action_receipts"] = [
+                                *previous["action_receipts"],
+                                {**receipt, "tool_call_id": tool_call_id},
+                            ]
+                            tx.conn.execute(
+                                "UPDATE ga_decisions SET body=%s WHERE group_id=%s AND event_id=%s",
+                                (Jsonb(previous), actor.group_id, event.id),
+                            )
+                            return CoordinationResult.model_validate(receipt["result"]).model_copy(
+                                update={"duplicate": True}
+                            )
+                else:
+                    return CoordinationResult.model_validate(previous["result"]).model_copy(
+                        update={"duplicate": True}
+                    )
             self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
             if (
                 context.get("_exact_fact_reply")
@@ -1481,6 +1760,19 @@ class ConversationCoordinator(Coordinator):
             work_id = delivery_id = None
             controlled_work_ids: list[str] = []
             action_result = None
+            if (
+                tool_call_id is None
+                and decision.kind == "reply"
+                and context.get("_last_work_fact_read")
+            ):
+                observed = context["_last_work_fact_read"]
+                action_result = {
+                    "work_facts": observed,
+                    "work_ids": [row["id"] for row in observed["facts"]],
+                    "states": [row["state"] for row in observed["facts"]],
+                }
+                identifiers = action_result["work_ids"]
+                work_id = identifiers[0] if len(identifiers) == 1 else None
             original_snapshot = deepcopy(context["_snapshot"])
             try:
                 # Savepoint lets a rejected candidate produce an honest response
@@ -1848,6 +2140,9 @@ class ConversationCoordinator(Coordinator):
                             update={"response": "已更新同一项工作的要求，旧结果不会覆盖新目标。"}
                         )
                     elif decision.kind == "query_work":
+                        # Compatibility for persisted/scripted Decision callers.
+                        # The live agent reads via read_work_facts and supplies
+                        # its own final text, never this deterministic renderer.
                         observed = query_work_in_tx(
                             tx, event, decision, context, WorkFacts(self.store)
                         )
@@ -1971,7 +2266,11 @@ class ConversationCoordinator(Coordinator):
                         if decision.kind not in {"reply", "clarify"}
                         else Decision(kind="observe", reason_code=admission.reason_code)
                     )
-            if decision.response and decision.kind not in {"ignore", "observe"}:
+            if (
+                tool_call_id is None
+                and decision.response
+                and decision.kind not in {"ignore", "observe"}
+            ):
                 delivery = tx.enqueue_reply(
                     event.id,
                     decision.response,
@@ -2025,19 +2324,69 @@ class ConversationCoordinator(Coordinator):
                 action_result=action_result,
                 controlled_work_ids=controlled_work_ids,
             )
-            tx.record_decision(
-                event.id,
-                {
-                    "kind": decision.kind,
-                    "result": result.model_dump(mode="json"),
-                    # Revocation lineage is metadata, not an attachment/tool
-                    # grant or a requirement to hydrate an entire old archive.
-                    "source_event_ids": sorted(
-                        set(context["_snapshot"]["source_fingerprints"])
-                        | set(context.get("_work_fact_source_ids", []))
-                    ),
-                    "source_fingerprints": context["_snapshot"]["source_fingerprints"],
-                    "source_task_revisions": context["_snapshot"].get("source_task_revisions", {}),
+            privacy_action = decision.action is not None and decision.action.get("op") == "forget"
+            if privacy_action:
+                # Forget can redact this open turn. Never rehydrate a stale
+                # receipt/transcript after the privacy transaction has done so.
+                canonical: dict[str, Any] | None = tx.get_decision(event.id)
+                previous = {**canonical, "action_receipts": []} if canonical is not None else None
+                context["_agent_context_revoked"] = True
+            lineage = previous if previous and not privacy_action else {}
+            body: dict[str, Any] = {
+                "kind": decision.kind,
+                "result": result.model_dump(mode="json"),
+                # Revocation lineage is metadata, not an attachment/tool grant.
+                "source_event_ids": sorted(
+                    set(context["_snapshot"]["source_fingerprints"])
+                    | set(context.get("_work_fact_source_ids", []))
+                    | set(lineage.get("source_event_ids", []))
+                ),
+                "source_fingerprints": {
+                    **lineage.get("source_fingerprints", {}),
+                    **context["_snapshot"]["source_fingerprints"],
                 },
-            )
+                "source_task_revisions": {
+                    **lineage.get("source_task_revisions", {}),
+                    **context["_snapshot"].get("source_task_revisions", {}),
+                },
+            }
+            if tool_call_id is not None:
+                # Refresh witnesses changed by our own accepted mutation. A later
+                # tool still revalidates all sources against concurrent changes.
+                snapshot = context["_snapshot"]
+                from groupagent.memory.common import memory_lock
+
+                snapshot["privacy_epoch"] = memory_lock(tx)
+                for index, witness in enumerate(snapshot.get("task_queries", [])):
+                    _, refreshed = self.memory.task_query_in_tx(
+                        tx,
+                        witness["query"],
+                        topic_id=witness["topic_id"],
+                        limit=witness["limit"],
+                        public_only=witness["public_only"],
+                        through_sequence=witness.get("through_sequence"),
+                    )
+                    snapshot["task_queries"][index] = refreshed
+                body["agent_snapshot"] = {
+                    key: value for key, value in snapshot.items() if key != "items"
+                }
+                body["action_receipts"] = [
+                    *(previous.get("action_receipts", []) if previous else []),
+                    {
+                        "tool_call_id": tool_call_id,
+                        "candidate_sha256": candidate_digest,
+                        "result": result.model_dump(mode="json"),
+                    },
+                ]
+                body["agent_pending_response"] = decision.reason_code != "quiet_enabled"
+                body["agent_context_revoked"] = bool(context.get("_agent_context_revoked"))
+                if previous:
+                    tx.conn.execute(
+                        "UPDATE ga_decisions SET body=%s WHERE group_id=%s AND event_id=%s",
+                        (Jsonb(body), actor.group_id, event.id),
+                    )
+                else:
+                    tx.record_decision(event.id, body)
+            else:
+                tx.record_decision(event.id, body)
             return result

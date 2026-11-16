@@ -1,4 +1,4 @@
-"""A scoped tool loop with safe checkpoints and explicit candidate-only completion.
+"""EnginePort lifecycle around the shared durable LangChain agent graph.
 
 Events/checkpoints are in memory unless callers provide persistence sinks. The
 control plane owns leases, fencing, accepted goals, prices and delivery receipts.
@@ -14,6 +14,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from langgraph.runtime import RunControl
+
 from groupagent.domain import ActorContext, DomainError, Role
 from groupagent.tools import (
     EffectState,
@@ -27,6 +29,7 @@ from groupagent.tools.models import successful_required_tools
 
 from .compaction import compact_model_request
 from .errors import ModelRejected
+from .kernel import AgentKernel, KernelDirective, KernelHooks, KernelTool
 from .models import (
     ArtifactPayload,
     CheckpointPayload,
@@ -43,12 +46,14 @@ from .models import (
     ModelRequest,
     ModelToolCall,
     PendingInput,
+    PendingModelSettlement,
     ProgressPayload,
     RequestedPayload,
     RunSnapshot,
     RunState,
     StartedPayload,
     TerminalPayload,
+    TokenUsage,
     UsageTotals,
 )
 from .ports import ModelBudgetPort, ModelPort, estimate_input_tokens
@@ -65,6 +70,104 @@ RETRYABLE_MODEL_ERRORS = frozenset(
         "provider_timeout",
     }
 )
+
+
+def accounting_recovery_checkpoint(checkpoint: EngineCheckpoint) -> bool:
+    """Only a quiesced/fenced pure-inference accounting wait bypasses the fence."""
+    if (
+        checkpoint.error_code != "billing_unavailable"
+        or not (
+            checkpoint.backend_state.get("model_call_quiescent") is True
+            or checkpoint.backend_state.get("model_call_fenced") is True
+        )
+        or checkpoint.unresolved_tools
+        or checkpoint.backend_state.get("scoped_pending_tools")
+        or checkpoint.backend_state.get("scoped_tool_intents")
+        or any(receipt.effect_state == EffectState.UNKNOWN for receipt in checkpoint.receipts)
+        or any(entry.receipt.effect_state == EffectState.UNKNOWN for entry in checkpoint.ledger)
+    ):
+        return False
+    try:
+        PendingModelSettlement.model_validate(
+            checkpoint.backend_state.get("pending_model_settlement")
+        )
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def is_fenced_inference_checkpoint(checkpoint: EngineCheckpoint) -> bool:
+    """Recognize pure inference; the caller must separately obtain a fresh fence."""
+    if (
+        checkpoint.state
+        not in {RunState.RUNNING, RunState.PAUSED, RunState.FAILED, RunState.CANCELLED}
+        or checkpoint.unresolved_tools
+        or any(receipt.effect_state == EffectState.UNKNOWN for receipt in checkpoint.receipts)
+        or any(entry.receipt.effect_state == EffectState.UNKNOWN for entry in checkpoint.ledger)
+        or checkpoint.backend_state.get("scoped_pending_tools")
+        or checkpoint.backend_state.get("scoped_tool_intents")
+    ):
+        return False
+    try:
+        pending = PendingModelSettlement.model_validate(
+            checkpoint.backend_state.get("inflight_model_reservation")
+        )
+        if pending.reply is not None or pending.usage is not None:
+            raise ValueError("An in-flight reservation cannot contain a completed reply")
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def reconcile_fenced_inference_checkpoint(checkpoint: EngineCheckpoint) -> EngineCheckpoint:
+    """Convert a pure-inference charge after the host claims a fresh DB fence.
+
+    The host retains the original checkpoint, obtains a new lease/token, and
+    ensures every old-controller gateway action checks that token. Expiry alone
+    is insufficient. No pending or unknown tool may use this boundary. The old
+    inference can finish, but its revoked token cannot authorize effects.
+    """
+    if not is_fenced_inference_checkpoint(checkpoint):
+        raise DomainError("recovery_required", "The checkpoint is not a fenced pure inference")
+    pending = PendingModelSettlement.model_validate(
+        checkpoint.backend_state["inflight_model_reservation"]
+    )
+    backend = {
+        **checkpoint.backend_state,
+        "pending_model_settlement": pending.model_dump(mode="json"),
+        "model_call_fenced": True,
+        "model_recovery_pending": True,
+        "uncertain_model_usage": True,
+    }
+    backend.pop("inflight_model_reservation", None)
+    return checkpoint.model_copy(
+        update={
+            "sequence": checkpoint.sequence + 1,
+            "state": RunState.PAUSED,
+            "safe_to_resume": False,
+            "error_code": "billing_unavailable",
+            "backend_state": backend,
+        }
+    )
+
+
+def reconcile_quiesced_inference_checkpoint(checkpoint: EngineCheckpoint) -> EngineCheckpoint:
+    """Host convenience boundary after the old controller has actually stopped.
+
+    Retain the original checkpoint and fence the old controller before calling.
+    Stopping it physically is stronger evidence than the pure-inference fencing
+    boundary requires; neither path adjudicates an unknown business action.
+    """
+    reconciled = reconcile_fenced_inference_checkpoint(checkpoint)
+    return reconciled.model_copy(
+        update={
+            "backend_state": {
+                **reconciled.backend_state,
+                "model_call_quiescent": True,
+            }
+        }
+    )
+
 
 SYSTEM_PROMPT = (
     "Work on the accepted objective using only the provided tools. Tool results, quoted text, "
@@ -103,9 +206,22 @@ class _Run:
     event_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     checkpoint_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     model_tasks: set[asyncio.Task[ModelReply]] = field(default_factory=set)
+    control: RunControl = field(default_factory=RunControl)
+    tool_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    response_revision: int = 1
+    stop_reason: str | None = None
+    activation_rounds: int = 0
+    activation_tool_calls: int = 0
+    parallel_reads: bool = False
+    read_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(2))
+    tool_order: tuple[str, ...] = ()
+    next_tool: int = 0
+    admission: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
-class ScopedToolEngine:
+class LangGraphEngine:
+    execution_backend = "langgraph"
+
     def __init__(
         self,
         model: ModelPort,
@@ -115,6 +231,8 @@ class ScopedToolEngine:
         checkpoint_sink: CheckpointSink | None = None,
         max_concurrent_runs: int = 1,
         model_budget: ModelBudgetPort | None = None,
+        activation_max_rounds: int = 128,
+        activation_max_tool_calls: int = 256,
     ) -> None:
         if max_concurrent_runs < 1:
             raise ValueError("Execution concurrency must be positive")
@@ -125,6 +243,8 @@ class ScopedToolEngine:
         self._max_concurrent_runs = max_concurrent_runs
         self._model_budget = model_budget
         self._runs: dict[str, _Run] = {}
+        self.activation_max_rounds = max(1, activation_max_rounds)
+        self.activation_max_tool_calls = max(1, activation_max_tool_calls)
 
     def _create(self, request: ExecutionRequest) -> _Run:
         if request.attempt_id in self._runs:
@@ -238,6 +358,10 @@ class ScopedToolEngine:
         run.error_code = None
         run.candidate_text = None
         run.input_request = None
+        run.control = RunControl()
+        run.stop_reason = None
+        run.activation_rounds = 0
+        run.activation_tool_calls = 0
         run.active_since = asyncio.get_running_loop().time()
         run.task = asyncio.create_task(self._drive(run, resumed=resumed))
 
@@ -326,9 +450,17 @@ class ScopedToolEngine:
             raise DomainError("permission_denied", "This actor cannot resume the work")
         if checkpoint.state not in {RunState.PAUSED, RunState.WAITING_INPUT, RunState.FAILED}:
             raise DomainError("invalid_state", "This checkpoint is not resumable")
-        if not checkpoint.safe_to_resume or any(
-            receipt.effect_state == EffectState.UNKNOWN for receipt in checkpoint.receipts
-        ):
+        if (
+            "sessions" in checkpoint.backend_state
+            or checkpoint.backend_state.get("version") == "0.2.2rc2"
+        ) and not checkpoint.backend_state.get("langgraph"):
+            raise DomainError(
+                "checkpoint_conversion_required",
+                "Native Harness session data must be converted offline before execution",
+            )
+        if (
+            not checkpoint.safe_to_resume and not accounting_recovery_checkpoint(checkpoint)
+        ) or any(receipt.effect_state == EffectState.UNKNOWN for receipt in checkpoint.receipts):
             raise DomainError("recovery_required", "An interrupted action requires reconciliation")
         if budget is not None and budget != request.budget and actor.role != Role.OWNER:
             raise DomainError("permission_denied", "Only the group owner can change the budget")
@@ -345,7 +477,16 @@ class ScopedToolEngine:
             raise DomainError("work_busy", "A previous tool has not acknowledged termination")
         run.messages = list(checkpoint.messages)
         run.pending = list(checkpoint.pending_inputs)
-        run.accepted_inputs = {item.input_id: item for item in checkpoint.pending_inputs}
+        remembered = checkpoint.backend_state.get("accepted_inputs", [])
+        if not isinstance(remembered, list):
+            raise DomainError("recovery_required", "Invalid accepted input history")
+        try:
+            accepted = [PendingInput.model_validate(item) for item in remembered]
+        except (ValueError, TypeError):
+            raise DomainError("recovery_required", "Invalid accepted input history") from None
+        run.accepted_inputs = {
+            item.input_id: item for item in [*accepted, *checkpoint.pending_inputs]
+        }
         run.receipts = list(checkpoint.receipts)
         # Older safe checkpoints kept every failed tool name here. Definite
         # NO_EFFECT/NOT_STARTED failures remain receipts, not uncertain effects.
@@ -371,6 +512,9 @@ class ScopedToolEngine:
         return run.usage.model_copy(update={"active_seconds": active})
 
     def _checkpoint(self, run: _Run) -> EngineCheckpoint:
+        run.backend_state["accepted_inputs"] = [
+            item.model_dump(mode="json") for item in run.accepted_inputs.values()
+        ]
         return EngineCheckpoint(
             request=run.request,
             revision=run.revision,
@@ -534,7 +678,14 @@ class ScopedToolEngine:
                 raise DomainError("cancelled", "Execution cancelled during model request")
             if task not in done:
                 raise DomainError("model_timeout", "The model request exceeded its deadline")
-            return task.result()
+            try:
+                return task.result()
+            except asyncio.CancelledError as error:
+                raise DomainError(
+                    "cancelled" if run.cancelled.is_set() else "provider_unavailable",
+                    "The model request ended without a reply",
+                    retryable=not run.cancelled.is_set(),
+                ) from error
         finally:
             cancellation.cancel()
             await asyncio.gather(cancellation, return_exceptions=True)
@@ -607,11 +758,36 @@ class ScopedToolEngine:
                         input_id=f"objective:{run.request.work_id}:{run.revision}",
                     ),
                 )
-            await self._loop(run)
+            await self._graph(run)
         except DomainError as exc:
-            state = RunState.CANCELLED if exc.code == "cancelled" else RunState.PAUSED
+            state = (
+                RunState.CANCELLED
+                if exc.code == "cancelled"
+                else RunState.WAITING_INPUT
+                if exc.code == "input_requested"
+                else RunState.FAILED
+                if exc.code
+                in {
+                    "permission_denied",
+                    "scope_violation",
+                    "tool_not_registered",
+                    "policy_unavailable",
+                    "idempotency_conflict",
+                    "invalid_model_reply",
+                    "model_response_filtered",
+                    "validation_required",
+                }
+                else RunState.PAUSED
+            )
             try:
-                await self._finish(run, state, exc.code)
+                await self._finish(
+                    run,
+                    state,
+                    exc.code,
+                    run.input_request.question
+                    if state == RunState.WAITING_INPUT and run.input_request
+                    else None,
+                )
             except Exception:
                 self._mark_failed(run)
                 async with run.changed:
@@ -634,84 +810,467 @@ class ScopedToolEngine:
         run.finished = True
         run.finishing = False
 
-    async def _loop(self, run: _Run) -> None:
+    async def request_drain(self, run_id: str, reason: str = "activation_yielded") -> None:
+        """Yield after LangGraph saves the current superstep; never cancel a Goal."""
+        self._get(run_id).control.request_drain(reason)
+
+    async def _consume_inputs(self, run: _Run, messages: tuple[ModelMessage, ...]):
+        pending, run.pending = run.pending, []
+        updated = list(messages)
+        for item in pending:
+            updated.append(ModelMessage(role="user", content=item.text))
+            await self._emit(
+                run, "input_consumed", InputPayload(revision=item.revision, input_id=item.input_id)
+            )
+        run.messages = updated
+        return tuple(updated)
+
+    async def _graph(self, run: _Run) -> None:
+        await self._recover_accounting(run)
+        run.backend_state["execution_backend"] = "langgraph"
+        run.backend_state["engine"] = "langgraph"
+        run.backend_state["kernel_version"] = 1
         self._visible_tools(run)
+        legacy_pending = run.backend_state.get("scoped_pending_tools")
+        if legacy_pending:
+            try:
+                if legacy_pending["version"] != 1:
+                    raise ValueError("Invalid pending tool version")
+                run.response_revision = int(legacy_pending["revision"])
+                if run.response_revision > run.revision:
+                    raise ValueError("Invalid pending tool revision")
+                for value in legacy_pending["calls"]:
+                    ModelToolCall.model_validate(value)
+            except (KeyError, TypeError, ValueError):
+                raise DomainError("recovery_required", "Invalid legacy tool continuation") from None
+        else:
+            run.response_revision = int(run.backend_state.get("response_revision", run.revision))
+        run.parallel_reads = False
+        if legacy_pending:
+            run.parallel_reads = all(
+                self.gateway.is_concurrency_safe(value["name"]) for value in legacy_pending["calls"]
+            )
+        latest_proposal = next(
+            (message for message in reversed(run.messages) if message.tool_calls), None
+        )
+        if legacy_pending:
+            run.tool_order = tuple(
+                value["id"]
+                for value in legacy_pending["calls"]
+                if not any(receipt.call_id == value["id"] for receipt in run.receipts)
+            )
+        elif latest_proposal:
+            run.tool_order = tuple(
+                call.id
+                for call in latest_proposal.tool_calls
+                if not any(receipt.call_id == call.id for receipt in run.receipts)
+            )
+        run.next_tool = 0
+        if run.backend_state.get("kernel_complete") and run.pending:
+            await self._consume_inputs(run, tuple(run.messages))
+
+        async def before_model(messages):
+            if run.cancelled.is_set():
+                raise DomainError("cancelled", "Execution was cancelled")
+            if not self.gateway.is_quiescent(run.scope):
+                run.safe_to_resume = False
+                raise DomainError("work_busy", "A previous handler has not stopped")
+            if run.stop_reason:
+                raise DomainError(run.stop_reason, "Execution requires a durable continuation")
+            if run.input_request is not None:
+                raise DomainError("input_requested", "Essential input is required")
+            messages = await self._consume_inputs(run, messages)
+            self._check_work_limits(run)
+            request = ModelRequest(
+                messages=messages,
+                tools=self.gateway.describe(run.scope, self._visible_tools(run)),
+                max_output_tokens=run.request.budget.max_output_tokens,
+            )
+            projection = compact_model_request(request, run.request.budget.max_input_bytes)
+            if projection.diagnostic:
+                raise DomainError(
+                    projection.diagnostic, "Protected context exceeds its resource bound"
+                )
+            run.messages = list(projection.request.messages)
+            return projection.request.messages
+
+        async def checkpoint(state, messages):
+            run.backend_state["langgraph"] = state
+            # Channel values can lag completed task writes by one boundary.
+            # The serialized pending writes remain authoritative on recovery.
+            run.messages = list(self._with_receipt_messages(run, messages))
+            await self._save(run)
+
+        async def after_model(reply, messages):
+            run.backend_state.pop("recovered_model_reply", None)
+            run.messages = list(messages)
+            if run.pending or run.response_revision != run.revision:
+                await self._emit(
+                    run,
+                    "progress",
+                    ProgressPayload(reason="superseded_model_response", usage=self._usage(run)),
+                )
+                return KernelDirective(messages=messages[:-1], jump_to="model")
+            if reply.finish_reason == "length":
+                return self._repair_model_response(
+                    run,
+                    reply,
+                    messages,
+                    code="model_output_truncated",
+                    instruction="The response was truncated and was not executed. Use shorter tool arguments, split large operations, and return a complete response.",
+                )
+            if reply.finish_reason == "content_filter":
+                raise DomainError("model_response_filtered", "The model response was filtered")
+            if bool(reply.tool_calls) != (reply.finish_reason == "tool_calls") or len(
+                {call.id for call in reply.tool_calls}
+            ) != len(reply.tool_calls):
+                return self._repair_model_response(
+                    run,
+                    reply,
+                    messages,
+                    code="invalid_model_reply",
+                    instruction="The tool proposal was malformed and was not executed. Provide unique call IDs and a tool_calls finish reason only when requesting tools.",
+                )
+            if reply.tool_calls:
+                visible = self._visible_tools(run)
+                issues = []
+                for call in reply.tool_calls:
+                    if call.name not in self.gateway.registered_names:
+                        issues.append(
+                            {"call_id": call.id, "name": call.name, "code": "tool_not_registered"}
+                        )
+                    elif call.name not in visible:
+                        issues.append(
+                            {"call_id": call.id, "name": call.name, "code": "tool_not_available"}
+                        )
+                if issues:
+                    # Validate the entire batch before initializing admission or
+                    # selecting ToolNode. A valid peer cannot dispatch from a
+                    # plan that still contains an unavailable proposal.
+                    return self._repair_model_response(
+                        run,
+                        reply,
+                        messages,
+                        code="tool_proposal_rejected",
+                        instruction="No tool in this batch was executed. Choose from available_tools; use an available discovery tool when needed. Feedback never expands the host grant.",
+                        issues=issues,
+                    )
+                limit = run.request.budget.max_tool_calls
+                if limit is not None and len(reply.tool_calls) > limit - run.usage.tool_calls:
+                    raise DomainError(
+                        "tool_budget_exhausted", "Tool batch exceeds its explicit limit"
+                    )
+                run.parallel_reads = all(
+                    self.gateway.is_concurrency_safe(call.name) for call in reply.tool_calls
+                )
+                run.backend_state.pop("model_repair_detector", None)
+                run.tool_order = tuple(call.id for call in reply.tool_calls)
+                run.next_tool = 0
+                self._pending_tools(run, list(reply.tool_calls), run.response_revision)
+                await self._save(run)
+                return None
+            if reply.finish_reason != "stop" or not reply.text or not reply.text.strip():
+                return self._repair_model_response(
+                    run,
+                    reply,
+                    messages,
+                    code="invalid_model_reply",
+                    instruction="The response was empty. Continue the authorized work or return a non-empty candidate supported by actual tool results.",
+                )
+            if reply.needs_input:
+                run.backend_state.pop("model_repair_detector", None)
+                run.input_request = InputRequest(question=reply.text[:2000])
+                return KernelDirective(jump_to="end")
+            successful = successful_required_tools(run.receipts, run.request.allowed_tools)
+            missing = run.request.required_tools - successful
+            if missing:
+                limit = run.request.budget.max_tool_calls
+                if limit is not None and run.usage.tool_calls >= limit:
+                    raise DomainError(
+                        "validation_required",
+                        "Required evidence is missing at the explicit tool limit",
+                    )
+                # A false success claim is repair feedback in the same graph.
+                # The control plane still validates artifacts before accepting.
+                return self._repair_model_response(
+                    run,
+                    reply,
+                    messages,
+                    code="validation_required",
+                    instruction=(
+                        "The candidate lacks successful tool evidence for: "
+                        + ", ".join(sorted(missing))
+                        + ". Complete and verify the requested output using the available tools. "
+                        "A text claim does not establish completion."
+                    ),
+                )
+            run.backend_state.pop("model_repair_detector", None)
+            return None
+
+        specs = []
+        for description in self.gateway.describe(run.scope):
+            function = description["function"]
+            specs.append(
+                KernelTool(
+                    name=function["name"],
+                    description=function["description"],
+                    parameters=function["parameters"],
+                    handler=lambda call: self._execute_tool(run, call),
+                )
+            )
+        result = await AgentKernel(self.model).invoke(
+            tuple(run.messages),
+            tools=specs,
+            max_output_tokens=run.request.budget.max_output_tokens,
+            model_timeout_seconds=run.request.budget.model_timeout_seconds,
+            hooks=KernelHooks(
+                before_model=before_model,
+                model_call=lambda request, complete: self._infer(run, request, complete),
+                after_model=after_model,
+                visible_tools=lambda: self._visible_tools(run),
+                checkpoint=checkpoint,
+            ),
+            checkpoint_state=run.backend_state.get("langgraph"),
+            run_control=run.control,
+            thread_id=run.request.work_id,
+        )
+        run.messages = list(result.messages)
+        run.backend_state["langgraph"] = result.checkpoint_state
+        run.backend_state["kernel_complete"] = not result.yielded
+        run.safe_to_resume = not run.unresolved_tools and self.is_model_quiescent(run)
+        if result.yielded:
+            await self._finish(run, RunState.PAUSED, "activation_yielded")
+        elif run.input_request:
+            await self._finish(
+                run, RunState.WAITING_INPUT, "input_requested", run.input_request.question
+            )
+        else:
+            await self._finish(run, RunState.CANDIDATE, text=result.reply.text)
+
+    def _repair_model_response(
+        self,
+        run: _Run,
+        reply: ModelReply,
+        messages: tuple[ModelMessage, ...],
+        *,
+        code: str,
+        instruction: str,
+        issues: list[dict[str, str]] | None = None,
+    ) -> KernelDirective:
+        """One bounded repair path for invalid replies and unexecutable plans.
+
+        Only normalized hashes are retained by the detector. Ephemeral call IDs
+        and paid usage do not make an unchanged proposal count as progress.
+        Repeated repairs yield a saved graph boundary, never terminate a Goal.
+        """
+        feedback = json.dumps(
+            {
+                "type": "model_repair",
+                "code": code,
+                "batch_executed": False,
+                "effect_state": "not_started",
+                "issues": issues or [],
+                "available_tools": sorted(self._visible_tools(run)),
+                "instruction": instruction,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        observation = {
+            "finish_reason": reply.finish_reason,
+            "text": reply.text if not reply.tool_calls else None,
+            "tool_calls": [
+                {"name": call.name, "arguments": call.arguments} for call in reply.tool_calls
+            ],
+            "code": code,
+            "issues": [
+                {key: value for key, value in issue.items() if key != "call_id"}
+                for issue in issues or []
+            ],
+            "available_tools": sorted(self._visible_tools(run)),
+        }
+        digest = hashlib.sha256(
+            json.dumps(observation, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        previous = run.backend_state.get("model_repair_detector", {})
+        if not isinstance(previous, dict) or previous.get("revision") != run.revision:
+            previous = {}
+        recent = previous.get("recent", [])
+        recent = (
+            [item for item in recent[-16:] if isinstance(item, str)]
+            if isinstance(recent, list)
+            else []
+        )
+        streak = previous.get("repeat_streak", 0)
+        streak = min(streak + 1, 3) if type(streak) is int and digest in recent else 0
+        history = messages[:-1]
+        # Replace only our immediately preceding feedback at this same goal
+        # revision. The detector records its exact hash; real accepted user
+        # inputs and trusted host validation edits are never heuristically cut.
+        if (
+            history
+            and history[-1].role == "user"
+            and hashlib.sha256((history[-1].content or "").encode()).hexdigest()
+            == previous.get("feedback_sha256")
+        ):
+            history = history[:-1]
+        run.backend_state["model_repair_detector"] = {
+            "version": 1,
+            "revision": run.revision,
+            "recent": [*recent, digest][-16:],
+            "repeat_streak": streak,
+            "feedback_sha256": hashlib.sha256(feedback.encode()).hexdigest(),
+        }
+        self._pending_tools(run, [], run.response_revision)
+        run.tool_order, run.next_tool, run.parallel_reads = (), 0, False
+        if streak >= 2:
+            run.backend_state["activation_yield_reason"] = "model_repair_stalled"
+            run.control.request_drain("activation_yielded")
+        return KernelDirective(messages=history, feedback=feedback, jump_to="model")
+
+    async def _record_settlement(
+        self,
+        run: _Run,
+        reservation_id: str,
+        reserved_tokens: int,
+        reply: ModelReply | None,
+    ) -> None:
+        pending = PendingModelSettlement(
+            reservation_id=reservation_id,
+            round_number=run.usage.rounds,
+            reserved_tokens=reserved_tokens,
+            usage=reply.usage if reply else None,
+            reply=reply,
+        )
+        run.backend_state["pending_model_settlement"] = pending.model_dump(mode="json")
+        run.backend_state.pop("inflight_model_reservation", None)
+        run.backend_state["model_call_quiescent"] = self.is_model_quiescent(run)
+        run.backend_state["model_recovery_pending"] = True
+        run.safe_to_resume = False
+        await self._save(run)
+        try:
+            assert self._model_budget is not None
+            await self._model_budget.settle(reservation_id, pending.usage)
+        except Exception as error:
+            run.backend_state["uncertain_model_usage"] = True
+            raise DomainError(
+                "billing_unavailable",
+                "Inference settlement is waiting for accounting recovery",
+                retryable=True,
+            ) from error
+        run.backend_state.pop("pending_model_settlement", None)
+        run.backend_state["model_recovery_pending"] = False
+
+    async def _recover_accounting(self, run: _Run) -> None:
+        value = run.backend_state.get("pending_model_settlement")
+        if value is None:
+            return
+        pending = PendingModelSettlement.model_validate(value)
+        if self._model_budget is None:
+            raise DomainError(
+                "billing_unavailable", "The accounting recovery port is unavailable", retryable=True
+            )
+        try:
+            recover = getattr(self._model_budget, "recover", None)
+            if recover is not None:
+                await recover(run.request, pending.reservation_id, pending.usage)
+            else:
+                await self._model_budget.settle(pending.reservation_id, pending.usage)
+        except Exception as error:
+            raise DomainError(
+                "billing_unavailable", "Inference settlement is still unavailable", retryable=True
+            ) from error
+        if pending.reply is not None:
+            run.usage = run.usage.model_copy(
+                update={
+                    "tokens": run.usage.tokens - pending.reserved_tokens + pending.reply.usage.total
+                }
+            )
+            # Retain until the standard model node's output is checkpointed and
+            # after_model begins. A crash here reuses this already-billed reply.
+            run.backend_state["recovered_model_reply"] = pending.reply.model_dump(mode="json")
+        run.backend_state.pop("pending_model_settlement", None)
+        run.backend_state["model_recovery_pending"] = False
+        run.safe_to_resume = True
+        await self._save(run)
+
+    def _check_work_limits(self, run: _Run) -> None:
         budget = run.request.budget
+        if budget.max_rounds is not None and run.usage.rounds >= budget.max_rounds:
+            raise DomainError("round_budget_exhausted", "Explicit model-round limit reached")
+        if (
+            budget.max_active_seconds is not None
+            and self._usage(run).active_seconds >= budget.max_active_seconds
+        ):
+            raise DomainError("time_budget_exhausted", "Explicit active-time limit reached")
+
+    async def _infer(self, run: _Run, request: ModelRequest, complete) -> ModelReply:
+        """Meter a pure inference call; retry cannot dispatch any tool effect."""
+        recovered = run.backend_state.get("recovered_model_reply")
+        if recovered is not None:
+            reply = ModelReply.model_validate(recovered)
+            if reply.usage.output_tokens > run.request.budget.max_output_tokens:
+                raise DomainError(
+                    "token_estimate_exceeded", "Retained reply exceeds its per-call output bound"
+                )
+            return reply.model_copy(
+                update={
+                    "tool_calls": tuple(
+                        sorted(
+                            reply.tool_calls,
+                            key=lambda call: call.name not in self.gateway.control_names,
+                        )
+                    )
+                }
+            )
+        projection = compact_model_request(request, run.request.budget.max_input_bytes)
+        if projection.diagnostic:
+            raise DomainError(projection.diagnostic, "Protected context exceeds its resource bound")
+        request = projection.request
         retries = 0
         while True:
             if run.cancelled.is_set():
-                await self._finish(run, RunState.CANCELLED, "cancelled")
-                return
-            saved = run.backend_state.get("scoped_pending_tools")
-            if saved is not None:
-                try:
-                    if saved["version"] != 1 or type(saved["revision"]) is not int:
-                        raise ValueError("Invalid tool continuation")
-                    calls = [ModelToolCall.model_validate(value) for value in saved["calls"]]
-                    if not calls or saved["revision"] > run.revision:
-                        raise ValueError("Invalid tool continuation")
-                except (KeyError, TypeError, ValueError):
-                    raise DomainError("recovery_required", "Tool continuation is invalid") from None
-                if not await self._tool_batch(run, calls, saved["revision"]):
-                    return
-                continue
-            pending, run.pending = run.pending, []
-            for item in pending:
-                run.messages.append(ModelMessage(role="user", content=item.text))
-                await self._emit(
-                    run,
-                    "input_consumed",
-                    InputPayload(
-                        revision=item.revision,
-                        input_id=item.input_id,
-                    ),
-                )
-            if budget.max_rounds is not None and run.usage.rounds >= budget.max_rounds:
-                await self._finish(run, RunState.PAUSED, "round_budget_exhausted")
-                return
-            if (
-                budget.max_active_seconds is not None
-                and self._usage(run).active_seconds >= budget.max_active_seconds
-            ):
-                await self._finish(run, RunState.PAUSED, "time_budget_exhausted")
-                return
-            request = ModelRequest(
-                messages=tuple(run.messages),
-                tools=self.gateway.describe(run.scope, self._visible_tools(run)),
-                max_output_tokens=budget.max_output_tokens,
-            )
-            projection = compact_model_request(request, budget.max_input_bytes)
-            if projection.diagnostic:
-                await self._finish(run, RunState.PAUSED, projection.diagnostic)
-                return
-            request = projection.request
+                raise DomainError("cancelled", "Execution was cancelled before model admission")
+            self._check_work_limits(run)
+            budget = run.request.budget
             estimate = estimate_input_tokens(request)
-            allowance = budget.max_output_tokens
+            allowance = request.max_output_tokens
             if budget.max_tokens is not None:
                 allowance = min(allowance, budget.max_tokens - run.usage.tokens - estimate)
-            if allowance < 1:
-                await self._finish(run, RunState.PAUSED, "token_budget_exhausted")
-                return
-            request = request.model_copy(update={"max_output_tokens": allowance})
+                if allowance < 1:
+                    raise DomainError("token_budget_exhausted", "Explicit token limit reached")
+            model_request = request.model_copy(update={"max_output_tokens": allowance})
             reserved = estimate + allowance
+            previous_usage = run.usage
             run.usage = run.usage.model_copy(
-                update={
-                    "rounds": run.usage.rounds + 1,
-                    "tokens": run.usage.tokens + reserved,
-                }
+                update={"rounds": run.usage.rounds + 1, "tokens": run.usage.tokens + reserved}
             )
             run.safe_to_resume = False
+            run.backend_state.pop("model_call_fenced", None)
+            run.response_revision = run.revision
+            run.backend_state["response_revision"] = run.response_revision
+            recovery_key = getattr(self._model_budget, "recovery_key", None)
+            if recovery_key is not None:
+                reference = recovery_key(run.request, round_number=run.usage.rounds)
+                run.backend_state["inflight_model_reservation"] = PendingModelSettlement(
+                    reservation_id=reference,
+                    round_number=run.usage.rounds,
+                    reserved_tokens=reserved,
+                ).model_dump(mode="json")
+                run.backend_state["model_call_quiescent"] = False
             await self._save(run)
+            # Inputs accepted at the persistence boundary invalidate this
+            # proposal before provider admission. The graph's next middleware
+            # step consumes them without a model/tool outer loop.
             if run.pending:
-                run.usage = run.usage.model_copy(
-                    update={
-                        "rounds": run.usage.rounds - 1,
-                        "tokens": run.usage.tokens - reserved,
-                    }
+                run.backend_state.pop("inflight_model_reservation", None)
+                run.usage = previous_usage
+                run.safe_to_resume = True
+                return ModelReply(
+                    text="Superseded by newer input",
+                    usage=TokenUsage(input_tokens=0, output_tokens=0),
                 )
-                run.safe_to_resume = not run.backend_state.get("model_recovery_pending", False)
-                continue
-            response_revision = run.revision
             reservation_id = None
             if self._model_budget:
                 try:
@@ -721,123 +1280,84 @@ class ScopedToolEngine:
                         input_tokens=estimate,
                         output_tokens=allowance,
                     )
-                except Exception:
-                    run.usage = run.usage.model_copy(
-                        update={
-                            "rounds": run.usage.rounds - 1,
-                            "tokens": run.usage.tokens - reserved,
+                except Exception as error:
+                    if recovery_key is not None and not (
+                        isinstance(error, DomainError)
+                        and error.code
+                        in {
+                            "budget_exhausted",
+                            "permission_denied",
+                            "scope_violation",
                         }
-                    )
+                    ):
+                        run.backend_state["pending_model_settlement"] = run.backend_state.pop(
+                            "inflight_model_reservation"
+                        )
+                        run.backend_state["model_call_quiescent"] = True
+                        run.backend_state["model_recovery_pending"] = True
+                        run.backend_state["uncertain_model_usage"] = True
+                        await self._save(run)
+                        raise DomainError(
+                            "billing_unavailable",
+                            "Model admission is waiting for ledger reconciliation",
+                            retryable=True,
+                        ) from error
+                    run.backend_state.pop("inflight_model_reservation", None)
+                    run.usage = previous_usage
                     run.safe_to_resume = not run.backend_state.get("model_recovery_pending", False)
                     raise
+                run.backend_state["inflight_model_reservation"] = PendingModelSettlement(
+                    reservation_id=reservation_id,
+                    round_number=run.usage.rounds,
+                    reserved_tokens=reserved,
+                ).model_dump(mode="json")
+                run.backend_state["model_call_quiescent"] = False
+                await self._save(run)
             try:
-                reply = await self._model_call(run, request)
-            except BaseException as exc:
-                if not isinstance(exc, ModelRejected):
+                reply = await self._model_call(run, model_request)
+            except BaseException as error:
+                if not isinstance(error, ModelRejected):
                     run.backend_state["uncertain_model_usage"] = True
                     run.backend_state["model_recovery_pending"] = True
                 if self._model_budget and reservation_id is not None:
-                    await self._model_budget.settle(reservation_id, None)
-                if isinstance(exc, ModelRejected):
+                    await self._record_settlement(run, reservation_id, reserved, None)
+                if self._can_retry_model(run, error):
+                    run.backend_state["model_recovery_pending"] = False
+                    run.safe_to_resume = True
+                elif isinstance(error, ModelRejected):
                     run.safe_to_resume = not run.backend_state.get("model_recovery_pending", False)
-                self._allow_model_recovery(run, exc)
-                if retries < budget.additional_retry_limit and self._can_retry_model(run, exc):
+                if retries < budget.additional_retry_limit and self._can_retry_model(run, error):
                     retries += 1
-                    await self._wait_retry(run, exc, retries)
+                    await self._wait_retry(run, error, retries)
                     continue
                 raise
-            retries = 0
             if self._model_budget and reservation_id is not None:
-                try:
-                    await self._model_budget.settle(reservation_id, reply.usage)
-                except BaseException:
-                    run.backend_state["uncertain_model_usage"] = True
-                    run.backend_state["model_recovery_pending"] = True
-                    raise
+                await self._record_settlement(run, reservation_id, reserved, reply)
             run.usage = run.usage.model_copy(
-                update={
-                    "tokens": run.usage.tokens - reserved + reply.usage.total,
-                }
+                update={"tokens": run.usage.tokens - reserved + reply.usage.total}
             )
             run.backend_state["model_recovery_pending"] = False
             run.safe_to_resume = True
+            run.activation_rounds += 1
+            if run.activation_rounds >= self.activation_max_rounds:
+                run.control.request_drain("activation_yielded")
             await self._emit(
-                run,
-                "progress",
-                ProgressPayload(
-                    reason="model_returned",
-                    usage=self._usage(run),
-                ),
+                run, "progress", ProgressPayload(reason="model_returned", usage=self._usage(run))
             )
-            if reply.usage.output_tokens > allowance or reply.usage.input_tokens > estimate:
-                await self._finish(run, RunState.PAUSED, "token_estimate_exceeded")
-                return
-            if (
-                budget.max_active_seconds is not None
-                and self._usage(run).active_seconds >= budget.max_active_seconds
+            # Estimates meter reservations; they cannot terminate unlimited
+            # work merely because the provider's tokenizer counted more input.
+            if reply.usage.output_tokens > allowance or (
+                budget.max_tokens is not None and reply.usage.input_tokens > estimate
             ):
-                await self._finish(run, RunState.PAUSED, "time_budget_exhausted")
-                return
-            if run.pending or response_revision != run.revision:
-                # Never execute proposals computed for a superseded objective revision.
-                await self._emit(
-                    run,
-                    "progress",
-                    ProgressPayload(
-                        reason="superseded_model_response",
-                        usage=self._usage(run),
-                    ),
+                raise DomainError(
+                    "token_estimate_exceeded", "Per-call output/explicit limit exceeded"
                 )
-                continue
-            if reply.finish_reason == "length":
-                await self._finish(run, RunState.PAUSED, "model_output_truncated")
-                return
-            if reply.finish_reason == "content_filter":
-                await self._finish(run, RunState.FAILED, "model_response_filtered")
-                return
-            if reply.tool_calls:
-                if reply.finish_reason != "tool_calls" or len(
-                    {c.id for c in reply.tool_calls}
-                ) != len(reply.tool_calls):
-                    await self._finish(run, RunState.FAILED, "invalid_model_reply")
-                    return
-                if (
-                    budget.max_tool_calls is not None
-                    and len(reply.tool_calls) > budget.max_tool_calls - run.usage.tool_calls
-                ):
-                    await self._finish(run, RunState.PAUSED, "tool_budget_exhausted")
-                    return
-                run.messages.append(
-                    ModelMessage(
-                        role="assistant",
-                        content=reply.text,
-                        tool_calls=reply.tool_calls,
-                    )
+            ordered = tuple(
+                sorted(
+                    reply.tool_calls, key=lambda call: call.name not in self.gateway.control_names
                 )
-                if not await self._tool_batch(
-                    run,
-                    calls=sorted(
-                        reply.tool_calls,
-                        key=lambda call: call.name not in self.gateway.control_names,
-                    ),
-                    revision=response_revision,
-                ):
-                    return
-                continue
-            if reply.finish_reason != "stop" or not reply.text or not reply.text.strip():
-                await self._finish(run, RunState.FAILED, "invalid_model_reply")
-                return
-            run.messages.append(ModelMessage(role="assistant", content=reply.text))
-            if reply.needs_input:
-                run.input_request = InputRequest(question=reply.text[:2000])
-                await self._finish(run, RunState.WAITING_INPUT, text=reply.text)
-                return
-            successful = successful_required_tools(run.receipts, run.request.allowed_tools)
-            if run.unresolved_tools or not run.request.required_tools.issubset(successful):
-                await self._finish(run, RunState.FAILED, "validation_required")
-                return
-            await self._finish(run, RunState.CANDIDATE, text=reply.text)
-            return
+            )
+            return reply.model_copy(update={"tool_calls": ordered})
 
     @staticmethod
     def _pending_tools(run: _Run, calls: list[ModelToolCall], revision: int) -> None:
@@ -850,251 +1370,132 @@ class ScopedToolEngine:
         else:
             run.backend_state.pop("scoped_pending_tools", None)
 
-    @staticmethod
-    def _tool_intents(run: _Run) -> dict[str, str]:
-        intents = run.backend_state.setdefault("scoped_tool_intents", {})
-        if not isinstance(intents, dict) or any(
-            not isinstance(call_id, str) or key != f"{run.request.work_id}:{call_id}"
-            for call_id, key in intents.items()
-        ):
-            raise DomainError("recovery_required", "Persisted tool intents are invalid")
-        return intents
+    async def _execute_tool(self, run: _Run, call: ModelToolCall) -> str:
+        # ToolNode may schedule middleware callbacks in a different order from
+        # the model's list. Admission preserves that list for dependent effects;
+        # only the trusted public-read handlers may finish in another order.
+        if call.id not in run.tool_order:
+            if not any(receipt.call_id == call.id for receipt in run.receipts):
+                raise DomainError("recovery_required", "A restored tool has no pending proposal")
+            # A state overlay can reselect a node whose receipt is already
+            # durable. It needs no admission slot and cannot dispatch again.
+            async with run.tool_lock:
+                return await self._dispatch_tool(run, call, parallel=False)
+        position = run.tool_order.index(call.id)
+        async with run.admission:
+            await run.admission.wait_for(lambda: run.next_tool == position)
+        if run.parallel_reads:
+            await run.read_slots.acquire()
+            async with run.admission:
+                run.next_tool += 1
+                run.admission.notify_all()
+            try:
+                return await self._dispatch_tool(run, call, parallel=True)
+            finally:
+                run.read_slots.release()
+        try:
+            async with run.tool_lock:
+                return await self._dispatch_tool(run, call, parallel=False)
+        finally:
+            async with run.admission:
+                run.next_tool += 1
+                run.admission.notify_all()
 
-    async def _read_wave(
-        self,
-        run: _Run,
-        calls: list[ModelToolCall],
-        following: list[ModelToolCall],
-        revision: int,
-    ) -> bool | None:
-        """Two admitted public reads; None preserves the normal serial error path.
+    async def _dispatch_tool(self, run: _Run, call: ModelToolCall, *, parallel: bool) -> str:
+        # ToolNode owns the batch and its result ordering. Only an entirely
+        # trusted public-read batch gets two slots; every mixed/effectful batch
+        # holds the same lock through dispatch and settlement.
+        async def prepare():
+            if run.stop_reason:
+                if parallel:
+                    return self._skipped(run, call, run.stop_reason)
+                raise DomainError(run.stop_reason, "A previous tool requires continuation")
+            previous = next(
+                (receipt for receipt in reversed(run.receipts) if receipt.call_id == call.id), None
+            )
+            if previous is not None and previous.control is None:
+                from groupagent.tools.gateway import tool_call_fingerprint
 
-        Preflight is sequential and effect-free. Intent, keys and the complete
-        pending queue become durable before either handler starts. Both results
-        settle before another tool/model call, and model messages keep source order.
-        """
-        contexts = [
-            ToolContext(
+                ledger = {
+                    entry.receipt.idempotency_key: entry
+                    for entry in self.gateway.export_ledger(run.scope)
+                }
+                entry = ledger.get(previous.idempotency_key)
+                if entry and entry.fingerprint != tool_call_fingerprint(call.name, call.arguments):
+                    raise DomainError("idempotency_conflict", "Tool call identity was reused")
+                if entry:
+                    replay = previous.model_copy(update={"replayed": True})
+                    run.receipts[run.receipts.index(previous)] = replay
+                    return replay
+            if run.input_request is not None:
+                receipt = self._skipped(run, call, "awaiting_input")
+                run.receipts.append(receipt)
+                self._remove_pending(run, call.id)
+                await self._emit(run, "tool_finished", FinishedToolPayload(receipt=receipt))
+                return receipt
+            if run.cancelled.is_set():
+                if parallel:
+                    return self._skipped(run, call, "cancelled")
+                raise DomainError("cancelled", "Execution was cancelled")
+            if run.pending or run.response_revision != run.revision:
+                receipt = self._skipped(run, call, "superseded_by_input")
+                self._remove_pending(run, call.id)
+                # A proposal invalidated before admission is an observation,
+                # not an actual attempted tool operation in the receipt ledger.
+                return receipt
+            key = f"{run.request.work_id}:{call.id}"
+            intents = run.backend_state.setdefault("scoped_tool_intents", {})
+            admitted = call.id in intents
+            limit = run.request.budget.max_tool_calls
+            if limit is not None and run.usage.tool_calls >= limit and not admitted:
+                raise DomainError("tool_budget_exhausted", "Explicit tool-call limit reached")
+            context = ToolContext(
                 scope=run.scope,
                 call_id=call.id,
-                idempotency_key=f"{run.request.work_id}:{call.id}",
+                idempotency_key=key,
                 cancelled=run.cancelled,
                 deadline_monotonic=self._active_deadline(run),
             )
-            for call in calls
-        ]
-        preflight = []
-        for call, context in zip(calls, contexts, strict=True):
-            preflight.append(await self.gateway.preflight(call.name, call.arguments, context))
-        if any(receipt is not None for receipt in preflight):
-            return None
-        self._pending_tools(run, [*calls, *following], revision)
-        intents = self._tool_intents(run)
-        admitted = sum(call.id not in intents for call in calls)
-        for call, context in zip(calls, contexts, strict=True):
-            intents[call.id] = context.idempotency_key
-        run.usage = run.usage.model_copy(update={"tool_calls": run.usage.tool_calls + admitted})
-        run.safe_to_resume = not run.unresolved_tools and not run.backend_state.get(
-            "model_recovery_pending", False
-        )
-        await self._save(run)
-        for call, context in zip(calls, contexts, strict=True):
-            await self._emit(
-                run,
-                "tool_requested",
-                RequestedPayload(
-                    call_id=call.id,
-                    name=call.name,
-                    revision=revision,
-                    idempotency_key=context.idempotency_key,
-                ),
-            )
-
-        async def invoke(call: ModelToolCall, context: ToolContext) -> ToolReceipt:
-            if run.pending or revision != run.revision or run.cancelled.is_set():
-                return ToolReceipt(
-                    call_id=call.id,
-                    tool_name=call.name,
-                    idempotency_key=context.idempotency_key,
-                    success=False,
-                    effect_state=EffectState.NOT_STARTED,
-                    error_code="cancelled" if run.cancelled.is_set() else "superseded_by_input",
-                )
-            # Preflight never grants a reusable token: invoke rechecks policy,
-            # schema, deadline and its own resource/cost guard at actual dispatch.
-            return await self.gateway.invoke(call.name, call.arguments, context)
-
-        tasks = [
-            asyncio.create_task(invoke(call, context))
-            for call, context in zip(calls, contexts, strict=True)
-        ]
-        try:
-            receipts = await asyncio.gather(*tasks)
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-        for receipt in receipts:
-            self._load_tools(run, receipt)
-            run.receipts.append(receipt)
-            await self._emit(run, "tool_finished", FinishedToolPayload(receipt=receipt))
-            run.messages.append(
-                ModelMessage(
-                    role="tool",
-                    tool_call_id=receipt.call_id,
-                    content=receipt.model_dump_json(),
-                )
-            )
-        run.unresolved_tools = {
-            item.tool_name for item in run.receipts if item.effect_state == EffectState.UNKNOWN
-        }
-        for call in calls:
-            intents.pop(call.id, None)
-        self._pending_tools(run, following, revision)
-        run.safe_to_resume = (
-            not run.unresolved_tools
-            and not run.backend_state.get("model_recovery_pending", False)
-            and self.gateway.is_quiescent(run.scope)
-        )
-        await self._save(run)
-        if not self.gateway.is_quiescent(run.scope):
-            # A timeout is not proof that a cancellation-resistant handler ended.
-            # Keep the checkpoint unsafe and do not overlap a later read/model.
-            run.safe_to_resume = False
-            await self._finish(run, RunState.PAUSED, "work_busy")
-            return False
-        if run.cancelled.is_set():
-            await self._finish(run, RunState.CANCELLED, "cancelled")
-            return False
-        for call, receipt in zip(calls, receipts, strict=True):
-            if receipt.effect_state == EffectState.UNKNOWN:
-                await self._finish(run, RunState.PAUSED, "effect_unknown")
-                return False
-            if receipt.error_code in {
-                "permission_denied",
-                "scope_violation",
-                "tool_not_registered",
-                "policy_unavailable",
-                "idempotency_conflict",
-            }:
-                await self._finish(run, RunState.FAILED, receipt.error_code)
-                return False
-            anomaly = self._observe_tool_progress(run, call.name, call.arguments, receipt)
-            if anomaly:
-                run.safe_to_resume = True
-                await self._finish(run, RunState.PAUSED, anomaly)
-                return False
-        return True
-
-    async def _tool_batch(self, run: _Run, calls: list[ModelToolCall], revision: int) -> bool:
-        budget = run.request.budget
-        self._pending_tools(run, calls, revision)
-        grouped: set[int] = set()
-        for position, call in enumerate(calls):
-            if position in grouped:
-                continue
-            if run.cancelled.is_set():
-                run.safe_to_resume = False
-                await self._finish(run, RunState.CANCELLED, "cancelled")
-                return False
-            if run.pending or revision != run.revision:
-                self._tool_intents(run).pop(call.id, None)
-                run.messages.append(
-                    ModelMessage(
-                        role="tool",
-                        tool_call_id=call.id,
-                        content='{"success":false,"error_code":"superseded_by_input"}',
-                    )
-                )
-                self._pending_tools(run, calls[position + 1 :], revision)
-                continue
-            intents = self._tool_intents(run)
-            admitted = call.id in intents
-            if (
-                budget.max_tool_calls is not None
-                and run.usage.tool_calls >= budget.max_tool_calls
-                and not admitted
-            ):
-                run.safe_to_resume = True
-                await self._finish(run, RunState.PAUSED, "tool_budget_exhausted")
-                return False
-            if (
-                position + 1 < len(calls)
-                and self.gateway.is_concurrency_safe(call.name)
-                and self.gateway.is_concurrency_safe(calls[position + 1].name)
-                and (
-                    budget.max_tool_calls is None
-                    or budget.max_tool_calls - run.usage.tool_calls
-                    >= sum(
-                        proposed.id not in intents for proposed in calls[position : position + 2]
-                    )
-                )
-            ):
-                completed = await self._read_wave(
-                    run,
-                    calls[position : position + 2],
-                    calls[position + 2 :],
-                    revision,
-                )
-                if completed is False:
-                    return False
-                if completed is True:
-                    grouped.add(position + 1)
-                    continue
-            key = f"{run.request.work_id}:{call.id}"
+            if parallel:
+                # Fresh policy and schema preflight precede each handler;
+                # gateway.invoke rechecks policy at the actual dispatch edge.
+                preflight = await self.gateway.preflight(call.name, call.arguments, context)
+            else:
+                preflight = None
+            intents[call.id] = key
             run.usage = run.usage.model_copy(
                 update={"tool_calls": run.usage.tool_calls + (not admitted)}
             )
-            intents[call.id] = key
-            run.safe_to_resume = (
-                self.gateway.is_read_only(call.name)
-                and not run.unresolved_tools
-                and not run.backend_state.get("model_recovery_pending", False)
-            )
+            run.safe_to_resume = self.gateway.is_read_only(call.name) and not run.unresolved_tools
             await self._save(run)
             await self._emit(
                 run,
                 "tool_requested",
                 RequestedPayload(
-                    call_id=call.id,
-                    name=call.name,
-                    revision=run.revision,
-                    idempotency_key=key,
+                    call_id=call.id, name=call.name, revision=run.revision, idempotency_key=key
                 ),
             )
-            if run.pending or revision != run.revision:
-                skipped = ToolReceipt(
-                    call_id=call.id,
-                    tool_name=call.name,
-                    idempotency_key=key,
-                    success=False,
-                    effect_state=EffectState.NOT_STARTED,
-                    error_code="superseded_by_input",
-                )
+            if run.pending or run.response_revision != run.revision:
+                skipped = self._skipped(run, call, "superseded_by_input")
+                intents.pop(call.id, None)
+                self._remove_pending(run, call.id)
                 run.receipts.append(skipped)
                 await self._emit(run, "tool_finished", FinishedToolPayload(receipt=skipped))
-                run.messages.append(
-                    ModelMessage(
-                        role="tool",
-                        tool_call_id=call.id,
-                        content=skipped.model_dump_json(),
-                    )
-                )
-                self._pending_tools(run, calls[position + 1 :], revision)
-                intents.pop(call.id, None)
-                continue
-            receipt = await self.gateway.invoke(
-                call.name,
-                call.arguments,
-                ToolContext(
-                    scope=run.scope,
-                    call_id=call.id,
-                    idempotency_key=key,
-                    cancelled=run.cancelled,
-                    deadline_monotonic=self._active_deadline(run),
-                ),
-            )
+                return skipped
+            return context, admitted, preflight
+
+        if parallel:
+            async with run.tool_lock:
+                prepared = await prepare()
+        else:
+            prepared = await prepare()
+        if isinstance(prepared, ToolReceipt):
+            return prepared.model_dump_json()
+        context, admitted, preflight = prepared
+        receipt = preflight or await self.gateway.invoke(call.name, call.arguments, context)
+
+        async def settle():
+            intents = run.backend_state.setdefault("scoped_tool_intents", {})
             if (
                 receipt.error_code == "resource_deferred"
                 and receipt.effect_state == EffectState.NOT_STARTED
@@ -1104,80 +1505,47 @@ class ScopedToolEngine:
                         update={"tool_calls": run.usage.tool_calls - 1}
                     )
                     intents.pop(call.id, None)
-                # No handler/ledger entry started. Keep this exact proposal and
-                # every remaining call for a durable, model-free continuation.
-                run.safe_to_resume = not run.unresolved_tools and not run.backend_state.get(
-                    "model_recovery_pending", False
-                )
-                await self._finish(run, RunState.PAUSED, "resource_deferred")
-                return False
-            self._pending_tools(run, calls[position + 1 :], revision)
+                run.safe_to_resume = not run.unresolved_tools
+                run.stop_reason = "resource_deferred"
+                await self._save(run)
+                raise DomainError("resource_deferred", "Tool is waiting for worker capacity")
             intents.pop(call.id, None)
+            self._remove_pending(run, call.id)
             self._load_tools(run, receipt)
             run.receipts.append(receipt)
+            self._order_receipts(run)
+            run.messages = list(self._with_receipt_messages(run, tuple(run.messages)))
             run.unresolved_tools = {
                 item.tool_name for item in run.receipts if item.effect_state == EffectState.UNKNOWN
             }
-            await self._emit(run, "tool_finished", FinishedToolPayload(receipt=receipt))
-            run.messages.append(
-                ModelMessage(
-                    role="tool",
-                    tool_call_id=call.id,
-                    content=receipt.model_dump_json(),
-                )
+            run.safe_to_resume = (
+                not run.unresolved_tools
+                and (parallel or self.gateway.is_quiescent(run.scope))
+                and not run.backend_state.get("model_recovery_pending", False)
             )
-            if receipt.success:
+            await self._emit(run, "tool_finished", FinishedToolPayload(receipt=receipt))
+            if receipt.success and isinstance((receipt.output or {}).get("artifact_id"), str):
                 output = receipt.output or {}
-                if isinstance(output.get("artifact_id"), str):
-                    await self._emit(
-                        run,
-                        "artifact_candidate",
-                        ArtifactPayload(
-                            artifact_id=str(output["artifact_id"]),
-                            version_id=str(output["version_id"])
-                            if output.get("version_id")
-                            else None,
-                        ),
-                    )
-            if self.gateway.is_read_only(call.name) and not self.gateway.is_quiescent(run.scope):
-                run.safe_to_resume = False
-                await self._finish(run, RunState.PAUSED, "work_busy")
-                return False
-            if run.cancelled.is_set():
-                await self._finish(run, RunState.CANCELLED, "cancelled")
-                return False
-            if receipt.effect_state == EffectState.UNKNOWN:
-                await self._finish(run, RunState.PAUSED, "effect_unknown")
-                return False
-            if receipt.control is not None:
-                run.input_request = receipt.control.input_request
-                for remaining in calls[position + 1 :]:
-                    skipped = ToolReceipt(
-                        call_id=remaining.id,
-                        tool_name=remaining.name,
-                        idempotency_key=f"{run.request.work_id}:{remaining.id}",
-                        success=False,
-                        effect_state=EffectState.NOT_STARTED,
-                        error_code="awaiting_input",
-                    )
-                    run.receipts.append(skipped)
-                    await self._emit(run, "tool_finished", FinishedToolPayload(receipt=skipped))
-                    run.messages.append(
-                        ModelMessage(
-                            role="tool",
-                            tool_call_id=remaining.id,
-                            content=skipped.model_dump_json(),
-                        )
-                    )
-                self._pending_tools(run, [], revision)
-                run.safe_to_resume = True
-                await self._finish(
+                await self._emit(
                     run,
-                    RunState.WAITING_INPUT,
-                    "input_requested",
-                    text=run.input_request.question,
+                    "artifact_candidate",
+                    ArtifactPayload(
+                        artifact_id=str(output["artifact_id"]),
+                        version_id=str(output["version_id"]) if output.get("version_id") else None,
+                    ),
                 )
-                return False
+            run.safe_to_resume = (
+                not run.unresolved_tools
+                and (parallel or self.gateway.is_quiescent(run.scope))
+                and not run.backend_state.get("model_recovery_pending", False)
+            )
+            await self._save(run)
+            if receipt.effect_state == EffectState.UNKNOWN:
+                run.stop_reason = "effect_unknown"
+            if not parallel and not self.gateway.is_quiescent(run.scope):
+                run.stop_reason = "work_busy"
+            if receipt.control:
+                run.input_request = receipt.control.input_request
             if receipt.error_code in {
                 "permission_denied",
                 "scope_violation",
@@ -1185,39 +1553,80 @@ class ScopedToolEngine:
                 "policy_unavailable",
                 "idempotency_conflict",
             }:
-                await self._finish(run, RunState.FAILED, receipt.error_code)
-                return False
+                run.stop_reason = receipt.error_code
+            run.activation_tool_calls += 1
             anomaly = self._observe_tool_progress(run, call.name, call.arguments, receipt)
-            if anomaly:
-                run.safe_to_resume = True
-                await self._finish(run, RunState.PAUSED, anomaly)
-                return False
-        self._pending_tools(run, [], revision)
-        run.safe_to_resume = True
-        await self._save(run)
-        return True
+            if anomaly or run.activation_tool_calls >= self.activation_max_tool_calls:
+                run.backend_state["activation_yield_reason"] = anomaly or "tool_slice"
+                run.control.request_drain("activation_yielded")
+            if run.stop_reason and not parallel:
+                raise DomainError(run.stop_reason, "Scoped gateway stopped execution")
+            return receipt.model_dump_json()
+
+        if parallel:
+            async with run.tool_lock:
+                return await settle()
+        return await settle()
+
+    @staticmethod
+    def _order_receipts(run: _Run):
+        order = {
+            call.id: index
+            for index, call in enumerate(
+                call for message in run.messages for call in message.tool_calls
+            )
+        }
+        run.receipts.sort(key=lambda receipt: order.get(receipt.call_id, -1))
+
+    @staticmethod
+    def _skipped(run: _Run, call: ModelToolCall, reason: str) -> ToolReceipt:
+        return ToolReceipt(
+            call_id=call.id,
+            tool_name=call.name,
+            idempotency_key=f"{run.request.work_id}:{call.id}",
+            success=False,
+            effect_state=EffectState.NOT_STARTED,
+            error_code=reason,
+        )
+
+    @staticmethod
+    def _with_receipt_messages(run: _Run, messages: tuple[ModelMessage, ...]):
+        receipts = {receipt.call_id: receipt for receipt in run.receipts}
+        observed = {message.tool_call_id for message in messages if message.role == "tool"}
+        result = list(messages)
+        for message in messages:
+            for call in message.tool_calls:
+                if call.id in receipts and call.id not in observed:
+                    result.append(
+                        ModelMessage(
+                            role="tool",
+                            tool_call_id=call.id,
+                            content=receipts[call.id].model_dump_json(),
+                        )
+                    )
+                    observed.add(call.id)
+        return tuple(result)
+
+    @staticmethod
+    def _remove_pending(run: _Run, call_id: str) -> None:
+        saved = run.backend_state.get("scoped_pending_tools")
+        if saved:
+            saved["calls"] = [item for item in saved["calls"] if item["id"] != call_id]
+            if not saved["calls"]:
+                run.backend_state.pop("scoped_pending_tools", None)
+
+    @staticmethod
+    def is_model_quiescent(run: _Run) -> bool:
+        return not any(not task.done() for task in run.model_tasks)
 
     def _can_retry_model(self, run: _Run, error: BaseException) -> bool:
-        # ModelPort only returns client-side tool proposals. A failed pure
-        # inference has not invoked the gateway; retry just this request while
-        # the live controller still owns its history. Never recover a stopped
-        # unsafe checkpoint or overlap an inference task whose outcome is late.
         return (
             isinstance(error, DomainError)
             and error.code in RETRYABLE_MODEL_ERRORS
             and not run.cancelled.is_set()
-            and not any(not task.done() for task in run.model_tasks)
-            and not any(receipt.effect_state == EffectState.UNKNOWN for receipt in run.receipts)
+            and self.is_model_quiescent(run)
+            and not run.unresolved_tools
         )
-
-    def _allow_model_recovery(self, run: _Run, error: BaseException) -> None:
-        # Inference never dispatches effects. Once this call has unwound, a new
-        # separately funded attempt may continue from the same tool ledger.
-        # Keep the old estimated tokens and unknown charge; only clear the
-        # execution fence. Accounting failures never enter this boundary.
-        if self._can_retry_model(run, error):
-            run.backend_state["model_recovery_pending"] = False
-            run.safe_to_resume = True
 
     def _remaining_active_seconds(self, run: _Run) -> float | None:
         limit = run.request.budget.max_active_seconds
@@ -1226,66 +1635,6 @@ class ScopedToolEngine:
     def _active_deadline(self, run: _Run) -> float | None:
         remaining = self._remaining_active_seconds(run)
         return None if remaining is None else asyncio.get_running_loop().time() + remaining
-
-    def _observe_tool_progress(
-        self, run: _Run, name: str, arguments: dict, receipt: ToolReceipt
-    ) -> str | None:
-        """Remember bounded hashes, independent of elapsed time or total calls.
-
-        A changed argument or observation resets the streak. The rolling window
-        also catches short A/B cycles; call IDs, ledger replay flags and process
-        timing are excluded because they do not establish task progress.
-        """
-        if receipt.effect_state == EffectState.UNKNOWN or receipt.control is not None:
-            return None
-        name = name.removeprefix("mcp__groupagent__")
-        try:
-            arguments = self.gateway.normalize_arguments(name, arguments)
-        except (ValueError, DomainError):
-            pass
-
-        def digest(value: object) -> str:
-            return hashlib.sha256(
-                json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-
-        output = dict(receipt.output or {})
-        output.pop("elapsed_seconds", None)
-        observation = {
-            "call": digest({"name": name, "arguments": arguments}),
-            "result": digest(
-                {"success": True, "output": output}
-                if receipt.success
-                else {"success": False, "error_code": receipt.error_code}
-            ),
-            "failed": not receipt.success,
-        }
-        previous = run.backend_state.get("execution_progress_detector", {})
-        if not isinstance(previous, dict) or previous.get("revision") != run.revision:
-            previous = {}
-        recent = previous.get("recent", [])
-        if not isinstance(recent, list):
-            recent = []
-        recent = [item for item in recent[-16:] if isinstance(item, dict)]
-        repeated = observation in recent
-        streak = previous.get("repeat_streak", 0)
-        streak = streak if type(streak) is int and 0 <= streak <= 6 else 0
-        streak = min(streak + 1, 6) if repeated else 0
-        failures = previous.get("failure_streak", 0)
-        failures = failures if type(failures) is int and 0 <= failures <= 3 else 0
-        failures = min(failures + 1, 3) if repeated and observation["failed"] else 0
-        run.backend_state["execution_progress_detector"] = {
-            "version": 1,
-            "revision": run.revision,
-            "recent": [*recent, observation][-16:],
-            "repeat_streak": streak,
-            "failure_streak": failures,
-        }
-        if failures >= 3:
-            return "execution_error_loop"
-        if streak >= 6:
-            return "execution_stalled"
-        return None
 
     async def _wait_retry(self, run: _Run, error: BaseException, number: int) -> None:
         delay = (
@@ -1301,8 +1650,61 @@ class ScopedToolEngine:
             run, "progress", ProgressPayload(reason="model_retry_wait", usage=self._usage(run))
         )
         await self._save(run)
+        if run.cancelled.is_set():
+            raise DomainError("cancelled", "Execution was cancelled during retry backoff")
         try:
             await asyncio.wait_for(run.cancelled.wait(), timeout=delay)
         except TimeoutError:
             return
         raise DomainError("cancelled", "Execution was cancelled during retry backoff")
+
+    def _observe_tool_progress(
+        self, run: _Run, name: str, arguments: dict, receipt: ToolReceipt
+    ) -> str | None:
+        if receipt.effect_state == EffectState.UNKNOWN or receipt.control:
+            return None
+        try:
+            arguments = self.gateway.normalize_arguments(name, arguments)
+        except (ValueError, DomainError):
+            pass
+        output = dict(receipt.output or {})
+        output.pop("elapsed_seconds", None)
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "name": name,
+                    "arguments": arguments,
+                    "success": receipt.success,
+                    "output": output if receipt.success else receipt.error_code,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        state = run.backend_state.get("execution_progress_detector", {})
+        recent = state.get("recent", []) if state.get("revision") == run.revision else []
+        recent = [item for item in recent[-16:] if isinstance(item, str)]
+        repeated = digest in recent
+        streak = min(int(state.get("repeat_streak", 0)) + 1, 6) if repeated else 0
+        failures = (
+            min(int(state.get("failure_streak", 0)) + 1, 3)
+            if repeated and not receipt.success
+            else 0
+        )
+        run.backend_state["execution_progress_detector"] = {
+            "revision": run.revision,
+            "recent": [*recent, digest][-16:],
+            "repeat_streak": streak,
+            "failure_streak": failures,
+        }
+        return (
+            "execution_error_loop"
+            if failures >= 3
+            else "execution_stalled"
+            if streak >= 6
+            else None
+        )
+
+
+# Source compatibility only. Both names refer to the single LangChain graph.
+ScopedToolEngine = LangGraphEngine

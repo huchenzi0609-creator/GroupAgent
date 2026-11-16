@@ -1,48 +1,27 @@
-# 本地 worker 构建与资源证据
+# 隔离 worker 构建
 
-应用运行只接受不可变镜像 ID/digest。`groupagent-worker:local-readiness` 是本地构建句柄，不能作为生产唯一标识。基础镜像固定为 `python@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72`；Python 依赖来自根 uv.lock 的 hash export，Harness 包另有 `harness-requirements.txt`。apt 安装的实际版本写入镜像内清单；apt 仓库未做日期快照，重新构建可能不同，因此应发布并测试同一最终镜像，而不是宣称位级可重复构建。
+更新：2026-11-17。控制进程采用 `langchain==1.5.0` + `langgraph==1.2.22`，无需另建 Harness 镜像。只有受限计算、文档、图片/ASR 和浏览器工具启动短时 Linux worker。旧原生 SDK 镜像和 2026-11-14 的 `resource-evidence.json` 仅保留历史测量语境，不作为当前容量证据。
+
+Python 依赖由根 `uv.lock` 导出并校验制品哈希：
 
 ```sh
-mkdir -p runtime/build
-docker -H "$GROUPAGENT_DOCKER_HOST" build \
-  --build-arg BASE_IMAGE=python@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72 \
-  -f deploy/worker/Dockerfile -t groupagent-worker:local-readiness --iidfile runtime/build/worker.iid .
-test "$(docker -H "$GROUPAGENT_DOCKER_HOST" image inspect groupagent-worker:local-readiness --format '{{.Id}}')" = "$(cat runtime/build/worker.iid)"
-docker -H "$GROUPAGENT_DOCKER_HOST" build --build-arg WORKER_IMAGE=groupagent-worker:local-readiness \
-  -f deploy/worker/Dockerfile.harness -t groupagent-harness:local-readiness --iidfile runtime/build/harness.iid .
+uv --no-config export --frozen --no-dev --no-emit-project --format requirements-txt --output-file deploy/worker/requirements.txt
+docker build --platform linux/amd64 \
+  --build-arg BASE_IMAGE=python@sha256:f3dac913ab53b78c64f26d5518fcd7043d5a1a46522d6a493b598c3ed12f62a6 \
+  -f deploy/worker/Dockerfile --iidfile runtime/build/worker.iid .
 export GROUPAGENT_WORKER_IMAGE="$(cat runtime/build/worker.iid)"
-export GROUPAGENT_HARNESS_IMAGE="$(cat runtime/build/harness.iid)"
 ```
 
-BuildKit 的 `FROM` 不按本机 image ID 查找 `sha256:...`；构建 Harness 时使用已核对 ID 的本地标签，应用启动仍读取生成的不可变 IID。标签只承担同次构建阶段的衔接，不能代替运行标识。
+测试和实际运行使用最终不可变 IID/digest。基础镜像多架构索引与实际目标架构分别核对；apt 仓库未做日期快照，不宣称跨时位级可重复构建。部署和验收使用同一最终制品。离线依赖层也必须由同一锁文件与目标 Python/架构生成。
 
-构建上下文默认拒绝全部，仅允许公开源码／依赖锁／部署文件；不得加入 `.env*`、运行数据库、会话或真实群数据。运行 worker 不挂载本机目录。媒体镜像包含中文／英文字体、Tesseract、Poppler、LibreOffice、Chromium、Playwright、用于音频容器检查的 ffmpeg 和 arm64 Playwright Node 所需 libatomic1；安装 ffmpeg 不授予视频处理能力。
+构建上下文只允许公开源码与依赖，不能复制密钥、群消息、数据库或本机登录数据。增量构建先在镜像中移除旧 `groupagent` 包，再复制完整新包，防止已删除旧执行器文件残留。实际群文件和数据库在镜像外保留。
 
-实际验收镜像记录（2026-11-14）：
+镜像含中文/英文字体、LibreOffice、Poppler、OCR、Chromium、Playwright、ffmpeg。安装音视频容器工具不授予视频或TTS产品能力。worker 无宿主挂载、无网络、非root、只读根目录，受cgroup/进程数/私有tmpfs限制；控制进程独占接入凭证与数据库权限。
 
-以下是升级 Pillow 13 之前的历史镜像，只保留早期测试证据，不作为发布目标。父流程需按新 uv.lock 重新导出 requirements.txt，再重建 worker 与 Harness，并记录新 ID 和验证结果；SDK wheel hash 钉不变。
+2GB 档重型工具单并发，默认512MiB上限；内存准入使用实时 `MemAvailable`、cgroup余量和预留，邻近游戏的占用已在系统余量中体现。所有子进程、输出发布和租约须确认结束后才释放资源。具体整机共存以目标机本轮证据为准。
 
-| 用途 | 不可变 ID | 验证 |
-| --- | --- | --- |
-| 边界与资源测量 worker | `sha256:65444c6be03356ddbcedc07c38cf1ce18c8066ae320449db12f25060afe29863` | sandbox 11 项（7 项真实容器）及并行资源采样 |
-| Harness | `sha256:23e34bc9067286559776fa44a5f8b94a176ec3694754bfae2612a44b092f88b1` | 实际 SDK 7 项，含 MCP、追加、取消、原生会话恢复 |
-| renderer 冻结后 worker | `sha256:82e85d4e5ee39387b30d71f08a21e30ccba7480daf3926fe0b7ed5a37f340d78` | artifacts 代理报告模板／遮挡 3 项、PPTX 图表／混合 3 项及输入 PG+Docker 16 项通过 |
+```sh
+.venv/bin/pytest tests/sandbox tests/execution/test_langgraph_core.py tests/runtime/test_durable_worker_pipeline.py -q
+```
 
-最后一项不是对全部新源码的最终镜像发布验收；最终 tree 冻结后由父流程重新构建并保存它实际测试的 ID。早期镜像仍作为可复核证据保留，不覆盖旧数据。
-
-## 实际资源测量
-
-以下数值和“未连接目标主机”状态属于 2026年11月14日的历史基线。2026年11月15日目标主机已由主流程通过 `pot-server` 只读盘点；新增 `server_2gb` 档采用 512 MiB 短时单 worker，部署说明与未验收边界见 [Pot 的 2GB 共存部署档](../SERVER_2GB.md)。本节历史 1 GiB／arm64 测量不构成该档或目标 x86_64 完整服务通过。
-
-`measure_resources.py` 在专用 Colima VM（Linux arm64，2 CPU、3 GiB RAM、20 GiB 开发盘，无 host mounts）同时运行真实 Harness SDK 与离线 Chromium。模型为显式 ScriptedFakeModel，故意延迟 10 秒确保进程重叠；供应商调用数为 0。完整机器可读证据是 `resource-evidence.json`。
-
-| 测试进程 | cgroup memory.peak | pids.peak | 私有 tmpfs 使用 |
-| --- | ---: | ---: | ---: |
-| Harness SDK | 405.5 MiB | 19 | /tmp 89.3 MiB |
-| Chromium 媒体 worker | 428.5 MiB | 121 | /work 184 KiB，浏览器结束时已清理临时目录 |
-
-个别峰值相加为 834.0 MiB，这是两个独立 cgroup 峰值之和，不是同一瞬间测得的 RSS；证据另保存确实并发的 docker stats 样本。工作负载是小型合成网页截图和 SDK 工具循环，不是最大尺寸 Office、200 页 OCR 或 40 MP 图片的压力测试。测量不含控制进程、PostgreSQL、真实微信客户端、操作系统、备份和保留文件。
-
-配置起点：计算 worker 512 MiB；Harness 1 GiB、/tmp 256 MiB、pids 128；媒体 1 GiB、/work 256 MiB、/tmp 256 MiB。浏览器实际 pids.peak 121 接近测试上限 128，建议部署配置给 256 后再验收。两个重型 worker 的内存上限已合计 2 GiB；当前约 2 GiB 的旧线上机器未测试、未连接，不能据此承诺可部署。建议以至少 2 vCPU / 4 GiB 的独立环境作为完整应用预发布验收起点，并用最终并发／媒体上限／保留期测试确定容量；这不是性能保证。磁盘应依据镜像、业务文件和备份保留预算，20 GiB 仅是本地开发配置。
-
-SDK 发布者 wheel 哈希、源码和许可证据见 `harness-manifest.json`。没有独立复现原生 runtime 构建或 PyPI attestation。Linux amd64、Python 3.11 宿主与实际云机的完整运行矩阵仍须使用目标构建重新验证；本轮真正运行的 Linux worker 是 arm64、Python 3.13。
+需要真实本地 Docker、不可变镜像、独立测试数据库和 `GROUPAGENT_DOCKER_HOST`。模型/通道夹具仍属合成；真实模型与微信测试另行记录，跳过不算能力通过。详见 [当前运行手册](../../docs/development/DURABLE_CORE_RUNBOOK.md)。

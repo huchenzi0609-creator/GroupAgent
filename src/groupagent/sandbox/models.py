@@ -6,6 +6,16 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from groupagent.domain import DomainError
+
+
+class UnpublishedDraftError(DomainError):
+    """The trusted controller proved no workspace outputs were published."""
+
+
+class DraftPublicationUnknown(DomainError):
+    """Publication started and its rollback could not be verified."""
+
 
 class SandboxData(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -41,6 +51,13 @@ class ProcessOutput(SandboxData):
     sha256: str
 
 
+class OutputContractIssue(SandboxData):
+    """An index into the declared outputs, never exception text or worker paths."""
+
+    output_index: int = Field(ge=0, le=4095)
+    kind: Literal["missing", "invalid_file", "unreadable", "total_size_exceeded"]
+
+
 class ProcessResult(SandboxData):
     backend: Literal["docker"] = "docker"
     image: str
@@ -50,10 +67,17 @@ class ProcessResult(SandboxData):
     timed_out: bool = False
     cancelled: bool = False
     output_limited: bool = False
+    error_code: Literal["output_contract_failed", "worker_failed"] | None = None
+    output_issues: tuple[OutputContractIssue, ...] = ()
+    # Set only after the controller validates and publishes the whole manifest.
+    # A worker's stdout cannot establish this host-side fact.
+    publication_state: Literal["unpublished", "published"] = "unpublished"
     outputs: tuple[ProcessOutput, ...] = ()
     elapsed_seconds: float = Field(ge=0)
     resource_usage: dict[str, int] = Field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
-        return self.exit_code == 0 and not (self.timed_out or self.cancelled or self.output_limited)
+        return self.exit_code == 0 and not (
+            self.timed_out or self.cancelled or self.output_limited or self.error_code
+        )

@@ -113,6 +113,43 @@ def regular_file(root: Path, name: str, limit: int) -> Path:
     return cursor
 
 
+def collect_outputs(work: Path, names: list[str], limits: dict) -> tuple[list[dict], list[dict]]:
+    """Validate the complete output contract before exporting any draft bytes.
+
+    Missing or invalid declared outputs are ordinary model-correctable results.
+    Keep diagnostics to reviewed codes and declaration indices: filesystem
+    exception strings can contain paths and untrusted file contents.
+    """
+    outputs, issues, total = [], [], 0
+    for index, name in enumerate(names):
+        try:
+            path = regular_file(work, name, limits["max_file_bytes"])
+            data = path.read_bytes()
+        except FileNotFoundError:
+            issues.append({"output_index": index, "kind": "missing"})
+            continue
+        except ValueError:
+            issues.append({"output_index": index, "kind": "invalid_file"})
+            continue
+        except OSError:
+            issues.append({"output_index": index, "kind": "unreadable"})
+            continue
+        total += len(data)
+        if total > limits["max_artifact_bytes"]:
+            issues.append({"output_index": index, "kind": "total_size_exceeded"})
+            break
+        outputs.append(
+            {
+                "path": name,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size_bytes": len(data),
+                "data": base64.b64encode(data).decode("ascii"),
+            }
+        )
+    # A good first output cannot escape while a later declaration failed.
+    return ([], issues[:8]) if issues else (outputs, [])
+
+
 def stop_process(process: subprocess.Popen) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -260,23 +297,10 @@ def execute(request: dict) -> dict:
         except ProcessLookupError:
             pass
         stop_descendants()
-    outputs = []
+    outputs: list[dict] = []
+    output_issues: list[dict] = []
     if process.returncode == 0 and not (timed_out or output_limited or controller_lost.is_set()):
-        total = 0
-        for name in spec["output_paths"]:
-            path = regular_file(work, name, limits["max_file_bytes"])
-            data = path.read_bytes()
-            total += len(data)
-            if total > limits["max_artifact_bytes"]:
-                raise ValueError("outputs exceed budget")
-            outputs.append(
-                {
-                    "path": name,
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "size_bytes": len(data),
-                    "data": base64.b64encode(data).decode("ascii"),
-                }
-            )
+        outputs, output_issues = collect_outputs(work, spec["output_paths"], limits)
     return {
         "exit_code": process.returncode,
         "stdout": bytes(buffers["stdout"]).decode("utf-8", errors="replace"),
@@ -285,6 +309,8 @@ def execute(request: dict) -> dict:
         "cancelled": controller_lost.is_set(),
         "output_limited": output_limited,
         "outputs": outputs,
+        "error_code": "output_contract_failed" if output_issues else None,
+        "output_issues": output_issues,
         "resource_usage": resource_usage(),
     }
 

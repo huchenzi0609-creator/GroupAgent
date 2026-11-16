@@ -44,6 +44,7 @@ from groupagent.runtime.contracts import DeliveryDraft, PreparedExecution, Valid
 from groupagent.runtime.executor import WorkSupervisor
 from groupagent.runtime.inputs import InputProcessor
 from groupagent.runtime.recovery import (
+    RECONCILIATION_SCOPE_KEY,
     RECOVERY_SCOPE_KEY,
     automatic_recovery_pending,
 )
@@ -336,7 +337,7 @@ async def test_resource_tool_deferral_survives_close_restart_without_repaying_mo
     before = env.state.load_checkpoint(env.actor, work.id)
     assert before.safe_to_resume and before.state == RunState.PAUSED
     assert (before.usage.rounds, before.usage.tool_calls, before.usage.tokens) == (1, 1, 30)
-    assert before.backend_state["execution_backend"] == "scoped"
+    assert before.backend_state["execution_backend"] == "langgraph"
     await first.close()
     assert env.state.load_checkpoint(env.actor, work.id).state == RunState.PAUSED
 
@@ -861,7 +862,7 @@ async def test_exhausted_validation_repairs_wait_then_recover_without_false_deli
     try:
         assert (await service.run_once()).state == WorkState.QUEUED
         waiting = await service.run_once()
-        assert waiting.state == WorkState.PAUSED and validator.calls == 2
+        assert waiting.state == WorkState.QUEUED and validator.calls == 2
         assert automatic_recovery_pending(waiting)
         checkpoint = env.state.load_checkpoint(env.actor, work.id)
         assert checkpoint.state == RunState.PAUSED and checkpoint.candidate_text is None
@@ -1052,7 +1053,8 @@ async def test_unknown_native_write_is_blocked_even_with_a_malformed_safe_checkp
             assert await service.run_once() is None
         blocked = work_state(env, work.id)
         assert blocked.state == WorkState.PAUSED and blocked.pause_reason == "effect_unknown"
-        assert not automatic_recovery_pending(blocked) and not factory.models
+        assert automatic_recovery_pending(blocked) and not factory.models
+        assert blocked.scope[RECONCILIATION_SCOPE_KEY]["reason"] == "effect_unknown"
     finally:
         await service.close()
 
@@ -1079,7 +1081,7 @@ async def test_every_retry_revalidates_current_policy_source_and_actor(env, reso
         restarted.resolve_actor = lambda member: env.actor.model_copy(update={"member_id": "other"})
     try:
         advance_resources(resource_clock)
-        assert await restarted.run_once() is None
+        await restarted.run_once()
         blocked = work_state(env, work.id)
         expected = {
             "policy": "policy_changed",
@@ -1100,7 +1102,7 @@ async def test_identical_validation_failures_back_off_across_restarts_until_fixe
     validator = Validator(fail=100)
     first = supervisor(env, factory, validator, validation_repair_limit=0)
     waiting = await first.run_once()
-    assert waiting.state == WorkState.PAUSED
+    assert waiting.state == WorkState.QUEUED
     first_metadata = waiting.scope[RECOVERY_SCOPE_KEY]
     assert first_metadata["backoff_step"] == 0
     await first.close()
@@ -1109,7 +1111,7 @@ async def test_identical_validation_failures_back_off_across_restarts_until_fixe
         assert await second.run_once() is None
         advance_resources(resource_clock)
         waiting = await second.run_once()
-        assert waiting.state == WorkState.PAUSED and validator.calls == 2
+        assert waiting.state == WorkState.QUEUED and validator.calls == 2
         metadata = waiting.scope[RECOVERY_SCOPE_KEY]
         assert metadata["backoff_step"] == 1 and metadata["consecutive_failures"] == 2
         assert "tight loop" in metadata["strategy_instruction"]
@@ -1122,7 +1124,7 @@ async def test_identical_validation_failures_back_off_across_restarts_until_fixe
         assert delivered.state == WorkState.DELIVERING
         checkpoint = env.state.load_checkpoint(env.actor, work.id)
         assert checkpoint.usage.rounds == 3 and checkpoint.usage.tokens == 90
-        assert checkpoint.backend_state["validation_repairs"] == 1
+        assert checkpoint.backend_state["validation_repairs"] == 2
         assert len(deliveries(env, work.id)) == 1
     finally:
         await second.close()
@@ -1144,8 +1146,8 @@ async def test_raw_validator_timeout_recovers_from_candidate_without_a_busy_loop
     service = supervisor(env, factory, TimeoutOnce())
     try:
         interrupted = await asyncio.wait_for(service.run_once(), 2)
-        assert interrupted.state == WorkState.PAUSED
-        assert interrupted.pause_reason == "dependency_timeout"
+        assert interrupted.state == WorkState.QUEUED
+        assert interrupted.scope[RECOVERY_SCOPE_KEY]["error_code"] == "dependency_timeout"
         assert await service.run_once() is None
         advance_resources(resource_clock)
         recovered = await service.run_once()
@@ -1177,7 +1179,8 @@ async def test_preparation_dependency_can_restore_without_checkpoint_and_preserv
     first = supervisor(env, factory)
     interrupted = await first.run_once()
     floor = interrupted.scope["_runtime_preparation"]["usage_floor"]
-    assert interrupted.state == WorkState.PAUSED and floor > 0
+    assert interrupted.state == WorkState.QUEUED and floor > 0
+    assert interrupted.scope[RECOVERY_SCOPE_KEY]["error_code"] == "dependency_unavailable"
     assert await first.run_once() is None
     await first.close()
     restarted = supervisor(env, factory)
@@ -1217,12 +1220,19 @@ async def test_recovery_never_waives_unknown_input_reservation(env, resource_clo
         held = work_state(env, work.id)
         assert held.state == WorkState.PAUSED
         assert held.pause_reason == "provider_reconciliation_required"
-        assert not factory.models and not automatic_recovery_pending(held)
+        assert not factory.models and automatic_recovery_pending(held)
+        assert held.scope[RECONCILIATION_SCOPE_KEY]["reason"] == "provider_reconciliation_required"
+        with env.store.transaction(env.actor) as tx:
+            recorded = tx.conn.execute(
+                "SELECT body FROM ga_media_inputs WHERE group_id=%s AND event_id=%s",
+                (env.actor.group_id, work.request_event_id),
+            ).fetchone()["body"]
+        assert recorded["reconciliation_reservation_id"] == "synthetic-held-unknown-input"
     finally:
         await service.close()
 
 
-async def test_no_candidate_reuse_after_source_removal(env):
+async def test_no_candidate_reuse_after_source_removal(env, resource_clock):
     work = new_work(env)
     service = supervisor(env)
     await service.run_once()
@@ -1237,6 +1247,8 @@ async def test_no_candidate_reuse_after_source_removal(env):
     restart = supervisor(env, factory)
     try:
         assert await restart.run_once() is None
+        advance_resources(resource_clock)
+        await restart.run_once()
         assert work_state(env, work.id).state == WorkState.PAUSED
         assert not factory.models
     finally:
@@ -1423,7 +1435,9 @@ class PreparationFailureFactory(Factory):
         raise DomainError(self.code, "Synthetic input preparation outcome", retryable=True)
 
 
-async def test_pending_retry_is_two_requests_total_across_restart_and_no_budget_reset(env):
+async def test_pending_attachment_retries_survive_restart_without_total_attempt_cutoff(
+    env, resource_clock
+):
     work = new_work(env)
     factory = PreparationFailureFactory(delay=0.01)
     first = supervisor(env, factory, attachment_retry_seconds=0.05)
@@ -1431,25 +1445,26 @@ async def test_pending_retry_is_two_requests_total_across_restart_and_no_budget_
     initial_floor = result.scope["_runtime_preparation"]["usage_floor"]
     assert result.state == WorkState.WAITING_EXTERNAL
     await first.close()
-    await asyncio.sleep(0.06)
+    advance_resources(resource_clock)
     restarted = supervisor(env, factory, attachment_retry_seconds=0.05)
     try:
-        result = await restarted.run_once()
-        assert result.id == work.id and result.state == WorkState.WAITING_INPUT
-        assert result.scope["_runtime_preparation"]["attempts"] == 2
-        assert result.scope["_runtime_preparation"]["error_code"] == "attachment_retry_exhausted"
-        assert result.scope["_runtime_preparation"]["usage_floor"] > initial_floor
-        assert await restarted.run_once() is None
-        assert factory.calls == 2 and not factory.models and not deliveries(env, work.id)
-        with env.store.transaction(env.actor) as tx:
-            tx.transition_work(
-                work.id,
-                WorkState.QUEUED,
-                expected_revision=result.revision,
-                reason="input_received",
+        for attempt in range(2, 6):
+            result = await restarted.run_once()
+            assert result.id == work.id and result.state == WorkState.WAITING_EXTERNAL
+            metadata = result.scope["_runtime_preparation"]
+            assert (
+                metadata["attempts"] == attempt and metadata["error_code"] == "attachment_pending"
             )
+            assert metadata["usage_floor"] > initial_floor
+            assert datetime.fromisoformat(metadata["next_retry_at"]) > resource_clock["now"]
+            assert await restarted.run_once() is None
+            advance_resources(resource_clock)
+        assert factory.calls == 5 and not factory.models and not deliveries(env, work.id)
+        # A real unavailable/expired fact still requests new material.
+        factory.code = "attachment_unavailable"
         result = await restarted.run_once()
-        assert result.state == WorkState.WAITING_INPUT and factory.calls == 2
+        assert result.state == WorkState.WAITING_INPUT and factory.calls == 6
+        assert result.scope["_runtime_preparation"]["error_code"] == "attachment_unavailable"
     finally:
         await restarted.close()
 
@@ -1476,7 +1491,9 @@ async def test_expired_inputs_and_auth_require_explicit_action(env, code, state)
         await service.close()
 
 
-async def test_attachment_wait_deadline_expires_without_another_request(env, monkeypatch):
+async def test_attachment_wait_backoff_window_does_not_become_a_total_task_deadline(
+    env, monkeypatch
+):
     from datetime import timedelta
 
     work = new_work(env)
@@ -1500,11 +1517,16 @@ async def test_attachment_wait_deadline_expires_without_another_request(env, mon
         assert clock["now"] < deadline and factory.calls == 1
         clock["now"] = deadline + timedelta(microseconds=1)
         assert clock["now"] >= datetime.fromisoformat(metadata["next_retry_at"])
-        assert await service.run_once() is None
+        assert (await service.run_once()).state == WorkState.WAITING_EXTERNAL
         result = work_state(env, work.id)
-        assert result.state == WorkState.WAITING_INPUT
-        assert result.scope["_runtime_preparation"]["error_code"] == "attachment_wait_timeout"
-        assert factory.calls == 1
+        assert result.state == WorkState.WAITING_EXTERNAL
+        assert result.scope["_runtime_preparation"]["error_code"] == "attachment_pending"
+        assert result.scope["_runtime_preparation"]["attempts"] == 2
+        assert (
+            datetime.fromisoformat(result.scope["_runtime_preparation"]["next_retry_at"])
+            > clock["now"]
+        )
+        assert factory.calls == 2
     finally:
         await service.close()
 
@@ -1515,7 +1537,8 @@ async def test_preparation_timeout_does_not_repeat_unknown_request(env):
     service = supervisor(env, factory, preparation_timeout_seconds=0.05)
     try:
         result = await service.run_once()
-        assert result.state == WorkState.PAUSED and result.pause_reason == "preparation_timeout"
+        assert result.state == WorkState.QUEUED
+        assert result.scope[RECOVERY_SCOPE_KEY]["error_code"] == "preparation_timeout"
         assert await service.run_once() is None
         assert factory.calls == 1 and not deliveries(env, work.id)
     finally:

@@ -232,8 +232,8 @@ async def test_long_actual_fetch_retains_separate_byte_and_codepoint_evidence(
         )
     )
     instructions = json.loads(run.prepared.request.objective)["instructions"]
-    profile = build_tool_profile(run.prepared.request.allowed_tools)
-    assert profile.families == ("research",)
+    profile = build_tool_profile(run.prepared.request.visible_tools)
+    assert profile.families == ("discovery", "research")
     assert set(profile.instructions) <= set(instructions)
 
 

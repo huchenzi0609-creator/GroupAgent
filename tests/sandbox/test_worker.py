@@ -263,19 +263,21 @@ async def test_real_workspace_quota_and_escaping_outputs(context):
         context,
     )
     assert not result.succeeded and not (context.workspace / "big.bin").exists()
-    with pytest.raises(DomainError, match="valid result"):
-        await sandbox.run(
-            ProcessSpec(
-                program="python3",
-                args=(
-                    "-I",
-                    "-c",
-                    "from pathlib import Path; Path('escape').symlink_to('/etc/passwd')",
-                ),
-                output_paths=("escape",),
+    refused = await sandbox.run(
+        ProcessSpec(
+            program="python3",
+            args=(
+                "-I",
+                "-c",
+                "from pathlib import Path; Path('escape').symlink_to('/etc/passwd')",
             ),
-            context,
-        )
+            output_paths=("escape",),
+        ),
+        context,
+    )
+    assert not refused.succeeded and refused.error_code == "output_contract_failed"
+    assert refused.publication_state == "unpublished" and refused.outputs == ()
+    assert len(refused.output_issues) == 1 and refused.output_issues[0].kind == "invalid_file"
     assert not (context.workspace / "escape").exists()
 
 

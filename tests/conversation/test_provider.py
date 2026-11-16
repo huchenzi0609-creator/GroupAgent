@@ -1,3 +1,9 @@
+"""Typed business validation plus the real graph's natural dialogue protocol.
+
+The old Decision-JSON routing/repair loop is deliberately absent. Strict business
+invariants remain tested directly and via normal graph tool observations.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,119 +12,22 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
+from jsonschema import Draft202012Validator
+from pydantic import ValidationError
 
-from groupagent.conversation.provider import ModelDecisionProvider, decision_schema
+from groupagent.conversation.provider import (
+    ModelDecisionProvider,
+    _InvalidCandidate,
+    business_action_schema,
+    decision_schema,
+    reference_catalog,
+    validate_candidate,
+    work_action_schema,
+    work_fact_tool_schema,
+)
 from groupagent.conversation.timeparse import normalize_time, shift_timing
 from groupagent.domain import DomainError, EventKind, GroupEvent
-from groupagent.execution.models import ModelReply, TokenUsage
-
-
-class FixtureModel:
-    name = "offline-structured-decision-fixture"
-
-    def __init__(self, *responses):
-        self.responses, self.requests = list(responses), []
-
-    async def complete(self, request):
-        self.requests.append(request)
-        result = self.responses.pop(0)
-        if isinstance(result, BaseException):
-            raise result
-        if isinstance(result, ModelReply):
-            return result
-        return ModelReply(
-            text=result if isinstance(result, str) else json.dumps(result, ensure_ascii=False),
-            usage=TokenUsage(input_tokens=100, output_tokens=50),
-        )
-
-
-@pytest.mark.parametrize(
-    "invalid,path,code",
-    [
-        ({"kind": "start_work"}, "goal", "decision_goal_required"),
-        (
-            {
-                "kind": "start_work",
-                "goal": "Synthetic goal",
-                "action": {"op": "claim_task", "title": "Synthetic"},
-            },
-            "action",
-            "decision_action_kind",
-        ),
-        ({"kind": "command"}, "action", "decision_action_required"),
-        (
-            {"kind": "update_work", "goal": "Synthetic goal", "target_work_id": "work-report"},
-            "expected_revision",
-            "decision_revision_required",
-        ),
-        (
-            {"kind": "start_work", "goal": "Synthetic goal", "work_selector": {"basis": "focus"}},
-            "work_selector",
-            "decision_selector_kind",
-        ),
-    ],
-)
-async def test_coherence_repairs_receive_safe_specific_field_paths_and_codes(
-    environment, invalid, path, code
-):
-    model = FixtureModel(
-        {
-            "reason_code": "synthetic_contract",
-            "directness": "direct",
-            "confidence": 0.95,
-            **invalid,
-        },
-        decision("reply", response="Synthetic repaired candidate"),
-    )
-    provider = ModelDecisionProvider(model)
-    result = await provider.decide(environment.event, environment.context)
-    assert result.kind == "reply" and len(model.requests) == 2
-    assert provider.diagnostics[0]["issues"] == [{"path": path, "code": code}]
-    repair = model.requests[1].messages[-1].content
-    assert path in repair and code in repair
-
-
-async def test_empty_attachment_and_file_catalogs_remain_explicit_during_repair(environment):
-    event = environment.event.model_copy(
-        update={"text": "Find a few public pictures for a synthetic example"}
-    )
-    context = {
-        **environment.context,
-        "works": [],
-        "files": [],
-        "recent_messages": [],
-        "model_event": {"id": event.id, "text": event.text, "attachments": []},
-    }
-    valid = decision(
-        "start_work",
-        goal=event.text,
-        work_capabilities=["public_images"],
-        public_image_count=3,
-    )
-    model = FixtureModel(
-        {**valid, "input_event_ids": [event.id]},
-        {**valid, "input_versions": ["unavailable-synthetic-version"]},
-        valid,
-    )
-    provider = ModelDecisionProvider(model)
-    result = await provider.decide(event, context)
-    assert result.input_event_ids == result.input_versions == []
-    assert [item["issues"][0]["code"] for item in provider.diagnostics] == [
-        "select_authorized_attachment_event",
-        "select_available_file_version",
-    ]
-    for request in model.requests:
-        catalog = json.loads(request.messages[1].content)["context"]["reference_catalog"]
-        assert catalog["attachment_event_ids"] == catalog["file_versions"] == []
-        assert event.id in catalog["source_event_ids"]
-        schema = json.loads(request.messages[0].content.split("Decision schema:\n", 1)[1])
-        fields = next(
-            item["properties"]
-            for item in schema["oneOf"]
-            if item["properties"]["kind"]["const"] == "start_work"
-        )
-        assert fields["input_event_ids"]["maxItems"] == 0
-        assert fields["input_versions"]["maxItems"] == 0
+from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
 
 def test_catalog_specific_input_schema_is_bounded_without_changing_static_compatibility():
@@ -214,417 +123,6 @@ def environment():
 
 
 @pytest.mark.parametrize(
-    "first",
-    [
-        decision("start_work", goal="制作报告", action={"op": "claim_task", "title": "制作报告"}),
-        decision("reply", target_work_id="work-report", expected_revision=4, control="pause"),
-        decision(
-            "reply",
-            action={
-                "op": "update_task",
-                "task_id": "work-report",
-                "expected_revision": 4,
-                "progress": "修改报告",
-            },
-        ),
-        decision(
-            "reply",
-            action={
-                "op": "control_schedule",
-                "schedule_id": "work-report",
-                "expected_revision": 4,
-                "command": "pause",
-            },
-        ),
-    ],
-)
-async def test_wrong_work_action_namespace_or_condition_is_repaired_before_return(
-    environment, first
-):
-    correct = decision(
-        "update_work",
-        goal="整理课程报告并补充局限",
-        target_work_id="work-report",
-        expected_revision=4,
-        action=None,
-    )
-    model = FixtureModel(first, correct)
-    provider = ModelDecisionProvider(model)
-    result = await provider.decide(environment.event, environment.context)
-    assert result.kind == "update_work" and result.action is None
-    assert result.target_work_id == "work-report" and len(model.requests) == 2
-    assert all(not request.tools for request in model.requests)
-    assert provider.diagnostics[0]["code"] == "provider_output_invalid"
-    assert "尚无任何业务写" in model.requests[1].messages[-1].content
-
-
-async def test_two_repairs_are_bounded_and_diagnostics_do_not_store_raw_response(environment):
-    secret = "sk-synthetic_private_token_123456789012345678"
-    private = "private person and payment details"
-    invalid = {**decision("reply"), private: secret}
-    model = FixtureModel("not valid JSON", invalid, decision("observe", directness="none"))
-    provider = ModelDecisionProvider(model)
-    result = await provider.decide(environment.event, environment.context)
-    assert result.kind == "observe" and len(model.requests) == 3
-    assert len(provider.diagnostics) == 2
-    serialized = json.dumps(provider.diagnostics)
-    assert (
-        secret not in serialized and private not in serialized and "response_sha256" in serialized
-    )
-    assert secret not in model.requests[-1].messages[-2].content
-
-
-async def test_schema_failure_stops_after_total_three_calls(environment):
-    model = FixtureModel("{}", "{}", "{}", decision("observe"))
-    provider = ModelDecisionProvider(model)
-    with pytest.raises(DomainError) as error:
-        await provider.decide(environment.event, environment.context)
-    assert error.value.code == "provider_output_invalid" and not error.value.retryable
-    assert len(model.requests) == len(provider.diagnostics) == 3
-
-
-def schedule_candidate(timing, **changes):
-    return decision(
-        action={
-            "op": "create_schedule",
-            "title": "合成提醒",
-            "goal": "提醒我休息",
-            "timing": timing,
-        },
-        **changes,
-    )
-
-
-@pytest.mark.parametrize("max_retries", [0, 1, 2])
-@pytest.mark.parametrize(
-    "text,timing,error_code",
-    [
-        (
-            "每隔四小时提醒我休息，持续到今天晚上。",
-            {
-                "kind": "every",
-                "interval_seconds": 14400,
-                "start_at": "2026-11-14T13:00:00+08:00",
-            },
-            "use_verified_time_resolution",
-        ),
-        (
-            "明天下午提醒我复核。",
-            {"kind": "at", "at": "2026-11-15T18:00:00+08:00"},
-            "time_requires_clarification",
-        ),
-    ],
-)
-async def test_only_exhausted_time_mismatches_become_safe_clarification(
-    environment, max_retries, text, timing, error_code
-):
-    candidate = schedule_candidate(timing)
-    model = FixtureModel(*([candidate] * (max_retries + 1)), schedule_candidate(timing))
-    provider = ModelDecisionProvider(model, max_retries=max_retries)
-    result = await provider.decide(
-        environment.event.model_copy(update={"text": text}), environment.context
-    )
-    assert result.kind == "clarify" and result.reason_code == "schedule_time_needs_confirmation"
-    assert result.action is None and result.goal is None and result.target_work_id is None
-    assert "时间" in result.response and "确认" in result.response
-    assert "18:00" not in result.response and "13:00" not in result.response
-    assert len(model.requests) == len(provider.diagnostics) == max_retries + 1
-    assert all(not request.tools for request in model.requests)
-    assert all(
-        record["issues"] == [{"path": "action.timing", "code": error_code}]
-        for record in provider.diagnostics
-    )
-    assert provider.diagnostics[-1]["fallback"] == "schedule_time_clarification"
-
-
-async def test_valid_time_repair_finishes_before_clarification_fallback(environment):
-    bad = schedule_candidate(
-        {"kind": "every", "interval_seconds": 14400, "start_at": "2026-11-14T13:00:00+08:00"}
-    )
-    good = schedule_candidate({"kind": "every", "interval_seconds": 14400})
-    model = FixtureModel(bad, bad, good)
-    provider = ModelDecisionProvider(model)
-    result = await provider.decide(
-        environment.event.model_copy(update={"text": "每隔四小时提醒我休息。"}),
-        environment.context,
-    )
-    assert result.kind == "reply" and result.action["timing"]["interval_seconds"] == 14400
-    assert len(model.requests) == 3 and len(provider.diagnostics) == 2
-    assert all("fallback" not in record for record in provider.diagnostics)
-
-
-@pytest.mark.parametrize(
-    "first",
-    [
-        "{}",
-        schedule_candidate({"kind": "every", "interval_seconds": 14400}, confidence=0.1),
-        schedule_candidate({"type": "every", "interval_seconds": 14400}),
-        schedule_candidate({"kind": "every", "interval_seconds": 60}),
-        decision(action={"op": "forget", "task_ids": ["another-persons-task"]}),
-    ],
-)
-async def test_mixed_schema_or_permission_failures_cannot_use_time_fallback(environment, first):
-    bad_time = schedule_candidate(
-        {"kind": "every", "interval_seconds": 14400, "start_at": "2026-11-14T13:00:00+08:00"}
-    )
-    model = FixtureModel(first, bad_time, bad_time)
-    provider = ModelDecisionProvider(model)
-    with pytest.raises(DomainError) as error:
-        await provider.decide(
-            environment.event.model_copy(update={"text": "每隔四小时提醒我休息。"}),
-            environment.context,
-        )
-    assert error.value.code == "provider_output_invalid" and len(model.requests) == 3
-    assert all("fallback" not in record for record in provider.diagnostics)
-
-
-async def test_transport_failure_cannot_be_hidden_by_time_clarification(environment, monkeypatch):
-    async def no_delay(seconds):
-        return None
-
-    monkeypatch.setattr("groupagent.conversation.provider.asyncio.sleep", no_delay)
-    bad_time = schedule_candidate(
-        {"kind": "every", "interval_seconds": 14400, "start_at": "2026-11-14T13:00:00+08:00"}
-    )
-    model = FixtureModel(
-        DomainError("provider_timeout", "fixture", retryable=True), bad_time, bad_time
-    )
-    provider = ModelDecisionProvider(model)
-    with pytest.raises(DomainError) as error:
-        await provider.decide(
-            environment.event.model_copy(update={"text": "每隔四小时提醒我休息。"}),
-            environment.context,
-        )
-    assert error.value.code == "provider_output_invalid" and len(model.requests) == 3
-    assert provider.diagnostics[0]["provider_error"]
-    assert all("fallback" not in record for record in provider.diagnostics)
-
-
-async def test_unresolved_quiet_until_is_not_the_schedule_timing_fallback(environment):
-    candidate = decision(
-        action={
-            "op": "quiet",
-            "scope": "self",
-            "enabled": True,
-            "until": "2026-11-15T18:00:00+08:00",
-        }
-    )
-    provider = ModelDecisionProvider(FixtureModel(candidate, candidate, candidate))
-    with pytest.raises(DomainError) as error:
-        await provider.decide(
-            environment.event.model_copy(update={"text": "安静到明天下午。"}), environment.context
-        )
-    assert error.value.code == "provider_output_invalid"
-    assert all(
-        record["issues"] == [{"path": "action.until", "code": "time_requires_clarification"}]
-        for record in provider.diagnostics
-    )
-
-
-@pytest.mark.parametrize("limit", [-1, 3, True, 2.5])
-def test_attempt_budget_cannot_be_unbounded(limit):
-    with pytest.raises(ValueError):
-        ModelDecisionProvider(FixtureModel(), max_retries=limit)
-
-
-async def test_provider_failure_and_cancellation_do_not_trigger_schema_writes(
-    environment, monkeypatch
-):
-    model = FixtureModel(DomainError("budget_exhausted", "No fixture budget"), decision("observe"))
-    with pytest.raises(DomainError) as error:
-        await ModelDecisionProvider(model).decide(environment.event, environment.context)
-    assert error.value.code == "budget_exhausted" and len(model.requests) == 1
-    model = FixtureModel(asyncio.CancelledError(), decision("observe"))
-    with pytest.raises(asyncio.CancelledError):
-        await ModelDecisionProvider(model).decide(environment.event, environment.context)
-    assert len(model.requests) == 1
-
-    async def no_delay(seconds):
-        return None
-
-    monkeypatch.setattr("groupagent.conversation.provider.asyncio.sleep", no_delay)
-    model = FixtureModel(
-        DomainError("provider_timeout", "synthetic", retryable=True), "{}", decision("observe")
-    )
-    assert (
-        await ModelDecisionProvider(model).decide(environment.event, environment.context)
-    ).kind == "observe"
-    assert len(model.requests) == 3
-
-
-async def test_natural_self_claim_needs_no_prefix_or_attachments(environment):
-    event = environment.event.model_copy(update={"text": "访谈摘要我来负责，不用你代写。"})
-    model = FixtureModel(
-        decision(action={"op": "claim_task", "title": "访谈摘要"}, directness="open")
-    )
-    result = await ModelDecisionProvider(model).decide(event, environment.context)
-    assert result.action["op"] == "claim_task" and result.input_event_ids == []
-    system = model.requests[0].messages[0].content
-    assert "无需/组长等前缀" in system and "只登记真人任务" in system
-
-
-async def test_available_image_and_explicit_source_references_are_in_payload(environment):
-    event = environment.event.model_copy(
-        update={
-            "text": "分析这张表格截图。",
-            "attachments": [{"kind": "image", "handle": {"message_id": "synthetic-message"}}],
-        }
-    )
-    context = {
-        **environment.context,
-        "_private": "never-send-this",
-        "model_event": {
-            "id": event.id,
-            "actor_id": "self",
-            "text": event.text,
-            "attachments": event.attachments,
-            "occurred_at": "1999-01-01T00:00:00Z",
-        },
-    }
-    model = FixtureModel(
-        decision(
-            "start_work",
-            goal="用真实图片工具分析表格",
-            input_versions=["version-table"],
-            input_event_ids=[event.id],
-            outputs=[{"format": "text"}],
-        )
-    )
-    result = await ModelDecisionProvider(model).decide(event, context)
-    assert result.kind == "start_work"
-    payload = json.loads(model.requests[0].messages[1].content)
-    assert payload["event"]["occurred_at"] == event.occurred_at.isoformat()
-    assert payload["context"]["reference_catalog"]["attachment_event_ids"] == [event.id]
-    assert "_private" not in payload["context"]
-    assert "图片理解、真实像素输入" in model.requests[0].messages[0].content
-    assert "独立插画/文生图服务已由用户排除" in model.requests[0].messages[0].content
-
-
-@pytest.mark.parametrize(
-    "values",
-    [
-        {"input_versions": ["unavailable-version"]},
-        {"input_event_ids": ["unselected-other-message"]},
-        {"outputs": [{"format": "mp4"}]},
-        {"confidence": 0.6},
-    ],
-)
-async def test_invalid_work_capabilities_or_sources_fail_closed(environment, values):
-    model = FixtureModel(decision("start_work", goal="Synthetic work", **values))
-    with pytest.raises(DomainError) as error:
-        await ModelDecisionProvider(model, max_retries=0).decide(
-            environment.event, environment.context
-        )
-    assert error.value.code == "provider_output_invalid"
-
-
-async def test_owner_task_batch_checks_every_namespace_and_assignee(environment):
-    context = {**environment.context, "role": "owner"}
-    first = decision(
-        action={
-            "op": "task_batch",
-            "actions": [
-                {"op": "claim_task", "title": "访谈摘要"},
-                {
-                    "op": "update_task",
-                    "task_id": "work-report",
-                    "expected_revision": 4,
-                    "progress": "Wrong namespace",
-                },
-            ],
-        }
-    )
-    second = decision(
-        action={
-            "op": "task_batch",
-            "actions": [
-                {"op": "claim_task", "title": "访谈摘要"},
-                {
-                    "op": "assign_task",
-                    "title": "现场记录",
-                    "member_id": "other",
-                    "member_name": "唐禾",
-                },
-            ],
-        }
-    )
-    model = FixtureModel(first, second)
-    provider = ModelDecisionProvider(model)
-    result = await provider.decide(environment.event, context)
-    assert result.kind == "reply" and result.action["op"] == "task_batch"
-    assert provider.diagnostics[0]["issues"][0]["path"].startswith("action.actions.1.")
-    assert len(model.requests) == 2
-    with pytest.raises(DomainError):
-        await ModelDecisionProvider(FixtureModel(second), max_retries=0).decide(
-            environment.event, environment.context
-        )
-
-
-async def test_time_schema_and_date_are_repaired_from_actual_occurred_at(environment):
-    event = environment.event.model_copy(
-        update={
-            "text": "明晚八点提醒我复核。",
-            "occurred_at": datetime.fromisoformat("2026-11-13T15:00:00+08:00"),
-        }
-    )
-    wrong = decision(
-        action={
-            "op": "create_schedule",
-            "title": "复核",
-            "goal": "提醒复核",
-            "timing": {"type": "at", "at": "2026-11-15T20:00:00+08:00"},
-        }
-    )
-    correct = decision(
-        action={
-            "op": "create_schedule",
-            "title": "复核",
-            "goal": "提醒复核",
-            "timing": {"kind": "at", "at": "2026-11-14T20:00:00+08:00"},
-        }
-    )
-    model = FixtureModel(wrong, correct)
-    result = await ModelDecisionProvider(model).decide(event, environment.context)
-    assert result.action["timing"]["at"] == "2026-11-14T20:00:00+08:00"
-    payload = json.loads(model.requests[0].messages[1].content)
-    assert payload["context"]["time_resolution"]["instant"] == "2026-11-14T20:00:00+08:00"
-    assert len(model.requests) == 2
-
-
-async def test_missing_time_or_dst_fold_cannot_be_filled_by_model(environment):
-    for text, stamp, zone, guessed in [
-        (
-            "周五提醒我交报告",
-            "2026-11-14T09:00:00+08:00",
-            "Asia/Shanghai",
-            "2026-11-20T09:00:00+08:00",
-        ),
-        (
-            "11月1日凌晨1点半提醒我",
-            "2026-10-31T18:00:00-04:00",
-            "America/New_York",
-            "2026-11-01T01:30:00-04:00",
-        ),
-    ]:
-        event = environment.event.model_copy(
-            update={"text": text, "occurred_at": datetime.fromisoformat(stamp)}
-        )
-        context = {**environment.context, "now": stamp, "group_time_zone": zone}
-        wrong = decision(
-            action={
-                "op": "create_schedule",
-                "title": "检查",
-                "goal": "提醒检查",
-                "timing": {"kind": "at", "at": guessed},
-            }
-        )
-        clarify = decision("clarify", response="请补充具体时刻或偏移。")
-        model = FixtureModel(wrong, clarify)
-        assert (await ModelDecisionProvider(model).decide(event, context)).kind == "clarify"
-        assert len(model.requests) == 2
-
-
-@pytest.mark.parametrize(
     "text,expected",
     [
         ("明天晚上八点提醒我", "2026-11-15T20:00:00+08:00"),
@@ -682,123 +180,6 @@ def test_nonexistent_dst_and_ambiguous_midnight_are_not_silently_resolved():
     assert shift_timing({"kind": "daily", "local_time": "23:45"}, 1800) is None
 
 
-async def test_completely_unspecified_reminder_time_cannot_be_invented(environment):
-    event = environment.event.model_copy(update={"text": "提醒我交报告。"})
-    invented = decision(
-        action={
-            "op": "create_schedule",
-            "title": "交报告",
-            "goal": "提醒交报告",
-            "timing": {"kind": "daily", "local_time": "09:00"},
-        }
-    )
-    model = FixtureModel(invented, decision("clarify", response="什么时候提醒你？"))
-    provider = ModelDecisionProvider(model)
-    assert (await provider.decide(event, environment.context)).kind == "clarify"
-    assert len(model.requests) == 2
-    assert provider.diagnostics[0]["issues"][0]["code"] == "time_requires_clarification"
-
-
-@pytest.mark.parametrize(
-    "text,timing",
-    [
-        ("把我每天检查文献的提醒改成晚上九点。", {"kind": "daily", "local_time": "21:00"}),
-        (
-            "我的文献提醒从每天改成每周一和周四。",
-            {"kind": "weekly", "local_time": "20:00", "weekdays": [0, 3]},
-        ),
-        ("提醒时间往后挪半小时，原规则是20点。", {"kind": "daily", "local_time": "20:30"}),
-    ],
-)
-async def test_changes_reuse_verified_existing_rule_clock_or_displacement(
-    environment, text, timing
-):
-    event = environment.event.model_copy(update={"text": text})
-    model = FixtureModel(
-        decision(
-            action={
-                "op": "change_schedule",
-                "schedule_id": "schedule-notes",
-                "expected_revision": 2,
-                "timing": timing,
-            }
-        )
-    )
-    result = await ModelDecisionProvider(model).decide(event, environment.context)
-    assert result.action["op"] == "change_schedule" and len(model.requests) == 1
-
-
-async def test_stale_or_missing_revision_and_readonly_role_are_not_guessed(environment):
-    bad = decision(
-        "update_work", goal="修订报告", target_work_id="work-report", expected_revision=2
-    )
-    for context in (
-        environment.context,
-        {**environment.context, "role": "observer", "read_only": True},
-    ):
-        model = FixtureModel(bad, decision("clarify", response="请提供当前可操作的工作对象。"))
-        assert (
-            await ModelDecisionProvider(model).decide(environment.event, context)
-        ).action is None
-        assert len(model.requests) == 2
-
-
-@pytest.mark.parametrize("directness", ["other", "none"])
-async def test_owner_explicit_human_assignment_does_not_need_to_address_bot(
-    environment, directness
-):
-    context = {**environment.context, "role": "owner"}
-    candidate = decision(
-        action={
-            "op": "assign_task",
-            "title": "答辩彩排主持",
-            "member_id": "other",
-            "member_name": "唐禾",
-        },
-        directness=directness,
-    )
-    model = FixtureModel(candidate)
-    result = await ModelDecisionProvider(model).decide(
-        environment.event.model_copy(update={"text": "唐禾负责答辩彩排主持。"}), context
-    )
-    assert result.action["op"] == "assign_task" and len(model.requests) == 1
-    unaddressed = await ModelDecisionProvider(FixtureModel(candidate), max_retries=0).decide(
-        environment.event, environment.context
-    )
-    assert unaddressed.kind == "observe" and unaddressed.action is None
-
-
-@pytest.mark.parametrize(
-    "text,note,op",
-    [
-        ("我负责实验方法那一节，周一前交。", "周一前", "claim_task"),
-        ("我这项任务改到周二下午交。", "周二下午", "update_task"),
-        ("截止日我申请延到下周三，改的是自己的文献任务。", "下周三", "update_task"),
-    ],
-)
-async def test_imprecise_human_deadline_keeps_verbatim_note_without_invented_time(
-    environment, text, note, op
-):
-    event = environment.event.model_copy(update={"text": text})
-    action = {"op": op, "due_at": None, "due_note": note}
-    if op == "claim_task":
-        action["title"] = "实验方法"
-    else:
-        action.update(task_id="task-notes", expected_revision=3)
-    model = FixtureModel(decision(action=action, directness="open"))
-    result = await ModelDecisionProvider(model).decide(event, environment.context)
-    assert result.action["due_at"] is None and result.action["due_note"] == note
-    assert len(model.requests) == 1
-
-
-async def test_made_up_deadline_note_cannot_replace_missing_source_date(environment):
-    candidate = decision(action={"op": "claim_task", "title": "整理资料", "due_note": "下周一"})
-    with pytest.raises(DomainError):
-        await ModelDecisionProvider(FixtureModel(candidate), max_retries=0).decide(
-            environment.event, environment.context
-        )
-
-
 def test_multiple_unqualified_weekdays_form_bounded_weekly_rule():
     value = normalize_time(
         "周一和周四晚上八点提醒我读论文。", datetime.fromisoformat("2026-11-14T09:00:00+08:00")
@@ -810,204 +191,472 @@ def test_multiple_unqualified_weekdays_form_bounded_weekly_rule():
     assert specific.status == "ambiguous"
 
 
-async def test_verified_quoted_work_reference_and_actual_tool_requirement_are_preserved(
-    environment,
-):
-    event = environment.event.model_copy(
-        update={"text": "用Python实际算出前100个整数的平方和，给我文件。"}
+def validate(value, environment, *, context=None, text=None):
+    ctx = context or environment.context
+    event = environment.event
+    source = event.text if text is None else text
+    ctx = {**ctx, "_source_text": source}
+    return validate_candidate(
+        json.dumps(value),
+        ctx,
+        reference_catalog(ctx, {"id": event.id, "text": source, "attachments": []}),
+        normalize_time(source, event.occurred_at, "Asia/Shanghai"),
     )
-    context = {**environment.context, "quoted_work_id": "work-report"}
-    model = FixtureModel(
-        decision(
-            "update_work",
-            goal=event.text,
-            target_work_id="work-report",
-            expected_revision=4,
-            outputs=[{"format": "md"}],
+
+
+@pytest.mark.parametrize(
+    "value,path,code",
+    [
+        (decision("start_work"), "goal", "decision_goal_required"),
+        (decision("command"), "action", "decision_action_required"),
+        (
+            decision(
+                "start_work", goal="Synthetic", action={"op": "claim_task", "title": "Synthetic"}
+            ),
+            "action",
+            "decision_action_kind",
+        ),
+        (
+            decision("update_work", goal="Synthetic", target_work_id="work-report"),
+            "expected_revision",
+            "decision_revision_required",
+        ),
+        (
+            decision("start_work", goal="Synthetic", work_selector={"basis": "focus"}),
+            "work_selector",
+            "decision_selector_kind",
+        ),
+    ],
+)
+def test_business_structural_errors_are_still_rejected(environment, value, path, code):
+    with pytest.raises(ValidationError) as error:
+        validate(value, environment)
+    assert error.value.errors(include_input=False)[0]["type"] == code
+
+
+@pytest.mark.parametrize(
+    "value,code",
+    [
+        (
+            decision("reply", outputs=[{"format": "docx"}]),
+            "work_fields_require_start_or_update_work",
+        ),
+        (
+            decision("start_work", goal="Synthetic", confidence=0.5),
+            "write_requires_confidence_at_least_0_85",
+        ),
+        (
+            decision("start_work", goal="Synthetic", input_event_ids=["guessed"]),
+            "select_authorized_attachment_event",
+        ),
+        (
+            decision("start_work", goal="Synthetic", input_versions=["guessed"]),
+            "select_available_file_version",
+        ),
+        (
+            decision(
+                "update_work", goal="Synthetic", target_work_id="task-notes", expected_revision=3
+            ),
+            "select_id_from_works",
+        ),
+        (
+            decision(
+                "command",
+                action={
+                    "op": "update_task",
+                    "task_id": "work-report",
+                    "expected_revision": 4,
+                    "progress": "x",
+                },
+            ),
+            "select_id_from_tasks",
+        ),
+        (
+            decision(
+                "command",
+                action={
+                    "op": "control_schedule",
+                    "schedule_id": "work-report",
+                    "expected_revision": 4,
+                    "command": "pause",
+                },
+            ),
+            "select_id_from_schedules",
+        ),
+        (
+            decision(
+                "command",
+                action={
+                    "op": "assign_task",
+                    "title": "Synthetic",
+                    "member_id": "other",
+                    "member_name": "唐禾",
+                },
+            ),
+            "owner_and_unique_current_member_required",
+        ),
+        (
+            decision("command", action={"op": "quiet", "scope": "group", "enabled": True}),
+            "group_policy_requires_owner",
+        ),
+    ],
+)
+def test_business_namespace_provenance_and_permission_checks(environment, value, code):
+    with pytest.raises(_InvalidCandidate) as error:
+        validate(value, environment)
+    assert error.value.issues[0]["code"] == code
+
+
+@pytest.mark.parametrize("role", ["observer", "maintainer"])
+def test_readonly_cannot_stage_business_write(environment, role):
+    with pytest.raises(_InvalidCandidate) as error:
+        validate(
+            decision("start_work", goal="Synthetic"),
+            environment,
+            context={**environment.context, "role": role},
         )
+    assert error.value.issues[0]["code"] == "read_only_actor_cannot_write"
+
+
+def test_update_patch_does_not_clear_deadline_or_progress_without_explicit_change(environment):
+    changed = validate(
+        decision(
+            "command",
+            action={
+                "op": "update_task",
+                "task_id": "task-notes",
+                "expected_revision": 3,
+                "title": "核对引文格式",
+                "due_at": None,
+                "progress": None,
+            },
+        ),
+        environment,
     )
-    result = await ModelDecisionProvider(model).decide(event, context)
-    assert result.target_work_id == "work-report"
-    system = model.requests[0].messages[0].content
-    assert "context.quoted_work_id" in system and "历史做过相似计算不代表本次执行" in system
-
-
-async def test_progress_patch_does_not_silently_clear_existing_deadline(environment):
-    bad = decision(
-        action={
-            "op": "update_task",
-            "task_id": "task-notes",
-            "expected_revision": 3,
-            "progress": "已核对作者",
-            "due_at": None,
-        }
-    )
-    good = decision(
-        action={
-            "op": "update_task",
-            "task_id": "task-notes",
-            "expected_revision": 3,
-            "progress": "已核对作者",
-        }
-    )
-    provider = ModelDecisionProvider(FixtureModel(bad, good))
-    result = await provider.decide(
-        environment.event.model_copy(update={"text": "文献进展更新为已核对作者。"}),
-        environment.context,
-    )
-    assert "due_at" not in result.action
-    assert provider.diagnostics == []
-
-
-async def test_explicit_deadline_clear_uses_dedicated_flag(environment):
-    event = environment.event.model_copy(update={"text": "取消我这项任务原来的截止日期。"})
-    candidate = decision(
-        action={
-            "op": "update_task",
-            "task_id": "task-notes",
-            "expected_revision": 3,
-            "clear_due": True,
-            "due_at": None,
-        }
-    )
-    result = await ModelDecisionProvider(FixtureModel(candidate)).decide(event, environment.context)
-    assert result.action["clear_due"] is True and result.action["due_at"] is None
-
-
-async def test_new_task_title_patch_uses_task_namespace_and_preserves_other_fields(environment):
-    action = {
+    assert changed.action == {
         "op": "update_task",
         "task_id": "task-notes",
         "expected_revision": 3,
         "title": "核对引文格式",
-        "progress": None,
-        "due_at": None,
     }
-    result = await ModelDecisionProvider(FixtureModel(decision(action=action))).decide(
-        environment.event.model_copy(update={"text": "把我的任务改名为核对引文格式。"}),
-        environment.context,
+    clear = validate(
+        decision(
+            "command",
+            action={
+                "op": "update_task",
+                "task_id": "task-notes",
+                "expected_revision": 3,
+                "clear_due": True,
+                "due_at": None,
+            },
+        ),
+        environment,
     )
-    assert (
-        result.action["title"] == "核对引文格式"
-        and "due_at" not in result.action
-        and "progress" not in result.action
-    )
-    action["task_id"] = "work-report"
-    with pytest.raises(DomainError):
-        await ModelDecisionProvider(FixtureModel(decision(action=action)), max_retries=0).decide(
-            environment.event, environment.context
+    assert clear.action["clear_due"] and clear.action["due_at"] is None
+
+
+def test_owner_batch_validates_every_child_and_does_not_leak_partial_action(environment):
+    context = {**environment.context, "role": "owner"}
+    actions = [
+        {"op": "claim_task", "title": "Synthetic"},
+        {
+            "op": "update_task",
+            "task_id": "work-report",
+            "expected_revision": 4,
+            "progress": "Wrong namespace",
+        },
+    ]
+    with pytest.raises(_InvalidCandidate) as error:
+        validate(
+            decision("command", action={"op": "task_batch", "actions": actions}),
+            environment,
+            context=context,
         )
+    assert error.value.issues[0]["path"].startswith("action.actions.1.")
+    actions[1] = {
+        "op": "assign_task",
+        "title": "Synthetic",
+        "member_id": "other",
+        "member_name": "唐禾",
+    }
+    assert (
+        len(
+            validate(
+                decision("command", action={"op": "task_batch", "actions": actions}),
+                environment,
+                context=context,
+            ).action["actions"]
+        )
+        == 2
+    )
 
 
-async def test_forget_task_uses_creator_permission_not_assignee_or_claimed_role(environment):
-    context = {
+def test_forget_uses_actual_creator_and_available_source_lineage(environment):
+    ctx = {
         **environment.context,
-        "tasks": [
-            {**environment.context["tasks"][0], "created_by": "self", "source_event_ids": []}
-        ],
+        "tasks": [{**environment.context["tasks"][0], "created_by": "someone_else"}],
     }
-    action = {"op": "forget", "task_ids": ["task-notes"]}
-    result = await ModelDecisionProvider(FixtureModel(decision(action=action))).decide(
-        environment.event, context
-    )
-    assert result.action["task_ids"] == ["task-notes"]
-    context["tasks"][0]["created_by"] = "another-creator"
-    with pytest.raises(DomainError):
-        await ModelDecisionProvider(FixtureModel(decision(action=action)), max_retries=0).decide(
-            environment.event, context
+    with pytest.raises(_InvalidCandidate):
+        validate(
+            decision("command", action={"op": "forget", "task_ids": ["task-notes"]}),
+            environment,
+            context=ctx,
         )
-    assert (
-        await ModelDecisionProvider(FixtureModel(decision(action=action))).decide(
-            environment.event, {**context, "role": "owner"}
-        )
+    assert validate(
+        decision("command", action={"op": "forget", "task_ids": ["task-notes"]}),
+        environment,
+        context={**ctx, "role": "owner"},
     ).action["task_ids"] == ["task-notes"]
-    with pytest.raises(DomainError):
-        await ModelDecisionProvider(
-            FixtureModel(decision(action={"op": "forget", "task_ids": ["work-report"]})),
-            max_retries=0,
-        ).decide(environment.event, context)
+    for sources in (
+        {"source_event_ids": ["legacy"]},
+        {"source_refs": [{"event_id": "legacy", "actor_id": "self"}]},
+    ):
+        ctx = {
+            **environment.context,
+            "memory": [{"id": "fact", "kind": "fact", "author_id": "self", **sources}],
+        }
+        assert validate(
+            decision("command", action={"op": "forget", "event_ids": ["legacy"]}),
+            environment,
+            context=ctx,
+        ).action["event_ids"] == ["legacy"]
 
 
 @pytest.mark.parametrize(
-    "sources",
+    "text,literals",
     [
-        {"source_event_ids": ["legacy-source"]},
-        {"source_refs": [{"event_id": "legacy-source", "actor_id": "self"}]},
+        ("Word里放表格，Alpha=12，Beta=7。", ["Alpha", "12", "Beta", "7"]),
+        ("Word里放表格，逐字保留字符串“Alpha=12”。", ["Alpha=12", "Beta", "7"]),
+        ("用Python运行Alpha=12并计算。", ["Alpha=12", "Beta=7"]),
     ],
 )
-async def test_compact_and_legacy_memory_source_references_remain_usable(environment, sources):
-    context = {
-        **environment.context,
-        "memory": [
-            {"id": "fact-one", "kind": "fact", "author_id": "self", "revision": 1, **sources}
-        ],
-    }
-    candidate = decision(action={"op": "forget", "event_ids": ["legacy-source"]})
-    result = await ModelDecisionProvider(FixtureModel(candidate)).decide(environment.event, context)
-    assert result.action["event_ids"] == ["legacy-source"]
-    with pytest.raises(DomainError):
-        await ModelDecisionProvider(
-            FixtureModel(decision(action={"op": "forget", "event_ids": ["not-in-context"]})),
-            max_retries=0,
-        ).decide(environment.event, context)
-
-
-async def test_owner_assignee_clarification_is_not_suppressed_as_human_chat(environment):
-    event = environment.event.model_copy(update={"text": "让小夏负责主持，但同名不能猜。"})
-    result = await ModelDecisionProvider(
-        FixtureModel(decision("clarify", response="请@你指的那位小夏。", directness="other"))
-    ).decide(event, {**environment.context, "role": "owner"})
-    assert result.kind == "clarify" and result.directness == "open" and result.action is None
-
-
-async def test_unaddressed_invalid_human_assignment_does_not_become_an_intrusive_repair(
-    environment,
-):
-    candidate = decision(
-        action={
-            "op": "assign_task",
-            "title": "文献",
-            "member_id": "unknown",
-            "member_name": "不在名单的人",
-        },
-        directness="other",
-    )
-    model = FixtureModel(candidate)
-    result = await ModelDecisionProvider(model).decide(environment.event, environment.context)
-    assert result.kind == "observe" and result.action is None and len(model.requests) == 1
-
-
-async def test_table_relations_become_cell_literals_without_changing_goal(environment):
-    text = "制作PPT原生表格，数据为Alpha=12、Beta=24、Gamma=36。"
-    proposal = decision(
+def test_table_relations_are_cells_but_verbatim_and_code_stay_literal(environment, text, literals):
+    value = decision(
         "start_work",
         goal=text,
-        outputs=[{"format": "pptx", "expected_text": ["Alpha=12", "Beta=24", "Gamma=36"]}],
+        outputs=[{"format": "docx", "expected_text": ["Alpha=12", "Beta=7"]}],
     )
-    result = await ModelDecisionProvider(FixtureModel(proposal)).decide(
-        environment.event.model_copy(update={"text": text}), environment.context
-    )
-    assert result.goal == text
-    assert result.outputs[0]["expected_text"] == ["Alpha", "12", "Beta", "24", "Gamma", "36"]
+    assert validate(value, environment, text=text).outputs[0]["expected_text"] == literals
 
 
-async def test_explicitly_verbatim_table_adjacent_literal_is_not_weakened(environment):
-    text = "请做一个PPT表格，旁边必须原样写字符串‘Alpha=12’。"
-    proposal = decision(
-        "start_work", goal=text, outputs=[{"format": "pptx", "expected_text": ["Alpha=12"]}]
-    )
-    result = await ModelDecisionProvider(FixtureModel(proposal)).decide(
-        environment.event.model_copy(update={"text": text}), environment.context
-    )
-    assert result.outputs[0]["expected_text"] == ["Alpha=12"]
+def test_named_tool_contracts_are_small_operations_without_decision_routing(environment):
+    schema = business_action_schema(reference_catalog(environment.context, {}))
+    Draft202012Validator.check_schema(schema)
+    assert set(schema["properties"]) == {"action"}
+    assert not Draft202012Validator(schema).is_valid({"kind": "start_work", "goal": "x"})
+    for kind in ("start_work", "update_work", "control_work"):
+        operation = work_action_schema(kind)
+        Draft202012Validator.check_schema(operation)
+        assert not {"kind", "reason_code", "confidence", "directness"} & set(
+            operation["properties"]
+        )
+        assert "action" not in operation["properties"]
+    assert "goal" in work_action_schema("start_work")["required"]
+    assert "work_selector" in work_action_schema("control_work")["required"]
+    Draft202012Validator.check_schema(work_fact_tool_schema())
 
 
-async def test_running_code_is_not_misclassified_as_table_rows(environment):
-    text = "做一个PPT说明运行代码 Alpha=12 的过程。"
-    proposal = decision(
-        "start_work", goal=text, outputs=[{"format": "pptx", "expected_text": ["Alpha=12"]}]
+class ModelFixture:
+    name = "offline-kernel-contract"
+
+    def __init__(self, *steps):
+        self.steps, self.requests = list(steps), []
+
+    async def complete(self, request):
+        self.requests.append(request)
+        step = self.steps.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step(request) if callable(step) else step
+
+
+def text_reply(text):
+    return ModelReply(text=text, usage=TokenUsage(input_tokens=1, output_tokens=1))
+
+
+def tool_reply(name, arguments):
+    if name == "apply_business_action" and "candidate" in arguments:
+        candidate = arguments["candidate"]
+        kind = candidate["kind"]
+        if kind in {"start_work", "update_work", "control_work"}:
+            name = kind
+        arguments = {
+            key: value
+            for key, value in candidate.items()
+            if key not in {"kind", "reason_code", "directness", "confidence"}
+        }
+    return ModelReply(
+        tool_calls=(ModelToolCall(id="synthetic-call", name=name, arguments=arguments),),
+        finish_reason="tool_calls",
+        usage=TokenUsage(input_tokens=1, output_tokens=1),
     )
-    result = await ModelDecisionProvider(FixtureModel(proposal)).decide(
-        environment.event.model_copy(update={"text": text}), environment.context
+
+
+async def test_ordinary_natural_text_survives_without_decision_json_or_actions(environment):
+    answer = "未确认是指缺少结果凭证。原始需求已经记录，不需要你重述。"
+    model = ModelFixture(text_reply(answer))
+    result = await ModelDecisionProvider(model).decide(environment.event, environment.context)
+    assert result.kind == "reply" and result.response == answer and result.action is None
+    request = model.requests[0]
+    assert {tool["function"]["name"] for tool in request.tools} == {
+        "read_work_facts",
+        "start_work",
+        "update_work",
+        "control_work",
+        "apply_business_action",
+        "observe",
+    }
+    assert "Decision schema:" not in request.messages[0].content
+
+
+async def test_invalid_action_is_observation_then_model_answers_current_question(environment):
+    def after_rejection(request):
+        observation = json.loads(request.messages[-1].content)
+        assert observation["status"] == "rejected" and not observation["committed"]
+        assert observation["issues"][0]["code"] == "owner_and_unique_current_member_required"
+        return text_reply("你当前没有给另一位成员分工的权限。")
+
+    model = ModelFixture(
+        tool_reply(
+            "apply_business_action",
+            {
+                "candidate": decision(
+                    "command",
+                    action={
+                        "op": "assign_task",
+                        "member_id": "other",
+                        "member_name": "唐禾",
+                        "title": "Synthetic",
+                    },
+                )
+            },
+        ),
+        after_rejection,
     )
-    assert result.outputs[0]["expected_text"] == ["Alpha=12"]
+    provider = ModelDecisionProvider(model)
+    result = await provider.decide(environment.event, environment.context)
+    assert result.response == "你当前没有给另一位成员分工的权限。"
+    assert provider.diagnostics[0]["code"] == "business_action_rejected"
+
+
+async def test_write_host_receipt_precedes_final_natural_response(environment):
+    seen = []
+
+    async def apply(candidate, identifier):
+        seen.append((candidate, identifier))
+        return {"status": "committed", "committed": True, "task_id": "synthetic-task"}
+
+    ctx = {**environment.context, "_apply_business_action": apply}
+
+    def after_commit(request):
+        assert seen and json.loads(request.messages[-1].content)["status"] == "committed"
+        return text_reply("记下了，你负责访谈摘要。")
+
+    model = ModelFixture(
+        tool_reply(
+            "apply_business_action",
+            {"candidate": decision("command", action={"op": "claim_task", "title": "访谈摘要"})},
+        ),
+        after_commit,
+    )
+    result = await ModelDecisionProvider(model).decide(environment.event, ctx)
+    assert result.response == "记下了，你负责访谈摘要。" and result.action is None
+
+
+async def test_inspection_reads_evidence_then_preserves_question_specific_reply(environment):
+    seen = []
+
+    async def read(selector, evidence):
+        seen.append((selector.title_query, evidence))
+        return {"facts": [{"id": "work-report", "state": "paused", "artifacts": {"items": []}}]}
+
+    def answer(request):
+        assert seen == [("报告", True)]
+        assert json.loads(request.messages[-1].content)["facts"][0]["state"] == "paused"
+        return text_reply("我查了记录，尚无已验证的文档。这次检查没有恢复执行。")
+
+    model = ModelFixture(
+        tool_reply(
+            "read_work_facts",
+            {
+                "selector": {"basis": "query", "title_query": "报告", "states": []},
+                "include_evidence": True,
+            },
+        ),
+        answer,
+    )
+    result = await ModelDecisionProvider(model).decide(
+        environment.event, {**environment.context, "_read_work_facts": read}
+    )
+    assert result.response == "我查了记录，尚无已验证的文档。这次检查没有恢复执行。"
+
+
+@pytest.mark.parametrize(
+    "failure", [DomainError("budget_exhausted", "fixture"), asyncio.CancelledError()]
+)
+async def test_provider_failure_or_cancellation_never_becomes_an_action(environment, failure):
+    model = ModelFixture(failure)
+    with pytest.raises(type(failure)):
+        await ModelDecisionProvider(model).decide(environment.event, environment.context)
+    assert len(model.requests) == 1
+
+
+async def test_kernel_timeout_remains_a_retryable_foreground_dependency_failure(environment):
+    model = ModelFixture(TimeoutError())
+    with pytest.raises(DomainError) as error:
+        await ModelDecisionProvider(model).decide(environment.event, environment.context)
+    assert error.value.code == "provider_timeout" and error.value.retryable
+    assert len(model.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "text,capability,output",
+    [
+        ("请实际核对这些观测值是否一致，保留可复现依据。", "compute", "text"),
+        ("把原始材料编排成可编辑的课堂讲义，核对后交付。", "documents", "docx"),
+        ("读取原图中的表格，核对数值再解释。", "image_analysis", "text"),
+    ],
+)
+async def test_named_start_work_primitive_exposes_real_execution_without_decision_wrapper(
+    environment, text, capability, output
+):
+    committed = []
+
+    async def apply(candidate, identifier):
+        committed.append(candidate)
+        assert candidate.kind == "start_work" and candidate.goal == text
+        return {"status": "committed", "committed": True, "work_id": "synthetic-work"}
+
+    def after_commit(request):
+        assert committed and json.loads(request.messages[-1].content)["status"] == "committed"
+        return text_reply("已委派实际执行，结果会以执行和检查凭证为准。")
+
+    proposal = ModelReply(
+        tool_calls=(
+            ModelToolCall(
+                id="actual-delegation",
+                name="start_work",
+                arguments={
+                    "goal": text,
+                    "work_capabilities": [capability],
+                    "outputs": [{"format": output}],
+                },
+            ),
+        ),
+        finish_reason="tool_calls",
+        usage=TokenUsage(input_tokens=1, output_tokens=1),
+    )
+    model = ModelFixture(proposal, after_commit)
+    current = environment.event.model_copy(update={"text": text})
+    result = await ModelDecisionProvider(model).decide(
+        current, {**environment.context, "_apply_business_action": apply}
+    )
+    assert result.response == "已委派实际执行，结果会以执行和检查凭证为准。"
+    assert committed[0].work_capabilities == [capability]
+    schema = next(
+        tool["function"]["parameters"]
+        for tool in model.requests[0].tools
+        if tool["function"]["name"] == "start_work"
+    )
+    assert {"goal", "work_capabilities"} <= set(schema["required"])
+    assert "candidate" not in schema["properties"] and "kind" not in schema["properties"]

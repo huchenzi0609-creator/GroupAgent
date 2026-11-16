@@ -681,7 +681,8 @@ class UnitOfWork:
     def list_pending_events(self, limit: int = 100) -> list[GroupEvent]:
         rows = self.conn.execute(
             "SELECT e.body FROM ga_events e WHERE e.group_id = %s AND e.memory_state='active' AND NOT EXISTS "
-            "(SELECT 1 FROM ga_decisions d WHERE d.group_id = e.group_id AND d.event_id = e.id) "
+            "(SELECT 1 FROM ga_decisions d WHERE d.group_id = e.group_id AND d.event_id = e.id "
+            "AND d.body->>'agent_pending_response' IS DISTINCT FROM 'true') "
             "ORDER BY e.sequence LIMIT %s",
             (self.group_id, min(max(limit, 1), 1000)),
         ).fetchall()

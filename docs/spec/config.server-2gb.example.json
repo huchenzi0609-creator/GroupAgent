@@ -97,12 +97,12 @@
     "image_generation": "NOT_IN_CURRENT_SCOPE"
   },
   "engine": {
-    "candidate": "deepseek_harness",
+    "candidate": "langgraph",
     "approved_runtime_version": null,
     "extra_session_log_upload": false
   },
   "runtime": {
-    "engine": "scoped",
+    "engine": "langgraph",
     "bot_name": "Pot",
     "bot_aliases": [
       "机器人",

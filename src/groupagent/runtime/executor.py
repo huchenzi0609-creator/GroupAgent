@@ -30,15 +30,23 @@ from groupagent.domain import (
     WorkOrder,
     WorkState,
 )
-from groupagent.execution import EngineCheckpoint, EnginePort, ModelMessage, RunSnapshot, RunState
-from groupagent.execution.engine import SYSTEM_PROMPT, ScopedToolEngine
-from groupagent.execution.harness import HarnessEngine
+from groupagent.execution import (
+    EngineCheckpoint,
+    EnginePort,
+    ModelMessage,
+    RunSnapshot,
+    RunState,
+    is_fenced_inference_checkpoint,
+    reconcile_fenced_inference_checkpoint,
+)
+from groupagent.execution.engine import SYSTEM_PROMPT
 from groupagent.execution.models import EngineEvent, PendingInput, ProgressPayload, UsageTotals
 from groupagent.persistence import PostgresStore
 from groupagent.resources import ResourceDeferred
 from groupagent.sandbox import DockerSandbox
 from groupagent.security import redact_credentials
 
+from .checkpoint_codec import encode_checkpoint
 from .contracts import (
     ActorResolver,
     CandidateValidator,
@@ -48,10 +56,15 @@ from .contracts import (
     ValidatedCandidate,
 )
 from .recovery import (
+    RECONCILIATION_CODES,
+    RECONCILIATION_SCOPE_KEY,
     RECOVERY_SCOPE_KEY,
+    checkpoint_digest,
     input_signature,
     is_automatic_recovery_reason,
+    plan_reconciliation,
     plan_recovery,
+    reconciliation_metadata,
     recovery_block_reason,
     recovery_due,
     recovery_metadata,
@@ -64,6 +77,11 @@ _CLOSED = {WorkState.COMPLETED, WorkState.CANCELLED, WorkState.FAILED}
 _RACES = {"stale_lease", "lease_busy", "lease_active", "version_conflict"}
 _PREPARATION = "_runtime_preparation"
 _RESOURCE_WAIT = "_runtime_resource_wait"
+_RECONCILIATION_ALIASES = {
+    "delivery_unknown": "delivery_uncertain",
+    "recovery_required": "reconciliation_required",
+    "work_busy": "reconciliation_required",
+}
 
 
 @dataclass
@@ -109,6 +127,10 @@ class WorkSupervisor:
         resource_retry_seconds: float = 5,
         execution_backend: str | None = None,
         release_attempt: Callable[[str, str], None | Awaitable[None]] | None = None,
+        reconcile_checkpoint: Callable[
+            [WorkOrder, EngineCheckpoint, ActorContext], Awaitable[EngineCheckpoint | None]
+        ]
+        | None = None,
     ) -> None:
         if (
             not 0 < heartbeat_seconds < lease_seconds <= 300
@@ -124,7 +146,7 @@ class WorkSupervisor:
             raise ValueError("Preparation and attachment waiting must be bounded")
         if not math.isfinite(resource_retry_seconds) or not 0 < resource_retry_seconds <= 3600:
             raise ValueError("Resource retries must have a bounded positive delay")
-        if execution_backend not in {None, "scoped", "harness"}:
+        if execution_backend not in {None, "scoped", "harness", "langgraph"}:
             raise ValueError("Unknown execution backend")
         root = workspace_root.absolute()
         if root != root.resolve() or root.is_symlink():
@@ -143,8 +165,11 @@ class WorkSupervisor:
         self.resource_ready = resource_ready
         self.work_ready = work_ready
         self.resource_retry_seconds = resource_retry_seconds
-        self.execution_backend = execution_backend
+        self.execution_backend = "langgraph" if execution_backend == "scoped" else execution_backend
         self.release_attempt = release_attempt
+        self.reconcile_checkpoint = reconcile_checkpoint or getattr(
+            factory, "reconcile_checkpoint", None
+        )
         self._task: asyncio.Task[WorkOrder | None] | None = None
         self._owned: _Owned | None = None
         self._delivering: dict[str, _Owned] = {}
@@ -212,12 +237,46 @@ class WorkSupervisor:
     def _pause(
         self, actor: ActorContext, work_id: str, reason: str, *, lease: ExecutionLease | None = None
     ) -> None:
+        reason = _RECONCILIATION_ALIASES.get(reason, reason)
         with self.store.transaction(actor) as tx:
             work = tx.get_work(work_id)
             if work.state in _CLOSED or work.state == WorkState.PAUSED:
                 return
             if lease is not None:
                 tx.assert_lease(lease)
+            if (
+                work.state == WorkState.DELIVERING
+                and is_automatic_recovery_reason(reason)
+                and any(
+                    state in {DeliveryState.UNKNOWN, DeliveryState.DISPATCHING}
+                    for state in tx.delivery_states(work.id, goal_revision=work.goal_revision)
+                )
+            ):
+                # A closing controller may release delivery supervision, but
+                # cannot turn an already submitted native send into execution.
+                reason = "delivery_uncertain"
+            if is_automatic_recovery_reason(reason):
+                checkpoint = self.state._load_checkpoint_in_tx(tx, actor, work_id)
+                preparation = self._preparation(work)
+                if (
+                    checkpoint is not None
+                    and safe_recovery_checkpoint(checkpoint)
+                    and checkpoint.revision == work.goal_revision
+                ) or (
+                    checkpoint is None
+                    and preparation.get("stage") == "failed"
+                    and preparation.get("error_code") == reason
+                ):
+                    self._queue_recovery(tx, work, reason, checkpoint=checkpoint, lease=lease)
+                    return
+            if reason in RECONCILIATION_CODES:
+                metadata = plan_reconciliation(work, reason)
+                tx.conn.execute(
+                    "UPDATE ga_work_orders SET scope=jsonb_set(scope,%s,%s),revision=revision+1 "
+                    "WHERE group_id=%s AND id=%s",
+                    ([RECONCILIATION_SCOPE_KEY], Jsonb(metadata), actor.group_id, work_id),
+                )
+                work = tx.get_work(work_id)
             tx.transition_work(
                 work_id,
                 WorkState.PAUSED,
@@ -243,6 +302,7 @@ class WorkSupervisor:
                 return 0
             self._wake_preparation()
             self._wake_reconciled()
+            await self._wake_reconciliation()
             self._wake_resources()
             self._wake_recovery()
             if not self._resources_ready():
@@ -277,6 +337,62 @@ class WorkSupervisor:
             self._starting_work_id, self._starting_process = works[0].id, process
             self._task = asyncio.create_task(self._execute(works[0], process))
             return 1
+
+    def _queue_recovery(
+        self,
+        tx,
+        work: WorkOrder,
+        reason: str,
+        *,
+        checkpoint: EngineCheckpoint | None,
+        lease: ExecutionLease | None = None,
+        diagnostic: str = "",
+    ) -> WorkOrder:
+        """Release one activation with its next wake in the same DB transaction."""
+        failure_key = (
+            f"{checkpoint.request.attempt_id}:{checkpoint.sequence}:{reason}"
+            if checkpoint is not None
+            else f"{self._preparation(work).get('attempt_id', work.id)}:{reason}"
+        )
+        metadata = plan_recovery(
+            work, reason, failure_key=failure_key, diagnostic=diagnostic, now=datetime.now(UTC)
+        )
+        tx.conn.execute(
+            "UPDATE ga_work_orders SET scope=jsonb_set(scope,%s,%s),revision=revision+1,"
+            "updated_at=clock_timestamp() WHERE group_id=%s AND id=%s",
+            ([RECOVERY_SCOPE_KEY], Jsonb(metadata), work.group_id, work.id),
+        )
+        work = tx.get_work(work.id)
+        if work.state == WorkState.DELIVERING:
+            # The delivery phase owns its lease until explicitly released.
+            # Preserve the candidate and idempotent pending bundle while
+            # atomically moving supervision back into the durable queue.
+            work = tx.transition_work(
+                work.id,
+                WorkState.PAUSED,
+                expected_revision=work.revision,
+                lease=lease,
+                reason=reason,
+            )
+            lease = None
+        if work.state != WorkState.QUEUED:
+            work = tx.transition_work(
+                work.id,
+                WorkState.QUEUED,
+                expected_revision=work.revision,
+                lease=lease,
+                reason="external_result"
+                if work.state == WorkState.WAITING_EXTERNAL
+                else "recovery",
+            )
+        tx._audit(
+            "work_recovery_scheduled",
+            work.id,
+            error_code=reason,
+            next_retry_at=metadata["next_retry_at"],
+            backoff_step=metadata["backoff_step"],
+        )
+        return work
 
     async def run_once(self) -> WorkOrder | None:
         await self.tick()
@@ -544,7 +660,7 @@ class WorkSupervisor:
             or value.get("stage")
             not in {"inflight", "ready", "waiting", "input_required", "failed"}
             or type(value.get("attempts")) is not int
-            or not 1 <= value["attempts"] <= 2
+            or not 1 <= value["attempts"] <= 1_000_000
             or type(value.get("usage_floor")) not in (float, int)
             or not math.isfinite(value["usage_floor"])
             or value["usage_floor"] < 0
@@ -686,7 +802,7 @@ class WorkSupervisor:
     def _checkpoint_backend(checkpoint: EngineCheckpoint) -> str:
         backend = checkpoint.backend_state
         explicit = backend.get("execution_backend")
-        if isinstance(explicit, str) and explicit in {"scoped", "harness"}:
+        if isinstance(explicit, str) and explicit in {"scoped", "harness", "langgraph"}:
             return explicit
         if explicit is not None:
             raise DomainError("checkpoint_backend_mismatch", "Checkpoint backend is unrecognized")
@@ -694,25 +810,28 @@ class WorkSupervisor:
         # A safe legacy native checkpoint cannot be resumed by the host loop.
         if "sessions" in backend or backend.get("version") == "0.2.2rc2":
             return "harness"
+        if backend.get("engine") == "langgraph":
+            return "langgraph"
         return "scoped"
 
     def _check_backend(self, checkpoint: EngineCheckpoint) -> None:
         if (
             self.execution_backend is not None
             and self._checkpoint_backend(checkpoint) != self.execution_backend
+            and not (
+                self.execution_backend == "langgraph"
+                and self._checkpoint_backend(checkpoint) == "scoped"
+                and safe_recovery_checkpoint(checkpoint)
+            )
         ):
             raise DomainError(
                 "checkpoint_backend_mismatch", "Checkpoint requires its original execution backend"
             )
 
     def _tag_backend(self, checkpoint: EngineCheckpoint, engine: EnginePort) -> EngineCheckpoint:
-        backend = (
-            "harness"
-            if isinstance(engine, HarnessEngine)
-            else "scoped"
-            if isinstance(engine, ScopedToolEngine)
-            else self.execution_backend
-        )
+        backend = getattr(engine, "execution_backend", self.execution_backend)
+        if backend not in {None, "langgraph", "harness"}:
+            raise DomainError("checkpoint_backend_mismatch", "Prepared backend is unrecognized")
         if self.execution_backend is not None and backend != self.execution_backend:
             raise DomainError("checkpoint_backend_mismatch", "Prepared execution backend differs")
         if backend is None:
@@ -728,10 +847,6 @@ class WorkSupervisor:
             old = self._preparation(current)
             signature = self._input_signature(current)
             same = old.get("input_signature") == signature
-            if same and old.get("stage") == "input_required" and old.get("attempts") == 2:
-                raise DomainError(
-                    "attachment_retry_exhausted", "Provide new available material before retrying"
-                )
             local_floor = self._usage_floor.get(current.id)
             base = max(
                 checkpoint.usage.active_seconds if checkpoint else 0,
@@ -744,17 +859,11 @@ class WorkSupervisor:
             # veto fresh preparation before that policy can be applied.
             waiting = same and old.get("stage") == "waiting"
             stamp = datetime.now(UTC)
-            if waiting and stamp >= datetime.fromisoformat(old["deadline_at"]):
-                raise DomainError("attachment_wait_timeout", "Provide a new available attachment")
             if waiting and stamp < datetime.fromisoformat(old["next_retry_at"]):
                 raise DomainError(
                     "attachment_backoff", "Attachment preparation is waiting for its retry time"
                 )
-            attempts = int(old["attempts"]) + 1 if waiting else 1
-            if attempts > 2:
-                raise DomainError(
-                    "attachment_retry_exhausted", "Attachment preparation retry limit reached"
-                )
+            attempts = min(int(old["attempts"]) + 1, 1_000_000) if waiting else 1
             deadline = (
                 old["deadline_at"]
                 if waiting
@@ -803,21 +912,13 @@ class WorkSupervisor:
             code = error.code if error else None
             if code == "attachment_pending":
                 now = datetime.now(UTC)
-                deadline = datetime.fromisoformat(metadata["deadline_at"])
-                if metadata["attempts"] >= 2 or now >= deadline:
-                    target = WorkState.WAITING_INPUT
-                    code = (
-                        "attachment_retry_exhausted"
-                        if metadata["attempts"] >= 2
-                        else "attachment_wait_timeout"
-                    )
-                    metadata["stage"] = "input_required"
-                else:
-                    target = WorkState.WAITING_EXTERNAL
-                    metadata["stage"] = "waiting"
-                    metadata["next_retry_at"] = min(
-                        deadline, now + timedelta(seconds=self.attachment_retry_seconds)
-                    ).isoformat()
+                target = WorkState.WAITING_EXTERNAL
+                metadata["stage"] = "waiting"
+                delay = min(
+                    self.attachment_retry_seconds * 2 ** min(metadata["attempts"] - 1, 6),
+                    self.attachment_wait_seconds,
+                )
+                metadata["next_retry_at"] = (now + timedelta(seconds=delay)).isoformat()
             elif code in {
                 "attachment_expired",
                 "attachment_unavailable",
@@ -881,33 +982,12 @@ class WorkSupervisor:
                             reason="policy_changed",
                         )
                         continue
-                    current = tx.transition_work(
+                    tx.transition_work(
                         current.id,
                         WorkState.QUEUED,
                         expected_revision=current.revision,
                         reason="external_result",
                     )
-                    if now >= datetime.fromisoformat(metadata["deadline_at"]):
-                        # The state machine permits this atomic two-step path;
-                        # no other process can observe/intercept the queued state.
-                        metadata.update(
-                            stage="input_required", error_code="attachment_wait_timeout"
-                        )
-                        tx.conn.execute(
-                            "UPDATE ga_work_orders SET scope=jsonb_set(scope,%s,%s) WHERE group_id=%s AND id=%s",
-                            ([_PREPARATION], Jsonb(metadata), actor.group_id, current.id),
-                        )
-                        tx.transition_work(
-                            current.id,
-                            WorkState.WAITING_INPUT,
-                            expected_revision=current.revision,
-                            reason="attachment_wait_timeout",
-                        )
-                        tx._audit(
-                            "attachment_wait_expired",
-                            current.id,
-                            instruction="Provide new available material",
-                        )
             except DomainError as error:
                 if error.code not in _RACES:
                     self._alert(error.code, work.id)
@@ -953,24 +1033,200 @@ class WorkSupervisor:
 
     def _hold_recovery(self, work: WorkOrder, reason: str) -> None:
         """Replace an obsolete transient reason once a durable safety blocker is found."""
+        reason = _RECONCILIATION_ALIASES.get(reason, reason)
         try:
             with self.store.transaction(self.control_actor) as tx:
                 current = tx.get_work(work.id)
                 if (
                     current.state != WorkState.PAUSED
                     or current.revision != work.revision
-                    or not is_automatic_recovery_reason(current.pause_reason)
+                    or not (
+                        is_automatic_recovery_reason(current.pause_reason)
+                        or current.pause_reason in RECONCILIATION_CODES
+                        or current.pause_reason in _RECONCILIATION_ALIASES
+                    )
                 ):
                     return
+                scope = current.scope
+                if reason in RECONCILIATION_CODES:
+                    scope = {
+                        **scope,
+                        RECONCILIATION_SCOPE_KEY: plan_reconciliation(current, reason),
+                    }
                 tx.conn.execute(
-                    "UPDATE ga_work_orders SET pause_reason=%s,revision=revision+1,"
+                    "UPDATE ga_work_orders SET pause_reason=%s,scope=%s,revision=revision+1,"
                     "updated_at=clock_timestamp() WHERE group_id=%s AND id=%s",
-                    (reason, self.control_actor.group_id, work.id),
+                    (reason, Jsonb(scope), self.control_actor.group_id, work.id),
                 )
                 tx._audit("work_recovery_blocked", work.id, reason=reason)
         except DomainError:
             # Diagnostics cannot bypass a revoked control identity either.
             pass
+
+    async def _wake_reconciliation(self) -> None:
+        """Inspect uncertain effects on a durable cadence; never replay them here."""
+        with self.store.transaction(self.control_actor) as tx:
+            paused = tx.list_work(state=WorkState.PAUSED, limit=1000)
+        inspected = False
+        for work in paused:
+            if inspected:
+                # Keep delivery lease heartbeats and ordinary intake responsive
+                # even when many old receipt services are unavailable at once.
+                return
+            if work.pause_reason in _RECONCILIATION_ALIASES:
+                self._hold_recovery(work, _RECONCILIATION_ALIASES[work.pause_reason])
+                continue
+            reason = work.pause_reason
+            if (
+                reason not in RECONCILIATION_CODES
+                or work.id in self._quiescence_owned
+                or work.id in self._delivering
+            ):
+                continue
+            try:
+                metadata = reconciliation_metadata(work)
+                now = datetime.now(UTC)
+                if (
+                    metadata
+                    and metadata["goal_revision"] == work.goal_revision
+                    and metadata["reason"] == reason
+                    and now < datetime.fromisoformat(metadata["next_check_at"])
+                ):
+                    continue
+                actor = self.resolve_actor(work.requester_id)
+                if actor.group_id != work.group_id or actor.member_id != work.requester_id:
+                    raise DomainError("scope_violation", "Reconciliation requester changed")
+                with self.store.transaction(actor) as tx:
+                    current = tx.get_work(work.id)
+                    if current.revision != work.revision or current.state != WorkState.PAUSED:
+                        continue
+                    if current.policy_revision != actor.policy_revision:
+                        raise DomainError("policy_changed", "Reconciliation policy is stale")
+                    planned = plan_reconciliation(current, str(reason), now=now)
+                    tx.conn.execute(
+                        "UPDATE ga_work_orders SET scope=jsonb_set(scope,%s,%s),revision=revision+1 "
+                        "WHERE group_id=%s AND id=%s",
+                        ([RECONCILIATION_SCOPE_KEY], Jsonb(planned), actor.group_id, work.id),
+                    )
+                    work = tx.get_work(work.id)
+                    tx._audit(
+                        "work_reconciliation_scheduled",
+                        work.id,
+                        reason=reason,
+                        next_check_at=planned["next_check_at"],
+                    )
+                    # An expired lease is a fence, not proof that a foreign
+                    # controller stopped. Do not kill/reconcile its children
+                    # while its heavy-worker process lease is still valid.
+                    foreign = tx.conn.execute(
+                        "SELECT 1 FROM ga_process_leases WHERE group_id=%s AND name='heavy-worker' "
+                        "AND owner_id<>%s AND expires_at>clock_timestamp()",
+                        (actor.group_id, self.worker_id),
+                    ).fetchone()
+                    row = tx._work_row(work.id)
+                    if foreign or (
+                        row["lease_expires_at"] is not None
+                        and row["lease_expires_at"] > row["db_now"]
+                    ):
+                        continue
+                checkpoint = self.state.load_checkpoint(actor, work.id)
+                if checkpoint is None:
+                    continue
+                if is_fenced_inference_checkpoint(checkpoint):
+                    # This queues a claim, not a replay. Only _execute may
+                    # convert a pure inference marker, after acquiring the
+                    # next durable work lease/fencing token. No physical-stop
+                    # claim is made about the old model HTTP task here.
+                    with self.store.transaction(actor) as tx:
+                        current = tx.get_work(work.id)
+                        if current.revision != work.revision or current.state != WorkState.PAUSED:
+                            continue
+                        self._queue_recovery(tx, current, "worker_lost", checkpoint=checkpoint)
+                        tx._audit(
+                            "work_inference_fencing_scheduled",
+                            work.id,
+                            checkpoint_digest=checkpoint_digest(checkpoint),
+                        )
+                    continue
+                reconciler = self.reconcile_checkpoint
+                if reconciler is None:
+                    continue
+                inspected = True
+
+                async def inspect_effect(
+                    actor=actor, work=work, checkpoint=checkpoint, reconciler=reconciler
+                ):
+                    await DockerSandbox.quiesce_work(actor.group_id, work.id)
+                    return await reconciler(work, checkpoint, actor)
+
+                reconciled = await asyncio.wait_for(
+                    inspect_effect(),
+                    timeout=min(self.cancel_grace_seconds, max(self.heartbeat_seconds, 0.1)),
+                )
+                if reconciled is None:
+                    continue
+                if (
+                    not safe_recovery_checkpoint(reconciled)
+                    or reconciled.request != checkpoint.request
+                    or reconciled.revision != checkpoint.revision
+                    or reconciled.usage != checkpoint.usage
+                    or reconciled.sequence <= checkpoint.sequence
+                ):
+                    raise DomainError("recovery_required", "Reconciliation changed task authority")
+                with self.store.transaction(actor) as tx:
+                    current = tx.get_work(work.id)
+                    if current.revision != work.revision or current.state != WorkState.PAUSED:
+                        continue
+                    old = tx.conn.execute(
+                        "SELECT * FROM ga_runtime_checkpoints WHERE group_id=%s AND work_id=%s "
+                        "AND attempt_id=%s FOR UPDATE",
+                        (actor.group_id, work.id, checkpoint.request.attempt_id),
+                    ).fetchone()
+                    if old is None or self.state._decode_checkpoint(old["body"]) != checkpoint:
+                        continue
+                    # Retain the entire original evidence before a compatibility
+                    # checkpoint is updated. There is no destructive state reset.
+                    tx._audit(
+                        "work_effect_reconciled",
+                        work.id,
+                        checkpoint_digest=checkpoint_digest(checkpoint),
+                        prior_checkpoint=old["body"],
+                        evidence=reconciled.backend_state.get("effect_reconciliation", {}),
+                    )
+                    tx.conn.execute(
+                        "UPDATE ga_runtime_checkpoints SET body=%s,sequence=%s,"
+                        "saved_at=clock_timestamp() WHERE group_id=%s AND work_id=%s AND attempt_id=%s",
+                        (
+                            Jsonb(encode_checkpoint(reconciled)),
+                            reconciled.sequence,
+                            actor.group_id,
+                            work.id,
+                            checkpoint.request.attempt_id,
+                        ),
+                    )
+                    tx.conn.execute(
+                        "UPDATE ga_work_orders SET scope=scope-%s,revision=revision+1 "
+                        "WHERE group_id=%s AND id=%s",
+                        (RECONCILIATION_SCOPE_KEY, actor.group_id, work.id),
+                    )
+                    current = tx.get_work(work.id)
+                    self._queue_recovery(tx, current, "worker_lost", checkpoint=reconciled)
+            except DomainError as error:
+                if error.code in {
+                    "policy_changed",
+                    "source_unavailable",
+                    "scope_violation",
+                    "permission_denied",
+                    "auth_required",
+                    "checkpoint_backend_mismatch",
+                }:
+                    self._hold_recovery(work, error.code)
+                if error.code not in _RACES | {"recovery_required", "work_busy"}:
+                    self._alert(error.code, work.id)
+            except Exception:
+                # The next inspection time is already durable. An unavailable
+                # receipt service must not cause a hot loop or free a fence.
+                self._alert("reconciliation_failed", work.id)
 
     def _wake_recovery(self) -> None:
         """Retry safe anomalies durably, with backoff and a fresh authorization check."""
@@ -1072,13 +1328,14 @@ class WorkSupervisor:
                             backoff_step=planned["backoff_step"],
                         )
                         current = tx.get_work(work.id)
-                    if recovery_due(current, now=datetime.now(UTC)):
-                        tx.transition_work(
-                            current.id,
-                            WorkState.QUEUED,
-                            expected_revision=current.revision,
-                            reason="recovery",
-                        )
+                    # Queue state and its durable deadline are independent:
+                    # intake checks recovery_due before claiming an activation.
+                    tx.transition_work(
+                        current.id,
+                        WorkState.QUEUED,
+                        expected_revision=current.revision,
+                        reason="recovery",
+                    )
             except DomainError as error:
                 if error.code not in _RACES:
                     self._hold_recovery(work, error.code)
@@ -1089,6 +1346,7 @@ class WorkSupervisor:
         metadata = recovery_metadata(work)
         if (
             not metadata
+            or metadata.get("error_code") in {"activation_yielded", "billing_unavailable"}
             or metadata["goal_revision"] != work.goal_revision
             or metadata["input_signature"] != input_signature(work)
             or checkpoint.state == RunState.CANDIDATE
@@ -1140,6 +1398,91 @@ class WorkSupervisor:
             checkpoint = self.state.load_checkpoint(actor, initial.id)
             if checkpoint is not None:
                 self._check_backend(checkpoint)
+            if (
+                checkpoint is not None
+                and is_fenced_inference_checkpoint(checkpoint)
+                and initial.state in {WorkState.QUEUED, WorkState.RUNNING}
+            ):
+                # An inference request has no external business write. A fresh
+                # database lease fences all checkpoint/tool/delivery mutations
+                # by the old controller even if its HTTP request finishes late.
+                # This does not attest physical worker/controller termination
+                # and never applies to an unresolved tool or native send.
+                with self.store.transaction(actor) as tx:
+                    current = tx.get_work(initial.id)
+                    if current.revision != initial.revision:
+                        raise DomainError(
+                            "version_conflict", "Work changed before inference fencing"
+                        )
+                    if any(
+                        state in {DeliveryState.UNKNOWN, DeliveryState.DISPATCHING}
+                        for state in tx.delivery_states(
+                            current.id, goal_revision=current.goal_revision
+                        )
+                    ):
+                        raise DomainError(
+                            "delivery_unknown", "A native send requires reconciliation"
+                        )
+                    previous = tx._work_row(initial.id)
+                    lease = tx.claim_work(
+                        initial.id,
+                        self.worker_id,
+                        ttl_seconds=self.lease_seconds,
+                        recovery_evidence_ref="pure-inference-fence:"
+                        + checkpoint_digest(checkpoint),
+                    )
+                    work = tx.get_work(initial.id)
+                    tx._audit(
+                        "work_inference_fenced",
+                        initial.id,
+                        prior_attempt_id=checkpoint.request.attempt_id,
+                        attempt_id=lease.attempt_id,
+                        prior_fencing_token=previous["fencing_token"],
+                        fencing_token=lease.fencing_token,
+                        checkpoint_digest=checkpoint_digest(checkpoint),
+                        prior_checkpoint=encode_checkpoint(checkpoint),
+                        evidence="fresh_database_lease_fences_old_inference_controller",
+                    )
+                owned = _Owned(work, actor, lease, process, self._workspace(work), time.monotonic())
+                self._owned = owned
+                previous_revision = checkpoint.revision
+                checkpoint = reconcile_fenced_inference_checkpoint(checkpoint)
+                pending = checkpoint.pending_inputs
+                if previous_revision != work.goal_revision:
+                    pending += (
+                        PendingInput(
+                            revision=work.goal_revision,
+                            input_id=f"objective:{work.id}:{work.goal_revision}",
+                            text=(
+                                "Accepted objective revision: "
+                                + work.goal
+                                + "\nAcceptance criteria: "
+                                + json.dumps(work.acceptance_criteria, ensure_ascii=False)
+                            ),
+                        ),
+                    )
+                checkpoint = checkpoint.model_copy(
+                    update={
+                        "request": checkpoint.request.model_copy(
+                            update={
+                                "attempt_id": lease.attempt_id,
+                                "actor": actor,
+                                "objective": work.goal,
+                                "revision": work.goal_revision,
+                                "workspace": owned.workspace,
+                            }
+                        ),
+                        "revision": work.goal_revision,
+                        "sequence": 0,
+                        "pending_inputs": pending,
+                    }
+                )
+                # Persist the recoverable accounting continuation before the
+                # factory or another provider can run. The old attempt's row
+                # and its original uncertain charge remain untouched.
+                self.state.save_checkpoint(
+                    actor, lease, checkpoint, source_event_ids=self._source_ids(work)
+                )
             if self._preparation(initial).get("stage") == "inflight":
                 self._pause(actor, initial.id, "preparation_reconciliation_required")
                 self._alert("preparation_reconciliation_required", initial.id)
@@ -1156,9 +1499,9 @@ class WorkSupervisor:
             if initial.state != WorkState.QUEUED and checkpoint is None:
                 self._pause(actor, initial.id, "reconciliation_required")
                 return self._get(actor, initial.id)
-            if initial.state == WorkState.DELIVERING and checkpoint:
+            if owned is None and initial.state == WorkState.DELIVERING and checkpoint:
                 try:
-                    lease = self.state.recover_phase(
+                    recovered_lease = self.state.recover_phase(
                         actor,
                         initial.id,
                         expected_revision=initial.revision,
@@ -1171,16 +1514,17 @@ class WorkSupervisor:
                         self._pause(actor, initial.id, "delivery_uncertain")
                         return self._get(actor, initial.id)
                     raise
-                if not isinstance(lease, ExecutionLease):
+                if not isinstance(recovered_lease, ExecutionLease):
                     raise DomainError(
                         "reconciliation_required", "Delivery supervision was not claimed"
                     )
+                lease = recovered_lease
                 work = self._get(actor, initial.id)
                 owned = _Owned(work, actor, lease, process, self._workspace(work), time.monotonic())
                 self._owned = owned
                 self._delivering[work.id] = owned
                 return work
-            if initial.state != WorkState.QUEUED and checkpoint:
+            if owned is None and initial.state != WorkState.QUEUED and checkpoint:
                 # An expired owner is an anomaly too. Persist a recovery wait
                 # before creating another paid attempt after a crash/restart.
                 uncertain = any(
@@ -1194,24 +1538,43 @@ class WorkSupervisor:
                         and abandoned["lease_expires_at"] > abandoned["db_now"]
                     ):
                         raise DomainError("lease_active", "Another execution owner is still active")
-                    tx.transition_work(
+                    current = tx.transition_work(
                         initial.id,
                         WorkState.PAUSED,
                         expected_revision=initial.revision,
                         reason="delivery_uncertain" if uncertain else "worker_lost",
                     )
+                    if uncertain:
+                        metadata = plan_reconciliation(current, "delivery_uncertain")
+                        tx.conn.execute(
+                            "UPDATE ga_work_orders SET scope=jsonb_set(scope,%s,%s) "
+                            "WHERE group_id=%s AND id=%s",
+                            (
+                                [RECONCILIATION_SCOPE_KEY],
+                                Jsonb(metadata),
+                                actor.group_id,
+                                initial.id,
+                            ),
+                        )
+                    else:
+                        self._queue_recovery(tx, current, "worker_lost", checkpoint=checkpoint)
                 return self._get(actor, initial.id)
-            work = initial
-            with self.store.transaction(actor) as tx:
-                lease = tx.claim_work(
-                    work.id,
-                    self.worker_id,
-                    ttl_seconds=self.lease_seconds,
-                    recovery_evidence_ref=f"runtime-checkpoint:{work.id}" if checkpoint else None,
-                )
-                work = tx.get_work(work.id)
-            owned = _Owned(work, actor, lease, process, self._workspace(work), time.monotonic())
-            self._owned = owned
+            if owned is None:
+                work = initial
+                with self.store.transaction(actor) as tx:
+                    lease = tx.claim_work(
+                        work.id,
+                        self.worker_id,
+                        ttl_seconds=self.lease_seconds,
+                        recovery_evidence_ref=f"runtime-checkpoint:{work.id}"
+                        if checkpoint
+                        else None,
+                    )
+                    work = tx.get_work(work.id)
+                owned = _Owned(work, actor, lease, process, self._workspace(work), time.monotonic())
+                self._owned = owned
+            else:
+                work, lease = owned.work, owned.lease
 
             allowance = self._begin_preparation(owned, checkpoint)
             work = owned.work
@@ -1349,16 +1712,6 @@ class WorkSupervisor:
                 )
             checkpoint = self._tag_backend(checkpoint, prepared.engine)
             checkpoint = self._recovery_instruction(checkpoint, work)
-            if (
-                request.budget.max_active_seconds is not None
-                and checkpoint.usage.active_seconds >= request.budget.max_active_seconds
-            ):
-                self.state.save_checkpoint(
-                    actor, lease, checkpoint, source_event_ids=self._source_ids(work)
-                )
-                raise DomainError(
-                    "time_budget_exhausted", "Input preparation used the remaining active time"
-                )
             if checkpoint and checkpoint.state == RunState.CANDIDATE:
                 snapshot = self._snapshot(checkpoint)
                 self.state.save_checkpoint(
@@ -1387,6 +1740,23 @@ class WorkSupervisor:
                 self._defer_resources(owned, "execution")
                 return self._get(actor, work.id)
             if snapshot.state != RunState.CANDIDATE:
+                if is_automatic_recovery_reason(snapshot.error_code) and safe_recovery_checkpoint(
+                    snapshot.checkpoint
+                ):
+                    self.state.save_checkpoint(
+                        actor, lease, snapshot.checkpoint, source_event_ids=self._source_ids(work)
+                    )
+                    with self.store.transaction(actor) as tx:
+                        tx.assert_lease(lease)
+                        current = tx.get_work(work.id)
+                        self._queue_recovery(
+                            tx,
+                            current,
+                            str(snapshot.error_code),
+                            checkpoint=snapshot.checkpoint,
+                            lease=lease,
+                        )
+                    return self._get(actor, work.id)
                 with self.store.transaction(actor) as tx:
                     current = tx.get_work(work.id)
                     tx.assert_lease(lease)
@@ -1396,6 +1766,15 @@ class WorkSupervisor:
                         RunState.PAUSED: WorkState.PAUSED,
                         RunState.FAILED: WorkState.FAILED,
                     }.get(snapshot.state, WorkState.FAILED)
+                    if snapshot.error_code in RECONCILIATION_CODES:
+                        state = WorkState.PAUSED
+                        metadata = plan_reconciliation(current, str(snapshot.error_code))
+                        tx.conn.execute(
+                            "UPDATE ga_work_orders SET scope=jsonb_set(scope,%s,%s),revision=revision+1 "
+                            "WHERE group_id=%s AND id=%s",
+                            ([RECONCILIATION_SCOPE_KEY], Jsonb(metadata), actor.group_id, work.id),
+                        )
+                        current = tx.get_work(work.id)
                     if (
                         state == WorkState.WAITING_INPUT
                         and snapshot.checkpoint.input_request is not None
@@ -1436,11 +1815,6 @@ class WorkSupervisor:
             validation_started = time.monotonic()
             owned.validation_started = validation_started
             owned.validation_base = snapshot.usage
-            remaining = (
-                request.budget.max_active_seconds - snapshot.usage.active_seconds
-                if request.budget.max_active_seconds is not None
-                else None
-            )
 
             async def validate() -> ValidatedCandidate:
                 self._require_resources()
@@ -1452,9 +1826,6 @@ class WorkSupervisor:
                 candidate = await self._monitor(
                     asyncio.create_task(validate()),
                     owned,
-                    deadline=validation_started + max(0, remaining)
-                    if remaining is not None
-                    else None,
                 )
                 if (
                     not set(work.required_checks).issubset(candidate.checks)
@@ -1653,16 +2024,7 @@ class WorkSupervisor:
         count = snapshot.checkpoint.backend_state.get("validation_repairs", 0)
         if not isinstance(count, int) or count < 0:
             raise DomainError("recovery_required", "Invalid validation repair counter")
-        budget = snapshot.checkpoint.request.budget
-        repairable = not (
-            (budget.max_rounds is not None and snapshot.usage.rounds >= budget.max_rounds)
-            or (budget.max_tokens is not None and snapshot.usage.tokens >= budget.max_tokens)
-            or (
-                budget.max_active_seconds is not None
-                and snapshot.usage.active_seconds + elapsed >= budget.max_active_seconds
-            )
-        )
-        if not repairable or not safe_recovery_checkpoint(snapshot.checkpoint):
+        if not safe_recovery_checkpoint(snapshot.checkpoint):
             return False
         redacted = redact_credentials(error.message)
         diagnostic = {
@@ -1695,7 +2057,7 @@ class WorkSupervisor:
         wait = count >= self.validation_repair_limit or repeated
         state = {
             **snapshot.checkpoint.backend_state,
-            "validation_repairs": min(count + 1, max(self.validation_repair_limit, 1)),
+            "validation_repairs": min(count + 1, 1_000_000),
             "resume_instruction": feedback,
             "last_validation_failure": diagnostic,
         }
@@ -1744,7 +2106,7 @@ class WorkSupervisor:
                 )
             tx.transition_work(
                 current.id,
-                WorkState.PAUSED if wait else WorkState.QUEUED,
+                WorkState.QUEUED,
                 expected_revision=current.revision,
                 lease=owned.lease,
                 reason="validation_failed" if wait else "validation_retry",
@@ -1809,17 +2171,18 @@ class WorkSupervisor:
                     await self._heartbeat(owned)
                 states = self._delivery_states(owned.actor, current)
                 if any(value in {"unknown", "rejected"} for value in states):
-                    with self.store.transaction(owned.actor) as tx:
-                        current = tx.get_work(work_id)
-                        tx.transition_work(
-                            work_id,
-                            WorkState.FAILED if "rejected" in states else WorkState.PAUSED,
-                            expected_revision=current.revision,
-                            lease=owned.lease,
-                            reason="delivery_rejected"
-                            if "rejected" in states
-                            else "delivery_uncertain",
-                        )
+                    if "rejected" in states:
+                        with self.store.transaction(owned.actor) as tx:
+                            current = tx.get_work(work_id)
+                            tx.transition_work(
+                                work_id,
+                                WorkState.FAILED,
+                                expected_revision=current.revision,
+                                lease=owned.lease,
+                                reason="delivery_rejected",
+                            )
+                    else:
+                        self._pause(owned.actor, work_id, "delivery_uncertain", lease=owned.lease)
                     self._delivering.pop(work_id, None)
                 elif states and all(value == "accepted" for value in states):
                     self.state.load_checkpoint(owned.actor, work_id)

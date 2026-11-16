@@ -1,6 +1,14 @@
-from .engine import ScopedToolEngine
+from .engine import (
+    LangGraphEngine,
+    ScopedToolEngine,
+    accounting_recovery_checkpoint,
+    is_fenced_inference_checkpoint,
+    reconcile_fenced_inference_checkpoint,
+    reconcile_quiesced_inference_checkpoint,
+)
 from .fake import ScriptedFakeModel
 from .harness import HarnessEngine
+from .kernel import AgentKernel, KernelDirective, KernelHooks, KernelResult, KernelTool
 from .models import (
     EngineCheckpoint,
     EngineEvent,
@@ -17,12 +25,18 @@ from .models import (
 from .ports import EnginePort, ModelPort
 
 __all__ = [
+    "AgentKernel",
     "EngineCheckpoint",
     "EngineEvent",
     "EnginePort",
     "ExecutionBudget",
     "ExecutionRequest",
     "HarnessEngine",
+    "KernelDirective",
+    "KernelHooks",
+    "KernelResult",
+    "KernelTool",
+    "LangGraphEngine",
     "ModelMessage",
     "ModelPort",
     "ModelReply",
@@ -33,4 +47,8 @@ __all__ = [
     "ScopedToolEngine",
     "ScriptedFakeModel",
     "TokenUsage",
+    "accounting_recovery_checkpoint",
+    "is_fenced_inference_checkpoint",
+    "reconcile_fenced_inference_checkpoint",
+    "reconcile_quiesced_inference_checkpoint",
 ]

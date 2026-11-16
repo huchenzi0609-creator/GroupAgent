@@ -8,7 +8,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from groupagent.domain import ActorContext, DomainError
-from groupagent.execution.models import ModelReply, ModelRequest
+from groupagent.execution.models import ExecutionRequest, ModelReply, ModelRequest, TokenUsage
 from groupagent.execution.ports import ModelPort, estimate_input_tokens
 
 from .ledger import BudgetLedger
@@ -112,12 +112,16 @@ class LedgerModelBudget:
         self.ledger, self.price_id = ledger, price_id
         self._actors: dict[str, ActorContext] = {}
 
+    @staticmethod
+    def recovery_key(request: ExecutionRequest, *, round_number: int) -> str:
+        return f"engine:{request.work_id}:{request.attempt_id}:{round_number}"
+
     async def reserve(
         self, request, *, round_number: int, input_tokens: int, output_tokens: int
     ) -> str:
         reservation = self.ledger.reserve(
             request.actor,
-            f"engine:{request.work_id}:{request.attempt_id}:{round_number}",
+            self.recovery_key(request, round_number=round_number),
             "text",
             self.price_id,
             {"input_tokens": Decimal(input_tokens), "output_tokens": Decimal(output_tokens)},
@@ -150,3 +154,49 @@ class LedgerModelBudget:
         )
         if result.overrun and result.limits_enabled:
             raise DomainError("budget_exhausted", "Provider usage exceeded its admission")
+
+    async def recover(
+        self, request: ExecutionRequest, reservation_id: str, usage: TokenUsage | None
+    ) -> None:
+        """Settle a persisted engine call after a process restart, without inference.
+
+        The request/checkpoint is supplied by the host. A reservation identifier
+        alone never grants ownership; the durable ledger binds actor and work.
+        Unknown charges remain recorded when no provider usage was preserved.
+        """
+        with self.ledger.store.transaction(request.actor) as tx:
+            work = tx.get_work(request.work_id)
+            if work.requester_id != request.actor.member_id:
+                raise DomainError("permission_denied", "Accounting work belongs to another member")
+            keyed = reservation_id.startswith(f"engine:{request.work_id}:")
+            row = tx.conn.execute(
+                "SELECT id,actor_id,work_id,key,operation,state FROM ga_budget_reservations "
+                + ("WHERE group_id=%s AND key=%s" if keyed else "WHERE group_id=%s AND id=%s"),
+                (request.actor.group_id, reservation_id),
+            ).fetchone()
+            if row is None and keyed and usage is None:
+                # The persisted admission intent preceded reserve(). Its exact
+                # deterministic key has no ledger entry, so no call began.
+                return
+            if (
+                row is None
+                or work.requester_id != request.actor.member_id
+                or row["actor_id"] != request.actor.member_id
+                or row["work_id"] != request.work_id
+                or not row["key"].startswith(f"engine:{request.work_id}:")
+                or row["operation"] != "text"
+                or row["state"] not in {"reserved", "released", "inflight", "unknown", "settled"}
+            ):
+                raise DomainError(
+                    "reconciliation_required", "Persisted accounting call does not match its work"
+                )
+            identifier, state = row["id"], row["state"]
+        if state in {"reserved", "released"}:
+            if usage is not None:
+                raise DomainError(
+                    "reconciliation_required", "Unstarted call cannot have provider usage"
+                )
+            self.ledger.release_unstarted(request.actor, identifier)
+            return
+        self._actors[identifier] = request.actor
+        await self.settle(identifier, usage)

@@ -19,11 +19,11 @@ from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import Decision
 from groupagent.domain import ActorContext, Role, WorkState
-from groupagent.execution import ModelReply, TokenUsage
 from groupagent.memory import MemberService, MemoryService
 from groupagent.runtime.work_facts import WorkFacts
 from groupagent.scheduling import Scheduler
 
+from .foreground_model_fixture import candidate_reply, observation_reply
 from .test_app import event
 
 pytestmark = [pytest.mark.postgres, pytest.mark.work_awareness]
@@ -45,13 +45,12 @@ def harness(env, decide):
             self.requests = []
 
         async def complete(self, request):
+            final = observation_reply(request)
+            if final is not None:
+                return final
             payload = json.loads(request.messages[1].content)
             self.requests.append(payload)
-            decision = decide(payload)
-            return ModelReply(
-                text=decision.model_dump_json(),
-                usage=TokenUsage(input_tokens=1, output_tokens=1),
-            )
+            return candidate_reply(decide(payload))
 
     model = ForegroundFixture()
     provider = ModelDecisionProvider(model)

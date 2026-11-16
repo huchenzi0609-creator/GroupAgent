@@ -196,6 +196,17 @@ class ToolGateway:
             and not definition.may_request_input
         )
 
+    def is_isolated_draft(self, name: str) -> bool:
+        """Reviewed worker effects cross only the declared workspace publication boundary."""
+        definition = self._tools.get(name)
+        return definition is not None and (
+            definition.risk_class == "local_draft"
+            and definition.idempotency_mode == IdempotencyMode.RECONCILE_BEFORE_RETRY
+            and "isolated_worker" in definition.resource_scopes
+            and not definition.control_kind
+            and not definition.may_request_input
+        )
+
     def is_concurrency_safe(self, name: str) -> bool:
         """Only reviewed public reads may overlap; this grants no authority.
 
@@ -554,22 +565,31 @@ class ToolGateway:
             else:
                 result = receipt("unregistered_tool_control", uncertain)
         except ToolFailure as exc:
+            effect = EffectState.NO_EFFECT if exc.no_effect else uncertain
             if exc.output is None:
                 result = receipt(
                     exc.code,
-                    EffectState.NO_EFFECT if exc.no_effect else uncertain,
+                    effect,
                     message=exc.message,
                 )
             else:
-                failed_output = definition.output_model.model_validate(exc.output)
-                if len(failed_output.model_dump_json().encode()) <= definition.max_output_bytes:
-                    result = receipt(
-                        exc.code,
-                        EffectState.NO_EFFECT if exc.no_effect else uncertain,
-                        message=exc.message,
-                    ).model_copy(update={"output": failed_output.model_dump(mode="json")})
-                else:
-                    result = receipt("output_too_large", uncertain)
+                try:
+                    failed_output = definition.output_model.model_validate(exc.output)
+                    if len(failed_output.model_dump_json().encode()) > definition.max_output_bytes:
+                        result = receipt("output_too_large", effect)
+                    else:
+                        result = receipt(exc.code, effect, message=exc.message).model_copy(
+                            update={"output": failed_output.model_dump(mode="json")}
+                        )
+                except Exception:
+                    # Bad diagnostics cannot erase the handler's independently
+                    # established unpublished/rollback fact or escape dispatch.
+                    # Never expose Pydantic errors containing tool output.
+                    result = receipt("invalid_output", effect)
+        except ResourceDeferred:
+            # This trusted control exception attests admission refused before
+            # the effectful operation. It is not a failed/unknown business call.
+            result = receipt("resource_deferred", EffectState.NOT_STARTED)
         except DomainError as exc:
             result = receipt(exc.code, uncertain)
         except Exception:
@@ -600,12 +620,15 @@ class ToolGateway:
                     task.add_done_callback(lambda _finished: reservation.release())
         result = await self._trusted_metadata(result, context)
         if (
+            result.error_code == "resource_deferred"
+            and result.effect_state == EffectState.NOT_STARTED
+        ) or (
             result.control is not None
             and not result.success
             and result.effect_state == EffectState.NO_EFFECT
         ):
-            # No business effect occurred. Fresh, trusted input may permit this
-            # same logical call after resume; never cache a stale question forever.
+            # Fresh capacity/input may permit this same logical call after
+            # resume. A denied admission/question cannot become a cached fence.
             self._ledger.pop(key, None)
         else:
             self._ledger[key] = (fingerprint, result)

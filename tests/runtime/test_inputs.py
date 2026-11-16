@@ -236,7 +236,7 @@ async def test_concurrent_audio_claim_prevents_duplicate_paid_attempt(runtime_en
         await setup.http.aclose()
 
 
-async def test_failures_keep_unknown_cost_and_stop_after_two_attempts(runtime_env):
+async def test_failures_keep_unknown_cost_without_a_total_attempt_cutoff(runtime_env):
     env, captured = runtime_env, []
 
     def response(request):
@@ -246,15 +246,14 @@ async def test_failures_keep_unknown_cost_and_stop_after_two_attempts(runtime_en
     setup = fixture_setup(env, response)
     event = attached(env)
     try:
-        for _ in range(2):
-            with pytest.raises(DomainError):
+        for _ in range(5):
+            with pytest.raises(DomainError) as error:
                 await setup.processor.preprocess_audio(event)
-        with pytest.raises(DomainError) as error:
-            await setup.processor.preprocess_audio(event)
-        assert error.value.code == "input_retry_exhausted"
-        assert len(captured) == 2
+            assert error.value.code != "input_retry_exhausted"
+        assert len(captured) == 5
         assert {row["state"] for row in rows(env, "ga_budget_reservations")} == {"unknown"}
         assert all(row["reserved_amount"] > 0 for row in rows(env, "ga_budget_reservations"))
+        assert len({row["key"] for row in rows(env, "ga_budget_reservations")}) == 5
         assert len(rows(env, "ga_events")) == 1 and not rows(env, "ga_decisions")
         # The successful byte cache survives failures; no second download is necessary.
         assert rows(env, "ga_media_inputs")[0]["body"]["reference"]["sha256"]

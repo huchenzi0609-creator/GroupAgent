@@ -42,6 +42,7 @@ from groupagent.tools import (
 )
 
 from .conftest import source
+from .foreground_model_fixture import candidate_reply, observation_reply
 from .test_app import app_for, event
 from .test_async_delivery_supervision import NativeQueueFixture, prepared_supervisor
 from .test_early_ack import intake
@@ -86,6 +87,9 @@ def foreground_model(harness):
         name = "synthetic-work-awareness-router"
 
         async def complete(self, request):
+            final = observation_reply(request)
+            if final is not None:
+                return final
             payload = json.loads(request.messages[1].content)
             current = payload["event"]
             scenario = harness.scenarios[current["id"]]
@@ -137,9 +141,7 @@ def foreground_model(harness):
                 )
             else:
                 decision = Decision(kind="observe", reason_code="synthetic_peer_conversation")
-            return ModelReply(
-                text=decision.model_dump_json(), usage=TokenUsage(input_tokens=1, output_tokens=1)
-            )
+            return candidate_reply(decision)
 
     return ForegroundModel()
 
@@ -436,11 +438,18 @@ async def test_read_query_refreshes_a_running_to_delivering_race_without_write_c
         base_factory = harness.app.coordinator.provider_factory
 
         class RacingProvider:
+            uses_agent_kernel = True
+
             async def decide(self, current, context):
-                decision = await base_factory(env.actor, current).decide(current, context)
-                harness.image_release.set()
-                assert (await asyncio.wait_for(running, 5)).state == WorkState.DELIVERING
-                return decision
+                original_read = context["_read_work_facts"]
+
+                async def read_after_transition(selector, evidence):
+                    harness.image_release.set()
+                    assert (await asyncio.wait_for(running, 5)).state == WorkState.DELIVERING
+                    return await original_read(selector, evidence)
+
+                context["_read_work_facts"] = read_after_transition
+                return await base_factory(env.actor, current).decide(current, context)
 
         harness.app.coordinator.provider_factory = lambda *_: RacingProvider()
         _, result = await turn(harness, "named_progress")

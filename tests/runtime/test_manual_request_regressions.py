@@ -3,23 +3,50 @@
 import pytest
 
 from groupagent.control import WorkSelector
+from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import Decision
 from groupagent.domain import DomainError, WorkState
+from groupagent.execution import ScriptedFakeModel
 
+from .foreground_model_fixture import candidate_reply, natural_reply
 from .test_app import app_for, event
 from .test_early_ack import intake, setup_chat
 
 pytestmark = pytest.mark.postgres
 
 
+def image_request_model(app, request):
+    """Explicit semantic fixture using the actual graph's named primitive."""
+    model = ScriptedFakeModel(
+        [
+            candidate_reply(
+                Decision(
+                    kind="start_work",
+                    reason_code="synthetic_image_delegation",
+                    goal=request.text,
+                    directness="direct",
+                    confidence=1,
+                    work_capabilities=["public_images"],
+                    public_image_count=2,
+                    outputs=[{"format": "png"}],
+                )
+            ),
+            natural_reply("我会上网找现成图片，核对清晰度和来源后发到这里。"),
+        ]
+    )
+    app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(model)
+    return model
+
+
 async def test_existing_meme_request_starts_retrieval_without_image_generation(runtime_env):
     env = runtime_env
     app, model, _ = setup_chat(env)
     request = event(env, "找两张“松鼠”的表情包给我，要清晰一点。")
+    model = image_request_model(app, request)
     try:
         await intake(app, env, request)
         result = await app.coordinator.process(request)
-        assert result.work_id and not model.requests
+        assert result.work_id and len(model.requests) == 2
         with env.store.transaction(env.actor) as tx:
             work = tx.get_work(result.work_id)
         assert work.scope["public_image_count"] == 2
@@ -100,10 +127,11 @@ async def test_background_preparation_waits_until_useful_admission_is_accepted(r
     app, model, _ = setup_chat(env)
     app.supervisor.work_ready = app._foreground_ready
     request = event(env, "找两张“松鼠”的表情包给我。")
+    model = image_request_model(app, request)
     try:
         await intake(app, env, request)
         result = await app.coordinator.process(request)
-        assert result.work_id
+        assert result.work_id and len(model.requests) == 2
         assert await app.supervisor.tick() == 0
         with env.store.transaction(env.actor) as tx:
             assert tx.get_work(result.work_id).state == WorkState.QUEUED

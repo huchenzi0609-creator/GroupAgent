@@ -8,6 +8,8 @@ version = "0.1.0.dev0"
 description = "A group collaboration agent with durable work, scoped tools and verifiable delivery"
 requires-python = ">=3.11"
 dependencies = [
+  "langchain==1.5.0",
+  "langgraph==1.2.22",
   "pydantic>=2.10,<3",
   "psycopg[binary]>=3.2,<4",
   "httpx>=0.28,<1",
@@ -40,7 +42,7 @@ packages = ["src/groupagent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["postgres: integration tests requiring an isolated PostgreSQL database", "render: document rendering with external tools", "sandbox: actual isolated Docker worker tests", "live: explicitly budgeted live provider tests", "public_image_workflow: retrieval, conversion, bounded inspection, recovery and delivery of public images", "work_awareness: shared task facts, natural follow-ups and delivery truth across dialogue and execution"]
+markers = ["postgres: integration tests requiring an isolated PostgreSQL database", "render: document rendering with external tools", "sandbox: actual isolated Docker worker tests", "live: explicitly authorized live provider tests", "public_image_workflow: retrieval, conversion, bounded inspection, recovery and delivery of public images", "work_awareness: shared task facts, natural follow-ups and delivery truth across dialogue and execution"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 

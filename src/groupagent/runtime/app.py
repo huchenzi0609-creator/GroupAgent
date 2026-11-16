@@ -55,6 +55,7 @@ from .artifacts import ArtifactRegistry
 from .cleanup import RuntimeCleanupHandler
 from .contracts import ProcessLease
 from .dispatch import Dispatcher
+from .effect_reconciler import UnpublishedDraftReconciler
 from .executor import WorkSupervisor
 from .inputs import InputProcessor
 from .notices import NoticeService
@@ -260,7 +261,8 @@ class RuntimeApp:
             rows = tx.conn.execute(
                 "SELECT e.id FROM ga_events e LEFT JOIN ga_event_retry r ON r.group_id=e.group_id "
                 "AND r.event_id=e.id WHERE e.group_id=%s AND e.memory_state='active' "
-                "AND NOT EXISTS(SELECT 1 FROM ga_decisions d WHERE d.group_id=e.group_id AND d.event_id=e.id) "
+                "AND NOT EXISTS(SELECT 1 FROM ga_decisions d WHERE d.group_id=e.group_id AND d.event_id=e.id "
+                "AND d.body->>'agent_pending_response' IS DISTINCT FROM 'true') "
                 "AND (r.event_id IS NULL OR (NOT r.blocked AND r.next_attempt_at<=clock_timestamp())) "
                 "ORDER BY e.sequence LIMIT 100",
                 (tx.group_id,),
@@ -332,12 +334,10 @@ class RuntimeApp:
                 ).fetchone()
                 waiting_resource = error.code == "resource_deferred"
                 attempts = (row["attempts"] if row else 0) + (0 if waiting_resource else 1)
-                blocked = not temporary or attempts >= 3
-                if waiting_resource:
-                    blocked = False
-                # Waiting for an external attachment/receipt is not a paid-model retry.
-                if error.code in {"attachment_pending", "echo_reconciliation_pending"}:
-                    blocked = attempts >= 60
+                # A recoverable dependency wait is not a finite task budget.
+                # Backoff is durable, so a controller restart cannot create a
+                # hot retry loop or strand a previously committed action reply.
+                blocked = not temporary
                 tx.conn.execute(
                     "INSERT INTO ga_event_retry(group_id,event_id,attempts,next_attempt_at,blocked,code) "
                     "VALUES(%s,%s,%s,clock_timestamp()+%s*interval '1 second',%s,%s) ON CONFLICT(group_id,event_id) "
@@ -348,7 +348,7 @@ class RuntimeApp:
                         attempts,
                         self.config.resources.retry_seconds
                         if waiting_resource
-                        else min(30, 2 ** min(attempts, 5)),
+                        else min(300, 2 ** min(attempts, 9)),
                         blocked,
                         error.code,
                     ),
@@ -914,6 +914,7 @@ def build_app(
         resource_retry_seconds=config.resources.retry_seconds,
         execution_backend=config.runtime.engine,
         release_attempt=toolkit.release_attempt,
+        reconcile_checkpoint=UnpublishedDraftReconciler(config, store),
     )
     dispatcher = Dispatcher(
         state,

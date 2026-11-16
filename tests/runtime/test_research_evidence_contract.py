@@ -181,6 +181,6 @@ async def test_late_actual_source_reaches_critic_and_optional_is_not_required(
     assert recorded["passed"] is (not extra_required)
     assert recorded["accepted"] is (not extra_required)
     instructions = json.loads(run.prepared.request.objective)["instructions"]
-    profile = build_tool_profile(run.prepared.request.allowed_tools)
-    assert profile.families == ("research",)
+    profile = build_tool_profile(run.prepared.request.visible_tools)
+    assert profile.families == ("discovery", "research")
     assert set(profile.instructions) <= set(instructions)

@@ -15,7 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
-from pydantic import Field, JsonValue, TypeAdapter, ValidationError
+from pydantic import Field, JsonValue
 
 from groupagent.artifacts import ArtifactScope, ArtifactStore, ArtifactVersion
 from groupagent.artifacts.isolated import IsolatedDocumentService
@@ -30,8 +30,7 @@ from groupagent.conversation.image_requirements import (
     projected_image_quantity,
 )
 from groupagent.domain import ActorContext, DomainError, ExecutionLease, GroupEvent, WorkOrder
-from groupagent.execution import ExecutionRequest, RunSnapshot, ScopedToolEngine
-from groupagent.execution.harness import HarnessEngine
+from groupagent.execution import ExecutionRequest, LangGraphEngine, RunSnapshot
 from groupagent.execution.models import ExecutionBudget
 from groupagent.execution.ports import ModelPort
 from groupagent.identity import BotIdentity
@@ -93,7 +92,7 @@ from .review import review_fingerprint, review_request, tool_observation
 from .scheduling_tools import register_scheduling_tools
 from .team_tools import register_team_tools
 from .tool_profiles import instructions_for_tools, names_for_capabilities
-from .tool_selection import select_tools
+from .tool_selection import authorized_tools, select_tools
 
 
 def _original_request_context(event: GroupEvent) -> dict[str, JsonValue]:
@@ -985,9 +984,7 @@ class WorkToolkit:
             route.capability == Capability.IMAGE_GENERATION for route in self.routes.values()
         ):
             allowed = allowed - {"image_generate"}
-        allowed = select_tools(
-            work, input_refs, allowed, identity=BotIdentity.from_runtime(self.config.runtime)
-        )
+        allowed = authorized_tools(work, allowed, actor=actor)
         with self.store.transaction(actor) as tx:
             original_event = tx.get_event(work.request_event_id)
             image_quantity = projected_image_quantity(tx, work)
@@ -998,47 +995,39 @@ class WorkToolkit:
             if isinstance(required_raw, list)
             else frozenset()
         )
-        visible_tools = None
-        capabilities = work.scope.get("work_capabilities", [])
-        if isinstance(capabilities, list) and capabilities:
-            try:
-                capability_names = TypeAdapter(list[WorkCapability]).validate_python(capabilities)
-            except ValidationError:
-                raise DomainError(
-                    "invalid_input", "Stored work capability plan is invalid"
-                ) from None
-            visible_tools = names_for_capabilities(capability_names, allowed) | required_tools
-            if not visible_tools.issubset(allowed):
-                raise DomainError(
-                    "permission_denied", "The requested capability is outside the work grant"
-                )
-            if allowed - visible_tools:
-                catalog_names = allowed
+        visible_tools = (
+            select_tools(
+                work, input_refs, allowed, identity=BotIdentity.from_runtime(self.config.runtime)
+            )
+            | required_tools
+        )
+        if allowed - visible_tools:
+            catalog_names = allowed
 
-                async def tool_catalog(
-                    args: ToolCatalogInput, context: ToolContext
-                ) -> ToolCatalogOutput:
-                    names = names_for_capabilities(args.capabilities, catalog_names)
-                    return ToolCatalogOutput(
-                        tool_names=tuple(sorted(names)),
-                        tools=gateway.describe(context.scope, names),
-                        instructions=instructions_for_tools(names),
-                    )
-
-                gateway.register(
-                    ToolDefinition(
-                        name="tool_catalog",
-                        description="Load descriptions for another needed capability. This only reveals tools already authorized for this work; it cannot enable disabled features or permissions.",
-                        input_model=ToolCatalogInput,
-                        output_model=ToolCatalogOutput,
-                        handler=tool_catalog,
-                        risk_class="read_only",
-                        idempotency_mode=IdempotencyMode.READ_ONLY,
-                        toolset_loader=True,
-                    )
+            async def tool_catalog(
+                args: ToolCatalogInput, context: ToolContext
+            ) -> ToolCatalogOutput:
+                names = names_for_capabilities(args.capabilities, catalog_names)
+                return ToolCatalogOutput(
+                    tool_names=tuple(sorted(names)),
+                    tools=gateway.describe(context.scope, names),
+                    instructions=instructions_for_tools(names),
                 )
-                allowed = allowed | {"tool_catalog"}
-                visible_tools = visible_tools | {"tool_catalog"}
+
+            gateway.register(
+                ToolDefinition(
+                    name="tool_catalog",
+                    description="Load another needed capability from the authorized tool catalogue. This reveals descriptions; it cannot enable disabled features or permissions.",
+                    input_model=ToolCatalogInput,
+                    output_model=ToolCatalogOutput,
+                    handler=tool_catalog,
+                    risk_class="read_only",
+                    idempotency_mode=IdempotencyMode.READ_ONLY,
+                    toolset_loader=True,
+                )
+            )
+            allowed = allowed | {"tool_catalog"}
+            visible_tools = visible_tools | {"tool_catalog"}
         objective = redact_credentials(
             json.dumps(
                 {
@@ -1134,23 +1123,7 @@ class WorkToolkit:
         budget = LedgerModelBudget(
             self.ledger, price_id=self.config.spend.pricing_snapshot_id or "deepseek-20261114-text"
         )
-        engine: ScopedToolEngine
-        if self.config.runtime.engine == "harness":
-            if not self.config.runtime.harness_image:
-                raise DomainError("sandbox_unavailable", "Harness image is not configured")
-            engine = HarnessEngine(
-                self.model,
-                gateway,
-                DockerSandbox(
-                    self.config.runtime.harness_image,
-                    docker_host=self.config.runtime.docker_host,
-                    limits=worker_limits(self.config, harness=True),
-                    resource_governor=self.resource_governor,
-                ),
-                model_budget=budget,
-            )
-        else:
-            engine = ScopedToolEngine(self.model, gateway, model_budget=budget)
+        engine = LangGraphEngine(self.model, gateway, model_budget=budget)
         return PreparedExecution(engine, request)
 
     async def _speech_permission(self, work, actor):
