@@ -24,9 +24,8 @@ from groupagent.billing.prices import deepseek_20261114
 from groupagent.channels import AgentWechatAdapter, AgentWechatConfig, MemberRecord
 from groupagent.channels.local import LocalChannel
 from groupagent.config import AppConfig, ConfigError
-from groupagent.conversation.intent import explicitly_requires_execution, new_work_intent
-from groupagent.conversation.participation import outside_quotes
-from groupagent.conversation.policy import policy_intent
+from groupagent.conversation.intent import new_work_intent
+from groupagent.conversation.policy import policy_intent, trusted_invocation_in_tx
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import CoordinationResult, Decision
@@ -414,35 +413,16 @@ class RuntimeApp:
             pass
 
     def _bypass_batch(self, event: GroupEvent) -> bool:
-        if event.kind != EventKind.TEXT or event.reply_to or event.attachments:
-            return False
-        if new_work_intent(event.text, identity=self.identity) is not None:
-            return True  # Preserve the existing independent-work admission path.
-        plain = outside_quotes(event.text)
-        if not plain or plain != event.text.strip() or len(plain) > 1200:
-            return False
-        request = self.identity.strip_address(plain)
-        if explicitly_requires_execution(plain, identity=self.identity):
-            return False
-        if request == plain and not re.search(r"[?？]", request):
-            return False
-        if re.search(
-            r"文件|文档|附件|图片|截图|音频|语音|视频|生成|制作|导出|交付|下载|上传|删除|修改|"
-            r"分配|安排|提醒|忽略|绕过|越权|密钥|密码|"
-            r"(?<![A-Za-z0-9_])(?:PDF|DOCX|PPTX?|Markdown|WAV|MP3|PNG|JPEG|Shell|secret|password|prompt)(?![A-Za-z0-9_])",
-            request,
-            re.I,
+        """Prioritize an existing admission or trusted invocation, without grants."""
+        if (
+            event.kind == EventKind.TEXT
+            and not event.reply_to
+            and not event.attachments
+            and new_work_intent(event.text, identity=self.identity) is not None
         ):
-            return False
-        return (
-            re.search(
-                r"[?？]|什么|啥|怎么|为何|为什么|解释|说明|讲讲|告诉我|叫什么|是谁|多少|区别|吗|"
-                r"\b(?:what|how|why|who|explain|describe)\b",
-                request,
-                re.I,
-            )
-            is not None
-        )
+            return True
+        with self.store.transaction(self.technical) as tx:
+            return trusted_invocation_in_tx(tx, event, self.identity) is not None
 
     async def process_pending(self, *, controls_only: bool = False, batched: bool = True) -> int:
         events = self._ready_events()
@@ -487,8 +467,8 @@ class RuntimeApp:
         identities = [
             event
             for event in events
-            if self._bypass_batch(event)
-            and self.coordinator._fast_identity_reply(event, self.identity.context()) is not None
+            if self.coordinator._fast_identity_reply(event, self.identity.context()) is not None
+            and self._bypass_batch(event)
         ]
         if identities:
             # A verified name response performs no model/tool call, so it can
