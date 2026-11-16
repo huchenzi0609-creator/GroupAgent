@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from groupagent.conversation.context import ContextQuery, result_reference, select_focus
-from groupagent.conversation.participation import fast_observe
+from groupagent.conversation.participation import fast_observe, verified_human_addressee
 from groupagent.conversation.provider import SYSTEM, reference_catalog
 from groupagent.coordinator import CoordinationResult, Decision
 from groupagent.domain import EventKind, GroupEvent
@@ -133,22 +133,20 @@ def test_new_work_can_reuse_explicit_files_without_inheriting_work_focus():
 )
 def test_canonical_and_legacy_roster_sources_identify_other_human(name_source):
     source = event("小唐，帮我测个东西。")
-    result = fast_observe(
-        source,
-        {
-            "role": "member",
-            "requester_member_id": "self",
-            "members": [
-                {
-                    "member_id": "peer",
-                    "name": "小唐",
-                    "name_source": name_source,
-                    "membership_state": "present",
-                }
-            ],
-        },
-    )
-    assert result is not None and result.directness == "other"
+    context = {
+        "role": "member",
+        "requester_member_id": "self",
+        "members": [
+            {
+                "member_id": "peer",
+                "name": "小唐",
+                "name_source": name_source,
+                "membership_state": "present",
+            }
+        ],
+    }
+    assert fast_observe(source, context) is None
+    assert verified_human_addressee(source.text, context) == "peer"
 
 
 def test_core_prompt_and_catalog_do_not_repeat_full_business_text():

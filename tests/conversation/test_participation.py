@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from groupagent.conversation.participation import fast_observe, policy_intent
+from groupagent.conversation.participation import (
+    fast_observe,
+    policy_intent,
+    verified_human_addressee,
+)
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import Decision
@@ -19,6 +23,26 @@ class NeverCalledFixtureModel:
 
     async def complete(self, request):
         raise AssertionError("This proven participation decision must not call a provider")
+
+
+class RecipientCandidateFixtureModel:
+    name = "synthetic-recipient-candidate"
+
+    def __init__(self, **candidate):
+        self.requests = []
+        self.candidate = {
+            "reason_code": "synthetic_recipient",
+            "directness": "direct",
+            "confidence": 0.95,
+            **candidate,
+        }
+
+    async def complete(self, request):
+        self.requests.append(request)
+        return ModelReply(
+            text=json.dumps(self.candidate, ensure_ascii=False),
+            usage=TokenUsage(input_tokens=100, output_tokens=50),
+        )
 
 
 def event(text, *, kind=EventKind.TEXT, **changes):
@@ -72,9 +96,106 @@ def context(role="member"):
         "拜托@夏禾，看看这句话。",
     ],
 )
-async def test_verified_other_member_address_is_observed_without_model(text):
-    result = await ModelDecisionProvider(NeverCalledFixtureModel()).decide(event(text), context())
+async def test_verified_other_member_address_reaches_router_then_non_declaration_stays_silent(text):
+    model = RecipientCandidateFixtureModel(kind="reply", response="Synthetic unsolicited reply")
+    assert fast_observe(event(text), context()) is None
+    assert verified_human_addressee(text, context()) == "other"
+    result = await ModelDecisionProvider(model).decide(event(text), context())
     assert result.kind == "observe" and result.action is None
+    assert result.directness == "other" and len(model.requests) == 1
+
+
+@pytest.mark.parametrize("role", ["member", "owner"])
+async def test_verified_human_recipient_does_not_discard_the_speakers_self_declaration(role):
+    text = "夏禾，这次演示稿由我准备。"
+    model = RecipientCandidateFixtureModel(
+        kind="command", action={"op": "claim_task", "title": "Synthetic demonstration script"}
+    )
+    ctx = context(role)
+    assert fast_observe(event(text), ctx) is None
+    result = await ModelDecisionProvider(model).decide(event(text), ctx)
+    assert result.kind == "command" and result.action["op"] == "claim_task"
+    assert result.directness == "other" and result.response is None
+    assert len(model.requests) == 1
+
+
+async def test_verified_recipient_keeps_owned_progress_and_owner_assignment_silent():
+    ctx = context()
+    ctx["tasks"] = [{"id": "synthetic-owned", "owner_id": "self", "revision": 2}]
+    progress = RecipientCandidateFixtureModel(
+        kind="command",
+        action={
+            "op": "update_task",
+            "task_id": "synthetic-owned",
+            "expected_revision": 2,
+            "progress": "Synthetic draft ready",
+        },
+    )
+    result = await ModelDecisionProvider(progress).decide(
+        event("夏禾，我的演示稿初稿完成了。"), ctx
+    )
+    assert result.kind == "command" and result.directness == "other" and result.response is None
+    assignment = RecipientCandidateFixtureModel(
+        kind="command",
+        action={
+            "op": "assign_task",
+            "title": "Synthetic review",
+            "member_id": "other",
+            "member_name": "夏禾",
+        },
+    )
+    result = await ModelDecisionProvider(assignment).decide(
+        event("夏禾，这次校对由你负责。"), context("owner")
+    )
+    assert result.kind == "command" and result.directness == "other" and result.response is None
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        {"kind": "start_work", "goal": "Synthetic peer request"},
+        {"kind": "command", "action": {"op": "quiet", "enabled": True}},
+    ],
+)
+async def test_verified_human_direction_cannot_be_overridden_by_model_direct_label(candidate):
+    model = RecipientCandidateFixtureModel(**candidate)
+    result = await ModelDecisionProvider(model).decide(event("夏禾，请你处理这件事。"), context())
+    assert result.kind == "observe" and result.directness == "other" and result.action is None
+
+
+def test_verified_recipient_requires_unique_current_roster_evidence_and_excludes_self_bot_and_quotes():
+    ctx = context("owner")
+    assert verified_human_addressee("夏禾，请看一下。", ctx) == "other"
+    assert verified_human_addressee("路宁，请看一下。", ctx) is None
+    assert verified_human_addressee("引用：『夏禾，请看一下』。", ctx) is None
+    assert verified_human_addressee("夏禾先看，机器人请翻译最后一句。", ctx) is None
+    for change in (
+        {"name_source": "private_remark"},
+        {"membership_state": "left"},
+        {"name": "Pot"},
+    ):
+        altered = context()
+        altered["members"][1].update(change)
+        assert (
+            verified_human_addressee(altered["members"][1]["name"] + "，请看一下。", altered)
+            is None
+        )
+    duplicate = context()
+    duplicate["members"].append({**duplicate["members"][1], "member_id": "another"})
+    assert verified_human_addressee("夏禾，请看一下。", duplicate) is None
+
+
+@pytest.mark.parametrize(
+    "name_source", ["room_display_name", "roomDisplayName", "roster", "owner_confirmed"]
+)
+def test_cached_unknown_presence_keeps_trusted_recipient_evidence_but_departure_revokes_it(
+    name_source,
+):
+    ctx = context()
+    ctx["members"][1].update(name_source=name_source, membership_state="unknown")
+    assert verified_human_addressee("夏禾，请看一下。", ctx) == "other"
+    ctx["members"][1]["membership_state"] = "left"
+    assert verified_human_addressee("夏禾，请看一下。", ctx) is None
 
 
 @pytest.mark.parametrize(

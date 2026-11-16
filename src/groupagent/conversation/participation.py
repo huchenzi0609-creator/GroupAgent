@@ -47,6 +47,59 @@ def _agent_request(text: str, context: dict[str, Any]) -> bool:
     return BotIdentity.from_context(context).request_addressed(text)
 
 
+def verified_human_addressee(text: str, context: dict[str, Any]) -> str | None:
+    """Return a trusted leading human recipient, independent of business intent.
+
+    This is direction evidence, not an observe decision. A message to a peer
+    can still declare the current speaker's own work or an owner's assignment.
+    A trusted cached nickname remains useful when presence is unknown; an
+    explicit departure removes that recipient evidence.
+    """
+    outside = outside_quotes(text)
+    if len(text) > 16000 or not outside or _agent_request(outside, context):
+        return None
+    requester = context.get("requester_member_id")
+    if not isinstance(requester, str):
+        return None
+    names: dict[str, set[str]] = {}
+    members = context.get("members", [])
+    for member in members if isinstance(members, list) else ():
+        if (
+            not isinstance(member, dict)
+            or not trusted_name_source(member.get("name_source"))
+            or member.get("membership_state") not in {"active", "present", "unknown"}
+        ):
+            continue
+        name, identifier = member.get("name"), member.get("member_id")
+        if isinstance(name, str) and name and isinstance(identifier, str):
+            names.setdefault(name, set()).add(identifier)
+    excluded = {
+        "我",
+        "你",
+        "他",
+        "她",
+        "它",
+        "大家",
+        "同学",
+        "群昵称待补充",
+        "机器人",
+        "机器人组长",
+        "组长",
+        "小伴",
+    }
+    excluded.update(BotIdentity.from_context(context).names)
+    excluded = {name.casefold() for name in excluded}
+    for name, identities in names.items():
+        if len(identities) != 1 or requester in identities or name.casefold() in excluded:
+            continue
+        if re.match(
+            r"^(?:(?:请|麻烦|拜托)\s*)?@?" + re.escape(name) + r"(?=[，,：:\s]|先|帮|来|你)",
+            outside,
+        ):
+            return next(iter(identities))
+    return None
+
+
 def _source_quote_only(text: str, outside: str) -> bool:
     """Match the entire source wrapper, never an instruction after the quote."""
     if not _QUOTED.search(text):
@@ -179,52 +232,6 @@ def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
                 kind="observe",
                 reason_code="explicit_one_off_nonintervention",
                 directness="none",
-                confidence=1,
-            )
-    if context.get("role") not in {"member", "observer", "maintainer"}:
-        return None  # An owner's explicit human assignments are preauthorized.
-    requester = context.get("requester_member_id")
-    if not isinstance(requester, str):
-        return None
-    names: dict[str, set[str]] = {}
-    members = context.get("members", [])
-    for member in members if isinstance(members, list) else ():
-        if (
-            not isinstance(member, dict)
-            or not trusted_name_source(member.get("name_source"))
-            or member.get("membership_state") not in {"active", "present"}
-        ):
-            continue
-        name, identifier = member.get("name"), member.get("member_id")
-        if isinstance(name, str) and name and isinstance(identifier, str):
-            names.setdefault(name, set()).add(identifier)
-    excluded = {
-        "我",
-        "你",
-        "他",
-        "她",
-        "它",
-        "大家",
-        "同学",
-        "群昵称待补充",
-        "机器人",
-        "机器人组长",
-        "组长",
-        "小伴",
-    }
-    excluded.update(BotIdentity.from_context(context).names)
-    excluded = {name.casefold() for name in excluded}
-    for name, identities in names.items():
-        if len(identities) != 1 or requester in identities or name.casefold() in excluded:
-            continue
-        if re.match(
-            r"^(?:(?:请|麻烦|拜托)\s*)?@?" + re.escape(name) + r"(?=[，,：:\s]|先|帮|来|你)",
-            outside,
-        ):
-            return Decision(
-                kind="observe",
-                reason_code="addressed_to_verified_other_member",
-                directness="other",
                 confidence=1,
             )
     return None

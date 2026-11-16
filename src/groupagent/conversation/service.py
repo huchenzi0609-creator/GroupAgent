@@ -75,7 +75,7 @@ from .intent import (
     requires_research,
     task_write_request,
 )
-from .participation import fast_observe, outside_quotes, policy_intent
+from .participation import fast_observe, outside_quotes, policy_intent, verified_human_addressee
 from .policy import apply_quiet_barrier_in_tx, ingress_admission, interpret_policy
 from .references import resolve_work_selection
 
@@ -222,6 +222,7 @@ class ConversationCoordinator(Coordinator):
             or context.get("role") not in {"owner", "member"}
             or context.get("read_only")
             or fast_observe(event, context) is not None
+            or verified_human_addressee(event.text, context) is not None
             or policy_intent(event, context) is not None
         ):
             return None
@@ -569,6 +570,8 @@ class ConversationCoordinator(Coordinator):
         observed = fast_observe(event, context)
         if observed is not None:
             return observed
+        if verified_human_addressee(event.text, context) is not None:
+            decision = decision.model_copy(update={"directness": "other"})
         write = decision.action is not None or decision.kind in {
             "start_work",
             "update_work",
@@ -1228,6 +1231,21 @@ class ConversationCoordinator(Coordinator):
             event, tx.actor, self.identity, time_zone=self.config.group.time_zone
         )
         if intent is None:
+            return None
+        recipient_context = {
+            **self.identity.context(),
+            "requester_member_id": tx.actor.member_id,
+            "members": [
+                {
+                    "member_id": member.member_id,
+                    "name": member.display_name,
+                    "name_source": member.name_source,
+                    "membership_state": member.membership_state,
+                }
+                for member in self.members.in_tx(tx).list(tx.actor)
+            ],
+        }
+        if verified_human_addressee(event.text, recipient_context) is not None:
             return None
         if tx.actor.role not in {Role.OWNER, Role.MEMBER}:
             decision = Decision(

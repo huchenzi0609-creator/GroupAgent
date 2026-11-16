@@ -4,14 +4,96 @@ import asyncio
 
 import pytest
 
+from groupagent.channels import MemberRecord
 from groupagent.control import WorkSelector
 from groupagent.coordinator import Decision
 from groupagent.domain import WorkState
+from groupagent.memory.members import ChannelRosterProvider
 
 from .test_app import app_for, event
 from .test_early_ack import intake, setup_chat
 
 pytestmark = pytest.mark.postgres
+
+
+@pytest.mark.parametrize("owner", [True, False])
+@pytest.mark.parametrize("mode", ["claim", "work", "policy"])
+async def test_human_recipient_controls_speech_without_discarding_task_facts(
+    runtime_env, owner, mode
+):
+    env = runtime_env
+    request = event(
+        env,
+        {
+            "claim": "小周，PPT我来准备。",
+            "work": "小周，帮我制作PPT。",
+            "policy": "小周，先保持安静。",
+        }[mode],
+    )
+    candidates = {
+        "claim": Decision(
+            kind="command",
+            reason_code="synthetic_claim",
+            action={"op": "claim_task", "title": "准备演示PPT"},
+            directness="direct",
+            confidence=1,
+        ),
+        "work": Decision(
+            kind="start_work",
+            reason_code="synthetic_misdirected_request",
+            goal="制作PPT",
+            directness="direct",
+            confidence=1,
+        ),
+        "policy": Decision(
+            kind="command",
+            reason_code="synthetic_misdirected_quiet",
+            action={"op": "quiet", "scope": "group", "enabled": True},
+            directness="direct",
+            confidence=1,
+        ),
+    }
+    app, _ = app_for(env, {request.id: candidates[mode]})
+    try:
+        env.channel.members_fixture = tuple(
+            MemberRecord(
+                group_id=env.actor.group_id,
+                member_id=identifier,
+                room_display_name=name,
+                membership_state="present",
+                name_source="roomDisplayName",
+            )
+            for identifier, name in ((env.actor.member_id, "小林"), ("synthetic-other", "小周"))
+        )
+        sync = await app.coordinator.members.sync_startup(
+            env.actor, "human-recipient-test", ChannelRosterProvider(env.channel)
+        )
+        assert sync.state == "complete"
+        if not owner:
+            app.config = app.config.model_copy(
+                update={
+                    "group": app.config.group.model_copy(update={"owner_ids": ["synthetic-admin"]})
+                }
+            )
+            app.coordinator.config = app.config
+        await intake(app, env, request)
+        result = await app.coordinator.process(request)
+        assert result.decision.kind == "observe" and result.delivery_id is None
+        assert result.work_id is None
+        assert bool(result.action_result) == (mode == "claim")
+        with env.store.transaction(env.actor) as tx:
+            assert not tx.conn.execute(
+                "SELECT 1 FROM ga_conversation_policy WHERE group_id=%s AND quiet",
+                (env.actor.group_id,),
+            ).fetchone()
+        if mode == "claim":
+            with env.store.transaction(env.actor) as tx:
+                assert (
+                    tx.get_team_task(str(result.action_result["task_id"])).owner_id
+                    == env.actor.member_id
+                )
+    finally:
+        await app.close()
 
 
 @pytest.mark.parametrize("direction", ["direct", "other", "none"])

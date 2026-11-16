@@ -10,7 +10,11 @@ from pydantic import ValidationError
 
 from groupagent.config import AppConfig, GroupConfig, RuntimeConfig
 from groupagent.conversation.intent import explicitly_requires_execution, new_work_intent
-from groupagent.conversation.participation import fast_observe, owner_assignment_request
+from groupagent.conversation.participation import (
+    fast_observe,
+    owner_assignment_request,
+    verified_human_addressee,
+)
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import Decision
@@ -157,8 +161,9 @@ def test_pot_name_does_not_turn_self_claims_or_member_assignments_into_bot_work(
         "name_source": "roster",
         "membership_state": "present",
     }
-    candidate = fast_observe(source("Potato，帮我制作PPT。"), context(members=[human]))
-    assert candidate and candidate.directness == "other" and candidate.kind == "observe"
+    text = "Potato，帮我制作PPT。"
+    assert fast_observe(source(text), context(members=[human])) is None
+    assert verified_human_addressee(text, context(members=[human])) == "other"
 
 
 def test_configured_identity_reaches_all_lexical_guards():

@@ -22,7 +22,12 @@ from groupagent.security import redact_credentials
 
 from .actions import ACTION_ADAPTER, OutputRequirement
 from .commands import is_task_declaration
-from .participation import fast_observe, owner_assignment_request, policy_intent
+from .participation import (
+    fast_observe,
+    owner_assignment_request,
+    policy_intent,
+    verified_human_addressee,
+)
 from .timeparse import TimeResolution, normalize_time, shift_timing
 
 SYSTEM = """你是大学微信群的协作伙伴。根据当前真人消息和相关上下文，返回一个符合Decision schema的JSON对象，无Markdown围栏；后端核验后才执行。
@@ -217,6 +222,25 @@ def decision_schema(catalog: dict[str, Any] | None = None) -> dict[str, Any]:
     selector_schema = definitions.get("WorkSelector")
     if isinstance(selector_schema, dict):
         selector_schema["required"] = ["basis", "states", "requester_scope", "quantifier"]
+        selector_schema["properties"]["states"]["description"] = (
+            "按工作当前所处阶段筛选，具体状态含义见WorkState。空数组表示所有状态、不作阶段过滤，"
+            "不是运行中、排队中或尚未完成的别名。目标状态限制与控制操作相互独立。"
+        )
+    state_schema = definitions.get("WorkState")
+    if isinstance(state_schema, dict):
+        state_schema["description"] = (
+            "工作当前所处的互斥阶段："
+            "queued=等待执行器领取，当前尚未执行；"
+            "running=执行器正在执行工作；"
+            "waiting_input=缺少必要输入，等待真人补充；"
+            "waiting_external=等待已发起的外部操作返回结果；"
+            "validating=正在检查执行结果；"
+            "delivering=正在交付结果，尚未确认全部交付；"
+            "paused=执行已暂停，当前不在运行，可能等待后续恢复；"
+            "completed=工作及必需交付已经完成；"
+            "failed=当前执行已经失败，未成功完成；"
+            "cancelled=后续执行已取消。"
+        )
     definitions.update(action.pop("$defs", {}))
     definitions.update(timing.pop("$defs", {}))
     for name in ("CreateSchedule", "ChangeSchedule"):
@@ -418,6 +442,8 @@ def validate_candidate(
         and owner_assignment_request(original_text, context)
     ):
         decision = decision.model_copy(update={"directness": "open"})
+    if isinstance(original_text, str) and verified_human_addressee(original_text, context):
+        decision = decision.model_copy(update={"directness": "other"})
     declaration = is_task_declaration(
         decision.action,
         context.get("role"),
