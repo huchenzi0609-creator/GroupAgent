@@ -59,7 +59,7 @@ from .dispatch import Dispatcher
 from .executor import WorkSupervisor
 from .inputs import InputProcessor
 from .notices import NoticeService
-from .resource_profile import worker_limits
+from .resource_profile import controller_resources_ready, worker_limits
 from .roster import RosterRefresher
 from .state import RuntimeState
 from .toolkit import WorkToolkit
@@ -533,7 +533,7 @@ class RuntimeApp:
             self._processing
             or self.supervisor.active_work_id is not None
             or self.worker_governor is None
-            or not self.worker_governor.ready(self.config.resources.worker_memory_mb)
+            or not controller_resources_ready(self.worker_governor)
         ):
             # No additional model/cleanup load while a foreground or isolated
             # job is active. Expiry is also enforced on reads until the next pass.
@@ -928,7 +928,7 @@ def build_app(
         lease_seconds=config.execution.lease_seconds,
         heartbeat_seconds=config.execution.heartbeat_seconds,
         cancel_grace_seconds=config.execution.cancel_grace_seconds,
-        resource_ready=(lambda: worker_governor.ready(config.resources.worker_memory_mb))
+        resource_ready=(lambda: controller_resources_ready(worker_governor))
         if config.resources.enabled
         else None,
         resource_retry_seconds=config.resources.retry_seconds,

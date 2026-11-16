@@ -1,7 +1,18 @@
 """Translate the opt-in host profile into the shared transient worker contract."""
 
 from groupagent.config import AppConfig
+from groupagent.resources import ResourceGovernor
 from groupagent.sandbox import SandboxLimits
+
+# The controller is already resident in MemAvailable. This is bounded transient
+# headroom for preparation, text/network work and review, not a child cgroup cap.
+CONTROLLER_MEMORY_MB = 64
+
+
+def controller_resources_ready(governor: ResourceGovernor) -> bool:
+    # Preserve the same transfer reserve, free floor, cgroup, pressure and
+    # exclusive-worker/poison checks. Actual child launches still reserve 512+ MiB.
+    return governor.ready(CONTROLLER_MEMORY_MB)
 
 
 def worker_limits(config: AppConfig, *, harness: bool = False) -> SandboxLimits:
