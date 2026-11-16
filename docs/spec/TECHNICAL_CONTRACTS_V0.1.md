@@ -112,9 +112,9 @@ Shell工具虽然可能运行很多程序，也必须受工作范围、预装软
 
 ### 5.3 模型能力注册
 
-模型路由保存provider、model_id、能力标志、上下文上限、价格快照、超时和版本记录。分别验证text、vision、tool_call、structured_output、speech_to_text和text_to_speech，禁止以供应商品牌推断能力。按2026年11月14日用户调整，image_generation外部插画服务不属于本版必选路由。
+模型路由保存provider、model_id、能力标志、上下文上限、价格快照、超时和版本记录。分别验证启用的text、vision、tool_call、structured_output和speech_to_text，禁止以供应商品牌推断能力。按用户最新范围，image_generation外部插画及text_to_speech不属于本轮必选路由；TTS已于2026年11月16日明确暂缓。
 
-默认文本/工具路由与视觉路由可复用同一模型，但ASR、TTS独立配置。image_generation和视频能力标志必须为false；当前工作授权不包含独立插画生成或视频解析工具。程序绘图通过隔离计算工具生成并校验真实图片产物。
+默认文本/工具路由与视觉路由可复用同一模型，ASR独立配置。`speech_reply_on_request=false`，`text_to_speech`样例值为`NOT_IN_CURRENT_SCOPE`，不要求TTS凭据、不向当前工具清单授予语音生成能力。image_generation和视频能力标志必须为false；当前工作授权不包含独立插画生成或视频解析工具。文字、附件与ASR输入继续使用原有权限、预算和交付契约；程序绘图通过隔离计算工具生成并校验真实图片产物。
 
 ## 6 WorkOrder状态机
 

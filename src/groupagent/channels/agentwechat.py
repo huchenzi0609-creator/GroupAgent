@@ -22,6 +22,7 @@ from pydantic import BaseModel, JsonValue, SecretStr, ValidationError
 
 from groupagent.domain import DomainError, EventKind, GroupEvent
 
+from .attachments import preferred_attachment_variants
 from .models import (
     AgentWechatConfig,
     AttachmentContent,
@@ -33,6 +34,7 @@ from .models import (
     EventBatch,
     MemberPage,
     MemberRecord,
+    MemberRefreshReceipt,
     SkippedChannelEvent,
     TransferReceipt,
     stable_key,
@@ -53,23 +55,33 @@ _ASSET_STATES = {"pending", "available", "expired", "unsupported"}
 _VARIANTS = {"best", "thumbnail", "standard", "original", "normal", "encoded"}
 _CONTROL_EVENTS = {
     "thread.updated",
+    "thread.read-state",
     "send.updated",
     "operation.updated",
     "job.updated",
     "media.updated",
+    "media.auto-download",
     "media.ready",
     "media.writeback_examined",
     "account.updated",
     "account.state",
     "account.connection",
+    "account.push",
+    "account.control_observed",
     "account.settings_updated",
+    "credentials.projected",
     "contacts.updated",
     "contacts.sync",
+    "metadata.changed",
     "sync.started",
+    "sync.received",
+    "sync.committed",
     "sync.completed",
     "sync.progress",
     "sync.failed",
     "group.refresh_blocked",
+    "profile.recovery-pending",
+    "projection.blocked",
 }
 _KNOWN_ERROR_CODES = {
     "not_found",
@@ -173,6 +185,8 @@ class AgentWechatAdapter:
         self._runtime: ChannelCapabilities | None = None
         self._handshake_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        self._roster_refresh_lock = asyncio.Lock()
+        self._pending_roster_refresh: tuple[str, float] | None = None
         self._issued_cursors: set[str] = set()
         self._last_ack = -1
         self._file_requests: dict[str, str] = {}
@@ -413,6 +427,12 @@ class AgentWechatAdapter:
             metadata_media_kinds=tuple(kind for kind in kinds if kind != "video"),
             upstream_features=tuple(features),
             quoted_text_send_reported=remote.get("quotedTextSend") is True,
+            # v2.2.1 exposes the targeted refresh route but no feature flag for it.
+            # This is pinned-contract support, not evidence of a live refresh.
+            roster_refresh_supported=True,
+            incoming_group_updates="partial"
+            if remote.get("incomingGroupUpdates") == "partial"
+            else "unknown",
         )
         if self._runtime is not None and self._runtime.daemon_server_id != server_id:
             raise DomainError(
@@ -460,6 +480,7 @@ class AgentWechatAdapter:
             raise DomainError("invalid_channel_response", "Event page exceeded its requested limit")
         entries = []
         skipped = []
+        roster_updates = []
         previous = int(after)
         for raw in page.items:
             cursor = self._cursor(raw.cursor, runtime.daemon_server_id)
@@ -490,6 +511,8 @@ class AgentWechatAdapter:
             elif raw.kind == "group.updated":
                 group_id = raw.data.get("groupId") or raw.data.get("threadId")
                 _identifier(group_id)
+                if group_id == self.config.external_group_id:
+                    roster_updates.append(cursor)
                 skipped.append(
                     SkippedChannelEvent(
                         cursor=cursor.value,
@@ -512,7 +535,12 @@ class AgentWechatAdapter:
             raise DomainError("channel_gap", "Page cursor does not match its final event")
         self._issued_cursors.add(next_cursor.serialize())
         self._issued_cursors.update(entry.cursor.serialize() for entry in entries)
-        return EventBatch(entries=tuple(entries), next_cursor=next_cursor, skipped=tuple(skipped))
+        return EventBatch(
+            entries=tuple(entries),
+            next_cursor=next_cursor,
+            skipped=tuple(skipped),
+            roster_updates=tuple(roster_updates),
+        )
 
     async def ack_committed(self, cursor: ChannelCursor) -> None:
         """Called by the durable control layer only AFTER committing the batch."""
@@ -916,27 +944,23 @@ class AgentWechatAdapter:
         assets = await self._assets(message)
         if any(self._is_video_asset(asset) for asset in assets):
             raise DomainError("unsupported_video", "Video attachments are never fetched")
-        if handle.asset_id is None:
-            priority = {
-                "original": 5,
-                "normal": 4,
-                "standard": 3,
-                "thumbnail": 2,
-                "encoded": 1,
-                "best": 0,
-            }
-            asset = max(
-                assets,
-                key=lambda value: (value.state == "available", priority[value.variant]),
-                default=None,
-            )
-        else:
-            asset = next((asset for asset in assets if asset.id == handle.asset_id), None)
-        if asset is None:
+        candidates = [
+            self._handle(message, asset)
+            for asset in assets
+            if (handle.asset_id is None or asset.id == handle.asset_id)
+            and (handle.variant == "best" or asset.variant == handle.variant)
+        ]
+        available = [value for value in candidates if value.availability == "available"]
+        choices = preferred_attachment_variants(available or candidates, handle.variant)
+        if not choices:
             raise DomainError(
                 "scope_denied", "Attachment is not listed under the scoped source message"
             )
-        fresh = self._handle(message, asset)
+        if len(choices) != 1:
+            raise DomainError(
+                "ambiguous_attachment", "Attachment metadata contains multiple matching assets"
+            )
+        fresh = choices[0]
         if fresh.kind != handle.kind:
             raise DomainError("scope_denied", "Attachment kind disagrees with its source message")
         return fresh
@@ -1126,6 +1150,151 @@ class AgentWechatAdapter:
         ):
             raise DomainError("invalid_channel_response", "Inconsistent member lookup")
         return self._member(member, present=True)
+
+    async def refresh_members(
+        self,
+        group_id: str,
+        *,
+        timeout_seconds: float = 20,
+        poll_interval_seconds: float = 0.25,
+    ) -> MemberRefreshReceipt:
+        """Refresh this room's native roster, then wait within a fixed deadline.
+
+        The upstream route requires read scope, performs native metadata RPCs and
+        updates the daemon cache. It has no idempotency key or group-bound result;
+        only the operation returned by this exact scoped request may be polled.
+        Subsequent members()/resolve_member() calls still expose cached coverage.
+        """
+        self._scope(group_id)
+        if (
+            type(timeout_seconds) not in {int, float}
+            or not math.isfinite(timeout_seconds)
+            or not 0 < timeout_seconds <= 60
+            or type(poll_interval_seconds) not in {int, float}
+            or not math.isfinite(poll_interval_seconds)
+            or not 0 < poll_interval_seconds <= 5
+        ):
+            raise DomainError("invalid_input", "Invalid roster refresh deadline or poll interval")
+        operation_id = None
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                async with self._roster_refresh_lock:
+                    await self._ensure_runtime()
+                    reused = False
+                    if self._pending_roster_refresh is not None:
+                        operation_id, started = self._pending_roster_refresh
+                        reused = True
+                        operation = await self._request(
+                            "GET", self._path("operations/" + quote(operation_id, safe=""))
+                        )
+                        self._check_roster_operation(operation, operation_id)
+                        if asyncio.get_running_loop().time() - started > 120:
+                            if operation.get("state") in {"queued", "running"}:
+                                raise DomainError(
+                                    "roster_refresh_pending",
+                                    "The prior roster refresh is unresolved; no duplicate was submitted",
+                                    resource_ref=operation_id,
+                                )
+                            # Reconcile an old terminal operation before admitting
+                            # another request; do not label old metadata as fresh.
+                            self._member_refresh_result(operation, operation_id, reused=True)
+                            self._pending_roster_refresh = None
+                    if self._pending_roster_refresh is None:
+                        reused = False
+                        try:
+                            operation = await self._request(
+                                "POST",
+                                self._path(
+                                    "groups/"
+                                    + quote(self.config.external_group_id, safe="")
+                                    + "/members/refresh"
+                                ),
+                                mutation=True,
+                            )
+                        except DomainError as error:
+                            if error.effect_state == "unknown":
+                                raise DomainError(
+                                    "roster_refresh_unknown",
+                                    "Roster refresh submission is uncertain; do not assume fresh metadata",
+                                    effect_state="unknown",
+                                ) from None
+                            raise
+                        operation_id = _identifier(operation.get("id"))
+                        self._check_roster_operation(operation, operation_id)
+                        self._pending_roster_refresh = (
+                            operation_id,
+                            asyncio.get_running_loop().time(),
+                        )
+                    assert operation_id is not None
+                    while True:
+                        receipt = self._member_refresh_result(
+                            operation, operation_id, reused=reused
+                        )
+                        if receipt is not None:
+                            self._pending_roster_refresh = None
+                            return receipt
+                        await asyncio.sleep(poll_interval_seconds)
+                        operation = await self._request(
+                            "GET", self._path("operations/" + quote(operation_id, safe=""))
+                        )
+        except TimeoutError:
+            raise DomainError(
+                "roster_refresh_timeout",
+                "Roster refresh is unconfirmed after its wait deadline",
+                resource_ref=operation_id,
+            ) from None
+
+    def _check_roster_operation(self, operation: dict[str, Any], operation_id: str) -> None:
+        if (
+            operation.get("id") != operation_id
+            or operation.get("accountId") != self.config.account_id
+            or operation.get("kind") != "metadata"
+        ):
+            raise DomainError(
+                "scope_denied", "Roster refresh returned another operation or account"
+            )
+
+    def _member_refresh_result(
+        self, operation: dict[str, Any], operation_id: str, *, reused: bool
+    ) -> MemberRefreshReceipt | None:
+        self._check_roster_operation(operation, operation_id)
+        state = operation.get("state")
+        if state == "succeeded":
+            result = operation.get("result")
+            if (
+                not isinstance(result, dict)
+                or result.get("profileProjection") != "complete"
+                or type(result.get("completeRoster")) is not bool
+                or type(result.get("memberCount")) is not int
+            ):
+                raise DomainError(
+                    "invalid_channel_response",
+                    "Roster refresh did not report its checked projection outcome",
+                )
+            return _schema(
+                MemberRefreshReceipt,
+                {
+                    "group_id": self.config.internal_group_id,
+                    "operation_id": operation_id,
+                    "complete_roster": result["completeRoster"],
+                    "member_count": result["memberCount"],
+                    "reused": reused,
+                },
+            )
+        if state in {"failed", "cancelled"}:
+            self._pending_roster_refresh = None
+            result = operation.get("result")
+            code = result.get("code") if isinstance(result, dict) else None
+            raise DomainError(
+                code
+                if code in {"auth_required", "account_identity_mismatch"}
+                else "roster_refresh_failed",
+                "Remote roster refresh did not complete successfully",
+                resource_ref=operation_id,
+            )
+        if state not in {"queued", "running"}:
+            raise DomainError("invalid_channel_response", "Unknown roster refresh operation state")
+        return None
 
     def _key(self, key: str) -> str:
         try:

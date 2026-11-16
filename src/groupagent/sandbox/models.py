@@ -14,6 +14,8 @@ class SandboxData(BaseModel):
 class SandboxLimits(SandboxData):
     memory_mb: int = Field(default=512, ge=128, le=4096)
     cpus: float = Field(default=1, gt=0, le=4)
+    cpu_shares: int = Field(default=1024, ge=2, le=262144)
+    oom_score_adj: int = Field(default=0, ge=0, le=1000)
     pids: int = Field(default=64, ge=16, le=512)
     workspace_mb: int = Field(default=128, ge=16, le=1024)
     temp_mb: int = Field(default=64, ge=16, le=512)

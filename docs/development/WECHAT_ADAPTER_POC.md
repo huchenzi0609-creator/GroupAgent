@@ -162,3 +162,45 @@ are observed without model requests, the final cursor persists, and restart
 resumes from that cursor. Malformed identity in the middle of that same batch
 still refuses the batch without ACK. These are synthetic transport/database
 tests, not live WeChat acceptance.
+
+## Pinned native control-event audit (2026-11-16)
+
+The account event store at commit `811d090770dd7b682b5bf69d54fc6fbd522cbe9b`
+contains 25 statically identified production emission kinds: 23 controls below, plus
+`message.committed` and `message.recalled`. This audit read the pinned Rust source
+through the GitHub connector and traced `append_event`, `append_event_once`,
+direct `events` SQL inserts and the media/logout event helpers. Test-only
+emissions and the separate calls WebSocket protocol are excluded.
+
+```text
+account.connection, account.control_observed, account.push,
+account.settings_updated, account.updated
+contacts.sync, contacts.updated, credentials.projected
+group.refresh_blocked, group.updated, job.updated
+media.auto-download, media.ready, media.writeback_examined
+metadata.changed, operation.updated, profile.recovery-pending
+projection.blocked, send.updated, sync.committed, sync.received
+thread.read-state, thread.updated
+```
+
+Five additional controls were missing after the first live-discovered controls
+were added. Their fixed-source evidence is:
+
+| Kind | Production emission and meaning |
+| --- | --- |
+| `thread.read-state` | [read_control.rs:211](https://github.com/thisnick/agent-wechat/blob/811d090770dd7b682b5bf69d54fc6fbd522cbe9b/packages/native-client-rust/crates/wechat-core/src/read_control.rs#L211-L216), [sync_projection.rs:448](https://github.com/thisnick/agent-wechat/blob/811d090770dd7b682b5bf69d54fc6fbd522cbe9b/packages/native-client-rust/crates/wechat-core/src/sync_projection.rs#L448-L454): a read-state projection already observed by the daemon; skipping the notification does not mark a chat read. |
+| `sync.committed` | [checkpoint.rs:140](https://github.com/thisnick/agent-wechat/blob/811d090770dd7b682b5bf69d54fc6fbd522cbe9b/packages/native-client-rust/crates/wechat-store/src/checkpoint.rs#L140-L145): publication of a completed profile checkpoint. |
+| `credentials.projected` | [authorization.rs:200](https://github.com/thisnick/agent-wechat/blob/811d090770dd7b682b5bf69d54fc6fbd522cbe9b/packages/native-client-rust/crates/wechat-store/src/authorization.rs#L193-L205): completed saved-login publication; no credential material is needed by the adapter. |
+| `metadata.changed` | [metadata.rs:49](https://github.com/thisnick/agent-wechat/blob/811d090770dd7b682b5bf69d54fc6fbd522cbe9b/packages/native-client-rust/crates/wechat-store/src/metadata.rs#L41-L50): a completed metadata receipt/cursor update, called by [native metadata projection](https://github.com/thisnick/agent-wechat/blob/811d090770dd7b682b5bf69d54fc6fbd522cbe9b/packages/native-client-rust/crates/wechat-core/src/metadata.rs#L704-L710). |
+| `profile.recovery-pending` | [bootstrap.rs:53](https://github.com/thisnick/agent-wechat/blob/811d090770dd7b682b5bf69d54fc6fbd522cbe9b/packages/native-client-rust/crates/wechat-core/src/bootstrap.rs#L50-L59): profile recovery needs attention; advancing over this control is not evidence that recovery succeeded. |
+
+`group.updated` retains its separate group-identity checks. The message and recall
+kinds retain their strict normalization paths. Only the named controls are
+skipped; arbitrary unknown kinds still fail the batch without ACK. Control
+payloads are not saved as chat events or supplied to models, and explicit
+account mismatches are checked before the control whitelist.
+
+The existing `media.updated`, `account.state`, `sync.started`, `sync.completed`,
+`sync.progress` and `sync.failed` entries were not found in this pin's native
+account-store emission paths. This patch leaves those historical entries
+unchanged and adds no wildcard or guessed event family.

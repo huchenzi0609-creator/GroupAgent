@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import math
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Any
@@ -14,6 +15,8 @@ from .browser import BrowserObservation, ControlledBrowser
 from .deepseek import DeepSeekResearchClient
 from .models import FetchInput, FetchOutput, SearchInput, SearchOutput
 
+_TRANSIENT_READ_FAILURES = frozenset({"research_timeout", "rate_limited", "provider_unavailable"})
+
 
 def register_research_tools(
     gateway: ToolGateway,
@@ -21,7 +24,13 @@ def register_research_tools(
     *,
     budget: Any | None = None,
     price_ids: dict[str, str] | None = None,
+    additional_retry_limit: int = 1,
+    retry_backoff_seconds: float = 0.5,
 ) -> None:
+    if type(additional_retry_limit) is not int or not 0 <= additional_retry_limit <= 2:
+        raise ValueError("Research permits at most two additional read attempts")
+    if not math.isfinite(retry_backoff_seconds) or not 0 <= retry_backoff_seconds <= 5:
+        raise ValueError("Research retry backoff must be between zero and five seconds")
     if budget is None and not client.fixture_transport:
         raise DomainError(
             "budget_unconfigured", "Live research tools require a durable budget ledger"
@@ -33,19 +42,35 @@ def register_research_tools(
             "fixture_budget_forbidden", "Fixture research budgets cannot use live transport"
         )
 
-    async def paid(operation: str, arguments, context: ToolContext):
+    def check_attempt(context: ToolContext) -> None:
+        if context.cancelled.is_set():
+            raise DomainError("cancelled", "Research work was cancelled")
+        if context.deadline_monotonic is not None and (
+            context.deadline_monotonic <= asyncio.get_running_loop().time()
+        ):
+            raise DomainError("time_budget_exhausted", "Research work exceeded its deadline")
+
+    async def attempt(operation: str, arguments, context: ToolContext, number: int):
+        check_attempt(context)
+        # Each additional provider request rechecks current authority and must
+        # obtain its own reservation. A previous unknown fee remains held.
+        context = await gateway.authorize("web_" + operation, context)
         if operation == "search":
             await client.url_policy.validate_query(arguments.query)
         else:
             await client.url_policy.validate(arguments.url)
+        check_attempt(context)
         call = client.search if operation == "search" else client.fetch
         if budget is None:
             return await call(arguments)
         assert price_ids is not None
+        key = context.idempotency_key + ":web." + operation
+        if number:
+            key += ":retry:" + str(number)
         reservation = await asyncio.to_thread(
             budget.reserve,
             context.actor,
-            context.idempotency_key + ":web." + operation,
+            key,
             "web." + operation,
             price_ids[operation],
             {"calls": Decimal(1)},
@@ -59,8 +84,7 @@ def register_research_tools(
                 "Research attempt already has a durable budget reservation",
             )
         try:
-            if context.cancelled.is_set():
-                raise DomainError("cancelled", "Research work was cancelled")
+            check_attempt(context)
             result = await call(arguments)
             evidence = (
                 "web."
@@ -79,6 +103,31 @@ def register_research_tools(
                 budget.unknown, context.actor, reservation.id, "research_call_incomplete"
             )
             raise
+
+    async def paid(operation: str, arguments, context: ToolContext):
+        for number in range(additional_retry_limit + 1):
+            try:
+                return await attempt(operation, arguments, context, number)
+            except DomainError as exc:
+                if (
+                    number >= additional_retry_limit
+                    or not exc.retryable
+                    or exc.code not in _TRANSIENT_READ_FAILURES
+                ):
+                    raise
+            # The gateway also enforces the work deadline over the entire tool,
+            # including this bounded, cancellation-aware backoff.
+            delay = retry_backoff_seconds * (number + 1)
+            if delay:
+                try:
+                    await asyncio.wait_for(context.cancelled.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+            check_attempt(context)
+        raise AssertionError("Research retry loop must return or raise")
+
+    attempts = additional_retry_limit + 1
+    backoff = retry_backoff_seconds * additional_retry_limit * attempts / 2
 
     async def search(arguments: SearchInput, context: ToolContext) -> SearchOutput:
         return await paid("search", arguments, context)
@@ -99,13 +148,13 @@ def register_research_tools(
             handler=search,
             risk_class="read_only",
             resource_scopes=("group", "work", "public_web"),
-            timeout_seconds=client.timeout_seconds + 6,
+            timeout_seconds=(client.timeout_seconds + 6) * attempts + backoff,
             max_input_bytes=4096,
             max_output_bytes=client.max_output_bytes,
             cost_meter="deepseek_search_request",
-            idempotency_mode=IdempotencyMode.RECONCILE_BEFORE_RETRY
-            if budget
-            else IdempotencyMode.READ_ONLY,
+            # Public reads have no mutable business effect. Unknown provider
+            # charges are retained separately by the durable monetary ledger.
+            idempotency_mode=IdempotencyMode.READ_ONLY,
         )
     )
     gateway.register(
@@ -121,13 +170,11 @@ def register_research_tools(
             handler=fetch,
             risk_class="read_only",
             resource_scopes=("group", "work", "public_web"),
-            timeout_seconds=client.timeout_seconds + 3,
+            timeout_seconds=(client.timeout_seconds + 3) * attempts + backoff,
             max_input_bytes=60_000,
             max_output_bytes=client.max_output_bytes,
             cost_meter="deepseek_fetch_request",
-            idempotency_mode=IdempotencyMode.RECONCILE_BEFORE_RETRY
-            if budget
-            else IdempotencyMode.READ_ONLY,
+            idempotency_mode=IdempotencyMode.READ_ONLY,
         )
     )
 

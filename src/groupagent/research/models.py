@@ -39,19 +39,25 @@ class ResearchSource(ToolData):
         default="",
         description="Client-built URL and actual retrieval time in UTC; copy this citation, optionally adding local time",
     )
-    provider: Literal["deepseek"] = "deepseek"
+    provider: Literal["deepseek", "public_http"] = "deepseek"
     operation: Literal["search", "fetch"]
-    evidence_kind: Literal["search_result", "provider_fetched_page"]
+    evidence_kind: Literal[
+        "search_result", "provider_fetched_page", "public_image_page", "public_image"
+    ]
     untrusted_content: Literal[True] = True
     published_at: AwareDatetime | None = None
     snippet: str = ""
     summary: str = ""
     content: str = ""
-    content_sha256: str = Field(description="SHA-256 of returned, possibly truncated, content")
+    content_sha256: str = Field(
+        description=(
+            "SHA-256 of returned, possibly truncated, text; direct public image/page evidence hashes fetched source bytes"
+        )
+    )
     content_bytes_received: int = Field(ge=0)
     content_bytes_returned: int = Field(ge=0)
     truncated_fields: tuple[str, ...] = ()
-    # Fetch does not return a final URL. Do not invent a redirect destination.
+    # DeepSeek fetch has no final URL. Direct public HTTP records checked redirects.
     final_url: str | None = None
 
 

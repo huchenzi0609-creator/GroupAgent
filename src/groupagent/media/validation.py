@@ -41,10 +41,19 @@ def reject_video(content: bytes) -> None:
         raise DomainError("unsupported_video", "Video bytes are not processed")
 
 
-def inspect_image(content: bytes) -> tuple[ImageInfo, bytes]:
+def inspect_image(
+    content: bytes, *, max_bytes: int = IMAGE_BYTES, max_pixels: int = IMAGE_PIXELS
+) -> tuple[ImageInfo, bytes]:
+    if (
+        type(max_bytes) is not int
+        or not 0 < max_bytes <= IMAGE_BYTES
+        or type(max_pixels) is not int
+        or not 0 < max_pixels <= IMAGE_PIXELS
+    ):
+        raise ValueError("Image limits must be within 15 MiB and 40 megapixels")
     reject_video(content)
-    if not content or len(content) > IMAGE_BYTES:
-        raise DomainError("image_size_limit", "Image must be nonempty and at most 15 MiB")
+    if not content or len(content) > max_bytes:
+        raise DomainError("image_size_limit", "Image exceeds its configured byte limit")
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -54,8 +63,10 @@ def inspect_image(content: bytes) -> tuple[ImageInfo, bytes]:
                     raise DomainError(
                         "unsupported_image", "Supported images are JPEG, PNG, WebP and GIF"
                     )
-                if original.width * original.height > IMAGE_PIXELS:
-                    raise DomainError("image_pixel_limit", "Image exceeds 40 megapixels")
+                if original.width * original.height > max_pixels:
+                    raise DomainError(
+                        "image_pixel_limit", "Image exceeds its configured pixel limit"
+                    )
                 frames = int(getattr(original, "n_frames", 1))
                 original.verify()
             with Image.open(io.BytesIO(content)) as original:
@@ -320,13 +331,20 @@ def _tesseract_text(output: bytes) -> tuple[str, tuple[OCRWord, ...]]:
     return text, tuple(words)
 
 
-def ocr_image(content: bytes, *, languages: str = "eng+chi_sim", page_number: int = 1) -> OCRPage:
+def ocr_image(
+    content: bytes,
+    *,
+    languages: str = "eng+chi_sim",
+    page_number: int = 1,
+    max_bytes: int = IMAGE_BYTES,
+    max_pixels: int = IMAGE_PIXELS,
+) -> OCRPage:
     if not re.fullmatch(r"(?:eng|chi_sim)(?:\+(?:eng|chi_sim))?", languages):
         raise DomainError(
             "unsupported_ocr_language",
             "Only configured English and simplified Chinese OCR are enabled",
         )
-    info, raster = inspect_image(content)
+    info, raster = inspect_image(content, max_bytes=max_bytes, max_pixels=max_pixels)
     executable = shutil.which("tesseract")
     if not executable:
         raise DomainError("media_dependency_missing", "Tesseract is not installed in the worker")

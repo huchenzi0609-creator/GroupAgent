@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from groupagent.domain import DomainError, Role
+from groupagent.resources import ResourceDeferred, ResourceGovernor
 
 from .models import (
     ISOLATED_PROCESS_TOOLS,
@@ -126,6 +127,21 @@ class ToolGateway:
         self._scopes: dict[tuple[str, str], ToolScope] = {}
         self._ledger: dict[tuple[str, str, str], tuple[str, ToolReceipt]] = {}
         self._active: dict[tuple[str, str, str], asyncio.Task[Any]] = {}
+        self._resource_admission: tuple[ResourceGovernor, int, frozenset[str]] | None = None
+
+    def bind_resource_admission(
+        self, governor: ResourceGovernor, *, memory_mb: int, tool_names: frozenset[str]
+    ) -> None:
+        """Admit reviewed worker tools before recording an in-flight effect.
+
+        The reservation follows the handler through ContextVar inheritance and
+        is reused by its DockerSandbox calls. It is never a model capability.
+        """
+        if self._active or not tool_names.issubset(self._tools):
+            raise ValueError("Bind resources to registered tools before invocation")
+        if type(memory_mb) is not int or memory_mb <= 0:
+            raise ValueError("A full child memory limit is required")
+        self._resource_admission = (governor, memory_mb, tool_names)
 
     @property
     def registered_names(self) -> frozenset[str]:
@@ -331,6 +347,18 @@ class ToolGateway:
         ):
             return receipt("time_budget_exhausted")
 
+        reservation = None
+        if self._resource_admission is not None:
+            governor, memory_mb, names = self._resource_admission
+            if governor.policy.enabled and name in names:
+                try:
+                    reservation = governor.reserve(memory_mb, owner=context.idempotency_key)
+                except ResourceDeferred:
+                    # No handler, timeout, in-flight ledger entry, or effect has
+                    # started. The exact proposal can resume without a new model
+                    # request and without replaying earlier tools in its batch.
+                    return receipt("resource_deferred")
+
         uncertain = (
             EffectState.NO_EFFECT
             if definition.idempotency_mode == IdempotencyMode.READ_ONLY
@@ -339,7 +367,10 @@ class ToolGateway:
         self._ledger[key] = (fingerprint, receipt("tool_in_progress", uncertain))
 
         async def execute() -> Any:
-            return await definition.handler(validated, effective_context)
+            if reservation is None:
+                return await definition.handler(validated, effective_context)
+            with reservation.activate():
+                return await definition.handler(validated, effective_context)
 
         task: asyncio.Task[Any] = asyncio.create_task(execute())
         cancellation = asyncio.create_task(context.cancelled.wait())
@@ -437,6 +468,14 @@ class ToolGateway:
                 task.add_done_callback(
                     lambda finished: finished.exception() if not finished.cancelled() else None
                 )
+            if reservation is not None:
+                if task.done():
+                    reservation.release()
+                else:
+                    # An uncooperative handler may still start/write a worker.
+                    # Retain capacity until it actually ends, not just until the
+                    # gateway's cancellation grace or execution timeout expires.
+                    task.add_done_callback(lambda _finished: reservation.release())
         result = await self._required_evidence(result, context)
         if (
             result.control is not None

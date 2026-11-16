@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from importlib.resources import files
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import psycopg
@@ -1377,7 +1377,8 @@ class UnitOfWork:
         if state == WorkState.COMPLETED:
             deliveries = self.conn.execute(
                 "SELECT state FROM ga_deliveries WHERE group_id = %s AND work_id = %s "
-                "AND goal_revision = %s",
+                "AND goal_revision = %s AND NOT (state = 'rejected' "
+                "AND reason IS NOT DISTINCT FROM 'candidate_superseded_before_dispatch')",
                 (self.group_id, work_id, row["goal_revision"]),
             ).fetchall()
             if not deliveries or any(
@@ -1467,6 +1468,31 @@ class UnitOfWork:
         policy, never from a model. This grants no work, artifact, recipient or
         generic outbox capability to an observer or maintainer.
         """
+        return self._enqueue_request_text(
+            request_event_id, text, slot="reply", read_only_authorized=read_only_authorized
+        )
+
+    def enqueue_early_ack(
+        self, request_event_id: str, text: str, *, read_only_authorized: bool = False
+    ) -> DeliveryIntent:
+        """Enqueue one source-bound acknowledgement before a slow final reply.
+
+        The acknowledgement has the same actor and trusted policy requirements
+        as enqueue_reply, with its own fixed idempotency key. It grants no
+        authority to use referenced text or create work.
+        """
+        return self._enqueue_request_text(
+            request_event_id, text, slot="early_ack", read_only_authorized=read_only_authorized
+        )
+
+    def _enqueue_request_text(
+        self,
+        request_event_id: str,
+        text: str,
+        *,
+        slot: Literal["reply", "early_ack"],
+        read_only_authorized: bool,
+    ) -> DeliveryIntent:
         if self.actor.role in (Role.OBSERVER, Role.MAINTAINER) and read_only_authorized is not True:
             raise DomainError(
                 "permission_denied", "Current policy has not authorized a read-only reply"
@@ -1481,7 +1507,7 @@ class UnitOfWork:
             None,
             "text:" + text,
             hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            "reply:" + event.id + ":1",
+            slot + ":" + event.id + ":1",
             request_event_id=event.id,
         )
 
@@ -1510,9 +1536,9 @@ class UnitOfWork:
         goal_revision: int | None = None,
         request_event_id: str | None = None,
     ) -> DeliveryIntent:
-        # Reply intents also have a unique request-event key. A targeted arbiter
-        # can pass its precheck, then race into the other unique index. Let all
-        # usable unique constraints arbitrate; validate the logical key below.
+        # Let every usable unique constraint arbitrate, including the primary
+        # key. Only the exact business key can identify the canonical intent:
+        # early acknowledgement and final reply share their source event.
         row = self.conn.execute(
             "INSERT INTO ga_deliveries (id, group_id, work_id, goal_revision, created_by, "
             "policy_revision, payload_ref, payload_hash, idempotency_key, request_event_id) "

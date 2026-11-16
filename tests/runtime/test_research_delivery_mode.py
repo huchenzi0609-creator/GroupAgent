@@ -314,7 +314,14 @@ async def test_message_contract_rejects_an_extra_result_before_critic(toolkit_se
         "请联网查阅资料，解释这个概念，用音频回复。",
     ],
 )
-async def test_explicit_speech_research_preserves_audio_and_required_tool(toolkit_setup, text):
+async def test_opted_in_legacy_speech_research_preserves_audio_and_required_tool(
+    toolkit_setup, text
+):
+    # TTS is outside the current release; only this dormant-path fixture opts in.
+    config = toolkit_setup.toolkit.config
+    toolkit_setup.toolkit.config = config.model_copy(
+        update={"features": config.features.model_copy(update={"speech_reply_on_request": True})}
+    )
     current, _, _, _ = await admitted(toolkit_setup, text, outputs=[{"format": "wav"}])
     assert current.scope["research_message_only"] is False
     assert current.scope["outputs"][0]["format"] == "wav"

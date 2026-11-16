@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -57,6 +58,129 @@ def test_split_preserves_all_content_and_combining_sequences():
     parts = split_text(text, maximum=200)
     assert len(parts) > 2 and "".join(parts) == text
     assert all(not p.startswith("\u0301") and not p.endswith("\u200d") for p in parts)
+
+
+async def test_chat_arriving_during_file_send_precedes_remaining_files(runtime_env, monkeypatch):
+    env = runtime_env
+    event = source(env, "Produce a synthetic background bundle")
+    with env.store.transaction(env.actor) as tx:
+        work = tx.create_work("Produce two reports", event.id)
+        lease = tx.claim_work(work.id, "fixture-worker", ttl_seconds=300)
+    scope = ArtifactScope(env.actor.group_id, work.id, env.actor.member_id)
+    docs = DocumentService(env.artifacts)
+    drafts = []
+    for name in ("first.md", "second.md"):
+        version = docs.generate(
+            scope, name, Report("Example", (Section("Result", ("A verified synthetic result",)),))
+        )
+        validation = docs.validate(
+            scope, version.file_id, version.version_id, expected_text=("verified",)
+        )
+        env.registry.register(env.actor, lease, version, validation=validation.to_dict())
+        drafts.append(
+            DeliveryDraft("artifact:" + version.version_id, version.sha256, "file:" + name)
+        )
+    closing = "Bundle complete"
+    drafts.append(
+        DeliveryDraft("text:" + closing, hashlib.sha256(closing.encode()).hexdigest(), "bundle:end")
+    )
+    with env.store.transaction(env.actor) as tx:
+        current = tx.get_work(work.id)
+        validating = tx.transition_work(
+            work.id, WorkState.VALIDATING, expected_revision=current.revision, lease=lease
+        )
+        tx.record_validation(work.id, lease, "synthetic:verified")
+        tx.transition_work(
+            work.id, WorkState.DELIVERING, expected_revision=validating.revision, lease=lease
+        )
+        bundle = env.state.enqueue_bundle_in_tx(tx, lease, tuple(drafts))
+    order = []
+    original_file, original_text = env.channel.send_file, env.channel.send_text
+
+    async def send_file(group, name, content, key):
+        order.append(("file", name))
+        if name == "first.md":
+            # The reply does not exist when the first file is selected. Admit
+            # it while that transport call is in progress, before its receipt.
+            question = source(env, "A new foreground chat question")
+            background = "Other background text"
+            with env.store.transaction(env.actor) as tx:
+                tx.enqueue_delivery(
+                    None,
+                    "text:" + background,
+                    hashlib.sha256(background.encode()).hexdigest(),
+                    "background:text",
+                )
+                tx.enqueue_reply(question.id, "Foreground answer")
+        return await original_file(group, name, content, key)
+
+    async def send_text(group, text, key):
+        order.append(("text", text))
+        return await original_text(group, text, key)
+
+    monkeypatch.setattr(env.channel, "send_file", send_file)
+    monkeypatch.setattr(env.channel, "send_text", send_text)
+    dispatcher = Dispatcher(env.state, env.service, lambda _: env.actor, env.channel, env.registry)
+    assert await dispatcher.tick() == 5
+    assert order == [
+        ("file", "first.md"),
+        ("text", dispatcher.badge + "Foreground answer"),
+        ("text", dispatcher.badge + "Other background text"),
+        ("file", "second.md"),
+        ("text", dispatcher.badge + closing),
+    ]
+    with env.store.transaction(env.actor) as tx:
+        assert all(tx.get_delivery(intent.id).state == DeliveryState.ACCEPTED for intent in bundle)
+
+
+async def test_unresolved_reply_is_checked_once_per_tick_without_blocking_other_text(
+    runtime_env, monkeypatch
+):
+    env = runtime_env
+    event = source(env)
+    with env.store.transaction(env.actor) as tx:
+        unresolved = tx.enqueue_reply(event.id, "Receipt still pending")
+        background = "Independent background text"
+        other = tx.enqueue_delivery(
+            None,
+            "text:" + background,
+            hashlib.sha256(background.encode()).hexdigest(),
+            "independent:text",
+        )
+    queued = {}
+    lookups, sends = [], []
+    original_lookup, original_send = env.channel.lookup_delivery, env.channel.send_text
+
+    async def lookup(group, key):
+        lookups.append(key)
+        return queued.get(key) or await original_lookup(group, key)
+
+    async def send_text(group, text, key):
+        assert key in lookups  # Every send still follows a receipt lookup.
+        sends.append(key)
+        if text.endswith("Receipt still pending"):
+            queued[key] = ChannelReceipt(
+                account_id="local-account",
+                group_id=group,
+                idempotency_key=key,
+                wire_idempotency_key=key,
+                state="queued",
+                observed_at=event.occurred_at,
+            )
+            return queued[key]
+        return await original_send(group, text, key)
+
+    monkeypatch.setattr(env.channel, "lookup_delivery", lookup)
+    monkeypatch.setattr(env.channel, "send_text", send_text)
+    dispatcher = Dispatcher(env.state, env.service, lambda _: env.actor, env.channel, env.registry)
+    assert await dispatcher.tick() == 1
+    unresolved_key = next(iter(queued))
+    assert lookups.count(unresolved_key) == 1 and sends.count(unresolved_key) == 1
+    with env.store.transaction(env.actor) as tx:
+        assert tx.get_delivery(unresolved.id).state == DeliveryState.UNKNOWN
+        assert tx.get_delivery(other.id).state == DeliveryState.ACCEPTED
+    assert await dispatcher.tick() == 0
+    assert lookups.count(unresolved_key) == 2 and sends.count(unresolved_key) == 1
 
 
 async def test_long_reply_crash_reconciles_each_part_without_duplicate(runtime_env):
@@ -165,6 +289,12 @@ async def test_file_bundle_preserves_partial_success_and_actual_bytes(runtime_en
     await dispatcher.tick()
     with env.store.transaction(env.actor) as tx:
         assert tx.get_delivery(intents[0].id).state == DeliveryState.REJECTED
+        assert tx.get_delivery(intents[0].id).reason == "synthetic rejection"
+        rejected_part = tx.conn.execute(
+            "SELECT reason FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s",
+            (env.actor.group_id, intents[0].id),
+        ).fetchone()
+        assert rejected_part["reason"] == "synthetic rejection"
         assert tx.get_delivery(intents[1].id).state == DeliveryState.ACCEPTED
         with pytest.raises(DomainError):
             tx.transition_work(

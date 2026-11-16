@@ -19,6 +19,7 @@ from typing import Any
 from weakref import WeakSet
 
 from groupagent.domain import DomainError
+from groupagent.resources import ResourceDeferred, ResourceGovernor, ResourceReservation
 from groupagent.tools import ToolContext, ToolScope
 from groupagent.tools.paths import open_parent, scoped_path
 
@@ -29,6 +30,7 @@ from .supervisor import PROGRAMS, relative_path
 class DockerSandbox:
     _instances: WeakSet[DockerSandbox] = WeakSet()
     _managed: dict[str, tuple[DockerSandbox, str, str]] = {}
+    _container_reservations: dict[str, ResourceReservation] = {}
 
     def __init__(
         self,
@@ -40,6 +42,7 @@ class DockerSandbox:
         allowed_programs: frozenset[str] = frozenset(PROGRAMS),
         staging_root: Path | None = None,
         policy_guard: Callable[[ToolContext], Awaitable[None]] | None = None,
+        resource_governor: ResourceGovernor | None = None,
     ) -> None:
         if not re.fullmatch(
             r"(?:sha256:[a-f0-9]{64}|[A-Za-z0-9./:_-]+@sha256:[a-f0-9]{64})", image
@@ -55,6 +58,7 @@ class DockerSandbox:
         self.allowed_programs = allowed_programs
         self.staging_root = staging_root
         self.policy_guard = policy_guard
+        self.resource_governor = resource_governor
         self._gate = asyncio.Lock()
         self._instances.add(self)
 
@@ -64,7 +68,20 @@ class DockerSandbox:
             json.dumps([group_id, work_id], separators=(",", ":")).encode()
         ).hexdigest()
 
+    @staticmethod
+    def group_label(group_id: str) -> str:
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError("A trusted group identity is required")
+        return hashlib.sha256(group_id.encode()).hexdigest()
+
     def track_container(self, name: str, scope: ToolScope) -> None:
+        if self.resource_governor and self.resource_governor.policy.enabled:
+            reservation = self.resource_governor.current(self.limits.memory_mb)
+            if reservation is None:
+                raise ResourceDeferred()
+            if name not in self._container_reservations:
+                reservation.container_started(name)
+                self._container_reservations[name] = reservation
         self._managed[name] = (self, scope.group_id, scope.work_id)
 
     @classmethod
@@ -76,20 +93,91 @@ class DockerSandbox:
             raise DomainError(
                 "work_busy", "Unrecognized managed container identity", retryable=True
             )
-        await self._control(home, "rm", "--force", "--volumes", name, timeout=5)
-        code, raw = await self._control(
-            home,
-            "ps",
-            "--all",
-            "--filter",
-            "name=^/" + name + "$",
-            "--format",
-            "{{.Names}}",
-            timeout=5,
-        )
-        if code or raw.strip():
-            raise DomainError("work_busy", "Container removal is not confirmed", retryable=True)
+        try:
+            await self._control(home, "rm", "--force", "--volumes", name, timeout=5)
+            code, raw = await self._control(
+                home,
+                "ps",
+                "--all",
+                "--filter",
+                "name=^/" + name + "$",
+                "--format",
+                "{{.Names}}",
+                timeout=5,
+            )
+            if code or raw.strip():
+                raise DomainError("work_busy", "Container removal is not confirmed", retryable=True)
+        except BaseException:
+            reservation = self._container_reservations.get(name)
+            if reservation is not None:
+                reservation.poison()
+            raise
+        reservation = self._container_reservations.pop(name, None)
+        if reservation is not None:
+            reservation.container_removed(name)
         self._managed.pop(name, None)
+
+    async def reconcile_group(self, group_id: str) -> int:
+        """Startup barrier after the application DB lease, before worker intake.
+
+        Inventory the daemon independently of process-local tracking, including
+        audio preprocessing scopes which have no WorkOrder. Only this group's
+        labelled managed workers may be removed. Legacy unlabelled workers are
+        retained and fail closed; other applications/groups are never removed.
+        """
+        label = self.group_label(group_id)
+
+        async def inventory(home: Path) -> dict[str, str]:
+            code, raw = await self._control(
+                home,
+                "ps",
+                "--all",
+                "--filter",
+                "label=org.groupagent.managed=1",
+                "--format",
+                '{{.Names}}\t{{.Label "org.groupagent.group"}}',
+                timeout=5,
+            )
+            if code or len(raw) > 256_000:
+                raise ValueError("Managed worker inventory is unavailable")
+            rows = raw.decode("ascii").splitlines()
+            if len(rows) > 1000:
+                raise ValueError("Managed worker inventory exceeds its bound")
+            values = {}
+            for row in rows:
+                name, group = row.split("\t")
+                if (
+                    not re.fullmatch(r"groupagent-(?:harness-)?[a-f0-9]{32}", name)
+                    or not re.fullmatch(r"[a-f0-9]{64}", group)
+                    or name in values
+                ):
+                    raise ValueError("Managed worker ownership cannot be established")
+                values[name] = group
+            return values
+
+        try:
+            if self.resource_governor and self.resource_governor.busy:
+                raise ValueError("Startup reconciliation cannot overlap an admitted handler")
+            with tempfile.TemporaryDirectory(dir=self.staging_root, prefix="ga-reconcile-") as root:
+                home = Path(root)
+                before = await inventory(home)
+                owned = [name for name, group in before.items() if group == label]
+                for name in owned:
+                    await self.remove_container(home, name)
+                after = await inventory(home)
+                if any(group == label for group in after.values()):
+                    raise ValueError("Managed worker absence is not confirmed")
+                return len(owned)
+        except BaseException as error:
+            if self.resource_governor:
+                self.resource_governor.poison()
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            raise DomainError(
+                "resource_reconciliation_required",
+                "Managed worker state requires reconciliation before new isolated work",
+                retryable=True,
+            ) from None
 
     @classmethod
     async def quiesce_work(cls, group_id: str, work_id: str) -> None:
@@ -242,21 +330,34 @@ class DockerSandbox:
                         raise DomainError(
                             "scope_violation", "Worker inputs must be private regular files"
                         )
-                    data = source.read(self.limits.max_input_bytes - total + 1)
-            total += len(data)
-            if total > self.limits.max_input_bytes:
-                raise DomainError("quota_exceeded", "Worker inputs exceed their byte limit")
-            destination = target / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(data)
+                    destination = target / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    size, digest = 0, hashlib.sha256()
+                    with destination.open("xb") as staged:
+                        while chunk := source.read(65536):
+                            total += len(chunk)
+                            size += len(chunk)
+                            if total > self.limits.max_input_bytes:
+                                raise DomainError(
+                                    "quota_exceeded", "Worker inputs exceed their byte limit"
+                                )
+                            digest.update(chunk)
+                            staged.write(chunk)
             destination.chmod(0o600)
-            manifest.append(
-                {"path": name, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-            )
+            manifest.append({"path": name, "size_bytes": size, "sha256": digest.hexdigest()})
         return manifest
 
     def _argv(self, name: str, *, scope: ToolScope | None = None) -> list[str]:
         limits = self.limits
+        if (
+            self.resource_governor
+            and self.resource_governor.policy.enabled
+            and self.resource_governor.current(limits.memory_mb) is None
+        ):
+            # Direct SDK launch paths cannot bypass transient worker admission.
+            # Low-memory execution uses the host ScopedToolEngine; persistent
+            # SDK workers need an explicit, separate resident-memory contract.
+            raise ResourceDeferred()
         return self._command(
             "run",
             "--name",
@@ -278,6 +379,8 @@ class DockerSandbox:
             f"--memory={limits.memory_mb}m",
             f"--memory-swap={limits.memory_mb}m",
             f"--cpus={limits.cpus}",
+            f"--cpu-shares={limits.cpu_shares}",
+            f"--oom-score-adj={limits.oom_score_adj}",
             "--ulimit",
             "nofile=256:256",
             "--tmpfs",
@@ -291,6 +394,8 @@ class DockerSandbox:
             "org.groupagent.managed=1",
             *(
                 [
+                    "--label",
+                    "org.groupagent.group=" + self.group_label(scope.group_id),
                     "--label",
                     "org.groupagent.scope=" + self.scope_label(scope.group_id, scope.work_id),
                 ]
@@ -306,6 +411,22 @@ class DockerSandbox:
             return ProcessResult(
                 image=self.image, exit_code=None, cancelled=True, elapsed_seconds=0
             )
+        governor = self.resource_governor
+        if governor is None or not governor.policy.enabled:
+            return await self._admitted_run(spec, context)
+        reservation = governor.current(self.limits.memory_mb)
+        owned = reservation is None
+        if reservation is None:
+            reservation = governor.reserve(self.limits.memory_mb, owner=context.idempotency_key)
+        try:
+            with reservation.activate():
+                async with reservation.child_slot(context.cancelled, context.deadline_monotonic):
+                    return await self._admitted_run(spec, context)
+        finally:
+            if owned:
+                reservation.release()
+
+    async def _admitted_run(self, spec: ProcessSpec, context: ToolContext) -> ProcessResult:
         async with self._gate:
             if self.policy_guard:
                 await self.policy_guard(context)
@@ -345,6 +466,10 @@ class DockerSandbox:
             if len(payload) > 2_000_000:
                 raise DomainError("invalid_input", "Worker request exceeds its protocol limit")
             command = self._argv(name, scope=context.scope)
+            # Track the intended identity before awaiting subprocess creation.
+            # Cancellation during creation cannot establish that Docker did not
+            # launch it, so removal must be confirmed before returning capacity.
+            self.track_container(name, context.scope)
             try:
                 process = await asyncio.create_subprocess_exec(
                     *command,
@@ -354,10 +479,13 @@ class DockerSandbox:
                     env=self._env(home),
                 )
             except OSError:
+                await self.remove_container(home, name)
                 raise DomainError(
                     "sandbox_unavailable", "Unable to start the isolated worker"
                 ) from None
-            self.track_container(name, context.scope)
+            except BaseException:
+                await self.remove_container(home, name)
+                raise
             assert process.stdin and process.stdout
             transfer_limit = (
                 self.limits.max_artifact_bytes * 2 + spec.max_output_bytes * 8 + 1_000_000

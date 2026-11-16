@@ -12,13 +12,17 @@ from typing import Any
 
 from groupagent.coordinator import Decision
 from groupagent.domain import EventKind, GroupEvent
+from groupagent.identity import BotIdentity
 
 from .timeparse import normalize_time
 
 _EXPLANATION = re.compile(
     r"^(?:请|麻烦(?:你)?|帮我)?\s*(?:解释|翻译|说明|分析|总结|评价|判断|比较|如何|怎么|为什么)|是什么意思|有什么(?:区别|不同)"
 )
-_QUOTED = re.compile(r"```.*?```|『[^』]*』|「[^」]*」|“[^”]*”|\"[^\"]*\"|(?m:^>[^\n]*)", re.S)
+_QUOTED = re.compile(
+    r"```.*?```|~~~.*?~~~|`[^`\n]*`|『[^』]*』|「[^」]*」|“[^”]*”|‘[^’]*’|\"[^\"]*\"|'[^'\n]*'|(?m:^>[^\n]*)",
+    re.S,
+)
 _OUTER_ASK = re.compile(r"解释|翻译|分析|总结|评价|判断|比较|核对|为什么|如何|怎么|[?？]")
 _GROUP = re.compile(r"全群|本群|整个群|这个群|当前群|群内|群里所有|群的|群参与|群讨论")
 _PARTICIPATION = re.compile(
@@ -47,26 +51,12 @@ _NON_CASUAL_STATE = re.compile(
 )
 
 
-def _outside(text: str) -> str:
+def outside_quotes(text: str) -> str:
     return _QUOTED.sub(" ", text).strip()
 
 
 def _agent_request(text: str, context: dict[str, Any]) -> bool:
-    aliases = context.get("agent_aliases", ["机器人", "机器人组长", "组长", "小伴"])
-    aliases = (
-        [value for value in aliases if isinstance(value, str) and value]
-        if isinstance(aliases, list)
-        else []
-    )
-    if text.startswith("/组长"):
-        return True
-    for name in aliases:
-        literal = re.escape(name)
-        if re.search(r"(?:请|麻烦|拜托)\s*@?" + literal, text) or re.search(
-            literal + r"[，,:：\s]*(?:请|帮|麻烦|能否|可以|解释|翻译|分析|总结|回答|继续|把)", text
-        ):
-            return True
-    return False
+    return BotIdentity.from_context(context).request_addressed(text)
 
 
 def _source_quote_only(text: str, outside: str) -> bool:
@@ -120,10 +110,7 @@ def _standalone_state(event: GroupEvent, text: str, context: dict[str, Any]) -> 
         or _NON_CASUAL_STATE.search(text)
     ):
         return False
-    aliases = context.get("agent_aliases", ["机器人", "机器人组长", "组长", "小伴"])
-    if isinstance(aliases, list) and any(
-        isinstance(alias, str) and alias and alias in text for alias in aliases
-    ):
+    if BotIdentity.from_context(context).mentioned(text):
         return False
     # An unthreaded answer to a recent question can still continue a request.
     recent = context.get("recent_messages", [])
@@ -156,7 +143,7 @@ def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
     ):
         return None
     text = event.text.strip()
-    outside = _outside(text)
+    outside = outside_quotes(text)
     explicit_data = bool(
         re.search(
             r"(?:只是|仅仅|仅|单纯).{0,4}(?:引用|转发|例子|示例)|假例子|(?:举的|中的)(?:例子|示例)|(?:这是|下面是).{0,4}(?:引用|转发)",
@@ -195,8 +182,10 @@ def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
         )
     ):
         if re.search(
-            r"(?:机器人|组长|小伴)[，,:：\s]*(?:先)?(?:别|不要|不用)(?:接|接手|参与这事|回复这条)",
+            BotIdentity.from_context(context).name_pattern
+            + r"[，,:：\s]*(?:先)?(?:别|不要|不用)(?:接|接手|参与这事|回复这条)",
             outside,
+            re.I,
         ):
             return Decision(
                 kind="observe",
@@ -221,7 +210,6 @@ def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
         name, identifier = member.get("name"), member.get("member_id")
         if isinstance(name, str) and name and isinstance(identifier, str):
             names.setdefault(name, set()).add(identifier)
-    aliases = context.get("agent_aliases", [])
     excluded = {
         "我",
         "你",
@@ -236,10 +224,10 @@ def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
         "组长",
         "小伴",
     }
-    if isinstance(aliases, list):
-        excluded.update(value for value in aliases if isinstance(value, str))
+    excluded.update(BotIdentity.from_context(context).names)
+    excluded = {name.casefold() for name in excluded}
     for name, identities in names.items():
-        if len(identities) != 1 or requester in identities or name in excluded:
+        if len(identities) != 1 or requester in identities or name.casefold() in excluded:
             continue
         if re.match(
             r"^(?:(?:请|麻烦|拜托)\s*)?@?" + re.escape(name) + r"(?=[，,：:\s]|先|帮|来|你)",
@@ -256,7 +244,7 @@ def fast_observe(event: GroupEvent, context: dict[str, Any]) -> Decision | None:
 
 def owner_assignment_request(text: str, context: dict[str, Any]) -> bool:
     """An owner may need an assignee clarification before an action can exist."""
-    outside = _outside(text)
+    outside = BotIdentity.from_context(context).strip_address(outside_quotes(text))
     if (
         context.get("role") != "owner"
         or _EXPLANATION.search(outside)
@@ -298,7 +286,7 @@ def policy_intent(event: GroupEvent, context: dict[str, Any]) -> PolicyIntent | 
     """Resolve explicit participation-policy semantics before mapping boolean fields."""
     if event.kind not in {EventKind.TEXT, EventKind.QUOTE} or len(event.text) > 2000:
         return None
-    text = _outside(event.text)
+    text = BotIdentity.from_context(context).strip_address(outside_quotes(event.text))
     if not text or _EXPLANATION.search(text) or not _PARTICIPATION.search(text):
         return None
     if re.search(

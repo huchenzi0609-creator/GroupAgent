@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -26,20 +27,28 @@ class FetchedHTML:
     content: bytes
     sha256: str
     status_code: int
+    content_type: str = "text/html"
+    retrieved_at: datetime | None = None
 
 
 class PublicPageBroker:
-    """Only trusted approved hostnames can be fetched. Every connection pins public DNS."""
+    """Pin public DNS; normal browser callers supply a trusted approved-host set.
+
+    The specialized image service uses None for its two fixed resource profiles.
+    Neither a webpage nor model arguments can change the normal browser's set.
+    """
 
     def __init__(
         self,
-        allowed_hosts: frozenset[str],
+        allowed_hosts: frozenset[str] | None,
         *,
         resolver: Resolver = system_resolver,
         client: httpx.AsyncClient | None = None,
         max_bytes: int = 4 * 1024 * 1024,
     ):
-        self.allowed_hosts = frozenset(host.lower() for host in allowed_hosts)
+        self.allowed_hosts = (
+            frozenset(host.lower() for host in allowed_hosts) if allowed_hosts is not None else None
+        )
         self.resolver = resolver
         self.client = client or httpx.AsyncClient(
             trust_env=False, follow_redirects=False, timeout=20
@@ -52,7 +61,9 @@ class PublicPageBroker:
             await self.client.aclose()
 
     @asynccontextmanager
-    async def _get(self, target: httpx.URL, host: str) -> AsyncIterator[httpx.Response]:
+    async def _get(
+        self, target: httpx.URL, host: str, *, accept: str = "text/html,application/xhtml+xml"
+    ) -> AsyncIterator[httpx.Response]:
         # A borrowed client may have default API headers/cookies. Construct a new
         # request instead of client.build_request/stream, and disable its auth hook.
         request = httpx.Request(
@@ -61,7 +72,7 @@ class PublicPageBroker:
             headers={
                 "Host": host,
                 "User-Agent": "GroupAgentResearch/0.1",
-                "Accept": "text/html,application/xhtml+xml",
+                "Accept": accept,
                 "Accept-Encoding": "identity",
             },
             extensions={
@@ -76,10 +87,29 @@ class PublicPageBroker:
             await response.aclose()
 
     async def fetch(self, url: str) -> FetchedHTML:
+        return await self._fetch_resource(url, kind="html", max_bytes=self.max_bytes)
+
+    async def _fetch_resource(
+        self, url: str, *, kind: Literal["html", "image"], max_bytes: int
+    ) -> FetchedHTML:
+        """Shared pinned transport for two fixed profiles, never arbitrary bytes.
+
+        The public-image service uses the image profile only after a same-work
+        candidate lookup. The normal browser retains its configured host list.
+        """
+        prefix = "browser" if kind == "html" else "public_image"
+        limit = 4 * 1024 * 1024 if kind == "html" else 15 * 1024 * 1024
+        if type(max_bytes) is not int or not 0 < max_bytes <= limit:
+            raise ValueError("Public resource byte limit is outside its fixed profile")
+        accepted = (
+            {"text/html", "application/xhtml+xml"}
+            if kind == "html"
+            else {"image/jpeg", "image/png", "image/webp", "image/gif"}
+        )
         requested = url
         for _ in range(4):
             canonical, host, literal = parse_public_url(url)
-            if host not in self.allowed_hosts:
+            if self.allowed_hosts is not None and host not in self.allowed_hosts:
                 raise DomainError(
                     "browser_host_not_authorized",
                     "Browser target is not in this work's approved source hosts",
@@ -99,42 +129,57 @@ class PublicPageBroker:
             # Connect to a checked IP rather than resolving the hostname a second time.
             target = httpx.URL(canonical).copy_with(host=addresses[0])
             try:
-                async with self._get(target, host) as response:
+                async with self._get(target, host, accept=",".join(sorted(accepted))) as response:
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location")
                         if not location:
                             raise DomainError(
-                                "browser_redirect_invalid", "Source redirect has no target"
+                                prefix + "_redirect_invalid", "Source redirect has no target"
                             )
                         url = urljoin(canonical, location)
                         continue
                     if response.status_code in {401, 403, 429}:
                         raise DomainError(
-                            "browser_access_blocked",
+                            prefix + "_access_blocked",
                             "Source requires access approval or has rate-limited this request",
                         )
                     if response.status_code != 200:
                         raise DomainError(
-                            "browser_fetch_failed", "Source page did not return success"
+                            prefix + "_fetch_failed", "Public source did not return success"
                         )
                     mime = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                    if mime not in {"text/html", "application/xhtml+xml"}:
+                    if mime not in accepted:
                         raise DomainError(
-                            "browser_non_html", "Browser broker accepts HTML pages only"
+                            "browser_non_html" if kind == "html" else "public_image_content_type",
+                            "Public source is outside the requested HTML or raster image profile",
+                        )
+                    if response.headers.get("content-encoding", "identity").lower() != "identity":
+                        raise DomainError(
+                            prefix + "_encoding_unsupported",
+                            "Encoded responses are outside the bounded identity transport profile",
                         )
                     length = response.headers.get("content-length")
-                    if length and (not length.isdecimal() or int(length) > self.max_bytes):
+                    if length and (
+                        len(length) > 10
+                        or not length.isascii()
+                        or not length.isdecimal()
+                        or int(length) > max_bytes
+                    ):
                         raise DomainError(
-                            "browser_page_limit", "Source page exceeds the bounded HTML limit"
+                            prefix + "_page_limit" if kind == "html" else "public_image_size_limit",
+                            "Public source exceeds its bounded byte limit",
                         )
                     content = bytearray()
                     async for chunk in response.aiter_bytes(chunk_size=65536):
                         content.extend(chunk)
-                        if len(content) > self.max_bytes:
+                        if len(content) > max_bytes:
                             raise DomainError(
-                                "browser_page_limit", "Source page exceeds the bounded HTML limit"
+                                prefix + "_page_limit"
+                                if kind == "html"
+                                else "public_image_size_limit",
+                                "Public source exceeds its bounded byte limit",
                             )
-                    text = bytes(content).lower()
+                    text = bytes(content).lower() if kind == "html" else b""
                     if any(
                         marker in text
                         for marker in (
@@ -155,12 +200,14 @@ class PublicPageBroker:
                         bytes(content),
                         hashlib.sha256(content).hexdigest(),
                         response.status_code,
+                        mime,
+                        datetime.now(UTC),
                     )
             except httpx.HTTPError:
                 raise DomainError(
-                    "browser_fetch_failed", "Public source request did not complete"
+                    prefix + "_fetch_failed", "Public source request did not complete"
                 ) from None
-        raise DomainError("browser_redirect_limit", "Source exceeded the redirect limit")
+        raise DomainError(prefix + "_redirect_limit", "Source exceeded the redirect limit")
 
 
 class BrowserObservation(ToolData):

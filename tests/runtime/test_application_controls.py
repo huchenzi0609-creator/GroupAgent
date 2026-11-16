@@ -79,7 +79,9 @@ def waiting_work(env, app, *, question="Which reporting period?"):
         return work, value, tx.get_delivery(identifier)
 
 
-@pytest.mark.parametrize("stop_text", ["停止", "@组长 停止", "机器人组长，暂停"])
+@pytest.mark.parametrize(
+    "stop_text", ["停止", "@组长 停止", "机器人组长，暂停", "Pot停止", "@pOt，暂停"]
+)
 async def test_control_preempts_a_different_slow_conversation_route(runtime_env, stop_text):
     env = runtime_env
     request = event(env, "请准备一个报告")

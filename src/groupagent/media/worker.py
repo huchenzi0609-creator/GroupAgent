@@ -35,8 +35,11 @@ def local_path(value: str) -> Path:
 
 def _input(request: dict[str, Any], index: int = 0) -> bytes:
     path = local_path(request["inputs"][index])
-    if not path.is_file() or path.stat().st_size > 30 * 1024 * 1024:
-        raise DomainError("media_size_limit", "Worker input is missing or exceeds 30 MiB")
+    max_bytes = request.get("parameters", {}).get("max_import_bytes", 30 * 1024 * 1024)
+    if type(max_bytes) is not int or not 0 < max_bytes <= 30 * 1024 * 1024:
+        raise DomainError("invalid_media_request", "Worker input byte limit is invalid")
+    if not path.is_file() or path.stat().st_size > max_bytes:
+        raise DomainError("media_size_limit", "Worker input exceeds its configured byte limit")
     return path.read_bytes()
 
 
@@ -47,7 +50,11 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
         request.get("parameters", {}),
     )
     if operation == "image_validate":
-        metadata, preview = inspect_image(_input(request))
+        metadata, preview = inspect_image(
+            _input(request),
+            max_bytes=params.get("max_bytes", 15 * 1024 * 1024),
+            max_pixels=params.get("max_pixels", 40_000_000),
+        )
         local_path(outputs[0]).write_bytes(preview)
         return metadata.model_dump(mode="json")
     if operation == "audio_validate":
@@ -80,7 +87,12 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
         local_path(outputs[0]).write_bytes(output.getvalue())
         return speech_metadata.model_dump(mode="json")
     if operation == "ocr_image":
-        result = ocr_image(_input(request), languages=params.get("languages", "eng+chi_sim"))
+        result = ocr_image(
+            _input(request),
+            languages=params.get("languages", "eng+chi_sim"),
+            max_bytes=params.get("max_bytes", 15 * 1024 * 1024),
+            max_pixels=params.get("max_pixels", 40_000_000),
+        )
         return {"pages": [result.model_dump(mode="json")]}
     if operation == "ocr_pdf":
         return ocr_pdf(

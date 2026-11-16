@@ -19,6 +19,7 @@ from groupagent.conversation.intent import (
     task_write_request,
 )
 from groupagent.domain import DomainError, WorkOrder
+from groupagent.identity import DEFAULT_IDENTITY, BotIdentity
 from groupagent.scheduling.reminders import get_reminder_body
 
 _IMAGE = frozenset({"png", "jpg", "jpeg", "webp", "gif"})
@@ -26,6 +27,17 @@ _AUDIO = frozenset({"wav", "mp3", "ogg", "flac", "m4a", "aac"})
 _IMAGE_TOOLS = frozenset({"request_input", "image_analyze", "media_ocr", "provider_ocr"})
 _AUDIO_TOOLS = frozenset({"request_input", "audio_transcribe"})
 _WEB_TOOLS = frozenset({"request_input", "web_search", "web_fetch", "browser_open"})
+_PUBLIC_IMAGE_TOOLS = frozenset(
+    {
+        "request_input",
+        "web_search",
+        "web_image_candidates",
+        "web_image_import",
+        "image_analyze",
+        "artifact_search",
+        "artifact_deliver",
+    }
+)
 _REMINDER_TOOLS = frozenset({"request_input"})
 _DOCUMENT_FORMATS = frozenset({"md", "docx", "pdf", "pptx"})
 _DOCUMENT_TOOLS = frozenset(
@@ -52,7 +64,7 @@ _DOCUMENT_TOOLS = frozenset(
     }
 )
 _MEDIA_REQUIREMENT = re.compile(
-    r"图片|图像|照片|插图|插画|语音|音频|转写|转录|视频|浏览器|image|photo|illustrat|audio|speech|transcrib|ocr|video|browser",
+    r"图片|图像|照片|表情包|壁纸|插图|插画|语音|音频|转写|转录|视频|浏览器|image|photo|meme|wallpaper|illustrat|audio|speech|transcrib|ocr|video|browser",
     re.I,
 )
 _TEAM_WRITES = frozenset({"team_task_create", "team_task_claim", "team_task_update"})
@@ -98,13 +110,9 @@ _REMINDER_GOAL = re.compile(
     r"^(?:(?:请|到时|届时|到点后|按时|定时|定期)[，,:：\s]*)*(?:提醒(?:我|我们|大家|成员)?|通知(?:我|我们|大家)|remind\b|notify\b)",
     re.I,
 )
-_ADDITIONAL_DELEGATION = re.compile(
-    r"(?:并|另外|同时|顺便).{0,5}(?:帮我|替我|由你|你来|机器人|组长)|(?:and|also)\s+(?:you|create|generate|search|fetch)",
-    re.I,
-)
 
 
-def message_only_research_request(text: str) -> bool:
+def message_only_research_request(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> bool:
     """A canonical information request cannot implicitly authorize a new file.
 
     URLs, code and quoted examples are data. Explicit file/report/format clauses
@@ -125,7 +133,7 @@ def message_only_research_request(text: str) -> bool:
         return False
     if (
         _COMPUTE.search(outside)
-        or task_write_request(outside)
+        or task_write_request(outside, identity=identity)
         or _SCHEDULING.search(outside)
         or _requires_memory(outside)
     ):
@@ -136,7 +144,10 @@ def message_only_research_request(text: str) -> bool:
         outside,
         flags=re.I,
     ):
-        clause = main_request(re.sub(r"^(?:并且|并|同时|然后|最后|另外)\s*", "", clause.strip()))
+        clause = main_request(
+            re.sub(r"^(?:并且|并|同时|然后|最后|另外)\s*", "", clause.strip()),
+            identity=identity,
+        )
         if _FILE_OUTPUT.search(clause) or re.search(
             r"(?:输出|交付|提供|撰写|写一份|形成).{0,24}(?:文件|报告|文档|附件)"
             r"|(?:结果|输出|交付|格式).{0,12}(?:Markdown|PDF|Word|DOCX|PPTX?|CSV|\.md\b)"
@@ -192,6 +203,8 @@ def select_tools(
     work: WorkOrder,
     input_refs: Sequence[Mapping[str, Any]],
     registered_names: Iterable[str],
+    *,
+    identity: BotIdentity = DEFAULT_IDENTITY,
 ) -> frozenset[str]:
     """Return only existing eligible names; never alter grants or budgets.
 
@@ -213,6 +226,36 @@ def select_tools(
     raw_formats = [ref.get("format") if isinstance(ref, Mapping) else None for ref in input_refs]
     formats = [value.casefold() if isinstance(value, str) else None for value in raw_formats]
     profile: frozenset[str] | None = None
+    declared_outputs = work.scope.get("outputs", [])
+    image_document = (
+        isinstance(declared_outputs, list)
+        and bool(declared_outputs)
+        and all(
+            isinstance(item, dict) and item.get("format") in _DOCUMENT_FORMATS
+            for item in declared_outputs
+        )
+    )
+    if (
+        image_document
+        and formats
+        and all(value in _IMAGE for value in formats)
+        and all(ref.get("public_image") for ref in input_refs)
+        and not research
+        and not business
+        and not requires_research(requirements)
+        and not _COMPUTE.search(requirements)
+    ):
+        image_document_tools = _DOCUMENT_TOOLS | _IMAGE_TOOLS
+        if required.issubset(image_document_tools):
+            return available & image_document_tools
+    if (
+        work.scope.get("public_image_count")
+        and text_only
+        and not input_refs
+        and not business
+        and required.issubset(_PUBLIC_IMAGE_TOOLS)
+    ):
+        return available & _PUBLIC_IMAGE_TOOLS
     if work.scope.get("research_message_only") is True and work.goal_revision == 1:
         if (
             not research
@@ -247,7 +290,7 @@ def select_tools(
         and text_only
         and not research
         and not team_write
-        and (literal_reminder or not _ADDITIONAL_DELEGATION.search(goal))
+        and (literal_reminder or not identity.additional_request(goal))
         and not _requires_memory(criteria)
         and not requires_research(criteria)
         # Criteria describe work the agent must actually satisfy, even when
@@ -292,6 +335,7 @@ def select_tools(
             profile = _AUDIO_TOOLS
         elif (
             research
+            and not _MEDIA_REQUIREMENT.search(requirements)
             and not input_refs
             and not work.input_versions
             and not work.scope.get("attachment_event_ids")

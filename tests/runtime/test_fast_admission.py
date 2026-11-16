@@ -121,11 +121,11 @@ async def test_fast_candidate_rejects_source_or_policy_change_after_context(
     assert counts(env) == (0, 0, 0)
 
 
-async def test_only_clear_new_work_bypasses_idle_batch_and_control_keeps_priority(runtime_env):
+async def test_discussion_waits_but_new_work_and_controls_keep_priority(runtime_env):
     env = runtime_env
     app = await ready(env)
     assert app.config.conversation.idle_batch_seconds == 2
-    ordinary = await ingest(env, app, "JSON是什么？")
+    ordinary = await ingest(env, app, "大家正在讨论JSON的背景。")
     assert await app.process_pending() == 0
     # Clear the earlier ordinary test event using the unchanged provider path.
     with env.store.transaction(env.actor) as tx:

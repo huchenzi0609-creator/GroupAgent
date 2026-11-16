@@ -127,6 +127,8 @@ class ChannelCapabilities(ChannelModel):
     metadata_media_kinds: tuple[str, ...]
     upstream_features: tuple[str, ...]
     quoted_text_send_reported: bool
+    roster_refresh_supported: bool = True
+    incoming_group_updates: Literal["partial", "unknown"] = "unknown"
     video_processing: Literal[False] = False
     recipient_read_receipts: Literal[False] = False
     live_acceptance_verified: Literal[False] = False
@@ -134,6 +136,7 @@ class ChannelCapabilities(ChannelModel):
         "HTTP contract fixtures do not establish live WeChat or recipient-client acceptance",
         "source_epoch is deployment-managed and must change on profile/account reset or ID remapping",
         "Saved roster absence is unconfirmed; roomDisplayName is the only exposed name",
+        "Roster reads are cached; remote refresh completion does not establish name completeness",
         "Accepted means WeChat accepted a send, not device delivery or recipient reading",
     )
 
@@ -153,6 +156,7 @@ class EventBatch(ChannelModel):
     entries: tuple[ChannelEvent, ...]
     next_cursor: ChannelCursor
     skipped: tuple[SkippedChannelEvent, ...] = ()
+    roster_updates: tuple[ChannelCursor, ...] = ()
 
     @property
     def events(self) -> tuple[GroupEvent, ...]:
@@ -173,6 +177,18 @@ class MemberPage(ChannelModel):
     next_cursor: str | None
     source_generation: str
     partial: bool
+
+
+class MemberRefreshReceipt(ChannelModel):
+    """A completed native metadata request, never a claim of complete names."""
+
+    group_id: str
+    operation_id: str
+    state: Literal["succeeded"] = "succeeded"
+    complete_roster: bool
+    member_count: int = Field(strict=True, ge=0, le=100000)
+    source: Literal["remote_refresh"] = "remote_refresh"
+    reused: bool = False
 
 
 class AttachmentHandle(ChannelModel):

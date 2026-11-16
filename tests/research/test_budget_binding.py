@@ -57,6 +57,7 @@ async def test_search_reserves_before_http_and_settles_or_keeps_unknown(tmp_path
             client,
             budget=budget,
             price_ids={"search": "search-price", "fetch": "fetch-price"},
+            additional_retry_limit=0,
         )
         scope = ToolScope(
             "g",

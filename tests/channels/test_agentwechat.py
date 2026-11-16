@@ -107,6 +107,114 @@ async def test_consume_filters_foreign_threads_and_requires_explicit_ack(adapter
     assert "/read-state" not in daemon.requests[-1].url.path
 
 
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "sync.received",
+        "account.push",
+        "account.control_observed",
+        "projection.blocked",
+        "media.auto-download",
+        "thread.read-state",
+        "credentials.projected",
+        "metadata.changed",
+        "sync.committed",
+        "profile.recovery-pending",
+    ],
+)
+async def test_observed_native_controls_allow_target_text_and_voice_without_payload_leak(
+    adapter, daemon, kind
+):
+    daemon.messages["voice"] = message("voice", kind=34, body=None, serverId="18446744073709551002")
+    daemon.events = [
+        {
+            "cursor": "1",
+            "kind": kind,
+            "data": {"accountId": ACCOUNT, "commands": ["SYNTHETIC_CONTROL_ONLY"]},
+            "createdAt": "2026-11-13T08:00:00Z",
+        },
+        {
+            "cursor": "2",
+            "kind": "message.committed",
+            "data": {"threadId": "other@chatroom", "messageId": "foreign"},
+            "createdAt": "2026-11-13T08:00:01Z",
+        },
+        {
+            "cursor": "3",
+            "kind": "message.committed",
+            "data": {"threadId": ROOM, "messageId": "local-1"},
+            "createdAt": "2026-11-13T08:00:02Z",
+        },
+        {
+            "cursor": "4",
+            "kind": "message.committed",
+            "data": {"threadId": ROOM, "messageId": "voice"},
+            "createdAt": "2026-11-13T08:00:03Z",
+        },
+    ]
+    daemon.next_cursor = "4"
+    batch = await adapter.consume()
+    assert [event.kind for event in batch.events] == [EventKind.TEXT, EventKind.AUDIO]
+    assert [item.reason for item in batch.skipped] == ["control_event", "outside_group"]
+    assert batch.skipped[0].kind == kind and batch.next_cursor.value == "4"
+    assert "SYNTHETIC_CONTROL_ONLY" not in batch.model_dump_json()
+    assert not any(
+        request.method == "POST" or "foreign" in request.url.path or "/media" in request.url.path
+        for request in daemon.requests
+    )
+    await adapter.ack_committed(batch.next_cursor)
+    assert json.loads(daemon.requests[-1].content) == {"cursor": "4"}
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "sync.received",
+        "account.push",
+        "account.control_observed",
+        "projection.blocked",
+        "media.auto-download",
+        "thread.read-state",
+        "credentials.projected",
+        "metadata.changed",
+        "sync.committed",
+        "profile.recovery-pending",
+    ],
+)
+async def test_observed_native_controls_still_reject_another_account(adapter, daemon, kind):
+    daemon.events = [
+        {
+            "cursor": "1",
+            "kind": kind,
+            "data": {"accountId": "another-account"},
+            "createdAt": "2026-11-13T08:00:00Z",
+        }
+    ]
+    daemon.next_cursor = "1"
+    with pytest.raises(DomainError) as error:
+        await adapter.consume()
+    assert error.value.code == "scope_denied"
+    assert not any(request.method == "POST" for request in daemon.requests)
+
+
+async def test_unknown_control_kind_in_a_foreign_chat_is_not_silently_skipped(adapter, daemon):
+    daemon.events = [
+        {
+            "cursor": "1",
+            "kind": "projection.unknown",
+            "data": {"threadId": "other@chatroom"},
+            "createdAt": "2026-11-13T08:00:00Z",
+        }
+    ]
+    daemon.next_cursor = "1"
+    with pytest.raises(DomainError) as error:
+        await adapter.consume()
+    assert error.value.code == "unsupported_event"
+    assert not any(
+        request.method == "POST" or "/messages/" in request.url.path for request in daemon.requests
+    )
+
+
 async def test_wrong_scope_or_epoch_cursor_fails_before_http(adapter, daemon):
     cursor = ChannelCursor(
         account_id=ACCOUNT,

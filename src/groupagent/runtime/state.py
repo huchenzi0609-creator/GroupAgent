@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 from groupagent.domain import (
     ActorContext,
     DeliveryIntent,
+    DeliveryState,
     DomainError,
     ExecutionLease,
     Role,
@@ -19,6 +20,7 @@ from groupagent.domain import (
 from groupagent.execution.models import EngineCheckpoint, EngineEvent
 from groupagent.persistence import PostgresStore, UnitOfWork
 
+from .checkpoint_codec import CheckpointCodecError, decode_checkpoint, encode_checkpoint
 from .contracts import DeliveryDraft, ProcessLease
 
 
@@ -166,6 +168,100 @@ class RuntimeState:
             )
         tx.assert_lease(lease)
         bundle_id = bundle_id or f"result:{lease.work_id}:{lease.goal_revision}"
+        existing_rows = tx.conn.execute(
+            "SELECT d.*,b.position FROM ga_delivery_bundles b JOIN ga_deliveries d "
+            "ON d.group_id=b.group_id AND d.id=b.intent_id "
+            "WHERE b.group_id=%s AND b.bundle_id=%s ORDER BY b.position FOR UPDATE OF d",
+            (tx.group_id, bundle_id),
+        ).fetchall()
+        superseded = []
+        for row in existing_rows:
+            tx._delivery_controller(row)
+            if (row["work_id"], row["goal_revision"]) != (
+                lease.work_id,
+                lease.goal_revision,
+            ):
+                raise DomainError("idempotency_conflict", "Delivery bundle belongs to another goal")
+            position = row["position"]
+            draft = drafts[position] if position < len(drafts) else None
+            if draft is None or (
+                row["payload_ref"],
+                row["payload_hash"],
+                row["idempotency_key"],
+            ) != (draft.payload_ref, draft.payload_hash, draft.idempotency_key):
+                superseded.append(row)
+        if superseded or (existing_rows and len(existing_rows) != len(drafts)):
+            # The work lease serializes this preflight with dispatcher claims.
+            # A validated repair may replace files that have never been sent;
+            # accepted messages and uncertain native writes retain their identity.
+            if any(row["state"] in {"dispatching", "unknown"} for row in existing_rows):
+                raise DomainError("delivery_unknown", "Reconcile the existing delivery first")
+            if any(
+                row["payload_ref"].startswith("artifact:") and row["state"] == "accepted"
+                for row in existing_rows
+            ):
+                raise DomainError("idempotency_conflict", "An accepted file cannot be superseded")
+            for row in superseded:
+                if (
+                    not row["payload_ref"].startswith("artifact:")
+                    or row["state"] != "pending"
+                    or row["claim_token"] != 0
+                    or row["worker_id"] is not None
+                    or row["claim_expires_at"] is not None
+                    or row["platform_message_id"] is not None
+                    or row["platform_job_id"] is not None
+                    or row["accepted_at"] is not None
+                ):
+                    raise DomainError(
+                        "idempotency_conflict", "Only an unsubmitted pending file may be superseded"
+                    )
+            parts = tx.conn.execute(
+                "SELECT p.* FROM ga_delivery_parts p JOIN ga_delivery_bundles b "
+                "ON b.group_id=p.group_id AND b.intent_id=p.intent_id "
+                "WHERE b.group_id=%s AND b.bundle_id=%s FOR UPDATE OF p",
+                (tx.group_id, bundle_id),
+            ).fetchall()
+            file_ids = {
+                row["id"] for row in existing_rows if row["payload_ref"].startswith("artifact:")
+            }
+            if any(
+                part["intent_id"] in file_ids
+                and (
+                    part["state"] != "pending"
+                    or part["platform_message_id"] is not None
+                    or part["platform_job_id"] is not None
+                )
+                for part in parts
+            ):
+                raise DomainError("delivery_unknown", "A submitted file requires reconciliation")
+            for row in superseded:
+                replacement = drafts[row["position"]] if row["position"] < len(drafts) else None
+                tx._delivery_outcome(
+                    row,
+                    DeliveryState.REJECTED,
+                    None,
+                    None,
+                    None,
+                    "candidate_superseded_before_dispatch",
+                )
+                tx.conn.execute(
+                    "DELETE FROM ga_delivery_bundles WHERE group_id=%s AND intent_id=%s",
+                    (tx.group_id, row["id"]),
+                )
+                tx._audit(
+                    "delivery_candidate_superseded",
+                    row["id"],
+                    bundle_id=bundle_id,
+                    position=row["position"],
+                    payload_ref=row["payload_ref"],
+                    payload_hash=row["payload_hash"],
+                    idempotency_key=row["idempotency_key"],
+                    replacement_payload_ref=replacement.payload_ref if replacement else None,
+                    replacement_payload_hash=replacement.payload_hash if replacement else None,
+                    replacement_idempotency_key=replacement.idempotency_key
+                    if replacement
+                    else None,
+                )
         result = []
         for position, draft in enumerate(drafts):
             intent = tx.enqueue_delivery(
@@ -208,9 +304,7 @@ class RuntimeState:
             or checkpoint.revision != lease.goal_revision
         ):
             raise DomainError("scope_violation", "Checkpoint does not match its execution lease")
-        body = checkpoint.model_dump(mode="json")
-        if len(checkpoint.model_dump_json().encode()) > 8 * 1024 * 1024:
-            raise DomainError("quota_exceeded", "Checkpoint exceeds the persisted context limit")
+        body = encode_checkpoint(checkpoint)
         with self.store.transaction(actor) as tx:
             tx.assert_lease(lease)
             work = tx.get_work(lease.work_id)
@@ -247,7 +341,10 @@ class RuntimeState:
             ).fetchone()
             if old and (
                 old["sequence"] > checkpoint.sequence
-                or (old["sequence"] == checkpoint.sequence and old["body"] != body)
+                or (
+                    old["sequence"] == checkpoint.sequence
+                    and self._decode_checkpoint(old["body"]) != checkpoint
+                )
             ):
                 raise DomainError(
                     "version_conflict", "Checkpoint sequence cannot regress or change"
@@ -299,7 +396,16 @@ class RuntimeState:
                 for source, digest in row["source_fingerprints"].items()
             ):
                 raise DomainError("source_unavailable", "Checkpoint source snapshots changed")
-            return EngineCheckpoint.model_validate(row["body"])
+            return self._decode_checkpoint(row["body"])
+
+    @staticmethod
+    def _decode_checkpoint(body) -> EngineCheckpoint:
+        try:
+            return decode_checkpoint(body)
+        except CheckpointCodecError:
+            raise DomainError(
+                "checkpoint_corrupt", "Stored execution state failed verification"
+            ) from None
 
     def append_event(self, actor: ActorContext, lease: ExecutionLease, event: EngineEvent) -> None:
         if event.work_id != lease.work_id or event.attempt_id != lease.attempt_id:

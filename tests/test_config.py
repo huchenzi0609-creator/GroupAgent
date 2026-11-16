@@ -14,6 +14,8 @@ def test_spec_example_and_constraints():
     assert config.conversation.hard_reply_character_limit is None
     assert not config.features.video_analysis
     assert config.features.audio_transcription
+    assert not config.features.speech_reply_on_request
+    assert not config.runtime.early_ack_enabled
     assert not config.group.periodic_roster_refresh
     assert "engine_not_validated" in config.production_blockers()
 

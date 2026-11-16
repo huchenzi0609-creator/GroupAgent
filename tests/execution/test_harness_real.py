@@ -167,7 +167,7 @@ async def test_real_sdk_live_model_retry_after_tool_preserves_unknown_budget(
     assert persisted.backend_state["model_recovery_pending"] is False
     assert any(
         not checkpoint.safe_to_resume
-        and checkpoint.backend_state.get("model_recovery_pending") is True
+        and checkpoint.backend_state.get("uncertain_model_usage") is True
         for checkpoint in checkpoints[:-1]
     )
 

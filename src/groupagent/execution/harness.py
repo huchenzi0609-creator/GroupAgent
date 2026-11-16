@@ -21,6 +21,7 @@ from groupagent.sandbox import DockerSandbox
 from groupagent.tools import EffectState, ToolContext, ToolGateway, ToolReceipt
 from groupagent.tools.models import successful_required_tools
 
+from .compaction import compact_model_request
 from .engine import SYSTEM_PROMPT, ScopedToolEngine, _Run
 from .errors import ModelRejected
 from .models import (
@@ -187,8 +188,8 @@ class HarnessEngine(ScopedToolEngine):
                     if run.cancelled.is_set():
                         await self._finish(run, RunState.CANCELLED, "cancelled")
                         return
-                    remaining = request.budget.max_active_seconds - self._usage(run).active_seconds
-                    if remaining <= 0:
+                    remaining = self._remaining_active_seconds(run)
+                    if remaining is not None and remaining <= 0:
                         run.safe_to_resume = False
                         await self._finish(run, RunState.PAUSED, "time_budget_exhausted")
                         return
@@ -256,6 +257,13 @@ class HarnessEngine(ScopedToolEngine):
                                     await self._emit(
                                         run, "tool_finished", FinishedToolPayload(receipt=skipped)
                                     )
+                                    anomaly = self._observe_tool_progress(
+                                        run, unobserved.name, unobserved.arguments, skipped
+                                    )
+                                    if anomaly:
+                                        raise DomainError(
+                                            anomaly, "Harness repeats an unstarted tool"
+                                        )
                                 pending_calls.clear()
                                 response_revision = run.revision
                                 reply = await self._relay_model(run, message["payload"])
@@ -411,14 +419,21 @@ class HarnessEngine(ScopedToolEngine):
         request = ModelRequest(
             messages=tuple(messages), tools=tools, max_output_tokens=budget.max_output_tokens
         )
-        if len(request.model_dump_json().encode()) > budget.max_input_bytes:
-            raise DomainError("input_budget_exhausted", "Harness input exceeds the work limit")
-        if run.usage.rounds >= budget.max_rounds:
+        projection = compact_model_request(request, budget.max_input_bytes)
+        if projection.diagnostic:
+            raise DomainError(projection.diagnostic, "Harness protected context exceeds the limit")
+        request = projection.request
+        if budget.max_rounds is not None and run.usage.rounds >= budget.max_rounds:
             raise DomainError("round_budget_exhausted", "Model round budget exhausted")
-        if self._usage(run).active_seconds >= budget.max_active_seconds:
+        if (
+            budget.max_active_seconds is not None
+            and self._usage(run).active_seconds >= budget.max_active_seconds
+        ):
             raise DomainError("time_budget_exhausted", "Execution active time budget exhausted")
         estimate = estimate_input_tokens(request)
-        allowance = min(budget.max_output_tokens, budget.max_tokens - run.usage.tokens - estimate)
+        allowance = budget.max_output_tokens
+        if budget.max_tokens is not None:
+            allowance = min(allowance, budget.max_tokens - run.usage.tokens - estimate)
         if allowance < 1:
             raise DomainError("token_budget_exhausted", "Model token budget exhausted")
         request = request.model_copy(update={"max_output_tokens": allowance})
@@ -464,6 +479,7 @@ class HarnessEngine(ScopedToolEngine):
                 run.backend_state["model_recovery_pending"] = True
             if self._model_budget and reservation_id is not None:
                 await self._model_budget.settle(reservation_id, None)
+            self._allow_model_recovery(run, exc)
             if retry_number < budget.additional_retry_limit and self._can_retry_model(run, exc):
                 await self._wait_retry(run, exc, retry_number + 1)
                 return await self._relay_model(run, payload, retry_number + 1)
@@ -482,7 +498,10 @@ class HarnessEngine(ScopedToolEngine):
             raise DomainError("token_estimate_exceeded", "Model usage exceeded its reservation")
         if any(call.name not in expected for call in reply.tool_calls):
             raise DomainError("permission_denied", "Model requested an ungranted Harness tool")
-        if len(reply.tool_calls) > budget.max_tool_calls - run.usage.tool_calls:
+        if (
+            budget.max_tool_calls is not None
+            and len(reply.tool_calls) > budget.max_tool_calls - run.usage.tool_calls
+        ):
             raise DomainError("tool_budget_exhausted", "The proposed tool batch exceeds its budget")
         if bool(reply.tool_calls) != (reply.finish_reason == "tool_calls"):
             raise DomainError(
@@ -532,7 +551,10 @@ class HarnessEngine(ScopedToolEngine):
             # Native MCP calls can arrive concurrently/out of model order. A
             # request for essential input takes priority over every other effect.
             return {"isError": True, "content": [{"type": "text", "text": "awaiting_input"}]}
-        if run.usage.tool_calls >= run.request.budget.max_tool_calls:
+        if (
+            run.request.budget.max_tool_calls is not None
+            and run.usage.tool_calls >= run.request.budget.max_tool_calls
+        ):
             raise DomainError("tool_budget_exhausted", "Tool budget exhausted")
         run.usage = run.usage.model_copy(update={"tool_calls": run.usage.tool_calls + 1})
         run.safe_to_resume = False
@@ -558,9 +580,7 @@ class HarnessEngine(ScopedToolEngine):
                 call_id=call.id,
                 idempotency_key=key,
                 cancelled=run.cancelled,
-                deadline_monotonic=asyncio.get_running_loop().time()
-                + run.request.budget.max_active_seconds
-                - self._usage(run).active_seconds,
+                deadline_monotonic=self._active_deadline(run),
             ),
         )
         run.receipts.append(receipt)
@@ -572,6 +592,17 @@ class HarnessEngine(ScopedToolEngine):
             raise DomainError("effect_unknown", "Tool effect requires reconciliation")
         if receipt.control is not None:
             run.input_request = receipt.control.input_request
+        if receipt.error_code in {
+            "permission_denied",
+            "scope_violation",
+            "tool_not_registered",
+            "policy_unavailable",
+            "idempotency_conflict",
+        }:
+            raise DomainError(receipt.error_code, "Harness tool was refused by the scoped gateway")
+        anomaly = self._observe_tool_progress(run, name, arguments, receipt)
+        if anomaly:
+            raise DomainError(anomaly, "Harness repeats tool calls without new observations")
         return {
             "isError": not receipt.success,
             "content": [{"type": "text", "text": receipt.model_dump_json()}],

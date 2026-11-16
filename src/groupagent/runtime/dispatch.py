@@ -13,6 +13,7 @@ from uuid import uuid4
 from groupagent.channels import ChannelReceipt
 from groupagent.conversation.quiet import is_quiet
 from groupagent.domain import ActorContext, DeliveryIntent, DeliveryState, DomainError
+from groupagent.identity import DEFAULT_BOT_BADGE, without_bot_badge
 
 from .artifacts import ArtifactRegistry
 from .contracts import ActorResolver, ProcessLease
@@ -77,13 +78,15 @@ class Dispatcher:
         channel: DeliveryPort,
         artifacts: ArtifactRegistry,
         *,
-        badge: str = "【机器人组长】",
+        badge: str = DEFAULT_BOT_BADGE,
         chunk_characters: int = 1800,
         after_submit: Callable[[DeliveryIntent, int], Awaitable[None]] | None = None,
         time_zone: str = "Asia/Shanghai",
         quiet_hours: list[str] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if not badge.strip():
+            raise ValueError("Text delivery requires a bot identity badge")
         self.state, self.service_actor, self.actor_resolver = state, service_actor, actor_resolver
         self.channel, self.artifacts = channel, artifacts
         self.badge, self.chunk_characters = badge, chunk_characters
@@ -120,12 +123,14 @@ class Dispatcher:
             heartbeat = asyncio.create_task(heartbeats())
             count = 0
             try:
-                with self.state.store.transaction(self.service_actor) as tx:
-                    rows = tx.conn.execute(
-                        "SELECT id,created_by FROM ga_deliveries WHERE group_id=%s AND state IN ('pending','dispatching','unknown') ORDER BY created_at,id LIMIT %s",
-                        (tx.group_id, min(max(limit, 1), 100)),
-                    ).fetchall()
-                for row in rows:
+                visited: set[str] = set()
+                for _ in range(min(max(limit, 1), 20)):
+                    # A foreground reply may arrive during a slow file send.
+                    # Re-read between intents instead of draining an old batch.
+                    row = self._next_intent(visited)
+                    if row is None:
+                        break
+                    visited.add(row["id"])
                     actor = None
                     try:
                         actor = self.actor_resolver(row["created_by"])
@@ -182,6 +187,27 @@ class Dispatcher:
                     self.state.release_process(self.service_actor, self._lease)
                 self._lease = None
 
+    def _next_intent(self, visited: set[str]) -> dict[str, str] | None:
+        with self.state.store.transaction(self.service_actor) as tx:
+            return tx.conn.execute(
+                "SELECT d.id,d.created_by FROM ga_deliveries d "
+                "WHERE d.group_id=%s AND d.state IN ('pending','dispatching','unknown') "
+                "AND NOT (d.id=ANY(%s::text[])) "
+                "AND (d.state<>'pending' OR NOT EXISTS ("
+                "SELECT 1 FROM ga_delivery_bundles b JOIN ga_delivery_bundles earlier "
+                "ON earlier.group_id=b.group_id AND earlier.bundle_id=b.bundle_id "
+                "AND earlier.position<b.position JOIN ga_deliveries predecessor "
+                "ON predecessor.group_id=earlier.group_id AND predecessor.id=earlier.intent_id "
+                "WHERE b.group_id=d.group_id AND b.intent_id=d.id "
+                "AND predecessor.state NOT IN ('accepted','rejected'))) "
+                "ORDER BY CASE "
+                "WHEN d.request_event_id IS NOT NULL AND d.work_id IS NULL "
+                "AND left(d.payload_ref,5)='text:' "
+                "AND d.idempotency_key='reply:'||d.request_event_id||':1' THEN 0 "
+                "WHEN left(d.payload_ref,5)='text:' THEN 1 ELSE 2 END,d.created_at,d.id LIMIT 1",
+                (tx.group_id, list(visited)),
+            ).fetchone()
+
     def _fence(self) -> None:
         if self._lease is None:
             raise DomainError("stale_lease", "Sender has no process lease")
@@ -194,7 +220,7 @@ class Dispatcher:
             text = intent.payload_ref[5:]
             if hashlib.sha256(text.encode()).hexdigest() != intent.payload_hash:
                 raise DomainError("source_unavailable", "Outgoing text was changed or removed")
-            chunks = split_text(text, maximum=self.chunk_characters)
+            chunks = split_text(without_bot_badge(text, self.badge), maximum=self.chunk_characters)
             return tuple(
                 (
                     "text",
@@ -358,8 +384,16 @@ class Dispatcher:
                     raise DomainError("idempotency_conflict", "Accepted receipt cannot change")
                 return
             tx.conn.execute(
-                "UPDATE ga_delivery_parts SET state=%s,platform_message_id=%s,platform_job_id=%s,updated_at=clock_timestamp() WHERE group_id=%s AND intent_id=%s AND position=%s",
-                (state, message_id, job_id, actor.group_id, intent_id, part["position"]),
+                "UPDATE ga_delivery_parts SET state=%s,platform_message_id=%s,platform_job_id=%s,reason=COALESCE(%s,reason),updated_at=clock_timestamp() WHERE group_id=%s AND intent_id=%s AND position=%s",
+                (
+                    state,
+                    message_id,
+                    job_id,
+                    receipt.reason if receipt else None,
+                    actor.group_id,
+                    intent_id,
+                    part["position"],
+                ),
             )
             if receipt is not None and receipt.accepted and receipt.fallback_reason:
                 parent = tx.get_delivery(intent_id)
@@ -519,6 +553,10 @@ class Dispatcher:
         if reconcile and state == DeliveryState.UNKNOWN:
             return False
         first = next((part for part in parts if part["platform_message_id"]), parts[0])
+        rejection = next(
+            (part["reason"] for part in parts if part["state"] == "rejected" and part["reason"]),
+            None,
+        )
         with self.state.store.transaction(actor) as tx:
             if reconcile:
                 tx.reconcile_delivery(
@@ -527,7 +565,9 @@ class Dispatcher:
                     evidence_ref="native-parts:" + intent.id,
                     platform_message_id=first["platform_message_id"],
                     platform_job_id=first["platform_job_id"],
-                    reason="parts_reconciled",
+                    reason=(rejection or "native_part_rejected")
+                    if state == DeliveryState.REJECTED
+                    else "parts_reconciled",
                 )
             else:
                 tx.finish_delivery(
@@ -537,7 +577,9 @@ class Dispatcher:
                     platform_message_id=first["platform_message_id"],
                     platform_job_id=first["platform_job_id"],
                     evidence_ref="native-parts:" + intent.id,
-                    reason="parts_checked",
+                    reason=(rejection or "native_part_rejected")
+                    if state == DeliveryState.REJECTED
+                    else "parts_checked",
                 )
             if state == DeliveryState.ACCEPTED and intent.payload_ref.startswith("artifact:"):
                 self.artifacts.mark_shared_in_tx(tx, intent.payload_ref[9:])

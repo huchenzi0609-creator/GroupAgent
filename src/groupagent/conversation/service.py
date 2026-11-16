@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -34,13 +35,18 @@ from groupagent.domain import (
     TeamTaskState,
     WorkState,
 )
+from groupagent.identity import BotIdentity, control_request
 from groupagent.memory import MemberService, MemoryService
 from groupagent.memory.retrieval import visible_events
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
+from groupagent.runtime.input_selection import canonicalize_input_selection
 from groupagent.runtime.tool_selection import message_only_research_request
+from groupagent.runtime.work_status import work_status_detail
 from groupagent.scheduling import Scheduler
 from groupagent.scheduling.reminders import extract_reminder_body, is_time_only_reminder_change
+from groupagent.security import redact_credentials
+from groupagent.vision_policy import FACE_ID_RESPONSE, requests_face_identification
 
 from .actions import (
     ACTION_ADAPTER,
@@ -63,11 +69,12 @@ from .intent import (
     explicitly_requires_execution,
     main_request,
     new_work_intent,
+    public_image_request_count,
     requests_speech_reply,
     requires_research,
     task_write_request,
 )
-from .participation import fast_observe, policy_intent
+from .participation import fast_observe, outside_quotes, policy_intent
 from .quiet import is_quiet
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
@@ -86,6 +93,41 @@ _ERRORS = {
 
 def _strings(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def _work_admission_text(
+    required_tools: list[str],
+    output_formats: list[str],
+    *,
+    research_required: bool,
+    image_inputs: bool = False,
+) -> str:
+    if "web_image_import" in required_tools:
+        return "我会上网找现成图片，核对清晰度和来源后发到这里。"
+    if "python_compute" in required_tools:
+        return "我会实际运行 Python 计算，再把结果发回来。"
+    if "process_run" in required_tools:
+        return "我会实际运行这段程序，再把结果发回来。"
+    labels = {
+        "docx": "Word",
+        "pdf": "PDF",
+        "pptx": "PPT",
+        "md": "Markdown",
+        "png": "图片",
+        "jpeg": "图片",
+    }
+    files = "、".join(dict.fromkeys(labels[value] for value in output_formats if value in labels))
+    if image_inputs and files:
+        return f"我会读取所选图片，再整理成 {files} 发回来。"
+    if image_inputs:
+        return "我会先读取所选图片，再给出分析结果。"
+    if research_required and files:
+        return f"我会先查资料并核对来源，再整理成 {files}，检查后发回来。"
+    if research_required:
+        return "我会查找资料并核对来源，再把结论发回来。"
+    if files:
+        return f"我会整理成 {files}，检查内容后发回来。"
+    return "这项工作已排队；有结果或需要补充资料时我会回复。"
 
 
 def _scope_sources(scope: dict[str, Any]) -> set[str]:
@@ -120,7 +162,12 @@ class ConversationCoordinator(Coordinator):
             scheduler,
         )
         self.artifacts, self.clock = artifacts, clock or (lambda: datetime.now(UTC))
+        self.identity = BotIdentity.from_runtime(config.runtime)
         self.execution_guard: Callable[..., None] = lambda *args: None
+        self.refresh_roster: (
+            Callable[[ActorContext, GroupEvent, dict[str, Any]], Awaitable[dict[str, Any] | None]]
+            | None
+        ) = None
         self.service_actor = ActorContext(
             group_id=config.group.internal_id,
             member_id="service:conversation",
@@ -339,6 +386,22 @@ class ConversationCoordinator(Coordinator):
                 and not _scope_sources(w.scope) & private_events
                 and tx.get_event(w.request_event_id).content_state == "active"
             ]
+            for work in works:
+                work["_requested_at"] = tx.get_event(
+                    work["request_event_id"]
+                ).occurred_at.isoformat()
+                if work["pause_reason"] == "effect_unknown":
+                    checkpoint = tx.conn.execute(
+                        "SELECT body->'receipts' AS receipts FROM ga_runtime_checkpoints "
+                        "WHERE group_id=%s AND work_id=%s ORDER BY saved_at DESC LIMIT 1",
+                        (tx.group_id, work["id"]),
+                    ).fetchone()
+                    if checkpoint:
+                        failures = [r for r in checkpoint["receipts"] or [] if not r.get("success")]
+                        if failures:
+                            work["_runtime_failure"] = {
+                                key: failures[-1].get(key) for key in ("tool_name", "error_code")
+                            }
             control_works = list(works)
             follow_up = bool(
                 re.search(
@@ -567,6 +630,11 @@ class ConversationCoordinator(Coordinator):
                 )
             }
             projected["goal"] = str(projected["goal"])[:3000]
+            detail = work_status_detail(row)
+            if row["state"] == "paused" and detail["code"] == "background_processing":
+                projected["state"] = "queued"
+            if row["state"] in {"paused", "waiting_input", "failed"}:
+                projected["status_detail"] = detail
             projected["acceptance_criteria"] = [
                 str(value)[:500] for value in projected["acceptance_criteria"]
             ]
@@ -623,7 +691,11 @@ class ConversationCoordinator(Coordinator):
             "group_time_zone": self.config.group.time_zone,
             "role": actor.role.value,
             "read_only": actor.role in {Role.OBSERVER, Role.MAINTAINER},
-            "capabilities": self.config.features.model_dump(mode="json"),
+            "capabilities": {
+                **self.config.features.model_dump(mode="json"),
+                "public_image_retrieval": self.config.features.public_image_retrieval
+                and self.config.features.web_research,
+            },
             "requester_member_id": inverse[actor.member_id],
             "members": [
                 {
@@ -632,6 +704,7 @@ class ConversationCoordinator(Coordinator):
                     "name_source": member.name_source,
                     "membership_state": member.membership_state,
                     "revision": member.revision,
+                    "updated_at": member.updated_at.isoformat(),
                 }
                 for member in member_rows
             ],
@@ -671,6 +744,7 @@ class ConversationCoordinator(Coordinator):
             },
         }
         payload = alias_value(payload)
+        payload.update(self.identity.context())
         payload.update(
             {
                 "_snapshot": snapshot,
@@ -756,24 +830,14 @@ class ConversationCoordinator(Coordinator):
             or policy_intent(event, context) is not None
         ):
             return None
-        intent = new_work_intent(event.text)
+        identity = BotIdentity.from_context(context)
+        intent = new_work_intent(event.text, identity=identity)
         if intent is None:
             return None
         # Only self-contained requests qualify. Missing unrelated history grants
         # no input references; the shared final transaction still asserts the
         # original complete snapshot, role and source below.
-        aliases = context.get("agent_aliases", [])
-        addressed = isinstance(aliases, list) and any(
-            isinstance(alias, str)
-            and alias
-            and re.match(
-                r"^\s*(?:请|麻烦|拜托)?\s*@?"
-                + re.escape(alias)
-                + r"[，,:：\s]*(?:请|帮|制作|生成|用|计算)",
-                event.text,
-            )
-            for alias in aliases
-        )
+        addressed = identity.strip_address(event.text) != event.text.strip()
         return Decision(
             kind="start_work",
             reason_code="explicit_new_work_admission",
@@ -786,15 +850,264 @@ class ConversationCoordinator(Coordinator):
             confidence=1,
         )
 
+    def _fast_roster_reply(self, event: GroupEvent, context: dict) -> Decision | None:
+        status = context.get("roster_status")
+        if not isinstance(status, dict) or re.search(
+            r"生成|制作|整理成|分配|分工|写入|文件|PDF|Word|PPT", event.text, re.I
+        ):
+            return None
+        if not status.get("fresh"):
+            text = (
+                "这次群资料刷新还没有成功，暂时只能看到已有记录，不能据此判断你是否设置了群昵称。"
+            )
+        elif not re.search(r"群成员|名单|群里|有哪些|有谁|所有人", event.text) and re.search(
+            r"我的|我.{0,6}(?:昵称|设置)|群昵称|再看看|现在", event.text
+        ):
+            member = next(
+                (m for m in context["members"] if m["member_id"] == context["requester_member_id"]),
+                None,
+            )
+            if member and member["name_source"] == "room_display_name":
+                text = f"现在能看见了，你的群昵称是「{member['name']}」。"
+            else:
+                text = "刚刷新了群资料，微信接口仍未返回你的群昵称；这不代表你没有设置。"
+        else:
+            members = [m for m in context["members"] if m["membership_state"] != "left"]
+            names = [m["name"] for m in members if m["name_source"] == "room_display_name"]
+            text = f"刚刷新了群资料，当前可读取到 {len(members)} 位成员。"
+            if names:
+                text += "群昵称：" + "、".join(names[:30]) + "。"
+            unknown = len(members) - len(names)
+            if unknown:
+                text += f"其中 {unknown} 位的群昵称尚未由微信接口返回。"
+        return Decision(
+            kind="reply",
+            reason_code="refreshed_roster",
+            response=text,
+            directness="direct",
+            confidence=1,
+        )
+
+    def _fast_diagnostic_reply(self, event: GroupEvent, context: dict) -> Decision | None:
+        if event.kind != EventKind.TEXT or event.attachments or len(event.text) > 240:
+            return None
+        plain = outside_quotes(event.text)
+        if plain != event.text.strip():
+            return None
+        specific = bool(re.search(r"出现什么问题|出了什么问题|是超时问题还是预算问题", plain))
+        if not specific and not (
+            re.search(r"为什么|为何|原因|why", plain, re.I)
+            and re.search(r"暂停|停了|失败|没完成|没结果|卡住|停止|paused|failed", plain, re.I)
+        ):
+            return None
+        if re.search(r"恢复|重试|取消|重新|继续执行|生成|下载|删除", plain):
+            return None
+        wording = self.identity.strip_address(plain)
+        wording = re.sub(r"[\s，,。?？!！;；:：]", "", wording)
+        wording = re.sub(
+            r"为什么|为何|是什么原因|原因是什么|是什么|导致|这项|这次|刚才|任务|工作|照片|图片|处理|暂停|停了|停止|失败|没完成|没结果|卡住|具体|真实|原因|告诉我|请|直接|说|一下|已|被|会|了|的",
+            "",
+            wording,
+        )
+        if wording and not specific:
+            return None  # An unrelated conceptual question still needs the router.
+        states = {"paused"} if "暂停" in plain else {"paused", "waiting_input", "failed"}
+        works = [
+            w
+            for w in context["_works"]
+            if w["state"] in states
+            and (context["role"] == "owner" or w["requester_id"] == event.actor_id)
+        ]
+        quoted = context.get("_quoted_work_id")
+        if quoted:
+            works = [w for w in works if w["id"] == quoted]
+        elif works:
+            latest = max(context["_works"], key=lambda w: w.get("_requested_at", ""))
+            works = [w for w in works if w["id"] == latest["id"]]
+        if len(works) != 1:
+            return None
+        work = works[0]
+        context["_diagnostic_work_revision"] = (work["id"], work["revision"])
+        return Decision(
+            kind="reply",
+            reason_code="durable_work_diagnostic",
+            response=work_status_detail(work)["message"],
+            directness="direct",
+            confidence=1,
+        )
+
+    def _fast_visual_boundary(self, event: GroupEvent, context: dict) -> Decision | None:
+        images = any(part.get("kind") == "image" for part in event.attachments)
+        images = images or any(
+            any(part.get("kind") == "image" for part in row.get("attachments", []))
+            for row in context.get("attachment_sources", [])
+        )
+        if event.kind in {
+            EventKind.TEXT,
+            EventKind.QUOTE,
+            EventKind.IMAGE,
+        } and requests_face_identification(event.text, image_context=images):
+            return Decision(
+                kind="reply",
+                reason_code="face_identification_unavailable",
+                response=FACE_ID_RESPONSE,
+                directness="direct",
+                confidence=1,
+            )
+        return None
+
+    def _fast_identity_reply(self, event: GroupEvent, context: dict) -> Decision | None:
+        """Answer only a standalone question about this configured bot's name."""
+        if (
+            event.kind != EventKind.TEXT
+            or event.reply_to
+            or event.attachments
+            or len(event.text) > 200
+            or fast_observe(event, context) is not None
+        ):
+            return None
+        raw = event.text.strip()
+        if outside_quotes(raw) != raw or self.identity.strip_address(raw) == raw:
+            return None
+        main = main_request(raw, identity=self.identity).strip(" ?？。!！")
+        if (
+            re.fullmatch(
+                r"(?:(?:告诉|告知)我)?"
+                r"(?:(?:你|您)(?:叫(?:什么|啥)(?:名字)?|是谁)|(?:你|您)的?名字(?:是什么|是啥|叫什么)"
+                r"|what(?:'s| is) your name|who are you)"
+                r"(?:[，,]\s*(?:请用|用)?(?:一句话|一句|一行)(?:回答|回复)(?:即可|就好)?)?",
+                main,
+                re.I,
+            )
+            is None
+        ):
+            return None
+        return Decision(
+            kind="reply",
+            reason_code="bot_identity_query",
+            response=f"我叫{self.identity.name}。",
+            directness="direct",
+            confidence=1,
+        )
+
+    def _fast_fact_reply(
+        self, event: GroupEvent, context: dict, actor: ActorContext, *, tx: UnitOfWork | None = None
+    ) -> Decision | None:
+        """Read one exact, source-bound groupwide record; never infer a fact."""
+        if (
+            event.kind != EventKind.TEXT
+            or event.reply_to
+            or event.attachments
+            or len(event.text) > 200
+            or context.get("context_incomplete")
+            or context.get("_topic_id")
+        ):
+            return None
+        raw = event.text.strip()
+        if outside_quotes(raw) != raw or self.identity.strip_address(raw) == raw:
+            return None
+        main = main_request(raw, identity=self.identity)
+        main = re.sub(r"^(?:(?:用一句话(?:回答|回复|告诉我))[，,：:\s]*|(?:告诉|告知)我)", "", main)
+        main = re.sub(r"^(?:(?:我|你|您)?(?:刚才|之前|此前|已经)?(?:记住|记下|记录)的)", "", main)
+        match = re.fullmatch(
+            r"([^，,。；;：:\s!?！？]{1,50}?)(?:是什么|是啥|是多少|有多少|多少)"
+            r"(?:[，,?？]\s*(?:请用|用)?一句话(?:回答|回复)(?:即可|就好)?)?[?？。!！]*",
+            main,
+        )
+        if match is None:
+            return None
+        predicate = match[1]
+        if re.search(
+            r"^(?:我|你|您|他|她|本人|谁)|更正|更新|修改|删除|记住|生成|执行|解释|翻译|并|且|顺便|另外|密钥|密码|口令|凭据|token|password|secret|api[_ -]?key",
+            predicate,
+            re.I,
+        ):
+            return None
+        if any(
+            isinstance(member.get("name"), str) and member["name"] + "的" in predicate
+            for member in context.get("members", [])
+            if isinstance(member, dict)
+        ):
+            return None
+        hits = [
+            item
+            for item in context.get("memory", [])
+            if item.get("kind") in {"fact", "decision"} and item.get("predicate") == predicate
+        ]
+        if len(hits) != 1:
+            return None
+        hit = hits[0]
+        value = hit.get("value")
+        if value is None or not isinstance(value, (str, int, float, bool)):
+            return None
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        display = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        if (
+            not display
+            or len(display) > 100
+            or not display.isprintable()
+            or display != display.strip()
+        ):
+            return None
+        if redact_credentials(predicate + display) != predicate + display:
+            return None
+        snapshot = context["_snapshot"]
+        original = next((item for item in snapshot["items"] if item["id"] == hit["id"]), None)
+        sources = set(hit.get("source_event_ids", []))
+        if (
+            original is None
+            or original.get("incomplete")
+            or hit.get("topic_id") is not None
+            or hit.get("context_excerpt_truncated")
+            or hit.get("source_refs_truncated")
+            or not sources
+            or not sources.issubset(snapshot["source_fingerprints"])
+            or sources != {ref["event_id"] for ref in original["source_refs"]}
+            or any(ref["state"] != "active" for ref in original["source_refs"])
+            or any(
+                original.get(key) != hit.get(key)
+                for key in ("predicate", "value", "revision", "kind")
+            )
+        ):
+            return None
+        if tx is None:
+            with self.store.transaction(actor) as owned:
+                self.memory.prepare_in_tx(owned)
+                self.memory.assert_snapshot_in_tx(owned, snapshot)
+                return self._fast_fact_reply(event, context, actor, tx=owned)
+        rows = tx.conn.execute(
+            "SELECT id,kind,subject_id,revision,value,source_event_ids FROM ga_memory_facts "
+            "WHERE group_id=%s AND topic_id IS NULL AND state='active' AND predicate=%s ORDER BY id LIMIT 2",
+            (actor.group_id, predicate),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        current = rows[0]
+        if (
+            current["subject_id"] not in {None, actor.member_id, actor.group_id}
+            or current["id"] != hit["id"]
+            or current["kind"] != hit["kind"]
+            or current["revision"] != hit["revision"]
+            or set(current["source_event_ids"]) != sources
+            or json.dumps(current["value"], ensure_ascii=False)
+            != json.dumps(value, ensure_ascii=False)
+        ):
+            return None
+        context["_exact_fact_reply"] = True
+        return Decision(
+            kind="reply",
+            reason_code="exact_known_fact",
+            response=f"我记下的{predicate}是{display}。",
+            directness="direct",
+            confidence=1,
+        )
+
     def _fast_control(self, event: GroupEvent, context: dict) -> Decision | None:
         if event.kind not in {EventKind.TEXT, EventKind.QUOTE}:
             return None
-        text = re.sub(r"^\s*(?:/组长|@?机器人组长|@?组长)[，,:：\s]*", "", event.text).strip()
-        match = re.fullmatch(
-            r"(停止|取消|暂停|先停一下|停一下|别做了)(?:这个任务|这项任务|刚才的任务|这个工作|任务)?[。！!\s]*",
-            text,
-        )
-        if not match:
+        command = control_request(event.text, identity=BotIdentity.from_context(context))
+        if command is None:
             return None
         works = [
             work
@@ -826,7 +1139,7 @@ class ConversationCoordinator(Coordinator):
             reason_code="explicit_local_control",
             target_work_id=work["id"],
             expected_revision=work["revision"],
-            control="pause" if match[1] in {"暂停", "先停一下", "停一下"} else "cancel",
+            control="pause" if command in {"暂停", "先停一下", "停一下"} else "cancel",
             directness="direct",
             confidence=1,
         )
@@ -852,7 +1165,7 @@ class ConversationCoordinator(Coordinator):
             requested_execution = event.kind in {
                 EventKind.TEXT,
                 EventKind.QUOTE,
-            } and explicitly_requires_execution(event.text)
+            } and explicitly_requires_execution(event.text, identity=self.identity)
             unsupported = bool(re.search(r"(?:无法|不能|不支持|没有权限)", decision.response or ""))
             if requested_execution and not unsupported:
                 formats: list[dict[str, JsonValue]] = []
@@ -1030,6 +1343,37 @@ class ConversationCoordinator(Coordinator):
             )
         ]
 
+    def _canonical_inputs(
+        self, tx: UnitOfWork, event: GroupEvent, decision: Decision, context: dict
+    ) -> tuple[Decision, list[str]]:
+        # First prove every original reference was authorized. Canonicalization
+        # never becomes a way to turn an unapproved ID into an approved file.
+        channel_ids = self._inputs(tx, event, decision, context)
+        if self.artifacts is None or not (channel_ids or decision.input_versions):
+            return decision, channel_ids
+        versions, channels = canonicalize_input_selection(
+            tx, self.artifacts, event, decision.input_versions, channel_ids
+        )
+        if versions == decision.input_versions and channels == channel_ids:
+            return decision, channel_ids
+        known = {row["version_id"] for row in context.get("files", [])}
+        for identifier in versions:
+            if identifier not in known:
+                context.setdefault("files", []).append({"version_id": identifier})
+        normalized = decision.model_copy(
+            update={"input_versions": versions, "input_event_ids": channels}
+        )
+        result = self._inputs(tx, event, normalized, context)
+        tx._audit(
+            "input_selection_canonicalized",
+            event.id,
+            original_versions=len(decision.input_versions),
+            original_channel_events=len(channel_ids),
+            versions=len(versions),
+            channel_events=len(result),
+        )
+        return normalized, result
+
     def _apply_action(
         self, tx: UnitOfWork, event: GroupEvent, decision: Decision, context: dict
     ) -> tuple[dict, str]:
@@ -1194,14 +1538,22 @@ class ConversationCoordinator(Coordinator):
         if isinstance(action, CreateSchedule):
             if not self.config.features.durable_schedules:
                 raise DomainError("feature_disabled", "Scheduling is disabled")
+            outside = self.identity.strip_address(outside_quotes(event.text))
             reminder_only = bool(
-                re.search(r"(?:提醒|通知)(?:我|我们|大家|一下|：|:)", event.text)
-            ) and not bool(
+                re.search(r"(?:提醒|通知)(?:我|我们|大家|一下|：|:)", outside)
+            ) and not (
                 re.search(
-                    r"(?:你|帮我|替我|机器人).{0,8}(?:实际|执行|生成|制作|搜索|整理成)", event.text
+                    r"(?:你|帮我|替我|"
+                    + self.identity.name_pattern
+                    + r").{0,8}(?:实际|执行|生成|制作|搜索|整理成)",
+                    outside,
+                    re.I,
                 )
+                or self.identity.additional_request(outside)
             )
-            body = extract_reminder_body(event.text) if reminder_only else None
+            body = (
+                extract_reminder_body(event.text, identity=self.identity) if reminder_only else None
+            )
             scope = {
                 "source_event_ids": list(context["_snapshot"]["source_fingerprints"]),
                 "source_fingerprints": context["_snapshot"]["source_fingerprints"],
@@ -1239,12 +1591,14 @@ class ConversationCoordinator(Coordinator):
                 for key in ("timing", "goal", "valid_until")
                 if key in action.model_fields_set
             }
-            replacement_body = extract_reminder_body(event.text, replacement=True)
+            replacement_body = extract_reminder_body(
+                event.text, replacement=True, identity=self.identity
+            )
             if replacement_body is not None:
                 values["goal"] = replacement_body
             elif previous_schedule.scope.get(
                 "reminder_body_literal"
-            ) is True and is_time_only_reminder_change(event.text):
+            ) is True and is_time_only_reminder_change(event.text, identity=self.identity):
                 # A timing-only request cannot replace its original literal
                 # body with a paraphrased goal supplied by the router.
                 values.pop("goal", None)
@@ -1286,7 +1640,7 @@ class ConversationCoordinator(Coordinator):
                 current_request = re.sub(
                     r"“[^”]*”|『[^』]*』|「[^」]*」|\"[^\"]*\"",
                     "<quoted data>",
-                    main_request(event.text),
+                    main_request(event.text, identity=self.identity),
                 )
                 reminder_text = current_request + "\n" + rule.goal
                 scope["reminder_only"] = bool(
@@ -1300,8 +1654,11 @@ class ConversationCoordinator(Coordinator):
                     re.search(
                         r"(?:不要|不用|不再|取消).{0,5}(?:提醒|通知)"
                         r"|(?:你|帮我|替我|机器人).{0,8}(?:实际|执行|生成|制作|搜索|检索|整理成)"
-                        r"|(?:并|另外|同时|顺便).{0,5}(?:帮我|替我|由你|你来|机器人|组长)",
+                        r"|(?:并|另外|同时|顺便).{0,5}(?:帮我|替我|由你|你来|"
+                        + self.identity.name_pattern
+                        + r")",
                         reminder_text,
+                        re.I,
                     )
                 )
             tx.conn.execute(
@@ -1470,9 +1827,26 @@ class ConversationCoordinator(Coordinator):
                     ).fetchone()
                 )
             )
+            if echo and event.kind != EventKind.RECALL:
+                # A durable native receipt is enough to discard our own text;
+                # it needs no history, model call or generated-reply context.
+                self.execution_guard(tx)
+                result = CoordinationResult(
+                    event_id=event.id,
+                    decision=Decision(kind="ignore", reason_code="verified_bot_receipt"),
+                )
+                tx.record_decision(
+                    event.id, {"kind": "ignore", "result": result.model_dump(mode="json")}
+                )
+                return result
         if event.kind == EventKind.RECALL:
             self.memory.recall(self.service_actor, event.id, now=self.clock())
         context = self._context(actor, event)
+        if self.refresh_roster is not None and not echo:
+            roster_status = await self.refresh_roster(actor, event, context)
+            if roster_status is not None:
+                context = self._context(actor, event)
+                context["roster_status"] = roster_status
         fast_admitted = False
         if self.config.group.bot_member_id == event.actor_id and not echo:
             if not self.config.group.shared_account:
@@ -1540,6 +1914,16 @@ class ConversationCoordinator(Coordinator):
             else:
                 immediate = self._fast_control(event, context)
                 if immediate is None:
+                    immediate = self._fast_roster_reply(event, context)
+                if immediate is None:
+                    immediate = self._fast_diagnostic_reply(event, context)
+                if immediate is None:
+                    immediate = self._fast_visual_boundary(event, context)
+                if immediate is None:
+                    immediate = self._fast_identity_reply(event, context)
+                if immediate is None:
+                    immediate = self._fast_fact_reply(event, context, actor)
+                if immediate is None:
                     immediate = self._fast_new_work(event, context)
                     fast_admitted = immediate is not None
                 decision = immediate or await self.provider_factory(actor, event).decide(
@@ -1554,6 +1938,16 @@ class ConversationCoordinator(Coordinator):
                     update={"duplicate": True}
                 )
             self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
+            diagnostic = context.get("_diagnostic_work_revision")
+            if diagnostic and tx.get_work(diagnostic[0]).revision != diagnostic[1]:
+                raise DomainError("memory_changed", "Work status changed before its explanation")
+            if (
+                context.get("_exact_fact_reply")
+                and self._fast_fact_reply(event, context, actor, tx=tx) != decision
+            ):
+                raise DomainError(
+                    "memory_changed", "Exact fact changed before its reply was committed"
+                )
             if event.platform_message_id and (
                 tx.is_bot_message(event.platform_message_id)
                 or tx.conn.execute(
@@ -1599,7 +1993,7 @@ class ConversationCoordinator(Coordinator):
                             and not event.attachments
                             and not decision.input_versions
                             and not decision.input_event_ids
-                            and message_only_research_request(event.text)
+                            and message_only_research_request(event.text, identity=self.identity)
                         )
                         outputs = [
                             OutputRequirement.model_validate(value)
@@ -1619,7 +2013,9 @@ class ConversationCoordinator(Coordinator):
                                 "feature_disabled", "Requested output capability is disabled"
                             )
                         snapshot = context["_snapshot"]
-                        attachment_ids = self._inputs(tx, event, decision, context)
+                        decision, attachment_ids = self._canonical_inputs(
+                            tx, event, decision, context
+                        )
                         topic_id = decision.topic_id or context["_topic_id"]
                         if topic_id is not None and topic_id not in {
                             topic["id"] for topic in context["topics"]
@@ -1649,18 +2045,27 @@ class ConversationCoordinator(Coordinator):
                                 request_text,
                             )
                         )
-                        research_required = requires_research(request_text)
+                        public_images = public_image_request_count(
+                            request_text, identity=self.identity
+                        )
+                        research_required = (
+                            requires_research(request_text) or public_images is not None
+                        )
+                        if public_images and not self.config.features.public_image_retrieval:
+                            raise DomainError(
+                                "feature_disabled", "Public image retrieval is disabled"
+                            )
                         direct_fetch = bool(
                             re.match(
                                 r"(?:真正|实际|现在|直接)?(?:读取|打开|查看|访问).{0,20}https?://",
-                                main_request(request_text),
+                                main_request(request_text, identity=self.identity),
                             )
                         )
                         research_required = research_required or direct_fetch
                         if research_required and not self.config.features.web_research:
                             raise DomainError("feature_disabled", "Web research is disabled")
                         required_tools = []
-                        main = main_request(request_text)
+                        main = main_request(request_text, identity=self.identity)
                         if re.match(
                             r"(?:真正|实际|现在|直接)?(?:用|使用)(?:受控的?)?\s*[Pp]ython", main
                         ):
@@ -1670,7 +2075,11 @@ class ConversationCoordinator(Coordinator):
                             main,
                         ):
                             required_tools.append("process_run")
-                        admitted_intent = new_work_intent(event.text) if fast_admitted else None
+                        admitted_intent = (
+                            new_work_intent(event.text, identity=self.identity)
+                            if fast_admitted
+                            else None
+                        )
                         if (
                             admitted_intent
                             and admitted_intent.required_tool
@@ -1683,7 +2092,7 @@ class ConversationCoordinator(Coordinator):
                             required_tools.append("web_fetch")
                         if re.match(r"(?:联网)?(?:检索|搜索|上网.{0,3}查)", main):
                             required_tools.append("web_search")
-                        team_write = task_write_request(request_text)
+                        team_write = task_write_request(request_text, identity=self.identity)
                         team_targets = [
                             row["id"]
                             for row in context["_tasks"]
@@ -1737,6 +2146,7 @@ class ConversationCoordinator(Coordinator):
                                 "speech_requested": speech_requested,
                                 "delivery_artifacts": delivery_artifacts,
                                 "research_required": research_required,
+                                "public_image_count": public_images,
                                 "required_tools": [str(name) for name in required_tools],
                                 "team_task_write_allowed": team_write,
                                 "team_task_authorization_event_id": event.id,
@@ -1768,10 +2178,22 @@ class ConversationCoordinator(Coordinator):
                         )
                         work_id = work.id
                         decision = decision.model_copy(
-                            update={"response": "收到，我会处理这项工作，完成后把结果发回来。"}
+                            update={
+                                "response": _work_admission_text(
+                                    required_tools,
+                                    [item.format for item in outputs],
+                                    research_required=research_required,
+                                    image_inputs=any(
+                                        tx.get_event(identifier).kind == EventKind.IMAGE
+                                        for identifier in attachment_ids
+                                    ),
+                                )
+                            }
                         )
                     elif decision.kind == "update_work":
-                        attachment_ids = self._inputs(tx, event, decision, context)
+                        decision, attachment_ids = self._canonical_inputs(
+                            tx, event, decision, context
+                        )
                         changed_outputs = [
                             OutputRequirement.model_validate(value).model_dump(mode="json")
                             for value in decision.outputs

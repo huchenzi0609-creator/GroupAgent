@@ -28,6 +28,7 @@ from groupagent.execution import ExecutionRequest, RunSnapshot, ScopedToolEngine
 from groupagent.execution.harness import HarnessEngine
 from groupagent.execution.models import ExecutionBudget, ModelMessage, ModelRequest
 from groupagent.execution.ports import ModelPort
+from groupagent.identity import BotIdentity
 from groupagent.media import MediaService
 from groupagent.media.isolation import IsolatedMediaWorker
 from groupagent.media.models import Capability, MediaSource, ProviderRoute, VisionResult
@@ -36,11 +37,18 @@ from groupagent.media.tools import register_media_tools
 from groupagent.memory import MemberService, MemoryService
 from groupagent.memory.common import memory_lock, source_rows
 from groupagent.persistence import PostgresStore
-from groupagent.research import validate_research_citations
+from groupagent.research import (
+    PublicImageService,
+    register_public_image_tools,
+    validate_research_citations,
+)
 from groupagent.research.browser import ControlledBrowser, PublicPageBroker
 from groupagent.research.deepseek import DeepSeekResearchClient
+from groupagent.research.images import ImageCandidatesOutput
+from groupagent.research.models import ResearchSource
 from groupagent.research.tools import register_browser_tool, register_research_tools
-from groupagent.sandbox import DockerSandbox, SandboxLimits
+from groupagent.resources import ResourceGovernor
+from groupagent.sandbox import DockerSandbox
 from groupagent.scheduling import Scheduler
 from groupagent.scheduling.reminders import get_reminder_body
 from groupagent.scheduling.triggers import EventTriggerService
@@ -59,11 +67,13 @@ from groupagent.tools import (
 from groupagent.tools.compute import register_compute_tools
 from groupagent.tools.models import ToolFailure, successful_required_tools
 from groupagent.tools.paths import open_parent
+from groupagent.vision_policy import FACE_ID_RESPONSE, requests_face_identification
 
 from .artifact_tools import register_export_tool
 from .artifacts import ArtifactRegistry
 from .contracts import DeliveryDraft, PreparedExecution, ValidatedCandidate
 from .inputs import InputProcessor
+from .resource_profile import worker_limits, worker_tool_names
 from .scheduling_tools import register_scheduling_tools
 from .team_tools import register_team_tools
 from .tool_selection import select_tools
@@ -426,6 +436,7 @@ class WorkToolkit:
         inputs: InputProcessor | None = None,
         scheduler: Scheduler | None = None,
         triggers: EventTriggerService | None = None,
+        resource_governor: ResourceGovernor | None = None,
     ) -> None:
         self.config, self.store, self.artifacts, self.registry, self.memory = (
             config,
@@ -444,6 +455,12 @@ class WorkToolkit:
         self._services: dict[str, tuple[IsolatedDocumentService, MediaService, ToolContext]] = {}
         self.inputs = inputs
         self.scheduler, self.triggers = scheduler, triggers
+        self.resource_governor = resource_governor
+
+    def release_attempt(self, work_id: str, attempt_id: str) -> None:
+        # The supervisor calls this only after the engine and all isolated
+        # children have stopped, including cancellation and reconciliation.
+        self._services.pop(attempt_id, None)
 
     def _sources(
         self, actor: ActorContext, work: WorkOrder, lease: ExecutionLease
@@ -503,17 +520,28 @@ class WorkToolkit:
             DockerSandbox(
                 self.config.runtime.worker_image,
                 docker_host=self.config.runtime.docker_host,
-                limits=SandboxLimits(memory_mb=1024, pids=256, workspace_mb=512, temp_mb=128),
+                limits=worker_limits(self.config),
                 policy_guard=guard,
+                resource_governor=self.resource_governor,
             )
         )
-        documents = IsolatedDocumentService(self.artifacts, worker, policy_guard=guard)
+        documents = IsolatedDocumentService(
+            self.artifacts,
+            worker,
+            policy_guard=guard,
+            max_import_bytes=self.config.limits.office_or_pdf_bytes,
+            max_markdown_bytes=self.config.limits.markdown_bytes,
+            max_output_bytes=self.config.limits.output_file_bytes,
+        )
         media = MediaService(
             self.artifacts,
             worker,
             providers=self.providers,
             budget=self.ledger,
             source_guard=source_guard,
+            max_image_bytes=self.config.limits.image_bytes,
+            max_image_pixels=self.config.limits.image_pixels,
+            max_images=self.config.limits.images_per_work,
         )
         context = ToolContext(
             ToolScope(
@@ -550,6 +578,11 @@ class WorkToolkit:
     async def prepare(
         self, work: WorkOrder, lease: ExecutionLease, actor: ActorContext, workspace: Path
     ) -> PreparedExecution:
+        if requests_face_identification(
+            work.goal,
+            image_context=bool(work.input_versions or work.scope.get("attachment_event_ids")),
+        ):
+            raise DomainError("face_identification_unavailable", FACE_ID_RESPONSE)
         documents, media, control_context, worker = self.services(work, lease, actor, workspace)
 
         async def policy(scope):
@@ -644,7 +677,11 @@ class WorkToolkit:
             extension = Path(arguments.name).suffix.lower()
             if extension in {".md", ".docx", ".pdf", ".pptx"}:
                 version = await documents.import_document(
-                    context, arguments.name, content, provenance=await provenance(context)
+                    context,
+                    arguments.name,
+                    content,
+                    provenance=await provenance(context),
+                    generated_output=True,
                 )
             elif extension in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
                 ref = await media.ingest_image(
@@ -694,6 +731,12 @@ class WorkToolkit:
                     "fetch": "deepseek-20261114-web.fetch",
                 },
             )
+            if self.config.features.public_image_retrieval:
+                register_public_image_tools(
+                    gateway,
+                    PublicImageService(media),
+                    source_factory=lambda context, url: self._source(work, actor, "image"),
+                )
         if self.config.runtime.browser_hosts:
             browser = ControlledBrowser(
                 PublicPageBroker(frozenset(self.config.runtime.browser_hosts)), worker
@@ -904,6 +947,12 @@ class WorkToolkit:
                 idempotency_mode=IdempotencyMode.MANAGED_TRANSACTION,
             )
         )
+        if self.resource_governor and self.resource_governor.policy.enabled:
+            gateway.bind_resource_admission(
+                self.resource_governor,
+                memory_mb=self.config.resources.worker_memory_mb,
+                tool_names=worker_tool_names(gateway.registered_names),
+            )
         input_refs = []
         if self.inputs:
             input_refs = await self.inputs.import_for_work(
@@ -927,7 +976,17 @@ class WorkToolkit:
         if not features.speech_reply_on_request:
             disabled.add("speech_synthesize")
         if not features.web_research:
-            disabled.update({"web_search", "web_fetch", "browser_open"})
+            disabled.update(
+                {
+                    "web_search",
+                    "web_fetch",
+                    "browser_open",
+                    "web_image_candidates",
+                    "web_image_import",
+                }
+            )
+        if not features.public_image_retrieval:
+            disabled.update({"web_image_candidates", "web_image_import"})
         if not features.durable_schedules:
             disabled.update(name for name in allowed if name.startswith(("schedule_", "trigger_")))
         allowed = allowed - disabled
@@ -935,7 +994,9 @@ class WorkToolkit:
             route.capability == Capability.IMAGE_GENERATION for route in self.routes.values()
         ):
             allowed = allowed - {"image_generate"}
-        allowed = select_tools(work, input_refs, allowed)
+        allowed = select_tools(
+            work, input_refs, allowed, identity=BotIdentity.from_runtime(self.config.runtime)
+        )
         with self.store.transaction(actor) as tx:
             original_event = tx.get_event(work.request_event_id)
         execution_intent = _execution_intent(work)
@@ -948,6 +1009,7 @@ class WorkToolkit:
         objective = redact_credentials(
             json.dumps(
                 {
+                    **BotIdentity.from_runtime(self.config.runtime).context(),
                     "goal": work.goal,
                     "original_request": _original_request_context(original_event),
                     "execution_intent": execution_intent,
@@ -974,6 +1036,7 @@ class WorkToolkit:
                         if execution_intent == "reminder"
                         else "Use actual scoped tools to complete this goal; do not just offer a plan.",
                         _REQUEST_CONTEXT_INSTRUCTION,
+                        BotIdentity.from_runtime(self.config.runtime).instruction(),
                         "标题/题目声明中的《》或引号通常是指令的引用标记，不是要求写入标题的字符；除非用户明确要求保留这些符号，按required_outputs.expected_text中的真实标题文字校验，不要自行再包上引用标记。",
                         "PPT若逐页明确指定了不同标题，required_outputs.metadata_title表示文件主题元数据，不是额外页内文字。用document_read.metadata.title核对真实主题，expected_text仅核对要求的可见文字；不要为让主题出现在可见文本里添加页脚、封面或改写指定页标题。",
                         "表格默认使用layout=records：名称=数值的一组观测按名称/数值两列、一条记录一行。工具会把默认records模式的一行横向纯数值向量规范化为行记录；只有用户明确要求横向或转置表格时才设置layout=columns，不要自行选择columns绕过默认记录布局。",
@@ -988,7 +1051,7 @@ class WorkToolkit:
                         "After a successful format/content check, call artifact_deliver and provide the candidate answer. The control service performs independent validation before sending; do not spend the entire budget repeating identical successful checks.",
                         "For a text-only question, answer directly from the actual tool evidence once it resolves the question; do not invent an output file, export inputs or search unrelated history. Research excerpts explicitly report truncation; do not claim to have read omitted text.",
                         "For concise research explanations, give the requested facts, links and retrieval times. Do not add code examples or demonstrations unless the user asks for them. When an example is requested, verify every input/output against actual tool/source evidence; preserve all values rather than inventing a plausible result.",
-                        "For research deliverables, cite only sources returned by successful web_search/web_fetch calls and copy each cited source.citation alongside that link. It records the actual retrieval time in UTC; you may additionally show local time. Do not substitute a publication date, the current clock, or another source's time. A search result observation is not proof of reading the full page.",
+                        "For research deliverables, cite only sources returned by successful web_search/web_fetch/web_image_candidates/web_image_import calls and copy each cited source.citation, page_citation or image_citation alongside that link. It records the actual retrieval time in UTC; you may additionally show local time. Do not substitute a publication date, the current clock, or another source's time. A search result observation is not proof of reading the full page.",
                         "Research answers should contain the requested facts and only the requested examples, expressed concisely in your own words. Avoid long source quotations and unrelated operating tutorials or restrictions. Review every extra note as a factual claim: a source's recommendation, default or example does not establish a unique requirement. Omit unsupported side claims rather than turning them into mandatory advice. Synthetic example values and correct direct deductions need not occur verbatim in the source, but must follow its actual semantics and must not be claimed as real events or already executed actions.",
                         "In research answers, omit unrequested internal fetch/read/truncation sizes, byte/character counts and token budgets. Explain meaningful evidence limits qualitatively. Only an explicit measurement/encoding diagnostic request calls for those figures: receipt content_bytes_* are UTF-8 bytes; len(source.content) counts Unicode code points, not bytes or tokens. Verify each requested value against actual returned content/receipts; a configured limit is not an observed count, and missing token evidence is not zero. Never hide a real truncation limitation.",
                         "Preserve user-requested quotations and translations as source data. Quoting a sentence does not mean this runtime performed its described operation. Other actual-operation claims still need real evidence.",
@@ -996,6 +1059,11 @@ class WorkToolkit:
                         "Default to concise natural Chinese. A candidate is not yet delivered; do not claim that it was sent.",
                         "Write only the final user-facing content; do not add internal labels such as candidate, awaiting validation, or not sent yet. For a short question use 1–3 short sentences plus the requested example and source link. Prefer a concise paraphrase to long webpage quotations.",
                         "If evidence/capability is missing, explain the concrete gap; do not invent images, sources, speech or completed operations.",
+                        "Existing public images are retrieved with web_search -> web_image_candidates -> web_image_import; this is not image generation. Imported MediaRefs can be selected with artifact_deliver or embedded using document_generate section.images. Check actual dimensions/content before calling an image high resolution. Try another public source when a candidate fails; never invent an image URL or ask the user to perform a search you can do. Preserve actual source page links in the answer and document captions.",
+                        "When input_files already contain public_image provenance and page_citation/image_citation, use those exact imported image file_id/version_id pairs and citations for the document. Do not search or download those images again. The format builder may normalize JPEG to PNG losslessly; byte-encoding differences alone do not mean the selected images changed.",
+                        "For a plain image request, stop searching once the requested number of distinct matching clear images has been downloaded and checked. Prefer the actual image to website logos, share cards or unrelated characters. Select all final image version_ids together in one artifact_deliver call, then finish with the page citations. Do not keep looking for marginal improvements after the request is satisfied.",
+                        "A link ending in .jpg can still be an HTML file-viewer page. If importing it fails content-type validation, inspect that exact candidate URL with web_image_candidates for the actual image resource instead of guessing raw filenames. Candidate page title/alt text and real pixels are sufficient for a plain image search; no separate paid page-reading call is necessary.",
+                        "Do not identify, confirm or match a real person's identity from images. Describe visible details or use OCR instead; fictional cartoons remain supported.",
                     ],
                 },
                 ensure_ascii=False,
@@ -1009,6 +1077,14 @@ class WorkToolkit:
             }
         )
         limits = self.config.execution
+
+        def cumulative_limit(current, original):
+            # The current explicit policy may remove a historical task cap.
+            # Numeric policies retain the stricter inherited numeric boundary.
+            if current is None:
+                return None
+            return current if original is None else min(current, original)
+
         request = ExecutionRequest(
             work_id=work.id,
             attempt_id=lease.attempt_id,
@@ -1020,10 +1096,20 @@ class WorkToolkit:
             trace_id=work.request_event_id,
             revision=work.goal_revision,
             budget=ExecutionBudget(
-                max_rounds=min(limits.max_model_rounds, original_limits.max_model_rounds),
-                max_tokens=min(limits.max_total_tokens, original_limits.max_total_tokens),
-                max_tool_calls=min(limits.max_tool_calls, original_limits.max_tool_calls),
-                max_active_seconds=min(
+                max_rounds=cumulative_limit(
+                    limits.max_model_rounds, original_limits.max_model_rounds
+                ),
+                max_tokens=(
+                    None
+                    if limits.max_total_tokens is None
+                    else limits.max_total_tokens
+                    if original_limits.max_total_tokens is None
+                    else min(limits.max_total_tokens, original_limits.max_total_tokens)
+                ),
+                max_tool_calls=cumulative_limit(
+                    limits.max_tool_calls, original_limits.max_tool_calls
+                ),
+                max_active_seconds=cumulative_limit(
                     limits.max_active_seconds, original_limits.max_active_seconds
                 ),
                 max_output_tokens=6000,
@@ -1045,7 +1131,8 @@ class WorkToolkit:
                 DockerSandbox(
                     self.config.runtime.harness_image,
                     docker_host=self.config.runtime.docker_host,
-                    limits=SandboxLimits(memory_mb=1024, pids=256, workspace_mb=512, temp_mb=256),
+                    limits=worker_limits(self.config, harness=True),
+                    resource_governor=self.resource_governor,
                 ),
                 model_budget=budget,
             )
@@ -1099,6 +1186,23 @@ class WorkToolkit:
             if isinstance(row, dict) and row.get("format") != "text"
         }
         actual_formats = {row["artifact"]["format"] for row in outputs}
+        requested_images = work.scope.get("public_image_count")
+        if (
+            isinstance(requested_images, int)
+            and requested_images > 0
+            and not (required_formats & {"md", "docx", "pdf", "pptx"})
+        ):
+            images = {
+                row["artifact"]["sha256"]
+                for row in outputs
+                if row["artifact"]["format"] in {"png", "jpeg", "jpg", "gif", "webp"}
+                and row["artifact"].get("provenance", {}).get("public_image")
+            }
+            if len(images) < requested_images:
+                raise DomainError(
+                    "validation_failed",
+                    "Deliver the requested number of distinct validated public images, not just links or a single duplicate",
+                )
         if required_formats - actual_formats:
             raise DomainError(
                 "validation_failed",
@@ -1133,6 +1237,47 @@ class WorkToolkit:
             if version.format in {"md", "docx", "pdf", "pptx"}:
                 read = await documents.read(context, version.file_id, version.version_id)
                 text = read.text
+                reuse_images = bool(
+                    re.search(r"放进|放入|放在|插入|嵌入|排进", original_event.text)
+                    and re.search(r"图片|照片|表情包|两张|这张|那张", original_event.text)
+                    and not re.search(r"图中.{0,4}文字|提取文字|OCR", original_event.text, re.I)
+                )
+                if version.format == "docx" and reuse_images:
+                    expected_images = set()
+                    for identifier in work.input_versions:
+                        original_image, _ = self.registry.read(actor, identifier)
+                        view_hash = original_image.provenance.get("media_metadata", {}).get(
+                            "preview_sha256"
+                        )
+                        if original_image.format in {
+                            "png",
+                            "jpeg",
+                            "jpg",
+                            "webp",
+                            "gif",
+                        } and isinstance(view_hash, str):
+                            expected_images.add(view_hash)
+                    embedded = set(json.loads(read.metadata.get("embedded_image_sha256", "[]")))
+                    if expected_images - embedded:
+                        raise DomainError(
+                            "validation_failed",
+                            "Embed the selected original input images; the Word file contains different pixels, a placeholder, or an image link",
+                        )
+                if (
+                    version.format == "docx"
+                    and isinstance(requested_images, int)
+                    and requested_images > 0
+                ):
+                    actual_images = read.metadata.get("distinct_embedded_image_count", "0")
+                    if (
+                        not actual_images.isascii()
+                        or not actual_images.isdecimal()
+                        or int(actual_images) < requested_images
+                    ):
+                        raise DomainError(
+                            "validation_failed",
+                            "The Word file must embed the requested number of distinct images, not only image links or duplicated pictures",
+                        )
                 metadata_title = matching.get("metadata_title")
                 if isinstance(metadata_title, str) and read.metadata.get("title") != metadata_title:
                     raise DomainError(
@@ -1344,6 +1489,59 @@ class WorkToolkit:
                                     **_research_source_metrics(source),
                                 }
                             )
+            if receipt.tool_name == "web_image_candidates":
+                try:
+                    page = ImageCandidatesOutput.model_validate(body)
+                except ValueError:
+                    raise DomainError(
+                        "validation_failed", "Public image discovery evidence is malformed"
+                    ) from None
+                source = ResearchSource(
+                    source_id="public-page:" + page.html_sha256,
+                    url=page.final_url,
+                    title=page.title,
+                    retrieved_at=page.retrieved_at,
+                    citation=page.citation,
+                    provider="public_http",
+                    operation="fetch",
+                    evidence_kind="public_image_page",
+                    content_sha256=hashlib.sha256(b"").hexdigest(),
+                    content_bytes_received=page.html_bytes_received,
+                    content_bytes_returned=0,
+                    truncated_fields=("content",),
+                ).model_dump(mode="json")
+                source_urls.add(str(source["url"]))
+                research_sources.append(source)
+            if receipt.tool_name == "web_image_import":
+                image_version = self.artifacts.get(
+                    ArtifactScope(context.group_id, context.work_id, context.actor.member_id),
+                    str(body["file_id"]),
+                    str(body["version_id"]),
+                )
+                provenance = image_version.provenance.get("public_image", {})
+                if not provenance or provenance.get("sha256") != image_version.sha256:
+                    raise DomainError(
+                        "validation_failed",
+                        "Public image download has no matching stored provenance",
+                    )
+                source = ResearchSource(
+                    source_id="public-image:" + image_version.sha256,
+                    url=str(provenance["final_url"]),
+                    title=image_version.name,
+                    retrieved_at=datetime.fromisoformat(
+                        str(provenance["retrieved_at"]).replace("Z", "+00:00")
+                    ),
+                    citation=str(body["image_citation"]),
+                    provider="public_http",
+                    operation="fetch",
+                    evidence_kind="public_image",
+                    content_sha256=hashlib.sha256(b"").hexdigest(),
+                    content_bytes_received=image_version.size_bytes,
+                    content_bytes_returned=0,
+                    truncated_fields=("content",),
+                ).model_dump(mode="json")
+                source_urls.add(str(source["url"]))
+                research_sources.append(source)
             observations.append(
                 {
                     "tool": receipt.tool_name,
@@ -1543,6 +1741,17 @@ class WorkToolkit:
                 if work.scope.get("delivery_artifacts", True)
                 else "草稿已准备好，按你的要求暂不发送文件。"
             )
+            if work.scope.get("public_image_count") and not (
+                required_formats & {"md", "docx", "pdf", "pptx"}
+            ):
+                citations = list(
+                    dict.fromkeys(
+                        str(source["citation"])
+                        for source in research_sources
+                        if source.get("evidence_kind") == "public_image_page"
+                    )
+                )
+                answer = "图片已准备好。\n来源：\n" + "\n".join(citations[:5])
         answer = redact_credentials(answer)
         drafts.insert(
             0,

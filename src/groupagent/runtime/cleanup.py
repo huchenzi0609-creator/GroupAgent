@@ -18,7 +18,7 @@ from groupagent.domain import ActorContext, DomainError, Role
 from groupagent.memory import CleanupJob, MemoryService
 from groupagent.memory.common import memory_lock
 from groupagent.memory.deletions import DeletionSink
-from groupagent.persistence import PostgresStore
+from groupagent.persistence import PostgresStore, UnitOfWork
 
 
 def _digest(value: str) -> str:
@@ -403,6 +403,93 @@ class RuntimeCleanupHandler:
             (job.group_id, work_ids),
         )
 
+    def _artifact_expiry_plan(
+        self, tx: UnitOfWork, candidate: dict[str, Any], stamp: datetime
+    ) -> dict[str, Any] | None:
+        """A locked snapshot; callers must release this transaction before channel I/O."""
+        memory_lock(tx)
+        work = tx._work_row(candidate["work_id"])
+        if self.quiesce is not None and work["state"] not in {
+            "paused",
+            "cancelled",
+            "failed",
+            "completed",
+        }:
+            raise DomainError("cleanup_busy", "Work restarted after writer shutdown")
+        if self.is_busy is not None:
+            busy = self.is_busy((candidate["work_id"],), ())
+        else:
+            busy = (
+                tx.conn.execute(
+                    "SELECT 1 FROM ga_process_leases WHERE group_id=%s AND expires_at>clock_timestamp() LIMIT 1",
+                    (tx.group_id,),
+                ).fetchone()
+                is not None
+            )
+        if self.quiesce is None:
+            busy = (
+                busy
+                or tx.conn.execute(
+                    "SELECT 1 FROM ga_process_leases WHERE group_id=%s AND expires_at>clock_timestamp() LIMIT 1",
+                    (tx.group_id,),
+                ).fetchone()
+                is not None
+            )
+        if busy:
+            raise DomainError("cleanup_busy", "A runtime writer still owns this file's work")
+        rows = tx.conn.execute(
+            "SELECT * FROM ga_artifact_catalog WHERE group_id=%s AND file_id=%s ORDER BY version_id FOR UPDATE",
+            (tx.group_id, candidate["file_id"]),
+        ).fetchall()
+        due = [
+            row
+            for row in rows
+            if row["available"] and row["expires_at"] is not None and row["expires_at"] <= stamp
+        ]
+        if not due:
+            return None
+        due_ids = {row["version_id"] for row in due}
+        keep = {
+            row["version_id"]
+            for row in rows
+            if row["available"] and row["version_id"] not in due_ids
+        }
+        intents = tx.conn.execute(
+            "SELECT * FROM ga_deliveries WHERE group_id=%s AND payload_ref=ANY(%s) ORDER BY id FOR UPDATE",
+            (
+                tx.group_id,
+                [
+                    reference
+                    for row in due
+                    for reference in (
+                        "artifact:" + row["version_id"],
+                        "artifact:" + row["file_id"] + ":" + row["version_id"],
+                    )
+                ],
+            ),
+        ).fetchall()
+        parts = tx.conn.execute(
+            "SELECT * FROM ga_delivery_parts WHERE group_id=%s AND intent_id=ANY(%s) ORDER BY intent_id,position",
+            (tx.group_id, [row["id"] for row in intents]),
+        ).fetchall()
+        if any(
+            row["state"] in {"dispatching", "submitted", "unknown"} for row in [*intents, *parts]
+        ):
+            raise DomainError("delivery_unknown", "Artifact delivery receipt is not conclusive")
+        sources = {work["request_event_id"], *work["scope"].get("source_fingerprints", {})}
+        for row in due:
+            sources.update(row["source_event_ids"])
+            sources.update(row["source_fingerprints"])
+        return {
+            "due": due,
+            "keep": keep,
+            "intents": intents,
+            "parts": parts,
+            "keys": tuple(sorted({row["idempotency_key"] for row in [*intents, *parts]})),
+            "work": {key: value for key, value in work.items() if key != "db_now"},
+            "sources": {source: tx.event_fingerprint(source) for source in sorted(sources)},
+        }
+
     async def expire_artifacts(
         self, actor: ActorContext, *, now: datetime | None = None, limit: int = 100
     ) -> dict[str, Any]:
@@ -438,107 +525,51 @@ class RuntimeCleanupHandler:
                             )
                     await self.quiesce((candidate["work_id"],), ())
                 with self.store.transaction(actor) as tx:
-                    memory_lock(tx)
-                    work = tx._work_row(candidate["work_id"])
-                    if self.quiesce is not None and work["state"] not in {
-                        "paused",
-                        "cancelled",
-                        "failed",
-                        "completed",
-                    }:
-                        raise DomainError("cleanup_busy", "Work restarted after writer shutdown")
-                    if self.is_busy is not None:
-                        busy = self.is_busy((candidate["work_id"],), ())
-                    else:
-                        busy = (
-                            tx.conn.execute(
-                                "SELECT 1 FROM ga_process_leases WHERE group_id=%s AND expires_at>clock_timestamp() LIMIT 1",
-                                (actor.group_id,),
-                            ).fetchone()
-                            is not None
-                        )
-                    if self.quiesce is None:
-                        busy = (
-                            busy
-                            or tx.conn.execute(
-                                "SELECT 1 FROM ga_process_leases WHERE group_id=%s AND expires_at>clock_timestamp() LIMIT 1",
-                                (actor.group_id,),
-                            ).fetchone()
-                            is not None
-                        )
-                    if busy:
+                    plan = self._artifact_expiry_plan(tx, candidate, stamp)
+                if plan is None:
+                    continue
+                if plan["keys"]:
+                    purge = getattr(self.channel, "purge_event", None)
+                    if purge is None:
                         raise DomainError(
-                            "cleanup_busy", "A runtime writer still owns this file's work"
+                            "upstream_cleanup_unsupported",
+                            "Expired delivery cache has no reliable erasure interface",
                         )
-                    rows = tx.conn.execute(
-                        "SELECT * FROM ga_artifact_catalog WHERE group_id=%s AND file_id=%s FOR UPDATE",
-                        (actor.group_id, candidate["file_id"]),
-                    ).fetchall()
-                    due = [
-                        row
-                        for row in rows
-                        if row["available"]
-                        and row["expires_at"] is not None
-                        and row["expires_at"] <= stamp
-                    ]
-                    if not due:
+                    receipt = purge(
+                        actor.group_id, None, delivery_keys=plan["keys"], reason="expired"
+                    )
+                    evidence = (
+                        await asyncio.wait_for(receipt, timeout=30)
+                        if inspect.isawaitable(receipt)
+                        else receipt
+                    )
+                    if not isinstance(evidence, str) or not evidence.strip():
+                        raise DomainError(
+                            "upstream_cleanup_unverified",
+                            "Artifact delivery cache returned no erasure evidence",
+                        )
+                with self.store.transaction(actor) as tx:
+                    # No transaction or memory/row lock survives the channel await.
+                    # Recheck every authority/source/receipt before touching local
+                    # payloads; new siblings must use the current retention set.
+                    current = self._artifact_expiry_plan(tx, candidate, stamp)
+                    if current is None:
                         continue
-                    due_ids = [row["version_id"] for row in due]
-                    keep = {
-                        row["version_id"]
-                        for row in rows
-                        if row["available"] and row["version_id"] not in due_ids
-                    }
-                    intents = tx.conn.execute(
-                        "SELECT id,idempotency_key,state FROM ga_deliveries WHERE group_id=%s AND payload_ref=ANY(%s) ORDER BY id FOR UPDATE",
-                        (
-                            actor.group_id,
-                            [
-                                reference
-                                for row in due
-                                for reference in (
-                                    "artifact:" + row["version_id"],
-                                    "artifact:" + row["file_id"] + ":" + row["version_id"],
-                                )
-                            ],
-                        ),
-                    ).fetchall()
-                    parts = tx.conn.execute(
-                        "SELECT idempotency_key,state FROM ga_delivery_parts WHERE group_id=%s AND intent_id=ANY(%s)",
-                        (actor.group_id, [row["id"] for row in intents]),
-                    ).fetchall()
                     if any(
-                        row["state"] in {"dispatching", "submitted", "unknown"}
-                        for row in [*intents, *parts]
+                        current[field] != plan[field]
+                        for field in ("work", "sources", "due", "intents", "parts")
                     ):
                         raise DomainError(
-                            "delivery_unknown", "Artifact delivery receipt is not conclusive"
+                            "version_conflict",
+                            "Artifact expiry inputs changed during channel erasure",
                         )
+                    due_ids = [row["version_id"] for row in current["due"]]
                     self.artifacts.retain_versions(
                         ArtifactScope(actor.group_id, candidate["work_id"], actor.member_id),
                         candidate["file_id"],
-                        keep,
+                        current["keep"],
                         reason="expired",
                     )
-                    keys = tuple(sorted({row["idempotency_key"] for row in [*intents, *parts]}))
-                    if keys:
-                        purge = getattr(self.channel, "purge_event", None)
-                        if purge is None:
-                            raise DomainError(
-                                "upstream_cleanup_unsupported",
-                                "Expired delivery cache has no reliable erasure interface",
-                            )
-                        receipt = purge(actor.group_id, None, delivery_keys=keys, reason="expired")
-                        evidence = (
-                            await asyncio.wait_for(receipt, timeout=30)
-                            if inspect.isawaitable(receipt)
-                            else receipt
-                        )
-                        if not isinstance(evidence, str) or not evidence.strip():
-                            raise DomainError(
-                                "upstream_cleanup_unverified",
-                                "Artifact delivery cache returned no erasure evidence",
-                            )
                     tx.conn.execute(
                         "UPDATE ga_artifact_catalog SET available=false,body='{}',validation=NULL,name='[expired]',format='deleted' WHERE group_id=%s AND version_id=ANY(%s)",
                         (actor.group_id, due_ids),
@@ -549,7 +580,7 @@ class RuntimeCleanupHandler:
                     )
                     tx.conn.execute(
                         "UPDATE ga_deliveries SET state=CASE WHEN state='pending' THEN 'rejected' ELSE state END,reason=CASE WHEN reason IN ('source_forgotten','source_recalled') THEN reason ELSE 'artifact_expired' END,revision=revision+1 WHERE group_id=%s AND id=ANY(%s)",
-                        (actor.group_id, [row["id"] for row in intents]),
+                        (actor.group_id, [row["id"] for row in current["intents"]]),
                     )
                     tx._audit(
                         "artifact_versions_expired", candidate["file_id"], version_ids=due_ids

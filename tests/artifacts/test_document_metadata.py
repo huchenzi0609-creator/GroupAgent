@@ -131,6 +131,26 @@ def test_docx_native_table_count_comes_from_actual_body_tables():
     assert worker_read(raw, "docx")["metadata"] == {"native_table_count": "1"}
 
 
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_word_counts_embedded_pixels_and_distinguishes_duplicate_images(duplicate):
+    def picture(color):
+        output = io.BytesIO()
+        Image.new("RGB", (160, 100), color).save(output, format="PNG")
+        return ImageData(output.getvalue(), "Synthetic test picture")
+
+    first = picture("red")
+    second = first if duplicate else picture("blue")
+    raw = build_docx(
+        Report(
+            "Two images",
+            (Section("Pictures", ("Synthetic images only.",), images=(first, second)),),
+        )
+    )
+    metadata = worker_read(raw, "docx")["metadata"]
+    assert metadata["embedded_image_count"] == "2"
+    assert metadata["distinct_embedded_image_count"] == ("1" if duplicate else "2")
+
+
 def test_markdown_and_old_read_result_have_independent_empty_metadata_defaults():
     assert worker_read(b"# Synthetic MD\n", "md")["metadata"] == {}
     one, two = DocumentRead("f", "v", "md", ()), DocumentRead("f", "v", "md", ())

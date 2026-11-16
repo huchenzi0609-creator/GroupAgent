@@ -77,24 +77,47 @@ def channel_event(cursor, *, foreign=False, kind="message.committed"):
 
 async def test_committed_intake_precedes_model_and_ack(intake_setup, daemon):
     store, channel, config, handler = intake_setup
-    daemon.events = [channel_event(1), channel_event(2, foreign=True)]
-    daemon.next_cursor = "2"
+    controls = ["sync.received", "account.push", "account.control_observed", "projection.blocked"]
+    daemon.events = [
+        channel_event(1),
+        channel_event(2, foreign=True),
+        *[
+            {
+                "cursor": str(index),
+                "kind": kind,
+                "data": {"commands": ["SYNTHETIC_CONTROL_ONLY"]},
+                "createdAt": "2026-11-13T08:00:00Z",
+            }
+            for index, kind in enumerate(controls, 3)
+        ],
+    ]
+    daemon.next_cursor = "6"
 
     class BrokenModel:
         async def decide(self, *args):
             raise DomainError("provider_unavailable", "Synthetic outage")
 
     coordinator = Coordinator(config, store, BrokenModel())
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+
+    def committed_before_ack(request):
+        if request.url.path.endswith("/ack"):
+            # This separate connection cannot see an uncommitted intake cursor.
+            with store.transaction(intake.service_actor) as tx:
+                assert len(tx.list_pending_events()) == 1
+                saved = ChannelCursor.model_validate_json(tx.get_cursor(intake.stream_id).cursor)
+                assert saved.value == "6"
+        return handler(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(committed_before_ack)) as client:
         adapter = AgentWechatAdapter(channel, TOKEN, client=client)
         intake = ChannelIntake(adapter, coordinator)
         result = await intake.poll_once()
-        assert result.acknowledged and len(result.event_ids) == 1 and result.skipped_count == 1
+        assert result.acknowledged and len(result.event_ids) == 1 and result.skipped_count == 5
         assert daemon.requests[-1].url.path.endswith("/ack")
         with store.transaction(intake.service_actor) as tx:
             assert len(tx.list_pending_events()) == 1 and not tx.list_work()
             cursor = ChannelCursor.model_validate_json(tx.get_cursor(intake.stream_id).cursor)
-            assert cursor.value == "2"
+            assert cursor.value == "6"
         with pytest.raises(DomainError, match="Synthetic outage"):
             await intake.process_pending()
         with store.transaction(intake.service_actor) as tx:

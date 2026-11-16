@@ -11,15 +11,18 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from groupagent.identity import DEFAULT_IDENTITY, BotIdentity
 
-def main_request(text: str) -> str:
-    text = re.sub(r"^\s*(?:/组长|@?机器人组长|@?组长)[，,:：\s]*", "", text).strip()
+
+def main_request(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> str:
+    text = identity.strip_address(text)
     previous = None
     while text != previous:
         previous = text
         text = re.sub(
             r"^(?:请你?|麻烦你?|帮我|替我|能否|能不能|可不可以|(?:你)?可以)[，,：:\s]*", "", text
         ).strip()
+        text = identity.strip_address(text)
     return text
 
 
@@ -27,6 +30,32 @@ def main_request(text: str) -> str:
 class NewWorkIntent:
     outputs: tuple[dict[str, Any], ...]
     required_tool: str | None = None
+
+
+def public_image_request_count(
+    text: str, *, identity: BotIdentity = DEFAULT_IDENTITY
+) -> int | None:
+    """Recognize a standalone request for existing images, not image generation."""
+    main = main_request(text, identity=identity)
+    outside = _QUOTED_DATA.sub(" <quoted data> ", main)
+    if re.search(
+        r"不要|不用|不必|无需|假如|如果|假设|怎么|如何|解释|引用|转发|生成|绘制|制作|修改|提醒|认领|负责",
+        outside,
+    ):
+        return None
+    if not re.match(r"^(?:(?:联网|上网)\s*)?(?:找|寻找|搜索|搜|检索|下载|获取)", outside):
+        return None
+    if not re.search(r"图片|表情包|照片|壁纸|插画|\b(?:images?|pictures?|memes?)\b", outside, re.I):
+        return None
+    # References to an earlier object need the model's normal context resolution.
+    if re.search(
+        r"上次|之前|刚才|那些|那两|这两|这个|那个|附件|你发的|我发的|群里|群聊|群成员|聊天记录|相册|昨天|历史|我们|本项目|[?？]",
+        outside,
+    ):
+        return None
+    match = re.search(r"([0-9]{1,3}|[一二两三四五六七八九十])\s*(?:张|幅|个)", outside)
+    number = _page_count(match[1]) if match else 1
+    return number if number is not None and 1 <= number <= 10 else None
 
 
 _QUOTED_DATA = re.compile(r'```.*?```|“[^”]*”|『[^』]*』|「[^」]*」|"[^"\n]*"', re.S)
@@ -147,7 +176,7 @@ def _enumerated_ppt_intent(main: str) -> NewWorkIntent | None:
     return NewWorkIntent(({"format": "pptx", "exact_units": count, "expected_text": visible},))
 
 
-def new_work_intent(text: str) -> NewWorkIntent | None:
+def new_work_intent(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> NewWorkIntent | None:
     """A bounded, self-contained new task; this hint never grants authority.
 
     Existing files, discussion references, human assignments, schedules and
@@ -156,15 +185,30 @@ def new_work_intent(text: str) -> NewWorkIntent | None:
     """
     if not text.strip() or len(text) > 6000:
         return None
-    main = re.sub(r"^\s*(?:@?机器人组长|@?机器人|@?组长|@?小伴)[，,:：\s]*", "", text)
-    main = main_request(main)
+    if public_image_request_count(text, identity=identity) is not None:
+        document_formats = [
+            name
+            for pattern, name in (
+                (r"Word|docx", "docx"),
+                (r"PDF", "pdf"),
+                (r"PPTX?|幻灯片", "pptx"),
+                (r"Markdown|\.md\b", "md"),
+            )
+            if re.search(pattern, text, re.I)
+        ]
+        if len(document_formats) > 1:
+            return None
+        return NewWorkIntent(
+            ({"format": document_formats[0] if document_formats else "text"},), "web_image_import"
+        )
+    main = main_request(text, identity=identity)
     main = re.sub(
         r"^(?:新建|创建|新开|另开)(?:一(?:个|项|份))?(?:独立(?:的)?)?"
         r"(?:工作|任务)[，,:：\s]*",
         "",
         main,
     )
-    main = main_request(main)
+    main = main_request(main, identity=identity)
     enumerated = _enumerated_ppt_intent(main)
     if enumerated is not None:
         return enumerated
@@ -322,8 +366,8 @@ def new_work_intent(text: str) -> NewWorkIntent | None:
     return NewWorkIntent((output,), tool)
 
 
-def explicitly_requires_execution(text: str) -> bool:
-    main = main_request(text)
+def explicitly_requires_execution(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> bool:
+    main = main_request(text, identity=identity)
     # Quoted strings are request data, not request verbs.
     main = re.sub(r"“[^”]*”|『[^』]*』|「[^」]*」|\"[^\"]*\"", "<quoted data>", main)
     if re.match(r"(?:解释|说明|说说|翻译|为什么|如何|怎么|如果|假如|假设|不要|不用|别|不想)", main):
@@ -344,9 +388,11 @@ def explicitly_requires_execution(text: str) -> bool:
     )
 
 
-def task_write_request(text: str) -> bool:
+def task_write_request(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> bool:
     outside = re.sub(
-        r"“[^”]*”|『[^』]*』|「[^」]*」|\"[^\"]*\"", "<quoted data>", main_request(text)
+        r"“[^”]*”|『[^』]*』|「[^」]*」|\"[^\"]*\"",
+        "<quoted data>",
+        main_request(text, identity=identity),
     )
     if re.search(
         r"(?:不要|不用|别|不作|不做).{0,8}(?:登记|分配|任务|落库|写入)|仅供参考|只.{0,5}(?:建议|方案)|虚构分工",
@@ -388,11 +434,56 @@ def requires_research(text: str) -> bool:
     return bool(_POSITIVE_RESEARCH.search(_NEGATIVE_RESEARCH.sub(" ", text)))
 
 
+_SPEECH_DATA = re.compile(
+    r"```.*?```|~~~.*?~~~|`[^`\n]*`|“[^”]*”|‘[^’]*’|『[^』]*』|「[^」]*」|\"[^\"\n]*\"|'[^'\n]*'|(?m:^>[^\n]*)",
+    re.S,
+)
+_VOICE = (
+    r"(?:(?:一|1)?(?:条|段|则|个)|一小段)?(?:(?:简短|短|清晰)(?:的)?){0,2}(?:语音|音频)(?:消息)?"
+)
+_SPEECH_ACTION = re.compile(
+    r"^(?:用|以)" + _VOICE + r"(?:来)?(?:说|读|念|回复|回答|讲|告诉|播报|朗读)"
+    r"|^(?:发|发送|发给我|给我发|回我|回复我)(?:给我|给我们|给大家|到群里)?"
+    + _VOICE
+    + r"(?=说|读|念|讲|回复|回答|并|[\s：:，,。.!！?？]|$)"
+    r"|^(?:合成|生成|制作)(?:给我)?"
+    + _VOICE
+    + r"(?=说|读|念|讲|回复|回答|并|[\s：:，,。.!！?？]|$)"
+    r"|^(?:(?:把|将).{0,100})?(?:朗读|读出来|读给我|念给我|说给我听)(?!功能|原理|接口|方法|技术|效果|能力|权限|是什么|怎么|如何)"
+    r"|^(?:语音|音频)(?:回复|回答|讲给我听)(?=我|我们|一下|这|那|刚才|上面|下面|[\s：:，,。.!！?？]|$)"
+    r"|^(?:say|read|speak)\b.{0,120}\b(?:in|as|using|with)\s+(?:a\s+)?(?:short\s+)?(?:voice|audio|speech)\b"
+    r"|^(?:say|read|speak)\b.{0,120}\b(?:aloud|out\s+loud)\b"
+    r"|^(?:send|generate|create|synthesize|synthesise)\s+(?:me\s+)?(?:a\s+)?(?:short\s+)?(?:voice\s+message|audio(?:\s+message)?|speech)\b",
+    re.I,
+)
+_NO_SPEECH = re.compile(
+    r"(?:不要|不用|不必|无需|不需要|禁止|别|暂不|先不)[^，,。；;：:\n!?！？]{0,12}"
+    r"(?:语音|音频|朗读|读出来|读给我|念给我|说给我听)"
+    r"|\b(?:do\s+not|don't|never|without|no)\b[^,.;:\n!?]{0,70}\b(?:voice|audio|speech|aloud)\b",
+    re.I,
+)
+_SPEECH_DISCUSSION = re.compile(
+    r"^(?:解释|说明|介绍|讨论|翻译|分析|比较|评价|如何|怎么|为什么|什么是|假如|如果|假设|举例|示例|引用|转发|转述)"
+    r"|^(?:explain|describe|discuss|translate|what|how|why|if)\b",
+    re.I,
+)
+
+
 def requests_speech_reply(text: str) -> bool:
-    """Explicit delivery wording shared by admission and media permission."""
-    return bool(
-        re.search(
-            r"语音(?:回复|回答|讲给我听)|音频(?:回复|回答)|朗读|读出来|读给我|念给我|说给我听", text
-        )
-        and not re.search(r"(?:不要|不用|别).{0,5}(?:语音|音频|朗读)", text)
-    )
+    """Require an outer speech-delivery action; quoted examples grant nothing."""
+    outside = _SPEECH_DATA.sub(" <quoted data> ", text)
+    if _NO_SPEECH.search(outside):
+        return False
+    # Without quotation boundaries, a reported command cannot become authority
+    # merely because a comma divides the report from its alleged command.
+    if outside == text and re.match(
+        r"^\s*(?:引用|转发|转述|示例|例子|只是.{0,5}(?:引用|转发))", main_request(outside)
+    ):
+        return False
+    for clause in re.split(r"[，,。；;\n]|并(?:且)?\s*(?=(?:用|以)(?:语音|音频)|朗读)", outside):
+        main = main_request(clause)
+        main = re.sub(r"^(?:please\s+|(?:can|could|would)\s+you\s+)", "", main, flags=re.I)
+        main = re.sub(r"^给我", "", main)
+        if not _SPEECH_DISCUSSION.search(main) and _SPEECH_ACTION.search(main):
+            return True
+    return False

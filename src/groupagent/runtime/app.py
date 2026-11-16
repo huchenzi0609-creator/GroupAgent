@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,12 +24,14 @@ from groupagent.billing.prices import deepseek_20261114
 from groupagent.channels import AgentWechatAdapter, AgentWechatConfig, MemberRecord
 from groupagent.channels.local import LocalChannel
 from groupagent.config import AppConfig, ConfigError
-from groupagent.conversation.intent import new_work_intent
+from groupagent.conversation.intent import explicitly_requires_execution, new_work_intent
+from groupagent.conversation.participation import outside_quotes
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import CoordinationResult, Decision
 from groupagent.domain import ActorContext, DomainError, EventKind, GroupEvent, Role
 from groupagent.execution.deepseek import DeepSeekHTTPModel
+from groupagent.identity import BotIdentity, control_request
 from groupagent.media.isolation import IsolatedMediaWorker
 from groupagent.media.models import Capability, ProviderRoute
 from groupagent.media.providers import MediaHTTPProvider
@@ -41,7 +44,8 @@ from groupagent.memory import (
 from groupagent.ops import BackupManager, CleanupRunner, DeletionJournal
 from groupagent.persistence import PostgresStore
 from groupagent.research.deepseek import DeepSeekResearchClient
-from groupagent.sandbox import DockerSandbox, SandboxLimits
+from groupagent.resources import ResourceDeferred, ResourceGovernor, ResourcePolicy
+from groupagent.sandbox import DockerSandbox
 from groupagent.scheduling import Scheduler
 from groupagent.scheduling.triggers import EventTriggerService
 from groupagent.security import load_secret_file
@@ -54,12 +58,10 @@ from .dispatch import Dispatcher
 from .executor import WorkSupervisor
 from .inputs import InputProcessor
 from .notices import NoticeService
+from .resource_profile import worker_limits
+from .roster import RosterRefresher
 from .state import RuntimeState
 from .toolkit import WorkToolkit
-
-CONTROL = re.compile(
-    r"^(?:(?:/组长|@?机器人组长|@?组长)[，,：:\s]*)?(?:停止|取消|暂停|先停一下|停一下|别做了)(?:这个任务|这项任务|刚才的任务|这个工作|任务)?[。！!\s]*$"
-)
 
 
 class RuntimeApp:
@@ -73,11 +75,16 @@ class RuntimeApp:
         inputs: InputProcessor | None = None,
         cleanup: Any = None,
         resources: tuple[Any, ...] = (),
+        worker_governor: ResourceGovernor | None = None,
+        worker_startup: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
         self.coordinator, self.channel = coordinator, channel
         self.config, self.store = coordinator.config, coordinator.store
+        self.identity = BotIdentity.from_runtime(self.config.runtime)
         self.supervisor, self.dispatcher, self.inputs = supervisor, dispatcher, inputs
         self.state, self.cleanup, self.resources = RuntimeState(self.store), cleanup, resources
+        self.worker_governor = worker_governor
+        self.worker_startup = worker_startup
         self.intake = ChannelIntake(channel, coordinator)
         self.owner = self.resolve_actor(self.config.group.owner_ids[0])
         self.technical = ActorContext(
@@ -92,6 +99,8 @@ class RuntimeApp:
             max_active_per_group=self.config.schedule.max_active_per_group,
             default_valid_days=self.config.schedule.default_valid_days,
         )
+        if self.config.runtime.channel == "agentwechat":
+            self.supervisor.work_ready = self._admission_delivered
         self.stop = asyncio.Event()
         self.instance_id = "runtime:" + uuid4().hex
         self._last_arrival = self._first_arrival = 0.0
@@ -100,6 +109,10 @@ class RuntimeApp:
         self._tasks: list[asyncio.Task] = []
         self._application_lease: ProcessLease | None = None
         self.coordinator.execution_guard = self._fence_application
+        self.roster = RosterRefresher(
+            coordinator.members, channel, self.technical, self._fence_application
+        )
+        self.coordinator.refresh_roster = self.roster.query
         self.notices = NoticeService(
             self.store,
             self.technical,
@@ -130,7 +143,28 @@ class RuntimeApp:
             pass  # Revalidate membership and restore/policy fences on every use.
         return actor
 
+    def _admission_delivered(self, work) -> bool:
+        """Keep native attachment I/O behind the useful initial work response."""
+        with self.store.transaction(self.technical) as tx:
+            row = tx.conn.execute(
+                "SELECT state FROM ga_deliveries WHERE group_id=%s AND request_event_id=%s "
+                "AND idempotency_key=%s",
+                (tx.group_id, work.request_event_id, "reply:" + work.request_event_id + ":1"),
+            ).fetchone()
+        return row is None or row["state"] == "accepted"
+
     async def start(self) -> None:
+        self._fence_application()
+        self._publish_foreground()
+        await asyncio.to_thread(self._retire_pending_acknowledgements)
+        if self.worker_startup is not None:
+            try:
+                await self.worker_startup()
+            except DomainError as error:
+                # A failed inventory keeps heavy admission closed; the group
+                # can still chat and inspect/cancel its durable queue.
+                self.state.alert(self.technical, error.code, resource_id="worker_startup")
+        self._fence_application()
         await self.coordinator.members.sync_startup(
             self.technical, self.instance_id, ChannelRosterProvider(self.channel)
         )
@@ -166,12 +200,56 @@ class RuntimeApp:
         self._fence_application()
         batch = await self.intake.poll_once()
         self._fence_application()
+        self.roster.changed(batch.roster_updates)
         if batch.event_ids:
             now = time.monotonic()
             if not self._first_arrival:
                 self._first_arrival = now
             self._last_arrival = now
         return len(batch.event_ids)
+
+    def _publish_foreground(self) -> None:
+        publish = getattr(self.worker_governor, "foreground_pending", None)
+        if callable(publish):
+            publish(len(self._processing))
+
+    def _retire_pending_acknowledgements(self) -> int:
+        """Cancel only old source-bound placeholders with no submitted part."""
+        with self.store.transaction(self.technical) as tx:
+            rows = tx.conn.execute(
+                "SELECT id,created_by FROM ga_deliveries WHERE group_id=%s AND state='pending' "
+                "AND request_event_id IS NOT NULL AND work_id IS NULL "
+                "AND left(idempotency_key,10)='early_ack:' ORDER BY created_at,id LIMIT 100",
+                (tx.group_id,),
+            ).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                actor = self.resolve_actor(row["created_by"])
+                with self.store.transaction(actor) as tx:
+                    self._fence_application(tx)
+                    intent = tx.get_delivery(row["id"])
+                    if intent.state.value != "pending" or not intent.idempotency_key.startswith(
+                        "early_ack:"
+                    ):
+                        continue
+                    if tx.conn.execute(
+                        "SELECT 1 FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s "
+                        "AND state<>'pending' LIMIT 1",
+                        (tx.group_id, intent.id),
+                    ).fetchone():
+                        continue
+                    tx.cancel_pending_delivery(intent.id, expected_revision=intent.revision)
+                    count += 1
+            except DomainError as error:
+                if error.code in {"stale_lease", "policy_changed", "restore_pending"}:
+                    raise
+        return count
+
+    async def early_ack_tick(self) -> int:
+        """Compatibility hook: ordinary chat never emits placeholder replies."""
+        self._publish_foreground()
+        return 0
 
     def _ready_events(self) -> list[GroupEvent]:
         with self.store.transaction(self.technical) as tx:
@@ -215,6 +293,7 @@ class RuntimeApp:
         self._fence_application()
         source_id = event.id
         self._processing.add(source_id)
+        self._publish_foreground()
         try:
             if (
                 event.kind == EventKind.AUDIO
@@ -222,6 +301,10 @@ class RuntimeApp:
                 and self.inputs
                 and not self._audio_echo(event)
             ):
+                if self.worker_governor and not self.worker_governor.ready(
+                    self.config.resources.worker_memory_mb
+                ):
+                    raise ResourceDeferred()
                 event = await self.inputs.preprocess_audio(event)
             await self.coordinator.process(event)
             with self.store.transaction(self.technical) as tx:
@@ -243,8 +326,11 @@ class RuntimeApp:
                     "SELECT attempts FROM ga_event_retry WHERE group_id=%s AND event_id=%s FOR UPDATE",
                     (tx.group_id, event.id),
                 ).fetchone()
-                attempts = (row["attempts"] if row else 0) + 1
+                waiting_resource = error.code == "resource_deferred"
+                attempts = (row["attempts"] if row else 0) + (0 if waiting_resource else 1)
                 blocked = not temporary or attempts >= 3
+                if waiting_resource:
+                    blocked = False
                 # Waiting for an external attachment/receipt is not a paid-model retry.
                 if error.code in {"attachment_pending", "echo_reconciliation_pending"}:
                     blocked = attempts >= 60
@@ -256,16 +342,20 @@ class RuntimeApp:
                         tx.group_id,
                         event.id,
                         attempts,
-                        min(30, 2 ** min(attempts, 5)),
+                        self.config.resources.retry_seconds
+                        if waiting_resource
+                        else min(30, 2 ** min(attempts, 5)),
                         blocked,
                         error.code,
                     ),
                 )
-            self.state.alert(self.technical, error.code, resource_id=event.id)
+            if error.code != "resource_deferred":
+                self.state.alert(self.technical, error.code, resource_id=event.id)
             if blocked:
                 self._failure_reply(event, error.code)
         finally:
             self._processing.discard(source_id)
+            self._publish_foreground()
 
     def _failure_reply(self, event: GroupEvent, code: str) -> None:
         # A missing capability or exhausted budget is not a successful response.
@@ -318,28 +408,81 @@ class RuntimeApp:
         except DomainError:
             pass
 
+    def _bypass_batch(self, event: GroupEvent) -> bool:
+        if event.kind != EventKind.TEXT or event.reply_to or event.attachments:
+            return False
+        if new_work_intent(event.text, identity=self.identity) is not None:
+            return True  # Preserve the existing independent-work admission path.
+        plain = outside_quotes(event.text)
+        if not plain or plain != event.text.strip() or len(plain) > 1200:
+            return False
+        request = self.identity.strip_address(plain)
+        if explicitly_requires_execution(plain, identity=self.identity):
+            return False
+        if request == plain and not re.search(r"[?？]", request):
+            return False
+        if re.search(
+            r"文件|文档|附件|图片|截图|音频|语音|视频|生成|制作|导出|交付|下载|上传|删除|修改|"
+            r"分配|安排|提醒|忽略|绕过|越权|密钥|密码|"
+            r"(?<![A-Za-z0-9_])(?:PDF|DOCX|PPTX?|Markdown|WAV|MP3|PNG|JPEG|Shell|secret|password|prompt)(?![A-Za-z0-9_])",
+            request,
+            re.I,
+        ):
+            return False
+        return (
+            re.search(
+                r"[?？]|什么|啥|怎么|为何|为什么|解释|说明|讲讲|告诉我|叫什么|是谁|多少|区别|吗|"
+                r"\b(?:what|how|why|who|explain|describe)\b",
+                request,
+                re.I,
+            )
+            is not None
+        )
+
     async def process_pending(self, *, controls_only: bool = False, batched: bool = True) -> int:
         events = self._ready_events()
         controls = [
             event
             for event in events
             if event.kind in {EventKind.TEXT, EventKind.QUOTE}
-            and CONTROL.fullmatch(event.text.strip())
+            and control_request(event.text, identity=self.identity) is not None
         ]
         if controls:
             await self._process(controls[0])
+            return 1
+        if events:
+            # Receipt-proven echoes are bookkeeping, not conversation. Drain
+            # them without the idle window or a full history reconstruction.
+            with self.store.transaction(self.technical) as tx:
+                echo = tx.conn.execute(
+                    "SELECT e.id FROM ga_events e WHERE e.group_id=%s AND e.id=ANY(%s) AND e.kind<>'recall' "
+                    "AND (EXISTS(SELECT 1 FROM ga_delivery_parts p WHERE p.group_id=e.group_id "
+                    "AND p.platform_message_id=e.body->>'platform_message_id' AND p.state='accepted') "
+                    "OR EXISTS(SELECT 1 FROM ga_deliveries d WHERE d.group_id=e.group_id "
+                    "AND d.platform_message_id=e.body->>'platform_message_id' AND d.state='accepted')) "
+                    "ORDER BY e.sequence LIMIT 1",
+                    (self.technical.group_id, [item.id for item in events]),
+                ).fetchone()
+            if echo:
+                await self._process(next(item for item in events if item.id == echo["id"]))
+                return 1
+        identities = [
+            event
+            for event in events
+            if self._bypass_batch(event)
+            and self.coordinator._fast_identity_reply(event, self.identity.context()) is not None
+        ]
+        if identities:
+            # A verified name response performs no model/tool call, so it can
+            # use the same responsive lane as controls during a slow dialogue.
+            await self._process(identities[0])
             return 1
         if controls_only or not events:
             return 0
         now = time.monotonic()
         if (
             batched
-            and not (
-                events[0].kind == EventKind.TEXT
-                and not events[0].reply_to
-                and not events[0].attachments
-                and new_work_intent(events[0].text) is not None
-            )
+            and not self._bypass_batch(events[0])
             and self._first_arrival
             and (
                 now - self._last_arrival < self.config.conversation.idle_batch_seconds
@@ -364,9 +507,19 @@ class RuntimeApp:
 
     async def maintenance(self, *, force: bool = False) -> None:
         self._fence_application()
-        if not force and time.monotonic() - self._last_maintenance < 60:
+        interval = self.config.resources.maintenance_interval_seconds
+        if not force and time.monotonic() - self._last_maintenance < interval:
             return
         self._last_maintenance = time.monotonic()
+        if self.config.resources.enabled and (
+            self._processing
+            or self.supervisor.active_work_id is not None
+            or self.worker_governor is None
+            or not self.worker_governor.ready(self.config.resources.worker_memory_mb)
+        ):
+            # No additional model/cleanup load while a foreground or isolated
+            # job is active. Expiry is also enforced on reads until the next pass.
+            return
         try:
             if self.coordinator.current_mode() not in {"paused", "disabled"}:
                 await self.coordinator.memory.compact(self.owner)
@@ -434,18 +587,19 @@ class RuntimeApp:
             self._application_lease = lease
 
         try:
+            self._tasks = [asyncio.create_task(loop(heartbeat, 8))]
             await self.start()
-            self._tasks = [
+            self._tasks.extend(
                 asyncio.create_task(loop(fn, seconds))
                 for fn, seconds in (
                     (intake_and_controls, self.config.runtime.poll_seconds),
                     (self.process_pending, self.config.runtime.poll_seconds),
+                    (self.roster.sync_pending, self.config.runtime.poll_seconds),
                     (self.execute_tick, self.config.runtime.poll_seconds),
                     (self.dispatcher.tick, self.config.runtime.poll_seconds),
-                    (self.maintenance, 60),
-                    (heartbeat, 8),
+                    (self.maintenance, self.config.resources.maintenance_interval_seconds),
                 )
-            ]
+            )
             done, _ = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
@@ -473,12 +627,16 @@ class RuntimeApp:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.supervisor.close()
+        self._publish_foreground()
+        governor_close = getattr(self.worker_governor, "aclose", None)
+        if callable(governor_close):
+            await governor_close()
         for resource in self.resources:
             await resource.aclose()
 
 
 def channel_config(config: AppConfig) -> AgentWechatConfig:
-    return AgentWechatConfig(
+    binding = AgentWechatConfig(
         base_url=config.runtime.channel_base_url,
         account_id=config.runtime.channel_account_id,
         external_group_id=config.group.external_group_id,
@@ -486,6 +644,22 @@ def channel_config(config: AppConfig) -> AgentWechatConfig:
         source_epoch=config.runtime.source_epoch,
         policy_revision=config.group.policy_revision,
     )
+    if config.resources.enabled:
+        return binding.model_copy(
+            update={
+                "max_attachment_bytes": min(
+                    binding.max_attachment_bytes,
+                    config.limits.total_input_bytes_per_work,
+                    max(
+                        config.limits.image_bytes,
+                        config.limits.markdown_bytes,
+                        config.limits.office_or_pdf_bytes,
+                        config.limits.audio_file_bytes,
+                    ),
+                )
+            }
+        )
+    return binding
 
 
 def build_app(
@@ -661,13 +835,25 @@ def build_app(
     def resolve(member_id):
         return app.resolve_actor(member_id)
 
-    worker = IsolatedMediaWorker(
-        DockerSandbox(
-            config.runtime.worker_image,
-            docker_host=config.runtime.docker_host,
-            limits=SandboxLimits(memory_mb=1024, pids=256, workspace_mb=512, temp_mb=128),
-        )
+    worker_governor = ResourceGovernor(
+        ResourcePolicy(
+            enabled=config.resources.enabled,
+            reserve_memory_mb=config.resources.reserve_memory_mb,
+            transfer_memory_mb=config.resources.transfer_memory_mb,
+        ),
+        foreground_socket=(
+            Path(config.runtime.broker_control_socket)
+            if config.runtime.broker_control_socket
+            else None
+        ),
     )
+    input_sandbox = DockerSandbox(
+        config.runtime.worker_image,
+        docker_host=config.runtime.docker_host,
+        limits=worker_limits(config),
+        resource_governor=worker_governor,
+    )
+    worker = IsolatedMediaWorker(input_sandbox)
     inputs = InputProcessor(
         store,
         artifacts,
@@ -680,6 +866,10 @@ def build_app(
         resolve,
         max_total_input_bytes=config.limits.total_input_bytes_per_work,
         max_images=config.limits.images_per_work,
+        max_input_files=config.limits.input_files_per_work,
+        max_image_bytes=config.limits.image_bytes,
+        max_image_pixels=config.limits.image_pixels,
+        max_document_bytes=config.limits.office_or_pdf_bytes,
     )
     toolkit = WorkToolkit(
         config,
@@ -694,6 +884,7 @@ def build_app(
         research=research,
         inputs=inputs,
         scheduler=scheduler,
+        resource_governor=worker_governor,
         triggers=EventTriggerService(
             store,
             resolve,
@@ -719,6 +910,12 @@ def build_app(
         lease_seconds=config.execution.lease_seconds,
         heartbeat_seconds=config.execution.heartbeat_seconds,
         cancel_grace_seconds=config.execution.cancel_grace_seconds,
+        resource_ready=(lambda: worker_governor.ready(config.resources.worker_memory_mb))
+        if config.resources.enabled
+        else None,
+        resource_retry_seconds=config.resources.retry_seconds,
+        execution_backend=config.runtime.engine,
+        release_attempt=toolkit.release_attempt,
     )
     dispatcher = Dispatcher(
         state,
@@ -738,6 +935,10 @@ def build_app(
         dispatcher,
         inputs=inputs,
         resources=(channel, model, provider, research),
+        worker_governor=worker_governor,
+        worker_startup=(lambda: input_sandbox.reconcile_group(config.group.internal_id))
+        if config.resources.enabled
+        else None,
     )
 
     def busy(work_ids, event_ids):

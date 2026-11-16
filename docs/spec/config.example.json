@@ -5,7 +5,9 @@
     "enabled": false,
     "internal_id": "group_demo",
     "external_group_id": "CONFIGURE_BEFORE_DEPLOYMENT",
-    "owner_ids": ["member_owner_demo"],
+    "owner_ids": [
+      "member_owner_demo"
+    ],
     "time_zone": "Asia/Shanghai",
     "participation_mode": "natural",
     "quiet_hours": [],
@@ -16,14 +18,15 @@
     "natural_participation": true,
     "image_understanding": true,
     "audio_transcription": true,
-    "speech_reply_on_request": true,
+    "speech_reply_on_request": false,
     "image_generation": false,
     "document_editing": true,
     "web_research": true,
     "durable_schedules": true,
     "video_analysis": false,
     "video_generation": false,
-    "realtime_voice_call": false
+    "realtime_voice_call": false,
+    "public_image_retrieval": true
   },
   "conversation": {
     "idle_batch_seconds": 2,
@@ -49,10 +52,10 @@
     "output_file_bytes": 26214400
   },
   "execution": {
-    "max_model_rounds": 24,
-    "max_total_tokens": 200000,
-    "max_tool_calls": 60,
-    "max_active_seconds": 1200,
+    "max_model_rounds": null,
+    "max_total_tokens": null,
+    "max_tool_calls": null,
+    "max_active_seconds": null,
     "max_subagents": 2,
     "max_concurrent_heavy_work": 1,
     "tool_timeout_seconds": 60,
@@ -90,12 +93,25 @@
     "text_agent": "CONFIGURE_AND_VALIDATE",
     "vision": "CONFIGURE_AND_VALIDATE",
     "speech_to_text": "CONFIGURE_AND_VALIDATE",
-    "text_to_speech": "CONFIGURE_AND_VALIDATE",
+    "text_to_speech": "NOT_IN_CURRENT_SCOPE",
     "image_generation": "NOT_IN_CURRENT_SCOPE"
   },
   "engine": {
     "candidate": "deepseek_harness",
     "approved_runtime_version": null,
     "extra_session_log_upload": false
+  },
+  "runtime": {
+    "engine": "harness",
+    "bot_name": "Pot",
+    "bot_aliases": [
+      "机器人",
+      "机器人组长",
+      "组长",
+      "小伴"
+    ],
+    "bot_badge": "【Pot】",
+    "early_ack_enabled": false,
+    "early_ack_seconds": 2.0
   }
 }

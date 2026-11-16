@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
@@ -229,7 +231,36 @@ def document_operation(
         elif format_name == "docx":
             from docx import Document
 
-            metadata["native_table_count"] = str(len(Document(io.BytesIO(content)).tables))
+            word_document = Document(io.BytesIO(content))
+            metadata["native_table_count"] = str(len(word_document.tables))
+            image_ids = {
+                blip.embed
+                for shape in word_document.inline_shapes
+                for blip in shape._inline.xpath(".//a:blip")
+                if blip.embed
+            }
+            if image_ids:
+                embedded_hashes = sorted(
+                    {
+                        hashlib.sha256(
+                            word_document.part.related_parts[identifier].blob
+                        ).hexdigest()
+                        for identifier in image_ids
+                    }
+                )
+                metadata["embedded_image_count"] = str(len(word_document.inline_shapes))
+                metadata["distinct_embedded_image_count"] = str(
+                    len(
+                        {
+                            hashlib.sha256(
+                                word_document.part.related_parts[identifier].blob
+                            ).hexdigest()
+                            for identifier in image_ids
+                        }
+                    )
+                )
+                if len(embedded_hashes) <= 10:
+                    metadata["embedded_image_sha256"] = json.dumps(embedded_hashes)
         return {
             "units": [asdict(unit) for unit in units[start : start + count]],
             "total_units": len(units),

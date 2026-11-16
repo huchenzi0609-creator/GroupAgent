@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from groupagent.domain import DomainError
+from groupagent.identity import DEFAULT_IDENTITY, BotIdentity
 
 MAX_REMINDER_BODY = 3000
 _TIME_SHELL = re.compile(
@@ -21,11 +22,11 @@ _ONCE = re.compile(
 )
 
 
-def _unwrapped_body(value: str) -> str | None:
+def _unwrapped_body(value: str, identity: BotIdentity) -> str | None:
     value = value.strip()
     # Frequency/one-shot wording belongs to the rule, not its notification.
     value = re.sub(r"[,，;；]\s*(?:" + _ONCE.pattern + r")[。.!！]?\s*$", "", value).strip()
-    quotes = {"“": "”", "「": "」", "『": "』", '"': '"', "'": "'"}
+    quotes = {"“": "”", "‘": "’", "「": "」", "『": "』", '"': '"', "'": "'"}
     if value[:1] in quotes:
         closing = quotes[value[0]]
         end = value.find(closing, 1)
@@ -34,7 +35,7 @@ def _unwrapped_body(value: str) -> str | None:
         body = value[1:end]
     else:
         body = value.rstrip("。.!！").strip()
-        if re.search(r"[，,；;\n]|并.{0,4}(?:帮我|替我|由你|你来|机器人)", body):
+        if re.search(r"[，,；;\n]", body) or identity.additional_request(body):
             return None
         # Postposed timing may be the command shell rather than the body.
         if re.match(
@@ -47,7 +48,9 @@ def _unwrapped_body(value: str) -> str | None:
     return body
 
 
-def extract_reminder_body(text: str, *, replacement: bool = False) -> str | None:
+def extract_reminder_body(
+    text: str, *, replacement: bool = False, identity: BotIdentity = DEFAULT_IDENTITY
+) -> str | None:
     """Return an explicit body without timing/receiver/frequency wrappers.
 
     Ambiguous prose is left to the existing semantic path. Quoted bodies retain
@@ -55,6 +58,7 @@ def extract_reminder_body(text: str, *, replacement: bool = False) -> str | None
     """
     if not text or len(text) > 6000:
         return None
+    text = identity.strip_address(text)
     if replacement:
         match = _REPLACEMENT.search(text)
         if match is None:
@@ -64,7 +68,7 @@ def extract_reminder_body(text: str, *, replacement: bool = False) -> str | None
                 text,
             )
         if match and not re.search(r"引用|转发|假设|如果|解释|不要|别", text[: match.start()]):
-            return _unwrapped_body(text[match.end() :])
+            return _unwrapped_body(text[match.end() :], identity)
     match = _NOTICE.search(text)
     if match is None:
         return None
@@ -72,15 +76,16 @@ def extract_reminder_body(text: str, *, replacement: bool = False) -> str | None
     prefix = re.sub(r"^(?:(?:请|麻烦你?|帮我|替我|为我|能否|能不能)\s*)+", "", prefix)
     if not _TIME_SHELL.fullmatch(prefix):
         return None
-    return _unwrapped_body(text[match.end() :])
+    return _unwrapped_body(text[match.end() :], identity)
 
 
-def is_time_only_reminder_change(text: str) -> bool:
+def is_time_only_reminder_change(text: str, *, identity: BotIdentity = DEFAULT_IDENTITY) -> bool:
     """A narrow timing change cannot authorize a model-generated body rewrite."""
+    text = identity.strip_address(text)
     head = re.split(r"[，,。；;]", text, maxsplit=1)[0]
     if re.search(r"解释|怎么|如何|如果|假如|假设|引用|转发|不要|别", head):
         return False
-    if extract_reminder_body(text, replacement=True) is not None:
+    if extract_reminder_body(text, replacement=True, identity=identity) is not None:
         return False
     parts = [x.strip() for x in re.split(r"[，,。；;]", text) if x.strip()]
     if not parts or any(not _ONCE.fullmatch(x) for x in parts[1:]):

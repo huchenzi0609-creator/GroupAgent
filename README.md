@@ -2,11 +2,11 @@
 
 **CI字体兼容小修：** 完整30/30实模验收绑定c411源码。最终提交另含`5c9c4640ac097c4a4c94b7a9c7a26708eb6ddd5a4ee982c0cb134b9b8880029e`的负数折线图标签避让修复；Linux DejaVu字体已复现原FAIL并验证修复PASS，正数验收样例及恒定/零值PNG字节不变。仅图表相关回归（13项及文档绘图选集172项）和必要CI重新验证，未重跑付费30项，旧CI失败记录保留。
 
-微信群协作智能体，按 [Spec v0.1](docs/SPEC_V0.1.zh-CN.md) 开发。GroupAgent 是暂用工程名。
+微信群协作智能体，按 [Spec v0.1](docs/SPEC_V0.1.zh-CN.md) 开发。工程名为 GroupAgent，群内名称为 **Pot**，文本使用 **【Pot】** 标识。
 
-当前处于 **本地集成开发与验收中**，工作分支为 `feat/local-readiness`。已接通 PostgreSQL 持久状态、自然语言协调、真实 Harness SDK、无宿主挂载的隔离 worker、四种文档、图片/OCR、ASR/TTS、搜索、程序绘图、长期记忆和有限调度。正在用固定样本检查实际结果、产物字节、费用及投递回执；尚未完成整版发布验收。
+当前处于 **本地集成开发与验收中**，当前适配分支为 `feat/pot-2gb-server`（基于 `feat/local-readiness`）。已接通 PostgreSQL 持久状态、自然语言协调、真实 Harness SDK、无宿主挂载的隔离 worker、四种文档、图片/OCR、ASR/TTS、搜索、程序绘图、长期记忆和有限调度。正在用固定样本检查实际结果、产物字节、费用及投递回执；尚未完成整版发布验收。
 
-现有线上机器人保持不变。本轮没有接入实际微信群、生产服务器、旧凭据或旧数据库。独立插画生成服务及所有视频处理不在本版范围；图片理解、OCR、代码生成图表/流程图和语音消息仍在范围内。
+现有线上机器人保持不变。2GB 适配已获目标服务器持久维护授权，并完成不停止原服务的隔离资源准入实验；尚未部署新版、接入实际微信群或迁移旧数据库。独立插画生成服务及所有视频处理不在本版范围；图片理解、OCR、代码生成图表/流程图和语音消息仍在范围内。
 
 ## 离线开发入口
 
@@ -42,7 +42,7 @@ uv --no-config build --no-build-isolation
 
 原累计预算daily/total均50 CNY、revision1未改。用户新报告累计实扣11.65 CNY已由可信Owner对账审计282332应用，原5笔unknown/held0.562140保留；最终有效上界17.266165包含后续suffix保守估算，非新实扣。对账是同一50元预算的计量校准，不是退款或追加额度；报告时间口径与证据见[修复报告](docs/development/FOUR_FAILURE_REPAIR.md)。
 
-[PR #8](https://github.com/huchenzi0609-creator/GroupAgent/pull/8)仍draft、base [PR #1](https://github.com/huchenzi0609-creator/GroupAgent/pull/1)尚未合并；最新提交CI以[动态checks页面](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)为准。真实微信L5、目标Linux容量、至少七天shadow、真实迁移及单发送者切换全部 **NOT_RUN**，本轮不部署。配置样例默认关闭群处理，`check-config --production`仅检查配置字段。
+[PR #8](https://github.com/huchenzi0609-creator/GroupAgent/pull/8)仍draft、base [PR #1](https://github.com/huchenzi0609-creator/GroupAgent/pull/1)尚未合并；最新提交CI以[动态checks页面](https://github.com/huchenzi0609-creator/GroupAgent/pull/8/checks)为准。真实微信L5、新版目标 Linux 整机容量、至少七天shadow、真实迁移及单发送者切换仍为 **NOT_RUN**。已执行的资源准入实验与本地512MiB worker验证见[2GB报告](docs/development/POT_2GB_VALIDATION.md)，本轮不部署新版。配置样例默认关闭群处理，`check-config --production`仅检查配置字段。
 
 ## 文档
 
@@ -54,6 +54,7 @@ uv --no-config build --no-build-isolation
 - [实现与验证状态](docs/development/IMPLEMENTATION_STATUS.md)
 - [四项失败修复报告](docs/development/FOUR_FAILURE_REPAIR.md)
 - [本地运行手册](docs/development/LOCAL_RUNBOOK.md)
+- [Pot 的 2GB 共存部署档](deploy/SERVER_2GB.md)、[资源准入决策](docs/adr/0002-server-2gb-resource-admission.md)
 - [分层验收矩阵](docs/development/LOCAL_ACCEPTANCE_MATRIX.md)
 - [Harness 实验](docs/development/HARNESS_POC.md)、[微信契约实验](docs/development/WECHAT_ADAPTER_POC.md)、[worker 构建与容量](deploy/worker/README.md)
 - [规格变更记录](docs/CHANGELOG.md)、[开发前报告](docs/PRE_SPEC_REPORT.zh-CN.md)、[来源登记](docs/SOURCES.md)

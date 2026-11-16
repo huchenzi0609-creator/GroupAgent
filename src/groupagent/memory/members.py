@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import builtins
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import uuid4
 
 from psycopg.types.json import Jsonb
@@ -29,6 +29,9 @@ class ChannelRosterProvider:
         self.max_pages = max_pages
 
     async def fetch(self, group_id: str) -> RosterSnapshot:
+        config = getattr(self.channel, "config", None)
+        if config is not None and config.internal_group_id != group_id:
+            raise DomainError("scope_violation", "Roster channel belongs to another group")
         members: dict[str, RosterMember] = {}
         cursor = None
         seen: set[str] = set()
@@ -145,6 +148,30 @@ class MemberService:
                 "permission_denied", "Only the owner may explicitly refresh the roster"
             )
         return await self._sync(actor, "manual:" + request_id, provider)
+
+    async def sync_runtime(
+        self,
+        actor: ActorContext,
+        request_id: str,
+        provider: RosterProvider,
+        *,
+        reason: Literal["group_updated", "member_query"],
+    ) -> RosterSyncResult:
+        """Synchronize channel observations under the runtime's technical identity.
+
+        A group update reads the daemon's changed cache; a member query may use a
+        provider that first completes a targeted remote refresh. Neither grants
+        a chatting member authority to change identities or membership.
+        """
+        if actor.role != Role.MAINTAINER or actor.member_id != "service:runtime":
+            raise DomainError(
+                "permission_denied", "Only the runtime's technical identity may sync observations"
+            )
+        if reason not in {"group_updated", "member_query"}:
+            raise DomainError("invalid_input", "Unknown runtime roster observation reason")
+        if not request_id.strip():
+            raise DomainError("invalid_input", "Runtime roster sync needs a stable request ID")
+        return await self._sync(actor, "runtime:" + reason + ":" + request_id, provider)
 
     async def _sync(
         self, actor: ActorContext, key: str, provider: RosterProvider

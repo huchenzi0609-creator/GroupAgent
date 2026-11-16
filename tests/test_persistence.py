@@ -45,7 +45,7 @@ def store() -> PostgresStore:
     if not dsn:
         pytest.skip("Set GROUPAGENT_TEST_DSN for real PostgreSQL integration tests")
     result = PostgresStore(dsn)
-    assert result.migrate() == 12
+    assert result.migrate() == 13
     return result
 
 
@@ -95,8 +95,8 @@ def preparing_delivery(
 
 
 def test_migration_is_idempotent(store: PostgresStore) -> None:
-    assert store.migrate() == 12
-    assert store.migrate() == 12
+    assert store.migrate() == 13
+    assert store.migrate() == 13
 
 
 def test_migration_checksum_and_failure_rollback_in_disposable_schema(
@@ -107,7 +107,7 @@ def test_migration_checksum_and_failure_rollback_in_disposable_schema(
         conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
     scoped = PostgresStore(make_conninfo(store.dsn, options=f"-c search_path={schema}"))
     try:
-        assert scoped.migrate() == 12
+        assert scoped.migrate() == 13
         with scoped.connect() as conn:
             conn.execute("UPDATE ga_schema_migrations SET sha256 = 'changed'")
         with pytest.raises(DomainError) as caught:

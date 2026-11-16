@@ -1331,6 +1331,7 @@ def evaluate_interaction_participation(
     from groupagent.conversation.service import ConversationCoordinator
     from groupagent.coordinator import Decision
     from groupagent.domain import ActorContext, EventKind, GroupEvent, Role
+    from groupagent.identity import BotIdentity
 
     cases = dataset["cases"]
     digest = hashlib.sha256(
@@ -1418,6 +1419,7 @@ def evaluate_interaction_participation(
         )
         coordinator.clock = lambda instant=stamp: instant
         decision = Decision.model_validate(row["decision"])
+        coordinator.identity = BotIdentity.from_context(context)
         effective = coordinator._gate(
             SimpleNamespace(actor=actor, group_id=actor.group_id, conn=ReadOnlyPolicies()),
             event,
