@@ -70,7 +70,11 @@ async def test_automatic_recovery_has_no_notice_and_is_presented_as_background_w
         status = event(env, "这项工作现在怎么样？", reply_to=request.id)
         await intake(app, env, status)
         context = app.coordinator._context(env.actor, status)
-        assert context["works"][0]["state"] == "queued"
+        assert context["works"][0]["state"] == "paused"
+        overview = context["work_facts_overview"]
+        recovering = next(row for row in overview["facts"] if row["id"] == work.id)
+        assert recovering["state"] == "paused"
+        assert recovering["presentation"]["background_processing"] is True
         assert context["works"][0]["status_detail"]["code"] == "background_processing"
         with env.store.transaction(env.actor) as tx:
             assert not tx.list_delivery()

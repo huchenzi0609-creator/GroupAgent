@@ -343,7 +343,14 @@ async def test_work_and_topic_source_growth_omits_whole_items_with_visible_incom
                 for source in work.scope["source_fingerprints"]
             } == work.scope["source_fingerprints"]
         else:
-            assert work.goal not in json.dumps(public, ensure_ascii=False)
+            # A compact public status does not hydrate the task's entire
+            # conversation archive or consume its transitive 400+ sources.
+            summary = next(
+                row for row in public["work_facts_overview"]["facts"] if row["id"] == work.id
+            )
+            assert summary["goal"] == work.goal
+            assert "scope" not in summary and "source_fingerprints" not in summary
+    assert "synthetic historical fragment" not in json.dumps(public["work_facts_overview"])
     for topic in public["topics"]:
         index = next(index for index, original in enumerate(topics) if original.id == topic["id"])
         assert {item.id for item in old[index * 180 : index * 180 + 20]} <= source_ids
@@ -366,9 +373,9 @@ async def test_deterministic_native_quote_stop_survives_omitted_huge_work_contex
     context = h.coordinator._context(env.actor, request)
     assert context["context_incomplete"] and len(context["_snapshot"]["source_fingerprints"]) <= 400
     assert huge.id not in {row["id"] for row in context["works"]}
-    assert "omitted-huge-sensitive-goal" not in json.dumps(
-        public_context(context), ensure_ascii=False
-    )
+    summary = next(row for row in context["work_facts_overview"]["facts"] if row["id"] == huge.id)
+    assert summary["goal"] == huge.goal and "scope" not in summary
+    assert "synthetic historical fragment" not in json.dumps(context["work_facts_overview"])
     result = await h.coordinator.process(request)
     assert result.work_id == huge.id and result.decision.control == "cancel"
     assert not h.model.requests
