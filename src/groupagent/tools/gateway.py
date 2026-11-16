@@ -15,7 +15,9 @@ from groupagent.domain import DomainError, Role
 from groupagent.resources import ResourceDeferred, ResourceGovernor
 
 from .models import (
+    AUTHORITY_FENCED_TOOL_ERRORS,
     ISOLATED_PROCESS_TOOLS,
+    LEGACY_FENCED_TOOL_ERRORS,
     EffectState,
     IdempotencyMode,
     InputRequest,
@@ -25,11 +27,15 @@ from .models import (
     ToolControl,
     ToolDefinition,
     ToolFailure,
+    ToolFailureDisposition,
+    ToolFailureMetadata,
+    ToolFailureOrigin,
     ToolInputIssue,
     ToolInputRequired,
     ToolLedgerEntry,
     ToolReceipt,
     ToolScope,
+    failure_disposition,
 )
 from .paths import scoped_path
 
@@ -54,7 +60,20 @@ def _failure(
     code: str,
     effect: EffectState = EffectState.NOT_STARTED,
     message: str = "The tool did not complete",
+    *,
+    origin: ToolFailureOrigin = ToolFailureOrigin.EXECUTION,
+    disposition: ToolFailureDisposition | None = None,
 ) -> ToolReceipt:
+    if effect == EffectState.UNKNOWN:
+        disposition = ToolFailureDisposition.RECONCILE
+    elif code in AUTHORITY_FENCED_TOOL_ERRORS:
+        origin, disposition = ToolFailureOrigin.AUTHORIZATION, ToolFailureDisposition.FENCE
+    elif disposition is None:
+        disposition = (
+            ToolFailureDisposition.FENCE
+            if code in LEGACY_FENCED_TOOL_ERRORS
+            else ToolFailureDisposition.REPAIR
+        )
     return ToolReceipt(
         call_id=context.call_id,
         tool_name=name,
@@ -63,6 +82,7 @@ def _failure(
         effect_state=effect,
         error_code=code,
         message=message,
+        failure=ToolFailureMetadata(origin=origin, disposition=disposition),
     )
 
 
@@ -386,16 +406,29 @@ class ToolGateway:
     async def _prepare(
         self, name: str, arguments: dict[str, Any], context: ToolContext
     ) -> _PreparedTool | ToolReceipt:
+        boundary = ToolFailureOrigin.AUTHORIZATION
+
         def receipt(
             code: str,
             effect: EffectState = EffectState.NOT_STARTED,
             message: str = "The tool did not complete",
         ) -> ToolReceipt:
-            return _failure(name, context, code, effect, message)
+            return _failure(
+                name,
+                context,
+                code,
+                effect,
+                message,
+                origin=boundary,
+                disposition=ToolFailureDisposition.FENCE
+                if boundary == ToolFailureOrigin.AUTHORIZATION
+                else ToolFailureDisposition.REPAIR,
+            )
 
         validating_arguments = False
         try:
             effective_context = await self.authorize(name, context)
+            boundary = ToolFailureOrigin.ARGUMENTS
             definition = self._tools[name]
             encoded = json.dumps(arguments, sort_keys=True, allow_nan=False).encode("utf-8")
             if len(encoded) > definition.max_input_bytes:
@@ -412,7 +445,13 @@ class ToolGateway:
             return receipt(exc.code)
         except ValidationError as error:
             if not validating_arguments:
-                return receipt("policy_unavailable")
+                return _failure(
+                    name,
+                    context,
+                    "policy_unavailable",
+                    origin=ToolFailureOrigin.AUTHORIZATION,
+                    disposition=ToolFailureDisposition.FENCE,
+                )
             issues = _input_issues(error, definition)
             description = "; ".join(
                 (".".join(str(part) for part in issue.field) or "<root>")
@@ -428,7 +467,13 @@ class ToolGateway:
         except (TypeError, ValueError):
             return receipt("invalid_input")
         except Exception:
-            return receipt("policy_unavailable")
+            return _failure(
+                name,
+                context,
+                "policy_unavailable",
+                origin=ToolFailureOrigin.AUTHORIZATION,
+                disposition=ToolFailureDisposition.FENCE,
+            )
 
         return _PreparedTool(definition, effective_context, encoded, validated)
 
@@ -456,8 +501,13 @@ class ToolGateway:
             code: str,
             effect: EffectState = EffectState.NOT_STARTED,
             message: str = "The tool did not complete",
+            *,
+            origin: ToolFailureOrigin = ToolFailureOrigin.EXECUTION,
+            disposition: ToolFailureDisposition | None = None,
         ) -> ToolReceipt:
-            return _failure(name, context, code, effect, message)
+            return _failure(
+                name, context, code, effect, message, origin=origin, disposition=disposition
+            )
 
         prepared = await self._prepare(name, arguments, context)
         if isinstance(prepared, ToolReceipt):
@@ -490,7 +540,11 @@ class ToolGateway:
                     # No handler, timeout, in-flight ledger entry, or effect has
                     # started. The exact proposal can resume without a new model
                     # request and without replaying earlier tools in its batch.
-                    return receipt("resource_deferred")
+                    return receipt(
+                        "resource_deferred",
+                        origin=ToolFailureOrigin.ADMISSION,
+                        disposition=ToolFailureDisposition.DEFER,
+                    )
 
         uncertain = (
             EffectState.NO_EFFECT
@@ -561,35 +615,63 @@ class ToolGateway:
                     "input_required",
                     EffectState.NO_EFFECT,
                     message="This action was not performed; confirmed input is required.",
+                    origin=ToolFailureOrigin.PRECONDITION,
+                    disposition=ToolFailureDisposition.REQUEST_INPUT,
                 ).model_copy(update={"control": ToolControl(input_request=exc.input_request)})
             else:
                 result = receipt("unregistered_tool_control", uncertain)
         except ToolFailure as exc:
-            effect = EffectState.NO_EFFECT if exc.no_effect else uncertain
+            effect = (
+                EffectState.NOT_STARTED
+                if exc.not_started
+                else EffectState.NO_EFFECT
+                if exc.no_effect
+                else uncertain
+            )
+            failure_origin = exc.failure.origin if exc.failure else ToolFailureOrigin.EXECUTION
+            failure_action = exc.failure.disposition if exc.failure else None
             if exc.output is None:
                 result = receipt(
                     exc.code,
                     effect,
                     message=exc.message,
+                    origin=failure_origin,
+                    disposition=failure_action,
                 )
             else:
                 try:
                     failed_output = definition.output_model.model_validate(exc.output)
                     if len(failed_output.model_dump_json().encode()) > definition.max_output_bytes:
-                        result = receipt("output_too_large", effect)
-                    else:
-                        result = receipt(exc.code, effect, message=exc.message).model_copy(
-                            update={"output": failed_output.model_dump(mode="json")}
+                        result = receipt(
+                            "output_too_large",
+                            effect,
+                            origin=failure_origin,
+                            disposition=failure_action,
                         )
+                    else:
+                        result = receipt(
+                            exc.code,
+                            effect,
+                            message=exc.message,
+                            origin=failure_origin,
+                            disposition=failure_action,
+                        ).model_copy(update={"output": failed_output.model_dump(mode="json")})
                 except Exception:
                     # Bad diagnostics cannot erase the handler's independently
                     # established unpublished/rollback fact or escape dispatch.
                     # Never expose Pydantic errors containing tool output.
-                    result = receipt("invalid_output", effect)
+                    result = receipt(
+                        "invalid_output", effect, origin=failure_origin, disposition=failure_action
+                    )
         except ResourceDeferred:
             # This trusted control exception attests admission refused before
             # the effectful operation. It is not a failed/unknown business call.
-            result = receipt("resource_deferred", EffectState.NOT_STARTED)
+            result = receipt(
+                "resource_deferred",
+                EffectState.NOT_STARTED,
+                origin=ToolFailureOrigin.ADMISSION,
+                disposition=ToolFailureDisposition.DEFER,
+            )
         except DomainError as exc:
             result = receipt(exc.code, uncertain)
         except Exception:
@@ -620,7 +702,7 @@ class ToolGateway:
                     task.add_done_callback(lambda _finished: reservation.release())
         result = await self._trusted_metadata(result, context)
         if (
-            result.error_code == "resource_deferred"
+            failure_disposition(result) == ToolFailureDisposition.DEFER
             and result.effect_state == EffectState.NOT_STARTED
         ) or (
             result.control is not None
@@ -694,7 +776,7 @@ class ToolGateway:
             if previous is not None and previous != value:
                 # Explicit read reconciliation may update an existing gateway
                 # as well as a fresh one. Retain the exact failed call and its
-                # result; only its business-effect classification can change.
+                # result; only its adjudicated effect/disposition can change.
                 old = previous[1]
                 reconciled_read = (
                     previous[0] == entry.fingerprint
@@ -704,7 +786,16 @@ class ToolGateway:
                     and bool(old.error_code)
                     and old.error_code != "tool_in_progress"
                     and entry.receipt
-                    == old.model_copy(update={"effect_state": EffectState.NO_EFFECT})
+                    == old.model_copy(
+                        update={
+                            "effect_state": EffectState.NO_EFFECT,
+                            "failure": old.failure.model_copy(
+                                update={"disposition": ToolFailureDisposition.REPAIR}
+                            )
+                            if old.failure is not None
+                            else None,
+                        }
+                    )
                 )
                 if not reconciled_read:
                     raise DomainError("idempotency_conflict", "Recovered tool ledger differs")

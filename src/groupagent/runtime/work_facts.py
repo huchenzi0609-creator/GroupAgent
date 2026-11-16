@@ -15,6 +15,7 @@ from groupagent.memory.causality import after_boundary_sql
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.persistence.delivery_knowledge import projected_delivery_state
 from groupagent.security import redact_credentials
+from groupagent.tools.models import ToolFailureMetadata
 
 from .recovery import (
     RECONCILIATION_CODES,
@@ -284,7 +285,8 @@ class WorkFacts:
             "e.body#>>'{payload,receipt,tool_name}' AS finished_name,"
             "e.body#>'{payload,receipt,success}' AS success,"
             "e.body#>>'{payload,receipt,error_code}' AS error_code,"
-            "e.body#>>'{payload,receipt,effect_state}' AS effect_state "
+            "e.body#>>'{payload,receipt,effect_state}' AS effect_state,"
+            "e.body#>'{payload,receipt,failure}' AS failure "
             "FROM ga_runtime_events e JOIN ga_execution_attempts a "
             "ON a.group_id=e.group_id AND a.id=e.attempt_id AND a.work_id=e.work_id "
             "WHERE e.group_id=%s AND e.work_id=%s AND a.goal_revision=%s "
@@ -304,7 +306,7 @@ class WorkFacts:
                 or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", name) is None
             ):
                 continue
-            item = {
+            item: dict[str, Any] = {
                 "tool_name": name,
                 "observed_at": event["created_at"].isoformat(),
                 "status": "requested"
@@ -321,6 +323,13 @@ class WorkFacts:
                 item["error_code"] = event["error_code"]
             if event["effect_state"] in {"not_started", "no_effect", "succeeded", "unknown"}:
                 item["effect_state"] = event["effect_state"]
+            if isinstance(event["failure"], dict):
+                try:
+                    item["failure"] = ToolFailureMetadata.model_validate(
+                        event["failure"]
+                    ).model_dump(mode="json")
+                except ValueError:
+                    pass
             activity.append(item)
         outputs = tx.conn.execute(
             "SELECT count(*) AS candidate_count,count(*) FILTER (WHERE "

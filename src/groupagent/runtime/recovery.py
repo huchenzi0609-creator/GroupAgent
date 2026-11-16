@@ -20,7 +20,7 @@ from groupagent.domain import DomainError, WorkOrder, WorkState
 from groupagent.execution import EngineCheckpoint, RunState, accounting_recovery_checkpoint
 from groupagent.tools import ToolGateway, ToolScope
 from groupagent.tools.gateway import tool_call_fingerprint
-from groupagent.tools.models import EffectState, ToolReceipt
+from groupagent.tools.models import EffectState, ToolFailureDisposition, ToolReceipt
 from groupagent.tools.paths import open_parent, scoped_path
 
 from .checkpoint_codec import serialize_runtime_model
@@ -180,7 +180,16 @@ def reconcile_unpublished_compute_checkpoint(
             refuse()
     proposals, observations = set(), set()
     reconciled = {
-        identifier: receipt.model_copy(update={"effect_state": EffectState.NO_EFFECT})
+        identifier: receipt.model_copy(
+            update={
+                "effect_state": EffectState.NO_EFFECT,
+                "failure": receipt.failure.model_copy(
+                    update={"disposition": ToolFailureDisposition.REPAIR}
+                )
+                if receipt.failure is not None
+                else None,
+            }
+        )
         for identifier, receipt in unknown.items()
     }
     messages = []

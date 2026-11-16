@@ -122,7 +122,9 @@ def _event_status_header(event: EngineEvent) -> dict[str, Any]:
     payload.pop("text", None)
     if isinstance(payload.get("receipt"), dict):
         payload["receipt"] = {
-            key: value for key, value in payload["receipt"].items() if key != "output"
+            key: value
+            for key, value in payload["receipt"].items()
+            if key != "output" and not (key == "failure" and value is None)
         }
         for name in ("required_tool_evidence", "loaded_tools"):
             # Frozenset JSON order changes with a restarted interpreter's hash

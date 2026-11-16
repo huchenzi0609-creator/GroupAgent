@@ -592,3 +592,56 @@ async def test_upper_bound_pdf_and_program_diagrams_do_not_gain_exact_pages_or_r
         == "上限是2页；内容完整并通过检查的1页PDF也符合要求，并不要求凑满2页。"
     )
     assert len(work_rows(env)) == 1 and work_rows(env)[0].state == WorkState.QUEUED
+
+
+async def test_revising_output_can_clear_page_bound_without_dropping_budget_nulls(conversation_env):
+    from groupagent.conversation.actions import OutputRequirement
+
+    env = conversation_env
+    initial, started = await turn(
+        env,
+        "Pot，制作最多2页的PDF。",
+        ScriptedModel(
+            call(
+                "start_work",
+                {
+                    "goal": "制作PDF，最多2页",
+                    "work_capabilities": ["documents"],
+                    "outputs": [{"format": "pdf", "max_units": 2}],
+                },
+            ),
+            reply("PDF已排队，上限2页。"),
+        ),
+    )
+    work = work_rows(env)[0]
+    original_budget = dict(work.budget)
+    assert work.scope["outputs"] == [{"format": "pdf", "max_units": 2, "expected_text": []}]
+    _, revised = await turn(
+        env,
+        "Pot，继续同一份PDF，取消页数限制。",
+        ScriptedModel(
+            call(
+                "update_work",
+                {
+                    "target_work_id": work.id,
+                    "expected_revision": work.revision,
+                    "goal": "制作同一份PDF，不设页数限制",
+                    "work_capabilities": ["documents"],
+                    "outputs": [{"format": "pdf", "max_units": None}],
+                },
+            ),
+            reply("已移除同一份PDF的页数上限。"),
+        ),
+        reply_to=initial.id,
+    )
+    changed = work_rows(env)[0]
+    assert revised.work_id == started.work_id == changed.id and len(work_rows(env)) == 1
+    assert changed.goal_revision == 2
+    assert changed.scope["outputs"] == [{"format": "pdf", "expected_text": []}]
+    assert OutputRequirement.model_validate(changed.scope["outputs"][0]).accepts_unit_count(3)
+    assert (
+        changed.budget
+        == original_budget
+        == env.coordinator.config.execution.model_dump(mode="json")
+    )
+    assert any(value is None for value in original_budget.values())

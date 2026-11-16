@@ -23,7 +23,13 @@ from groupagent.runtime.recovery import (
 from groupagent.tools import EffectState, ToolGateway, ToolReceipt
 from groupagent.tools.compute import register_compute_tools
 from groupagent.tools.gateway import tool_call_fingerprint
-from groupagent.tools.models import ToolLedgerEntry
+from groupagent.tools.models import (
+    ToolFailureDisposition,
+    ToolFailureMetadata,
+    ToolFailureOrigin,
+    ToolLedgerEntry,
+    failure_disposition,
+)
 
 
 class NeverRun:
@@ -111,6 +117,38 @@ def test_verified_legacy_worker_failure_becomes_repair_observation_without_repla
     assert restored.backend_state["uncertain_model_usage"] is True
     assert checkpoint.receipts[0].effect_state == EffectState.UNKNOWN
     assert checkpoint.error_code == "effect_unknown" and not checkpoint.safe_to_resume
+
+
+def test_host_effect_proof_updates_typed_reconciliation_disposition_together(legacy_draft):
+    checkpoint, gateway, evidence = legacy_draft
+    original = checkpoint.receipts[0].model_copy(
+        update={
+            "failure": ToolFailureMetadata(
+                origin=ToolFailureOrigin.EXECUTION, disposition=ToolFailureDisposition.RECONCILE
+            )
+        }
+    )
+    checkpoint = checkpoint.model_copy(
+        update={
+            "receipts": (original,),
+            "ledger": (checkpoint.ledger[0].model_copy(update={"receipt": original}),),
+            "messages": (
+                checkpoint.messages[0],
+                checkpoint.messages[1].model_copy(update={"content": original.model_dump_json()}),
+            ),
+        }
+    )
+    evidence = replace(evidence, checkpoint_digest=checkpoint_digest(checkpoint))
+    restored = reconcile_unpublished_compute_checkpoint(
+        checkpoint, gateway=gateway, evidence=evidence
+    )
+    assert failure_disposition(original) == ToolFailureDisposition.RECONCILE
+    assert failure_disposition(restored.receipts[0]) == ToolFailureDisposition.REPAIR
+    assert restored.receipts[0].effect_state == EffectState.NO_EFFECT
+    assert (
+        restored.receipts[0].error_code == original.error_code
+        and restored.usage == checkpoint.usage
+    )
 
 
 @pytest.mark.parametrize(

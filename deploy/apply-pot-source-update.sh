@@ -42,6 +42,8 @@ PY
 )
 test "$pg_bin" = /opt/pot-test2/postgresql/bin
 chown 994:990 "$release/config.before.canonical.json"
+group_hash=$(cat /etc/pot-test2/group.sha256)
+[[ "$group_hash" =~ ^[a-f0-9]{64}$ ]]
 
 maintenance() {
   local image=$1
@@ -57,6 +59,25 @@ maintenance() {
     --mount type=bind,src="$release/config.before.canonical.json",dst=/before.json,readonly \
     --mount type=bind,src="$release/config.after.json",dst=/after.json,readonly \
     --entrypoint python3 "$image" -I "$@"
+}
+
+controller_absent() {
+  local running_controller
+  running_controller=$(docker ps --filter 'name=^/pot-test2$' --format '{{.ID}}') || return 1
+  test -z "$running_controller"
+}
+
+cleanup_managed_workers() {
+  local managed_output managed_worker
+  managed_output=$(docker ps -aq --filter label=org.groupagent.managed=1 --filter label=org.groupagent.group="$group_hash") || return 1
+  if test -n "$managed_output"; then
+    while IFS= read -r managed_worker; do
+      [[ "$managed_worker" =~ ^[a-f0-9]{12,64}$ ]] || return 1
+      docker rm -f "$managed_worker" > /dev/null || return 1
+    done <<< "$managed_output"
+  fi
+  managed_output=$(docker ps -aq --filter label=org.groupagent.managed=1 --filter label=org.groupagent.group="$group_hash") || return 1
+  test -z "$managed_output"
 }
 
 health() {
@@ -82,12 +103,25 @@ source_replaced=false
 rollback() {
   trap - ERR
   set +e
-  systemctl stop pot-test2-container.service
-  systemctl stop pot-test2-docker-proxy.service
+  systemctl stop pot-test2-container.service || {
+    echo POT_ROLLBACK_CONTROLLER_STOP_NEEDS_ATTENTION >&2
+    return 1
+  }
+  systemctl stop pot-test2-docker-proxy.service || {
+    echo POT_ROLLBACK_BROKER_STOP_NEEDS_ATTENTION >&2
+    return 1
+  }
+  if ! controller_absent || ! cleanup_managed_workers; then
+    echo POT_ROLLBACK_QUIESCENCE_NEEDS_ATTENTION >&2
+    return 1
+  fi
   if $candidate_started; then
     maintenance "$next" -m groupagent.runtime.rollback \
       --config /etc/pot-test2/config.json --dsn-file /etc/pot-test2/database.dsn \
-      --confirmed-quiesced > "$release/rollback-park.log" 2>&1
+      --confirmed-quiesced > "$release/rollback-park.log" 2>&1 || {
+        echo POT_ROLLBACK_PARK_NEEDS_ATTENTION >&2
+        return 1
+      }
   fi
   if $handoff_applied; then
     maintenance "$next" -m groupagent.ops.release --before-config /after.json \
@@ -113,19 +147,16 @@ rollback() {
 }
 
 # Stop only Pot. Existing game, WeChat client and database remain running.
+trap 'rollback; exit 1' ERR
 systemctl stop pot-test2-container.service
 systemctl stop pot-test2-docker-proxy.service
-trap rollback ERR
 # No retired controller or labelled isolated child may publish later.
-test -z "$(docker ps --filter id="$old_container" --format '{{.ID}}')"
-group_hash=$(cat /etc/pot-test2/group.sha256)
-[[ "$group_hash" =~ ^[a-f0-9]{64}$ ]]
-mapfile -t obsolete < <(docker ps -aq --filter label=org.groupagent.managed=1 --filter label=org.groupagent.group="$group_hash")
-for worker in "${obsolete[@]}"; do
-  [[ "$worker" =~ ^[a-f0-9]{12,64}$ ]]
-  docker rm -f "$worker" > /dev/null
-done
-test -z "$(docker ps -aq --filter label=org.groupagent.managed=1 --filter label=org.groupagent.group="$group_hash")"
+old_controller_running=$(docker ps --filter id="$old_container" --format '{{.ID}}')
+test -z "$old_controller_running"
+controller_absent
+cleanup_managed_workers
+printf 'old_controller_removed=%s\ngroup_hash=%s\nmanaged_workers_absent=true\n' \
+  "$old_container" "$group_hash" > "$release/quiescence.before.log"
 # Placeholder for the read-only bind used by the common maintenance launcher.
 cp "$release/config.before.canonical.json" "$release/config.after.json"
 chown 994:990 "$release/config.after.json"
@@ -166,10 +197,12 @@ import hashlib,json,sys
 print(hashlib.sha256(json.dumps(json.load(open(sys.argv[1])),sort_keys=True).encode()).hexdigest())
 PY
 )
+# Reverse handoff is idempotent when the old digest remains. Arm before the
+# forward command: a lost success reply must not strand the new DB bookmark.
+handoff_applied=true
 maintenance "$next" -m groupagent.ops.release --before-config /before.json \
   --after-config /after.json --dsn-file /etc/pot-test2/database.dsn \
   --expected-digest "$old_digest" > "$release/configuration-handoff.json"
-handoff_applied=true
 # Record physical quiescence only; runtime reconciles each isolated effect separately.
 maintenance "$next" -c 'from pathlib import Path; from groupagent.config import AppConfig; from groupagent.domain import ActorContext,Role; from groupagent.persistence import PostgresStore; from groupagent.runtime.checkpoint_codec import decode_checkpoint; from groupagent.tools.models import EffectState; c=AppConfig.model_validate_json(Path("/after.json").read_text()); s=PostgresStore(Path("/etc/pot-test2/database.dsn").read_text().strip()); a=ActorContext(group_id=c.group.internal_id,member_id=c.group.owner_ids[0],role=Role.OWNER,policy_revision=c.group.policy_revision)
 with s.transaction(a) as tx:

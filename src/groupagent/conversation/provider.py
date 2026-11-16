@@ -538,10 +538,18 @@ def validate_candidate(
         _fail("public_image_count_evidence.event_id", "select_authorized_human_source")
     for output in decision.outputs:
         OutputRequirement.model_validate(output, strict=True)
-    if isinstance(original_text, str) and decision.outputs:
-        normalized_outputs = literal_output_requirements(decision.outputs, original_text)
-        for output in normalized_outputs:
-            OutputRequirement.model_validate(output, strict=True)
+    if decision.outputs:
+        normalized = (
+            literal_output_requirements(decision.outputs, original_text)
+            if isinstance(original_text, str)
+            else decision.outputs
+        )
+        normalized_outputs = [
+            OutputRequirement.model_validate(output, strict=True).model_dump(
+                mode="json", exclude_none=True, exclude_unset=True
+            )
+            for output in normalized
+        ]
         decision = decision.model_copy(update={"outputs": normalized_outputs})
     requester, role = context.get("requester_member_id"), context.get("role")
     if controlled and decision.work_selector is None:

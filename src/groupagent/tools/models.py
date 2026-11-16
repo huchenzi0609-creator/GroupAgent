@@ -35,6 +35,34 @@ class IdempotencyMode(StrEnum):
     NON_RETRYABLE = "non_retryable"
 
 
+class ToolFailureOrigin(StrEnum):
+    AUTHORIZATION = "authorization"
+    ARGUMENTS = "arguments"
+    CAPABILITY = "capability"
+    EXECUTION = "execution"
+    ADMISSION = "admission"
+    PRECONDITION = "precondition"
+
+
+class ToolFailureDisposition(StrEnum):
+    REPAIR = "repair"
+    FENCE = "fence"
+    RECONCILE = "reconcile"
+    DEFER = "defer"
+    REQUEST_INPUT = "request_input"
+
+
+class ToolFailureMetadata(ToolData):
+    """Trusted gateway/handler classification, never parsed from model output.
+
+    The business effect state remains an independent, stronger constraint:
+    UNKNOWN can only reconcile, regardless of a suggested repair disposition.
+    """
+
+    origin: ToolFailureOrigin
+    disposition: ToolFailureDisposition
+
+
 class InputRequest(ToolData):
     question: str = Field(min_length=1, max_length=2000)
     required_inputs: tuple[Annotated[str, Field(min_length=1, max_length=200)], ...] = Field(
@@ -85,6 +113,58 @@ class ToolReceipt(ToolData):
     required_tool_evidence: frozenset[Literal["process_run", "shell_command"]] = frozenset()
     # Only a registered host toolset loader can populate this presentation metadata.
     loaded_tools: frozenset[str] = frozenset()
+    # Optional for legacy receipts. New dispatch supplies trusted failure origin
+    # so an unsupported argument cannot masquerade as revoked authority.
+    failure: ToolFailureMetadata | None = None
+
+
+LEGACY_FENCED_TOOL_ERRORS = frozenset(
+    {
+        "permission_denied",
+        "scope_violation",
+        "tool_not_registered",
+        "policy_unavailable",
+        "idempotency_conflict",
+        "stale_lease",
+        "policy_changed",
+        "source_unavailable",
+        "auth_required",
+        "cancelled",
+    }
+)
+AUTHORITY_FENCED_TOOL_ERRORS = frozenset(
+    {
+        "stale_lease",
+        "policy_changed",
+        "source_unavailable",
+        "auth_required",
+        "policy_unavailable",
+        "idempotency_conflict",
+        "cancelled",
+    }
+)
+
+
+def failure_disposition(receipt: ToolReceipt) -> ToolFailureDisposition | None:
+    """Effect uncertainty wins; old unclassified authority failures stay conservative."""
+    if receipt.effect_state == EffectState.UNKNOWN:
+        return ToolFailureDisposition.RECONCILE
+    if not receipt.success and receipt.error_code in AUTHORITY_FENCED_TOOL_ERRORS:
+        return ToolFailureDisposition.FENCE
+    if receipt.control is not None:
+        return ToolFailureDisposition.REQUEST_INPUT
+    if receipt.success:
+        return None
+    if receipt.failure is not None:
+        return receipt.failure.disposition
+    if receipt.error_code in LEGACY_FENCED_TOOL_ERRORS:
+        return ToolFailureDisposition.FENCE
+    if (
+        receipt.error_code == "resource_deferred"
+        and receipt.effect_state == EffectState.NOT_STARTED
+    ):
+        return ToolFailureDisposition.DEFER
+    return ToolFailureDisposition.REPAIR
 
 
 ISOLATED_PROCESS_TOOLS = frozenset({"process_run", "shell_command"})
@@ -118,14 +198,35 @@ class ToolLedgerEntry(ToolData):
 
 
 class ToolFailure(DomainError):
-    """Reviewed handlers may provide bounded typed diagnostics for a failed action."""
+    """Reviewed handlers provide diagnostics and explicit failure provenance.
+
+    ``not_started`` is a host attestation that no effectful operation began;
+    ``no_effect`` may also attest a confirmed unpublished draft/rollback. Model
+    arguments and output dictionaries cannot supply either proof or disposition.
+    """
 
     def __init__(
-        self, code: str, message: str, *, output: BaseModel | None = None, no_effect: bool = False
+        self,
+        code: str,
+        message: str,
+        *,
+        output: BaseModel | None = None,
+        no_effect: bool = False,
+        not_started: bool = False,
+        origin: ToolFailureOrigin | None = None,
+        disposition: ToolFailureDisposition | None = None,
     ):
         super().__init__(code, message)
         self.output = output
-        self.no_effect = no_effect
+        self.no_effect = no_effect or not_started
+        self.not_started = not_started
+        if (origin is None) != (disposition is None):
+            raise ValueError("Failure origin and disposition must be supplied together")
+        self.failure = (
+            ToolFailureMetadata(origin=origin, disposition=disposition)
+            if origin is not None and disposition is not None
+            else None
+        )
 
 
 class ToolInputRequired(DomainError):

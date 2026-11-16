@@ -86,6 +86,7 @@ _RECEIPT_KEYS = (
     "error_code",
     "replayed",
     "control",
+    "failure",
     "input_issues",
 )
 

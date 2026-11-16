@@ -25,7 +25,11 @@ from groupagent.tools import (
     ToolReceipt,
     ToolScope,
 )
-from groupagent.tools.models import successful_required_tools
+from groupagent.tools.models import (
+    ToolFailureDisposition,
+    failure_disposition,
+    successful_required_tools,
+)
 
 from .compaction import compact_model_request
 from .errors import ModelRejected
@@ -872,6 +876,19 @@ class LangGraphEngine:
         async def before_model(messages):
             if run.cancelled.is_set():
                 raise DomainError("cancelled", "Execution was cancelled")
+            if run.stop_reason == "effect_unknown":
+                raise DomainError("effect_unknown", "External effect requires reconciliation")
+            fence = run.backend_state.get("tool_failure_fence")
+            if isinstance(fence, dict):
+                if (
+                    fence.get("revision") == run.revision
+                    and fence.get("policy_revision") == run.scope.actor.policy_revision
+                ):
+                    raise DomainError(
+                        fence.get("error_code") or "permission_denied",
+                        "A recorded host authorization refusal still fences this activation",
+                    )
+                run.backend_state.pop("tool_failure_fence", None)
             if not self.gateway.is_quiescent(run.scope):
                 run.safe_to_resume = False
                 raise DomainError("work_busy", "A previous handler has not stopped")
@@ -1490,14 +1507,18 @@ class LangGraphEngine:
         else:
             prepared = await prepare()
         if isinstance(prepared, ToolReceipt):
+            self._apply_tool_disposition(run, prepared)
+            if run.stop_reason and not parallel:
+                raise DomainError(run.stop_reason, "Scoped gateway stopped execution")
             return prepared.model_dump_json()
         context, admitted, preflight = prepared
         receipt = preflight or await self.gateway.invoke(call.name, call.arguments, context)
 
         async def settle():
+            disposition = failure_disposition(receipt)
             intents = run.backend_state.setdefault("scoped_tool_intents", {})
             if (
-                receipt.error_code == "resource_deferred"
+                disposition == ToolFailureDisposition.DEFER
                 and receipt.effect_state == EffectState.NOT_STARTED
             ):
                 if not admitted:
@@ -1505,10 +1526,13 @@ class LangGraphEngine:
                         update={"tool_calls": run.usage.tool_calls - 1}
                     )
                     intents.pop(call.id, None)
-                run.safe_to_resume = not run.unresolved_tools
-                run.stop_reason = "resource_deferred"
+                run.safe_to_resume = not run.unresolved_tools and run.stop_reason not in {
+                    "effect_unknown",
+                    "invalid_tool_control",
+                }
+                run.stop_reason = run.stop_reason or "resource_deferred"
                 await self._save(run)
-                raise DomainError("resource_deferred", "Tool is waiting for worker capacity")
+                raise DomainError(run.stop_reason, "Tool is waiting for worker capacity")
             intents.pop(call.id, None)
             self._remove_pending(run, call.id)
             self._load_tools(run, receipt)
@@ -1518,8 +1542,11 @@ class LangGraphEngine:
             run.unresolved_tools = {
                 item.tool_name for item in run.receipts if item.effect_state == EffectState.UNKNOWN
             }
+            self._apply_tool_disposition(run, receipt)
             run.safe_to_resume = (
                 not run.unresolved_tools
+                and disposition != ToolFailureDisposition.RECONCILE
+                and run.stop_reason not in {"effect_unknown", "invalid_tool_control"}
                 and (parallel or self.gateway.is_quiescent(run.scope))
                 and not run.backend_state.get("model_recovery_pending", False)
             )
@@ -1536,24 +1563,18 @@ class LangGraphEngine:
                 )
             run.safe_to_resume = (
                 not run.unresolved_tools
+                and disposition != ToolFailureDisposition.RECONCILE
+                and run.stop_reason not in {"effect_unknown", "invalid_tool_control"}
                 and (parallel or self.gateway.is_quiescent(run.scope))
                 and not run.backend_state.get("model_recovery_pending", False)
             )
             await self._save(run)
-            if receipt.effect_state == EffectState.UNKNOWN:
-                run.stop_reason = "effect_unknown"
-            if not parallel and not self.gateway.is_quiescent(run.scope):
+            if (
+                run.stop_reason != "effect_unknown"
+                and not parallel
+                and not self.gateway.is_quiescent(run.scope)
+            ):
                 run.stop_reason = "work_busy"
-            if receipt.control:
-                run.input_request = receipt.control.input_request
-            if receipt.error_code in {
-                "permission_denied",
-                "scope_violation",
-                "tool_not_registered",
-                "policy_unavailable",
-                "idempotency_conflict",
-            }:
-                run.stop_reason = receipt.error_code
             run.activation_tool_calls += 1
             anomaly = self._observe_tool_progress(run, call.name, call.arguments, receipt)
             if anomaly or run.activation_tool_calls >= self.activation_max_tool_calls:
@@ -1567,6 +1588,37 @@ class LangGraphEngine:
             async with run.tool_lock:
                 return await settle()
         return await settle()
+
+    @staticmethod
+    def _apply_tool_disposition(run: _Run, receipt: ToolReceipt) -> None:
+        """Consume trusted failure semantics, independently of ambiguous codes.
+
+        The shared classifier gives UNKNOWN priority and keeps conservative
+        legacy fences. Capability/argument repair never changes host grants.
+        """
+        disposition = failure_disposition(receipt)
+        if disposition == ToolFailureDisposition.RECONCILE:
+            run.safe_to_resume = False
+            run.stop_reason = "effect_unknown"
+        elif disposition == ToolFailureDisposition.FENCE:
+            run.stop_reason = receipt.error_code or "permission_denied"
+            # A native checkpoint may already contain this completed tool write
+            # after a later event/sink failure. The graph can skip its tool task
+            # on restart, so retain the host refusal at the model boundary too.
+            run.backend_state["tool_failure_fence"] = {
+                "call_id": receipt.call_id,
+                "error_code": run.stop_reason,
+                "revision": run.revision,
+                "policy_revision": run.scope.actor.policy_revision,
+            }
+        elif disposition == ToolFailureDisposition.DEFER:
+            run.stop_reason = "resource_deferred"
+        elif disposition == ToolFailureDisposition.REQUEST_INPUT:
+            if receipt.control is None:
+                run.safe_to_resume = False
+                run.stop_reason = "invalid_tool_control"
+            else:
+                run.input_request = receipt.control.input_request
 
     @staticmethod
     def _order_receipts(run: _Run):
@@ -1676,6 +1728,7 @@ class LangGraphEngine:
                     "arguments": arguments,
                     "success": receipt.success,
                     "output": output if receipt.success else receipt.error_code,
+                    "failure": receipt.failure.model_dump(mode="json") if receipt.failure else None,
                 },
                 sort_keys=True,
                 separators=(",", ":"),

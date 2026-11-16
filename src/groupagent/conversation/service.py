@@ -1984,7 +1984,10 @@ class ConversationCoordinator(Coordinator):
                                 "source_event_ids": list(snapshot["source_fingerprints"]),
                                 "attachment_event_ids": [str(value) for value in attachment_ids],
                                 "retained_fact_source_ids": retained,
-                                "outputs": [item.model_dump(mode="json") for item in outputs],
+                                "outputs": [
+                                    item.model_dump(mode="json", exclude_none=True)
+                                    for item in outputs
+                                ],
                                 "research_message_only": message_only,
                                 "planner_outputs": planner_outputs,
                                 "admission_path": "deterministic_current_request"
@@ -2045,7 +2048,9 @@ class ConversationCoordinator(Coordinator):
                             tx, event, decision, context
                         )
                         changed_outputs = [
-                            OutputRequirement.model_validate(value).model_dump(mode="json")
+                            OutputRequirement.model_validate(value).model_dump(
+                                mode="json", exclude_none=True
+                            )
                             for value in decision.outputs
                         ]
                         previous_work = tx.get_work(decision.target_work_id or "")

@@ -660,3 +660,36 @@ async def test_named_start_work_primitive_exposes_real_execution_without_decisio
     )
     assert {"goal", "work_capabilities"} <= set(schema["required"])
     assert "candidate" not in schema["properties"] and "kind" not in schema["properties"]
+
+
+def test_output_normalization_omits_null_counts_without_dropping_explicit_action_clears(
+    environment,
+):
+    candidate = decision(
+        "start_work",
+        goal="Produce the accepted PDF",
+        outputs=[
+            {
+                "format": "pdf",
+                "exact_units": None,
+                "min_units": None,
+                "max_units": 2,
+            }
+        ],
+    )
+    assert validate(candidate, environment).outputs == [{"format": "pdf", "max_units": 2}]
+    cleared = validate(
+        decision(
+            "command",
+            action={
+                "op": "update_task",
+                "task_id": "task-notes",
+                "expected_revision": 3,
+                "clear_due": True,
+                "due_at": None,
+            },
+        ),
+        environment,
+    )
+    assert cleared.action["clear_due"] is True and "due_at" in cleared.action
+    assert cleared.action["due_at"] is None
