@@ -181,7 +181,9 @@ class RetrievalMethods:
         limit: int = 20,
         include_tasks: bool = True,
         through_sequence: int | None = None,
+        exact_predicate: bool = False,
     ) -> list[MemoryHit]:
+        """Exact predicate reads consult registered facts only; archive reads stay explicit."""
         if len(query) > 1000 or not 1 <= limit <= 100:
             raise DomainError("invalid_input", "Retrieval query or result limit is too large")
         with self.store.transaction(actor) as tx:
@@ -190,14 +192,19 @@ class RetrievalMethods:
             pattern = (
                 "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
             )
-            for row in visible_events(
-                tx,
-                topic_id=topic_id,
-                query=query,
-                limit=limit,
-                newest_first=True,
-                through_sequence=through_sequence,
-            ):
+            events = (
+                []
+                if exact_predicate
+                else visible_events(
+                    tx,
+                    topic_id=topic_id,
+                    query=query,
+                    limit=limit,
+                    newest_first=True,
+                    through_sequence=through_sequence,
+                )
+            )
+            for row in events:
                 hits.append(
                     MemoryHit(
                         kind="event",
@@ -209,8 +216,14 @@ class RetrievalMethods:
                         retrieval_reason="source_text_match" if query else "recent_source_context",
                     )
                 )
-            for table, kind in (("ga_memory_facts", "fact"), ("ga_memory_summaries", "summary")):
+            records = (
+                (("ga_memory_facts", "fact"),)
+                if exact_predicate
+                else (("ga_memory_facts", "fact"), ("ga_memory_summaries", "summary"))
+            )
+            for table, kind in records:
                 text_column = "f.predicate || ' ' || f.value::text" if kind == "fact" else "f.text"
+                match = "f.predicate=%s" if exact_predicate else "(" + text_column + ") ILIKE %s"
                 rows = tx.conn.execute(
                     "SELECT f.* FROM "
                     + table
@@ -220,7 +233,7 @@ class RetrievalMethods:
                     "AND (%s::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM ga_events s WHERE s.group_id=f.group_id AND "
                     + after_boundary_sql("s")
                     + " AND f.source_event_ids ? s.id)) "
-                    "AND (" + text_column + ") ILIKE %s ORDER BY f.created_at DESC LIMIT %s",
+                    "AND " + match + " ORDER BY f.created_at DESC LIMIT %s",
                     (
                         actor.group_id,
                         topic_id,
@@ -231,7 +244,7 @@ class RetrievalMethods:
                         through_sequence,
                         through_sequence,
                         through_sequence,
-                        pattern,
+                        query if exact_predicate else pattern,
                         limit,
                     ),
                 ).fetchall()
@@ -267,7 +280,7 @@ class RetrievalMethods:
                             incomplete=kind == "summary",
                         )
                     )
-            if include_tasks and topic_id is None:
+            if include_tasks and not exact_predicate and topic_id is None:
                 for task in tx.find_team_tasks(query, limit=limit):
                     if (
                         through_sequence is not None

@@ -103,9 +103,8 @@ def test_actual_runtime_configuration_question_does_not_search_old_bot_claims():
 
 
 def test_exact_fact_recall_and_nonprefixed_human_claim_have_local_read_plans():
-    assert ContextQuery.from_event(event("Pot，项目代号是什么？"), BotIdentity()).memory_terms == (
-        "项目代号",
-    )
+    query = ContextQuery.from_event(event("Pot，项目代号是什么？"), BotIdentity())
+    assert query.fact_predicate == "项目代号" and query.memory_terms == ()
     claim = ContextQuery.from_event(event("访谈摘要我来负责，不用代写。"), BotIdentity())
     assert not claim.new_request and "tasks" in claim.resources and "works" not in claim.resources
 
@@ -118,7 +117,25 @@ def test_exact_fact_recall_and_nonprefixed_human_claim_have_local_read_plans():
     ],
 )
 def test_fact_lookup_remains_local_when_question_specifies_reply_length(text, predicate):
-    assert ContextQuery.from_event(event(text), BotIdentity()).memory_terms == (predicate,)
+    query = ContextQuery.from_event(event(text), BotIdentity())
+    assert query.fact_predicate == predicate and query.memory_terms == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Pot，用一句话解释Python元组是什么",
+        "Pot，解释Rust所有权是什么",
+        "Pot，HTTP状态码是什么",
+    ],
+)
+def test_knowledge_questions_never_turn_latin_subject_tokens_into_archive_queries(text):
+    assert ContextQuery.from_event(event(text), BotIdentity()).memory_terms == ()
+
+
+def test_explicit_history_reference_retains_archive_query():
+    query = ContextQuery.from_event(event("Pot，之前讨论的Python方案有哪些？"), BotIdentity())
+    assert query.memory_terms == ("Python",)
 
 
 def test_new_work_can_reuse_explicit_files_without_inheriting_work_focus():

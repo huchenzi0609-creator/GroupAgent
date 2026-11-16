@@ -89,6 +89,7 @@ class ContextQuery:
     resources: frozenset[str] = frozenset()
     states: frozenset[str] = frozenset()
     memory_terms: tuple[str, ...] = ()
+    fact_predicate: str | None = None
     roster: bool = False
     operations: bool = False
 
@@ -164,6 +165,7 @@ class ContextQuery:
             main,
         )
         terms: list[str] = []
+        fact_predicate = None
         if (recall or question) and not operations:
             noun = question[1] if question else main
             noun = re.sub(
@@ -171,15 +173,19 @@ class ContextQuery:
                 "",
                 noun,
             ).strip()
-            terms = re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,30}", noun)
-            if not terms and noun:
-                terms = [noun[:100]]
+            if question and noun:
+                fact_predicate = noun
+            if recall:
+                terms = re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,30}", noun)
+                if not terms and noun:
+                    terms = [noun[:100]]
         return cls(
             new_request=new_request,
             continuation=continuation and not new_request,
             resources=frozenset(resources),
             states=states,
             memory_terms=tuple(dict.fromkeys(terms))[:2],
+            fact_predicate=fact_predicate,
             roster=bool(re.search(r"群成员|群昵称|名单|群里.{0,5}(?:有谁|有哪些)|我的昵称", main)),
             operations=operations,
         )
@@ -817,7 +823,10 @@ class ContextBuilder:
                         break
             memory_items, original_items = [], []
             seen = set()
-            for term in query.memory_terms:
+            memory_reads = (
+                [(query.fact_predicate, True)] if query.fact_predicate is not None else []
+            ) + [(term, False) for term in query.memory_terms]
+            for term, exact_predicate in memory_reads:
                 for hit in self.memory.in_tx(tx).retrieve(
                     actor,
                     term,
@@ -825,6 +834,7 @@ class ContextBuilder:
                     limit=8,
                     include_tasks=False,
                     through_sequence=through_sequence,
+                    exact_predicate=exact_predicate,
                 ):
                     if (hit.kind, hit.id) in seen or hit.topic_id in private_topics:
                         continue
