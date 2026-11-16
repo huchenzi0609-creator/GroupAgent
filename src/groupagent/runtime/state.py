@@ -17,11 +17,12 @@ from groupagent.domain import (
     WorkOrder,
     WorkState,
 )
-from groupagent.execution.models import EngineCheckpoint, EngineEvent
+from groupagent.execution.models import EngineCheckpoint, EngineEvent, RunState
 from groupagent.persistence import PostgresStore, UnitOfWork
 
 from .checkpoint_codec import CheckpointCodecError, decode_checkpoint, encode_checkpoint
 from .contracts import DeliveryDraft, ProcessLease
+from .recovery import safe_recovery_checkpoint
 
 
 def source_fingerprint(event: Any) -> str:
@@ -123,8 +124,15 @@ class RuntimeState:
             ]
 
     def recover_phase(
-        self, actor: ActorContext, work_id: str, *, expected_revision: int, evidence_ref: str
-    ) -> WorkOrder:
+        self,
+        actor: ActorContext,
+        work_id: str,
+        *,
+        expected_revision: int,
+        evidence_ref: str,
+        worker_id: str | None = None,
+        ttl_seconds: int = 30,
+    ) -> WorkOrder | ExecutionLease:
         if not evidence_ref.strip():
             raise DomainError("recovery_required", "Recovery requires durable evidence")
         with self.store.transaction(actor) as tx:
@@ -135,10 +143,53 @@ class RuntimeState:
                 row["lease_expires_at"] is not None and row["lease_expires_at"] > row["db_now"]
             ):
                 raise DomainError("lease_active", "Finalization is still owned or not recoverable")
-            uncertain = tx.conn.execute(
-                "SELECT 1 FROM ga_deliveries WHERE group_id=%s AND work_id=%s AND state IN ('dispatching','unknown') LIMIT 1",
-                (actor.group_id, work_id),
-            ).fetchone()
+            if worker_id is not None:
+                checkpoint = self._load_checkpoint_in_tx(tx, actor, work_id)
+                if (
+                    row["state"] != WorkState.DELIVERING
+                    or checkpoint is None
+                    or checkpoint.state != RunState.CANDIDATE
+                    or not safe_recovery_checkpoint(checkpoint)
+                    or checkpoint.revision != row["goal_revision"]
+                    or checkpoint.request.revision != row["goal_revision"]
+                    or checkpoint.request.work_id != work_id
+                    or checkpoint.request.actor.group_id != actor.group_id
+                    or checkpoint.request.actor.member_id != row["requester_id"]
+                    or checkpoint.request.actor.policy_revision != actor.policy_revision
+                ):
+                    raise DomainError(
+                        "reconciliation_required",
+                        "Delivery supervision needs a safe current candidate",
+                    )
+                lease = tx.claim_delivery_supervision(
+                    work_id,
+                    worker_id,
+                    expected_revision=expected_revision,
+                    checkpoint_attempt_id=checkpoint.request.attempt_id,
+                    ttl_seconds=ttl_seconds,
+                )
+                tx._audit(
+                    "finalization_recovered",
+                    work_id,
+                    previous=row["state"],
+                    evidence_ref=evidence_ref,
+                    mode="delivery_supervision_only",
+                )
+                return lease
+            states = tx.delivery_states(work_id, goal_revision=row["goal_revision"])
+            if (
+                row["state"] == WorkState.DELIVERING
+                and states
+                and not any(
+                    state in {DeliveryState.UNKNOWN, DeliveryState.REJECTED} for state in states
+                )
+            ):
+                # Native progress cannot authorize a new model/validation run.
+                # A supervisor must take the explicit, fenced branch above.
+                return tx.get_work(work_id)
+            uncertain = any(
+                state in {DeliveryState.UNKNOWN, DeliveryState.DISPATCHING} for state in states
+            )
             paused = tx.transition_work(
                 work_id,
                 WorkState.PAUSED,
@@ -365,38 +416,41 @@ class RuntimeState:
 
     def load_checkpoint(self, actor: ActorContext, work_id: str) -> EngineCheckpoint | None:
         with self.store.transaction(actor) as tx:
-            work = tx.get_work(work_id)
-            if work.requester_id != actor.member_id and actor.role not in {
-                Role.OWNER,
-                Role.MAINTAINER,
-            }:
-                raise DomainError("permission_denied", "Checkpoint is private to its work")
-            row = tx.conn.execute(
-                "SELECT * FROM ga_runtime_checkpoints WHERE group_id=%s AND work_id=%s ORDER BY saved_at DESC,sequence DESC LIMIT 1",
-                (actor.group_id, work_id),
-            ).fetchone()
-            if row is None:
-                return None
-            retained = work.scope.get("retained_fact_source_ids", [])
-            if row["invalidated"] or any(
-                getattr(tx.get_event(source), "content_state", "active") != "active"
-                and not (
-                    getattr(tx.get_event(source), "content_state", "active") == "expired"
-                    and source != work.request_event_id
-                    and isinstance(retained, list)
-                    and source in retained
-                )
-                for source in row["source_event_ids"]
-            ):
-                raise DomainError(
-                    "source_unavailable", "Checkpoint sources are no longer available"
-                )
-            if any(
-                source_fingerprint(tx.get_event(source)) != digest
-                for source, digest in row["source_fingerprints"].items()
-            ):
-                raise DomainError("source_unavailable", "Checkpoint source snapshots changed")
-            return self._decode_checkpoint(row["body"])
+            return self._load_checkpoint_in_tx(tx, actor, work_id)
+
+    def _load_checkpoint_in_tx(
+        self, tx: UnitOfWork, actor: ActorContext, work_id: str
+    ) -> EngineCheckpoint | None:
+        work = tx.get_work(work_id)
+        if work.requester_id != actor.member_id and actor.role not in {
+            Role.OWNER,
+            Role.MAINTAINER,
+        }:
+            raise DomainError("permission_denied", "Checkpoint is private to its work")
+        row = tx.conn.execute(
+            "SELECT * FROM ga_runtime_checkpoints WHERE group_id=%s AND work_id=%s ORDER BY saved_at DESC,sequence DESC LIMIT 1",
+            (actor.group_id, work_id),
+        ).fetchone()
+        if row is None:
+            return None
+        retained = work.scope.get("retained_fact_source_ids", [])
+        if row["invalidated"] or any(
+            getattr(tx.get_event(source), "content_state", "active") != "active"
+            and not (
+                getattr(tx.get_event(source), "content_state", "active") == "expired"
+                and source != work.request_event_id
+                and isinstance(retained, list)
+                and source in retained
+            )
+            for source in row["source_event_ids"]
+        ):
+            raise DomainError("source_unavailable", "Checkpoint sources are no longer available")
+        if any(
+            source_fingerprint(tx.get_event(source)) != digest
+            for source, digest in row["source_fingerprints"].items()
+        ):
+            raise DomainError("source_unavailable", "Checkpoint source snapshots changed")
+        return self._decode_checkpoint(row["body"])
 
     @staticmethod
     def _decode_checkpoint(body) -> EngineCheckpoint:

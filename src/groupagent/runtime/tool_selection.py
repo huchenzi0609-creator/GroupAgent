@@ -12,6 +12,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from groupagent.conversation.image_requirements import is_public_image_work
 from groupagent.conversation.intent import (
     main_request,
     requests_speech_reply,
@@ -250,7 +251,7 @@ def select_tools(
         if required.issubset(image_document_tools):
             return available & image_document_tools
     if (
-        work.scope.get("public_image_count")
+        is_public_image_work(work)
         and text_only
         and not input_refs
         and not business

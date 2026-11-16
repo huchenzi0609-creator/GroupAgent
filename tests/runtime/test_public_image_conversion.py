@@ -17,6 +17,7 @@ from groupagent.research.image_transforms import (
     convert_image,
     resolve_public_image,
 )
+from groupagent.tools import EffectState, ToolReceipt
 
 from .test_toolkit_contract import (
     SyntheticFixtureWorker,
@@ -130,11 +131,31 @@ async def test_toolkit_accepts_jpeg_to_trusted_png_results_and_real_delivery_dra
     count = scenario["count"]
     run, originals = await imported_jpegs(setup, count=count, request_text=scenario["request"])
     receipts = await convert_and_select(run, originals)
+    unused_page = ToolReceipt(
+        call_id="unused-candidate-page",
+        tool_name="web_image_candidates",
+        idempotency_key="unused-candidate-page",
+        success=True,
+        effect_state=EffectState.NO_EFFECT,
+        output={
+            "scope_fingerprint": "d" * 64,
+            "requested_url": "https://unused.example.com/github-page",
+            "final_url": "https://unused.example.com/github-page",
+            "title": "Unused candidate page",
+            "retrieved_at": "2026-11-16T00:00:00Z",
+            "citation": "https://unused.example.com/github-page（页面访问时间 UTC：2026-11-16T00:00:00Z）",
+            "html_sha256": "e" * 64,
+            "html_bytes_received": 12,
+            "candidates": [],
+            "filtered_candidate_count": 0,
+            "truncated": False,
+        },
+    )
     accepted = await setup.toolkit.validate(
         run.work,
         run.lease,
         setup.env.actor,
-        candidate(run, receipts=receipts),
+        candidate(run, receipts=(*receipts, unused_page)),
         run.workspace,
     )
     drafts = [draft for draft in accepted.deliveries if draft.payload_ref.startswith("artifact:")]
@@ -159,6 +180,7 @@ async def test_toolkit_accepts_jpeg_to_trusted_png_results_and_real_delivery_dra
         "https://example.com/page（页面访问时间 UTC：2026-11-16T00:00:00Z）"
         in accepted.deliveries[0].payload_ref
     )
+    assert "unused.example.com" not in accepted.deliveries[0].payload_ref
     review = setup.model.requests[-1]
     assert "public_image_source" in review.messages[1].content
     assert all(
@@ -200,7 +222,9 @@ async def test_toolkit_missing_format_diagnostic_reuses_valid_existing_imports(c
 
 async def test_toolkit_two_encodings_of_one_source_cannot_satisfy_two_images(conversion_setup):
     setup = conversion_setup
-    run, originals = await imported_jpegs(setup, count=1)
+    run, originals = await imported_jpegs(
+        setup, count=1, request_text="请交付2张已验证的公开来源图片，全部使用PNG格式。"
+    )
     # Keep the accepted task count at two while creating only one source.
     with setup.env.store.transaction(setup.env.actor) as tx:
         tx.conn.execute(
@@ -226,6 +250,61 @@ async def test_toolkit_two_encodings_of_one_source_cannot_satisfy_two_images(con
         )
     assert failure.value.details["validated_distinct_count"] == 1
     assert len(failure.value.details["duplicate_version_ids"]) == 1
+
+
+async def test_legacy_planning_five_does_not_block_four_valid_png_images(conversion_setup):
+    setup = conversion_setup
+    run, originals = await imported_jpegs(
+        setup, count=4, request_text="请找海豹表情包，交付PNG图片。"
+    )
+    assert json.loads(run.prepared.request.objective)["requested_image_count"] is None
+    with setup.env.store.transaction(setup.env.actor) as tx:
+        tx.conn.execute(
+            "UPDATE ga_work_orders SET scope=jsonb_set(scope,'{public_image_count}','5'),"
+            "goal='查找五张海豹表情包，交付PNG图片。',acceptance_criteria='[\"交付五张PNG图片\"]'::jsonb WHERE group_id=%s AND id=%s",
+            (setup.env.actor.group_id, run.work.id),
+        )
+        run.work = tx.get_work(run.work.id)
+    run.prepared = await setup.toolkit.prepare(run.work, run.lease, setup.env.actor, run.workspace)
+    objective = json.loads(run.prepared.request.objective)
+    assert "五张" in objective["goal"]
+    assert objective["image_quantity_requirement"]["public_image_count"] is None
+    assert any(
+        "host-verified image_quantity_requirement" in instruction
+        for instruction in objective["instructions"]
+    )
+    receipts = await convert_and_select(run, originals)
+    accepted = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, candidate(run, receipts=receipts), run.workspace
+    )
+    assert (
+        len([draft for draft in accepted.deliveries if draft.payload_ref.startswith("artifact:")])
+        == 4
+    )
+    with setup.env.store.transaction(setup.env.actor) as tx:
+        assert tx.get_work(run.work.id).scope["public_image_count"] == 5
+    assert setup.http_calls == []
+    review = setup.model.requests[-1]
+    review_payload = json.loads(review.messages[1].content)
+    assert "五张" in review_payload["goal"] and "五张" in review_payload["criteria"][0]
+    assert review_payload["image_quantity_requirement"]["public_image_count"] is None
+    assert "only the host-verified image_quantity_requirement" in review.messages[0].content
+
+
+async def test_unspecified_quantity_still_rejects_empty_or_wrong_format_delivery(conversion_setup):
+    setup = conversion_setup
+    run, originals = await imported_jpegs(
+        setup, count=1, request_text="请找海豹表情包，交付PNG图片。"
+    )
+    for selected_ids in ([], [originals[0].version_id]):
+        if selected_ids:
+            selected = await call(run, "artifact_deliver", {"version_ids": selected_ids})
+            assert selected.success
+        with pytest.raises(PublicImageValidationError):
+            await setup.toolkit.validate(
+                run.work, run.lease, setup.env.actor, candidate(run), run.workspace
+            )
+    assert setup.http_calls == []
 
 
 @pytest.mark.parametrize("withdrawal", ["catalog", "forgotten", "changed_bytes", "departed"])

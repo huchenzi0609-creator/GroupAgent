@@ -38,6 +38,7 @@ from groupagent.domain import (
     WorkState,
     check_transition,
 )
+from groupagent.persistence.delivery_knowledge import projected_delivery_state
 
 Row = dict[str, Any]
 Connection = psycopg.Connection[Row]
@@ -1218,14 +1219,27 @@ class UnitOfWork:
             raise DomainError("lease_busy", "Another execution lease is active", retryable=True)
         if row["state"] == WorkState.RUNNING and not recovery_evidence_ref:
             raise DomainError("reconciliation_required", "Expired work requires recovery evidence")
+        return self._claim_execution_lease(
+            row, worker_id, ttl_seconds, WorkState.RUNNING, recovery_evidence_ref
+        )
+
+    def _claim_execution_lease(
+        self,
+        row: Row,
+        worker_id: str,
+        ttl_seconds: int,
+        state: WorkState,
+        recovery_evidence_ref: str | None,
+    ) -> ExecutionLease:
+        work_id = row["id"]
         self._revoke(work_id, state="expired")
         updated = self.conn.execute(
             "UPDATE ga_work_orders SET lease_owner = %s, "
             "lease_expires_at = clock_timestamp() + %s * interval '1 second', "
             "fencing_token = fencing_token + 1, attempt_no = attempt_no + 1, "
-            "state = 'running', pause_reason = NULL, revision = revision + 1, "
+            "state = %s, pause_reason = NULL, revision = revision + 1, "
             "updated_at = clock_timestamp() WHERE group_id = %s AND id = %s RETURNING *",
-            (worker_id, ttl_seconds, self.group_id, work_id),
+            (worker_id, ttl_seconds, state.value, self.group_id, work_id),
         ).fetchone()
         assert updated is not None
         attempt_id = _id()
@@ -1245,7 +1259,7 @@ class UnitOfWork:
             ),
         )
         self._audit(
-            "work_claimed",
+            "delivery_supervision_claimed" if state == WorkState.DELIVERING else "work_claimed",
             work_id,
             fencing_token=updated["fencing_token"],
             recovery_evidence_ref=recovery_evidence_ref,
@@ -1259,6 +1273,73 @@ class UnitOfWork:
             fencing_token=updated["fencing_token"],
             goal_revision=updated["goal_revision"],
             expires_at=updated["lease_expires_at"],
+        )
+
+    def claim_delivery_supervision(
+        self,
+        work_id: str,
+        worker_id: str,
+        *,
+        expected_revision: int,
+        checkpoint_attempt_id: str,
+        ttl_seconds: int = 30,
+    ) -> ExecutionLease:
+        """Fence an expired finalizer; this grants no new execution/validation step."""
+        _nonempty(worker_id, "worker_id")
+        _ttl(ttl_seconds)
+        row = self._work_row(work_id)
+        self._controller(row)
+        self._revision(row, expected_revision)
+        self._check_work_source(row)
+        if row["policy_revision"] != self.actor.policy_revision:
+            raise DomainError("policy_changed", "Delivery supervision needs current policy")
+        if (
+            row["state"] != WorkState.DELIVERING
+            or row["lease_expires_at"] is None
+            or row["lease_expires_at"] > row["db_now"]
+        ):
+            raise DomainError("lease_active", "Delivery supervision needs an expired finalizer")
+        candidate_attempt = self.conn.execute(
+            "SELECT fencing_token FROM ga_execution_attempts "
+            "WHERE group_id=%s AND work_id=%s AND id=%s AND goal_revision=%s",
+            (self.group_id, work_id, checkpoint_attempt_id, row["goal_revision"]),
+        ).fetchone()
+        checks = self.conn.execute(
+            "SELECT check_key,passed,fencing_token FROM ga_work_validations "
+            "WHERE group_id=%s AND work_id=%s AND goal_revision=%s",
+            (self.group_id, work_id, row["goal_revision"]),
+        ).fetchall()
+        passed = {
+            check["check_key"]
+            for check in checks
+            if candidate_attempt
+            and check["passed"]
+            and check["fencing_token"] == candidate_attempt["fencing_token"]
+        }
+        if not passed or not set(row["required_checks"]).issubset(passed):
+            raise DomainError("validation_failed", "Original candidate validation is incomplete")
+        deliveries = self._work_delivery_rows(work_id, row["goal_revision"])
+        bundle = self.conn.execute(
+            "SELECT intent_id,position FROM ga_delivery_bundles "
+            "WHERE group_id=%s AND bundle_id=%s ORDER BY position",
+            (self.group_id, f"result:{work_id}:{row['goal_revision']}"),
+        ).fetchall()
+        if (
+            not deliveries
+            or [part["position"] for part in bundle] != list(range(len(deliveries)))
+            or {part["intent_id"] for part in bundle} != {delivery["id"] for delivery in deliveries}
+        ):
+            raise DomainError("reconciliation_required", "Original delivery bundle is incomplete")
+        for delivery in deliveries:
+            state = projected_delivery_state(delivery["state"], delivery["parts"] or ())
+            if state in {DeliveryState.UNKNOWN, DeliveryState.REJECTED} or (
+                delivery["state"] == DeliveryState.DISPATCHING
+                and projected_delivery_state(DeliveryState.UNKNOWN, delivery["parts"] or ())
+                != DeliveryState.DISPATCHING
+            ):
+                raise DomainError("delivery_unknown", "Native delivery is not safe to supervise")
+        return self._claim_execution_lease(
+            row, worker_id, ttl_seconds, WorkState.DELIVERING, "runtime-checkpoint:" + work_id
         )
 
     def heartbeat_lease(
@@ -1640,6 +1721,27 @@ class UnitOfWork:
         ).fetchall()
         return [_delivery(row) for row in rows]
 
+    def _work_delivery_rows(self, work_id: str, goal_revision: int) -> list[Row]:
+        return self.conn.execute(
+            "SELECT d.id,d.state,(SELECT jsonb_agg(jsonb_build_object("
+            "'state',p.state,'platform_job_id',p.platform_job_id,"
+            "'platform_message_id',p.platform_message_id)) "
+            "FROM ga_delivery_parts p WHERE p.group_id=d.group_id AND p.intent_id=d.id) "
+            "AS parts FROM ga_deliveries d "
+            "WHERE d.group_id=%s AND d.work_id=%s AND d.goal_revision=%s "
+            "AND NOT (d.state='rejected' "
+            "AND d.reason IS NOT DISTINCT FROM 'candidate_superseded_before_dispatch') "
+            "ORDER BY d.created_at,d.id",
+            (self.group_id, work_id, goal_revision),
+        ).fetchall()
+
+    def delivery_states(self, work_id: str, *, goal_revision: int) -> tuple[DeliveryState, ...]:
+        """One-snapshot supervision view; durable send identities stay unchanged."""
+        return tuple(
+            projected_delivery_state(row["state"], row["parts"] or ())
+            for row in self._work_delivery_rows(work_id, goal_revision)
+        )
+
     def claim_delivery(
         self, worker_id: str, ttl_seconds: int = 30, *, intent_id: str | None = None
     ) -> DeliveryIntent | None:
@@ -1788,8 +1890,14 @@ class UnitOfWork:
             ),
         ).fetchone()
         assert updated is not None
-        if state == DeliveryState.UNKNOWN:
-            self._uncertain_work(row["work_id"])
+        if state == DeliveryState.UNKNOWN and row["work_id"] is not None:
+            parts = self.conn.execute(
+                "SELECT state,platform_job_id,platform_message_id FROM ga_delivery_parts "
+                "WHERE group_id=%s AND intent_id=%s",
+                (self.group_id, row["id"]),
+            ).fetchall()
+            if projected_delivery_state(state, parts) == DeliveryState.UNKNOWN:
+                self._uncertain_work(row["work_id"])
         self._audit("delivery_outcome", row["id"], state=state.value, evidence_ref=evidence_ref)
         return _delivery(updated)
 

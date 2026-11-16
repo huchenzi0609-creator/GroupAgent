@@ -204,7 +204,8 @@ async def test_fresh_semantic_image_request_starts_new_work_with_its_plan(runtim
         with env.store.transaction(env.actor) as tx:
             work = tx.get_work(result.work_id)
             assert work.scope["work_capabilities"] == ["public_images"]
-            assert work.scope["public_image_count"] == 3
+            assert work.scope["public_image_count"] is None
+            assert work.scope["planner_public_image_count"] == 3
             assert "web_image_import" in work.scope["required_tools"]
             assert work.scope["research_required"] is True
             assert tx.get_work(old[0].id).state == WorkState.PAUSED

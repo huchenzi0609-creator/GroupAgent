@@ -12,6 +12,8 @@
 | IMGWF-005 | 同一来源的不同编码仅计一次；格式缺失与重复给出不同诊断 | `tests/research/test_image_transforms.py`、`tests/runtime/test_public_image_conversion.py` |
 | IMGWF-006 | 授权跨工作复用、私有父版本边界、撤回与离群 | `tests/runtime/test_public_image_inputs.py`、`tests/runtime/test_public_image_conversion.py` |
 | IMGWF-007 | 历史失败检查按可信只读契约恢复；未知写操作仍隔离 | `tests/execution/test_read_reconciliation.py` |
+| IMGWF-008 | 用户明确数量与模型计划分开；承接前文需原请求证据，不能把两张扩大成五张 | `tests/conversation/test_image_quantity.py`、`tests/runtime/test_public_image_quantity.py`、`tests/runtime/test_public_image_conversion.py` |
+| IMGWF-009 | 有原生排队／运行回执的发送保持交付中；重启仅接管监督，真正未知结果继续核对 | `tests/runtime/test_delivery_knowledge.py`、`tests/runtime/test_async_delivery_supervision.py` |
 
 运行整个任务族（`GROUPAGENT_TEST_DSN`只能指向隔离数据库）：
 

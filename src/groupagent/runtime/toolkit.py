@@ -24,6 +24,11 @@ from groupagent.billing import BudgetLedger
 from groupagent.billing.metering import LedgerModelBudget, MeteredModel
 from groupagent.config import AppConfig, ExecutionConfig
 from groupagent.control import WorkCapability
+from groupagent.conversation.image_requirements import (
+    IMAGE_QUANTITY_INSTRUCTION,
+    is_public_image_work,
+    projected_image_quantity,
+)
 from groupagent.domain import ActorContext, DomainError, ExecutionLease, GroupEvent, WorkOrder
 from groupagent.execution import ExecutionRequest, RunSnapshot, ScopedToolEngine
 from groupagent.execution.harness import HarnessEngine
@@ -985,6 +990,7 @@ class WorkToolkit:
         )
         with self.store.transaction(actor) as tx:
             original_event = tx.get_event(work.request_event_id)
+            image_quantity = projected_image_quantity(tx, work)
         execution_intent = _execution_intent(work)
         required_raw = work.scope.get("required_tools", [])
         required_tools = (
@@ -1053,7 +1059,8 @@ class WorkToolkit:
                     "acceptance_criteria": work.acceptance_criteria,
                     "required_outputs": _output_requirements(work, original_event),
                     "required_tools": sorted(required_tools),
-                    "requested_image_count": work.scope.get("public_image_count"),
+                    "requested_image_count": image_quantity.count,
+                    "image_quantity_requirement": image_quantity.fields(),
                     "input_files": input_refs,
                     "media_routes": [
                         route.model_dump(mode="json") for route in self.routes.values()
@@ -1068,6 +1075,7 @@ class WorkToolkit:
                         *instructions_for_tools(
                             visible_tools if visible_tools is not None else allowed
                         ),
+                        *([IMAGE_QUANTITY_INSTRUCTION] if is_public_image_work(work) else []),
                     ],
                 },
                 ensure_ascii=False,
@@ -1293,6 +1301,7 @@ class WorkToolkit:
             )
         with self.store.transaction(actor) as tx:
             original_event = tx.get_event(work.request_event_id)
+            image_quantity = projected_image_quantity(tx, work)
         requirements = _output_requirements(work, original_event)
         required_formats = {
             row.get("format")
@@ -1300,20 +1309,40 @@ class WorkToolkit:
             if isinstance(row, dict) and row.get("format") != "text"
         }
         actual_formats = {row["artifact"]["format"] for row in outputs}
-        requested_images = work.scope.get("public_image_count")
-        if (
-            isinstance(requested_images, int)
-            and requested_images > 0
-            and not (required_formats & {"md", "docx", "pdf", "pptx"})
-        ):
+        requested_images = image_quantity.count or (1 if is_public_image_work(work) else None)
+        if is_public_image_work(work) and not (required_formats & {"md", "docx", "pdf", "pptx"}):
+            image_scope = ArtifactScope(actor.group_id, work.id, actor.member_id)
+            selected_images = [ArtifactVersion(**row["artifact"]) for row in outputs]
+            requested_formats = {value for value in required_formats if isinstance(value, str)}
+            reusable_images = [ArtifactVersion(**row["artifact"]) for row in produced]
             validate_public_image_delivery(
                 self.artifacts,
-                ArtifactScope(actor.group_id, work.id, actor.member_id),
-                [ArtifactVersion(**row["artifact"]) for row in outputs],
-                required_count=requested_images,
-                required_formats={value for value in required_formats if isinstance(value, str)},
-                reusable=[ArtifactVersion(**row["artifact"]) for row in produced],
+                image_scope,
+                selected_images,
+                required_count=image_quantity.count or 1,
+                required_formats=requested_formats,
+                reusable=reusable_images,
             )
+            image_formats = {"png", "jpg", "jpeg", "webp", "gif"}
+            requested_image_formats = requested_formats & image_formats
+            for version in selected_images:
+                if version.format not in image_formats:
+                    continue
+                # No fixed quantity still requires every delivered image to
+                # retain a verified public source and requested image format.
+                validate_public_image_delivery(
+                    self.artifacts,
+                    image_scope,
+                    [version],
+                    required_count=1,
+                    required_formats=set(),
+                    reusable=reusable_images,
+                )
+                if requested_image_formats and version.format not in requested_image_formats:
+                    raise DomainError(
+                        "validation_failed",
+                        "Selected public images must use the requested image format",
+                    )
         if required_formats - actual_formats:
             raise DomainError(
                 "validation_failed",
@@ -1748,6 +1777,7 @@ class WorkToolkit:
                     if _execution_intent(work) == "reminder"
                     else "Complete the authorized work described by the goal and criteria.",
                     "criteria": work.acceptance_criteria,
+                    "image_quantity_requirement": image_quantity.fields(),
                     "answer": answer,
                     "artifacts": excerpts,
                     "tool_evidence": observations,
@@ -1762,6 +1792,7 @@ class WorkToolkit:
                     "capabilities": "Scoped files, public research, isolated compute and approved media. No external-account submissions. File delivery follows this check.",
                 },
                 (receipt.tool_name for receipt in snapshot.receipts if receipt.success),
+                public_image_workflow=is_public_image_work(work),
             )
             await self._semantic_review(work, lease, actor, request, outputs, answer)
 
@@ -1771,20 +1802,13 @@ class WorkToolkit:
                 if work.scope.get("delivery_artifacts", True)
                 else "草稿已准备好，按你的要求暂不发送文件。"
             )
-            if work.scope.get("public_image_count") and not (
+            if is_public_image_work(work) and not (
                 required_formats & {"md", "docx", "pdf", "pptx"}
             ):
                 citations = list(
-                    dict.fromkeys(
-                        [
-                            str(source["citation"])
-                            for source in research_sources
-                            if source.get("evidence_kind") == "public_image_page"
-                        ]
-                        + [lineage.page_citation for _, lineage in retained_public_images]
-                    )
+                    dict.fromkeys(lineage.page_citation for _, lineage in retained_public_images)
                 )
-                answer = "图片已准备好。\n来源：\n" + "\n".join(citations[:5])
+                answer = "图片已准备好。\n来源：\n" + "\n".join(citations)
         answer = redact_credentials(answer)
         drafts.insert(
             0,

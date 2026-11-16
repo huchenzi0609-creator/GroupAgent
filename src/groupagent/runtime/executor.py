@@ -204,13 +204,10 @@ class WorkSupervisor:
 
     def _delivery_states(self, actor: ActorContext, work: WorkOrder) -> tuple[str, ...]:
         with self.store.transaction(actor) as tx:
-            rows = tx.conn.execute(
-                "SELECT state FROM ga_deliveries WHERE group_id=%s AND work_id=%s AND goal_revision=%s "
-                "AND NOT (state='rejected' "
-                "AND reason IS NOT DISTINCT FROM 'candidate_superseded_before_dispatch')",
-                (actor.group_id, work.id, work.goal_revision),
-            ).fetchall()
-        return tuple(row["state"] for row in rows)
+            return tuple(
+                state.value
+                for state in tx.delivery_states(work.id, goal_revision=work.goal_revision)
+            )
 
     def _pause(
         self, actor: ActorContext, work_id: str, reason: str, *, lease: ExecutionLease | None = None
@@ -1159,6 +1156,30 @@ class WorkSupervisor:
             if initial.state != WorkState.QUEUED and checkpoint is None:
                 self._pause(actor, initial.id, "reconciliation_required")
                 return self._get(actor, initial.id)
+            if initial.state == WorkState.DELIVERING and checkpoint:
+                try:
+                    lease = self.state.recover_phase(
+                        actor,
+                        initial.id,
+                        expected_revision=initial.revision,
+                        evidence_ref=f"runtime-checkpoint:{initial.id}",
+                        worker_id=self.worker_id,
+                        ttl_seconds=self.lease_seconds,
+                    )
+                except DomainError as error:
+                    if error.code == "delivery_unknown":
+                        self._pause(actor, initial.id, "delivery_uncertain")
+                        return self._get(actor, initial.id)
+                    raise
+                if not isinstance(lease, ExecutionLease):
+                    raise DomainError(
+                        "reconciliation_required", "Delivery supervision was not claimed"
+                    )
+                work = self._get(actor, initial.id)
+                owned = _Owned(work, actor, lease, process, self._workspace(work), time.monotonic())
+                self._owned = owned
+                self._delivering[work.id] = owned
+                return work
             if initial.state != WorkState.QUEUED and checkpoint:
                 # An expired owner is an anomaly too. Persist a recovery wait
                 # before creating another paid attempt after a crash/restart.
