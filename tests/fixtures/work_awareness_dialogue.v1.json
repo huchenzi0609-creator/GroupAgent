@@ -1,0 +1,127 @@
+{
+  "version": 1,
+  "family": "shared_work_facts_dialogue",
+  "evidence_kind": "synthetic_dialogue_local_postgres_fake_models_and_local_channel",
+  "synthetic_subject": "主播阿蓝",
+  "privacy": "All names, conversations, pictures and identifiers are synthetic. No real group data is included.",
+  "dialogue": [
+    {
+      "id": "profile_request",
+      "actor": "requester",
+      "text": "Pot，介绍一下主播阿蓝，整理有来源的简短资料。",
+      "intent": "start_profile",
+      "expected_work": "profile"
+    },
+    {
+      "id": "meme_request",
+      "actor": "requester",
+      "text": "给我找两张他的梗图可以吗？",
+      "intent": "start_memes",
+      "expected_work": "memes"
+    },
+    {
+      "id": "early_progress",
+      "actor": "requester",
+      "text": "你还在找吗？",
+      "intent": "query_memes",
+      "expected_state": "running"
+    },
+    {
+      "id": "unrelated_01",
+      "actor": "requester",
+      "text": "Pot，换个话题，最近天气凉了，出门衣服怎么搭配？",
+      "intent": "ordinary_reply"
+    },
+    {
+      "id": "unrelated_02",
+      "actor": "requester",
+      "text": "我下午打算去买点温热的饮料。",
+      "intent": "ordinary_observe"
+    },
+    {
+      "id": "unrelated_03",
+      "actor": "requester",
+      "text": "今天课间我先休息一会儿。",
+      "intent": "ordinary_observe"
+    },
+    {
+      "id": "unrelated_04",
+      "actor": "peer",
+      "text": "小林，晚饭要不要一起吃粥？",
+      "intent": "ordinary_observe"
+    },
+    {
+      "id": "unrelated_05",
+      "actor": "requester",
+      "text": "小周，可以，我下课再过去。",
+      "intent": "ordinary_observe"
+    },
+    {
+      "id": "unrelated_06",
+      "actor": "peer",
+      "text": "那我先去整理桌子。",
+      "intent": "ordinary_observe"
+    },
+    {
+      "id": "unrelated_07",
+      "actor": "requester",
+      "text": "Pot，解释一下保温杯为什么能保温。",
+      "intent": "ordinary_reply"
+    },
+    {
+      "id": "unrelated_08",
+      "actor": "requester",
+      "text": "这个话题先聊到这里。",
+      "intent": "ordinary_observe"
+    },
+    {
+      "id": "named_progress",
+      "actor": "requester",
+      "text": "我让你找的阿蓝梗图你找了吗？",
+      "intent": "query_memes",
+      "expected_state": "running"
+    },
+    {
+      "id": "contradiction_after_delivery",
+      "actor": "requester",
+      "text": "可是你明明找到了啊。",
+      "intent": "query_memes",
+      "expected_state": "completed"
+    },
+    {
+      "id": "wake_after_delivery",
+      "actor": "requester",
+      "text": "Pot？",
+      "intent": "query_memes",
+      "expected_state": "completed"
+    },
+    {
+      "id": "playful_followup",
+      "actor": "requester",
+      "text": "你是不是把自己刚找到的图忘啦，哈哈？",
+      "intent": "query_memes",
+      "expected_state": "completed"
+    },
+    {
+      "id": "image_followup",
+      "actor": "requester",
+      "text": "",
+      "intent": "attach_synthetic_image"
+    },
+    {
+      "id": "look_yourself",
+      "actor": "requester",
+      "text": "你自己看。",
+      "intent": "query_memes",
+      "expected_state": "completed"
+    }
+  ],
+  "cases": [
+    {"id": "WFACT-001-dialogue", "requirement": "Two accepted works remain factual after eight unrelated turns, natural followups, native image delivery and a same-actor picture followup; no duplicate work or implicit resume."},
+    {"id": "WFACT-002-read-race", "requirement": "A running-to-delivering change during interpretation refreshes a read query; mutation CAS remains separate."},
+    {"id": "WFACT-003-ordinary-chat", "requirement": "An active work does not turn ordinary peer chat into an operational status reply."},
+    {"id": "WFACT-004-native-uncertainty", "requirement": "Known native progress and genuinely unknown sends do not imply acceptance, delivery to a device or recipient reading."},
+    {"id": "WFACT-005-visibility", "requirement": "A fact lookup cannot expose another group or participants-only topic, including through an explicit hidden work ID."},
+    {"id": "WFACT-006-user-quiet", "requirement": "A wakeup, playful followup or picture does not silently change the user's explicit quiet preference."}
+  ]
+}

@@ -30,11 +30,13 @@ from groupagent.memory.common import source_rows
 from groupagent.memory.retrieval import visible_events
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
+from groupagent.runtime.work_facts import WorkFacts, visible_work_index_in_tx
 from groupagent.runtime.work_status import work_status_detail
 from groupagent.scheduling import Scheduler
 
 from .intent import main_request, new_work_intent
 from .participation import outside_quotes
+from .work_queries import compact_work_overview
 
 _LIVE = frozenset(
     {"queued", "running", "waiting_input", "waiting_external", "validating", "delivering"}
@@ -526,41 +528,12 @@ class ContextBuilder:
         private_topics: set[str],
         through_sequence: int,
     ) -> tuple[list[dict], bool]:
-        # Do not hydrate or fingerprint every work's transitive evidence. This
-        # index never reaches the model and is not a provenance dependency.
-        rows = tx.conn.execute(
-            "SELECT w.id,w.group_id,w.requester_id,w.request_event_id,w.goal,w.state,w.revision,"
-            "w.goal_revision,w.created_at,w.updated_at,w.scope->>'topic_id' AS topic_id "
-            "FROM ga_work_orders w "
-            "JOIN ga_events e ON e.group_id=w.group_id AND e.id=w.request_event_id "
-            "WHERE w.group_id=%s AND e.memory_state='active' AND NOT "
-            + after_boundary_sql("e")
-            + " "
-            "AND NOT COALESCE((w.scope->>'privacy_redacted')::boolean,false) "
-            "AND NOT COALESCE(w.scope->>'topic_id'=ANY(%s::text[]),false) "
-            "AND NOT (w.request_event_id=ANY(%s::text[])) "
-            "AND NOT COALESCE(w.scope->'source_fingerprints' ?| %s::text[],false) "
-            "AND NOT COALESCE(w.scope->'source_event_ids' ?| %s::text[],false) "
-            "AND NOT COALESCE(w.scope->>'request_source_id'=ANY(%s::text[]),false) "
-            "ORDER BY w.created_at DESC,w.id DESC LIMIT 1001",
-            (
-                tx.group_id,
-                through_sequence,
-                through_sequence,
-                sorted(private_topics),
-                sorted(private_events),
-                sorted(private_events),
-                sorted(private_events),
-                sorted(private_events),
-            ),
-        ).fetchall()
-        complete = len(rows) <= 1000
-        result = []
-        for raw in rows[:1000]:
-            row = dict(raw)
-            row["_requested_at"] = row["created_at"].isoformat()
-            result.append(row)
-        return result, complete
+        return visible_work_index_in_tx(
+            tx,
+            private_events=private_events,
+            private_topics=private_topics,
+            through_sequence=through_sequence,
+        )
 
     def build(
         self, actor: ActorContext, event: GroupEvent, query: ContextQuery | None = None
@@ -623,8 +596,16 @@ class ContextBuilder:
                 tx, private_events, private_topics, through_sequence
             )
             index_by_id = {row["id"]: row for row in index}
+            work_overview = compact_work_overview(
+                WorkFacts(self.store).overview_in_tx(
+                    tx, active_limit=4, recent_limit=3, through_sequence=through_sequence
+                )
+            )
             if quoted_work_id not in index_by_id:
                 quoted_work_id = None
+            metadata_source_ids = WorkFacts(self.store).source_dependencies_in_tx(
+                tx, tuple(row["id"] for row in work_overview["facts"])
+            )
             topic_rows = tx.conn.execute(
                 "SELECT t.id,t.title FROM ga_memory_topics t JOIN ga_topic_events r "
                 "ON r.group_id=t.group_id AND r.topic_id=t.id WHERE r.group_id=%s AND r.event_id=ANY(%s) AND t.visibility='group'",
@@ -772,8 +753,6 @@ class ContextBuilder:
                 }
                 if work["state"] in {"paused", "waiting_input", "failed"}:
                     projected["status_detail"] = detail
-                if work["state"] == "paused" and detail["code"] == "background_processing":
-                    projected["state"] = "queued"
                 question = work["scope"].get("_runtime_input_request")
                 if (
                     isinstance(question, dict)
@@ -1006,7 +985,15 @@ class ContextBuilder:
                         collect_identities(item, key)
 
             collect_identities(
-                [public_works, tasks, rules, memory_items, recent, attachment_sources]
+                [
+                    public_works,
+                    work_overview,
+                    tasks,
+                    rules,
+                    memory_items,
+                    recent,
+                    attachment_sources,
+                ]
             )
             text_for_names = event.text + "\n" + "\n".join(row["text"] for row in recent)
             visible_members = [
@@ -1042,6 +1029,7 @@ class ContextBuilder:
                     for member in visible_members
                 ],
                 "works": public_works,
+                "work_facts_overview": work_overview,
                 "tasks": [
                     {
                         key: row[key]
@@ -1161,6 +1149,7 @@ class ContextBuilder:
             payload.update(
                 {
                     "_snapshot": snapshot,
+                    "_work_fact_source_ids": sorted(metadata_source_ids),
                     "_aliases": aliases,
                     "_policies": policies,
                     "_topic_id": topic_id,

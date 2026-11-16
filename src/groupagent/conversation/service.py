@@ -41,7 +41,7 @@ from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
 from groupagent.runtime.input_selection import canonicalize_input_selection
 from groupagent.runtime.tool_selection import message_only_research_request
-from groupagent.runtime.work_status import work_status_detail
+from groupagent.runtime.work_facts import WorkFacts
 from groupagent.scheduling import Scheduler
 from groupagent.scheduling.reminders import extract_reminder_body, is_time_only_reminder_change
 from groupagent.security import redact_credentials
@@ -79,6 +79,7 @@ from .intent import (
 from .participation import fast_observe, outside_quotes, policy_intent, verified_human_addressee
 from .policy import apply_quiet_barrier_in_tx, ingress_admission, interpret_policy
 from .references import resolve_work_selection
+from .work_queries import query_work_in_tx, render_work_query
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
 _ERRORS = {
@@ -548,22 +549,6 @@ class ConversationCoordinator(Coordinator):
                 confidence=1,
             )
         return decision
-
-    @staticmethod
-    def _work_status(work) -> str:
-        if work.state == WorkState.PAUSED:
-            return work_status_detail(work)["message"]
-        return {
-            WorkState.QUEUED: "已排队，尚未开始执行。",
-            WorkState.RUNNING: "正在处理。",
-            WorkState.WAITING_INPUT: "还缺少必要资料。",
-            WorkState.WAITING_EXTERNAL: "正在等待外部服务。",
-            WorkState.VALIDATING: "正在检查结果。",
-            WorkState.DELIVERING: "正在交付结果。",
-            WorkState.COMPLETED: "已完成。",
-            WorkState.CANCELLED: "已取消。",
-            WorkState.FAILED: "执行失败，已有记录保留。",
-        }[work.state]
 
     def _gate(
         self, tx: UnitOfWork, event: GroupEvent, decision: Decision, context: dict
@@ -1528,6 +1513,7 @@ class ConversationCoordinator(Coordinator):
                                 event.id: tx.event_fingerprint(event.id)
                             }
                             context["_snapshot"]["source_task_revisions"] = {}
+                            context["_work_fact_source_ids"] = []
                         else:
                             task_map = context["_snapshot"].get("source_task_revisions", {})
                             task_ids = set(task_map)
@@ -1861,7 +1847,37 @@ class ConversationCoordinator(Coordinator):
                         decision = decision.model_copy(
                             update={"response": "已更新同一项工作的要求，旧结果不会覆盖新目标。"}
                         )
-                    elif decision.kind in {"control_work", "query_work"}:
+                    elif decision.kind == "query_work":
+                        observed = query_work_in_tx(
+                            tx, event, decision, context, WorkFacts(self.store)
+                        )
+                        current_facts = observed["facts"]
+                        context["_work_fact_source_ids"] = sorted(
+                            set(context.get("_work_fact_source_ids", []))
+                            | WorkFacts.source_dependencies_in_tx(
+                                tx, tuple(row["id"] for row in current_facts)
+                            )
+                        )
+                        for fact in current_facts:
+                            source_id = fact["request_event_id"]
+                            context["_snapshot"]["source_fingerprints"][source_id] = (
+                                tx.event_fingerprint(source_id)
+                            )
+                        identifiers = [fact["id"] for fact in current_facts]
+                        action_result = {
+                            "work_ids": identifiers,
+                            "states": [fact["state"] for fact in current_facts],
+                            "work_facts": observed,
+                        }
+                        work_id = identifiers[0] if len(identifiers) == 1 else None
+                        decision = Decision(
+                            kind="reply",
+                            reason_code="work_status_query",
+                            response=render_work_query(observed),
+                            directness="direct",
+                            confidence=1,
+                        )
+                    elif decision.kind == "control_work":
                         resolved = self._resolve_work_set(actor, event, decision, context)
                         selected = []
                         for ref in resolved.refs:
@@ -1877,76 +1893,53 @@ class ConversationCoordinator(Coordinator):
                                 tx.event_fingerprint(source.id)
                             )
                             selected.append(work)
-                        if decision.kind == "query_work":
-                            if len(selected) == 1:
-                                text = self._work_status(selected[0])
-                            else:
-                                text = "\n".join(
-                                    f"{index + 1}. {item.goal[:48]}：{self._work_status(item)}"
-                                    for index, item in enumerate(selected)
+                        target = {
+                            "cancel": WorkState.CANCELLED,
+                            "pause": WorkState.PAUSED,
+                            "resume": WorkState.QUEUED,
+                            "retry": WorkState.QUEUED,
+                        }[decision.control or "pause"]
+                        for work in selected:
+                            if (
+                                decision.control in {"resume", "retry"}
+                                and work.policy_revision != actor.policy_revision
+                            ):
+                                # The user's current scoped command reauthorizes the same
+                                # immutable goal under the current policy; it resets nothing.
+                                tx.conn.execute(
+                                    "UPDATE ga_work_orders SET policy_revision=%s WHERE group_id=%s AND id=%s AND revision=%s",
+                                    (
+                                        actor.policy_revision,
+                                        actor.group_id,
+                                        work.id,
+                                        work.revision,
+                                    ),
                                 )
-                            action_result = {
-                                "work_ids": list(resolved.ids),
-                                "states": [item.state.value for item in selected],
-                            }
-                            work_id = selected[0].id if len(selected) == 1 else None
-                            decision = Decision(
-                                kind="reply",
-                                reason_code="work_status_query",
-                                response=text,
-                                directness="direct",
-                                confidence=1,
+                            tx.transition_work(
+                                work.id,
+                                target,
+                                expected_revision=work.revision,
+                                reason="retry" if decision.control == "retry" else "user_request",
                             )
-                        else:
-                            target = {
-                                "cancel": WorkState.CANCELLED,
-                                "pause": WorkState.PAUSED,
-                                "resume": WorkState.QUEUED,
-                                "retry": WorkState.QUEUED,
-                            }[decision.control or "pause"]
-                            for work in selected:
-                                if (
-                                    decision.control in {"resume", "retry"}
-                                    and work.policy_revision != actor.policy_revision
-                                ):
-                                    # The user's current scoped command reauthorizes the same
-                                    # immutable goal under the current policy; it resets nothing.
-                                    tx.conn.execute(
-                                        "UPDATE ga_work_orders SET policy_revision=%s WHERE group_id=%s AND id=%s AND revision=%s",
-                                        (
-                                            actor.policy_revision,
-                                            actor.group_id,
-                                            work.id,
-                                            work.revision,
-                                        ),
-                                    )
-                                tx.transition_work(
-                                    work.id,
-                                    target,
-                                    expected_revision=work.revision,
-                                    reason="retry"
-                                    if decision.control == "retry"
-                                    else "user_request",
-                                )
-                                controlled_work_ids.append(work.id)
-                            action_result = {
-                                "work_ids": controlled_work_ids,
-                                "control": decision.control,
-                                "selected_states": [item.state.value for item in selected],
-                            }
-                            work_id = selected[0].id if len(selected) == 1 else None
-                            verb = {
-                                "cancel": "取消",
-                                "pause": "暂停",
-                                "resume": "恢复排队",
-                                "retry": "安排重试",
-                            }[decision.control or "pause"]
-                            text = (
-                                f"已{verb}这项工作。"
-                                if len(selected) == 1
-                                else f"已{verb}{len(selected)}项匹配的工作。"
-                            )
-                            decision = decision.model_copy(update={"response": text})
+                            controlled_work_ids.append(work.id)
+                        action_result = {
+                            "work_ids": controlled_work_ids,
+                            "control": decision.control,
+                            "selected_states": [item.state.value for item in selected],
+                        }
+                        work_id = selected[0].id if len(selected) == 1 else None
+                        verb = {
+                            "cancel": "取消",
+                            "pause": "暂停",
+                            "resume": "恢复排队",
+                            "retry": "安排重试",
+                        }[decision.control or "pause"]
+                        text = (
+                            f"已{verb}这项工作。"
+                            if len(selected) == 1
+                            else f"已{verb}{len(selected)}项匹配的工作。"
+                        )
+                        decision = decision.model_copy(update={"response": text})
             except (DomainError, ValidationError) as error:
                 context["_snapshot"] = original_snapshot
                 code = error.code if isinstance(error, DomainError) else "invalid_input"
@@ -1996,6 +1989,34 @@ class ConversationCoordinator(Coordinator):
                         admission.invocation_root_event_id,
                     ),
                 )
+            if (
+                event.kind in {EventKind.IMAGE, EventKind.AUDIO, EventKind.FILE}
+                and decision.kind == "observe"
+                and decision.directness != "other"
+            ):
+                # A silent attachment inside an existing invoked conversation
+                # carries that same session; it neither wakes a new one nor
+                # changes the user's quiet policy or starts execution.
+                media_admission = ingress_admission(
+                    tx,
+                    event,
+                    self.identity,
+                    time_zone=self.config.group.time_zone,
+                    quiet_hours=self.config.group.quiet_hours,
+                    now=self.clock(),
+                    default_mode=self.config.group.participation_mode,
+                )
+                if media_admission.allowed and media_admission.invocation_root_event_id:
+                    tx.conn.execute(
+                        "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason,created_at,invocation_root_event_id) "
+                        "VALUES(%s,%s,false,'invocation_attachment',%s,%s) ON CONFLICT DO NOTHING",
+                        (
+                            actor.group_id,
+                            event.id,
+                            self.clock(),
+                            media_admission.invocation_root_event_id,
+                        ),
+                    )
             result = CoordinationResult(
                 event_id=event.id,
                 decision=decision,
@@ -2009,7 +2030,12 @@ class ConversationCoordinator(Coordinator):
                 {
                     "kind": decision.kind,
                     "result": result.model_dump(mode="json"),
-                    "source_event_ids": list(context["_snapshot"]["source_fingerprints"]),
+                    # Revocation lineage is metadata, not an attachment/tool
+                    # grant or a requirement to hydrate an entire old archive.
+                    "source_event_ids": sorted(
+                        set(context["_snapshot"]["source_fingerprints"])
+                        | set(context.get("_work_fact_source_ids", []))
+                    ),
                     "source_fingerprints": context["_snapshot"]["source_fingerprints"],
                     "source_task_revisions": context["_snapshot"].get("source_task_revisions", {}),
                 },

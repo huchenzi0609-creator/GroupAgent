@@ -40,7 +40,7 @@ packages = ["src/groupagent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["postgres: integration tests requiring an isolated PostgreSQL database", "render: document rendering with external tools", "sandbox: actual isolated Docker worker tests", "live: explicitly budgeted live provider tests", "public_image_workflow: retrieval, conversion, bounded inspection, recovery and delivery of public images"]
+markers = ["postgres: integration tests requiring an isolated PostgreSQL database", "render: document rendering with external tools", "sandbox: actual isolated Docker worker tests", "live: explicitly budgeted live provider tests", "public_image_workflow: retrieval, conversion, bounded inspection, recovery and delivery of public images", "work_awareness: shared task facts, natural follow-ups and delivery truth across dialogue and execution"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 

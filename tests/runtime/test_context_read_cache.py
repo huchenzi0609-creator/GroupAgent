@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from contextlib import contextmanager
+from datetime import datetime
 
 import psycopg
 import pytest
@@ -75,6 +76,11 @@ def test_context_cache_deduplicates_sql_without_changing_payload_or_hashes(
     assert before["_snapshot"] == after["_snapshot"]
     before.pop("now", None)
     after.pop("now", None)
+    # Live observations have their own clocks; the cache must preserve every
+    # fact and source hash, not make two distinct reads appear simultaneous.
+    before_observed = before["work_facts_overview"].pop("observed_at")
+    after_observed = after["work_facts_overview"].pop("observed_at")
+    assert datetime.fromisoformat(before_observed) <= datetime.fromisoformat(after_observed)
     assert json.dumps(before, sort_keys=True, default=str) == json.dumps(
         after, sort_keys=True, default=str
     )
