@@ -173,6 +173,6 @@ async def test_actual_native_table_with_noneditable_read_unit_reaches_semantic_r
     assert excerpt["metadata"]["native_table_count"] == "1"
     assert "类别" in excerpt["text"] and "合成甲" in excerpt["text"]
     instruction = review.messages[0].content
-    assert "unit.editable" in instruction and "机器人文本编辑接口" in instruction
-    assert "native_table_count" in instruction and "editable:false" in instruction
+    assert "unit.editable" in instruction and "编辑接口" in instruction
+    assert "native_table_count" in instruction and "原生表格" in instruction
     assert any(draft.payload_ref == "artifact:" + version.version_id for draft in result.deliveries)

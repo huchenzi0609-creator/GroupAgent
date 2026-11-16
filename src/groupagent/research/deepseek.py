@@ -35,9 +35,9 @@ class _SearchResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
     title: str
     url: str
-    snippet: str
-    summary: str
-    content: str
+    snippet: str = ""
+    summary: str = ""
+    content: str = ""
     date: AwareDatetime | None = None
 
 
@@ -191,6 +191,7 @@ class DeepSeekResearchClient:
         published_at: datetime | None = None,
         text_budget_bytes: int | None = None,
         include_content: bool = True,
+        retain_received: bool = False,
     ) -> ResearchSource:
         limits = {
             "title": 2048,
@@ -203,6 +204,24 @@ class DeepSeekResearchClient:
         if not include_content:
             limits["content"] = 0
         original = {"title": title, "snippet": snippet, "summary": summary, "content": content}
+        if retain_received:
+            # The HTTP response has already passed the transport's hard bound.
+            # ResearchSession persists this received body before making a small
+            # model projection; it must not irreversibly discard the page tail.
+            try:
+                limits = {field: len(value.encode("utf-8")) for field, value in original.items()}
+            except UnicodeError:
+                raise DomainError(
+                    "invalid_research_response", "The provider returned invalid Unicode text"
+                ) from None
+            text_budget_bytes = None
+        elif text_budget_bytes is not None and include_content and content:
+            # Metadata must not consume a requested body before it is visited.
+            # Unused shares flow to content, so short metadata keeps its bytes
+            # while long snippets cannot starve every source's actual evidence.
+            limits["title"] = min(limits["title"], text_budget_bytes // 8)
+            limits["snippet"] = min(limits["snippet"], text_budget_bytes // 8)
+            limits["summary"] = min(limits["summary"], text_budget_bytes // 4)
         values: dict[str, str] = {}
         truncated = []
         for field, value in original.items():
@@ -250,9 +269,15 @@ class DeepSeekResearchClient:
                 "research_timeout", "The search exceeded its deadline", retryable=True
             ) from None
 
-    async def _search(self, arguments: SearchInput) -> SearchOutput:
+    async def search_received(self, arguments: SearchInput) -> SearchOutput:
+        """Host-only received evidence; use ResearchSession before exposing to a model."""
+        return await self._search(arguments, retain_received=True)
+
+    async def _search(
+        self, arguments: SearchInput, *, retain_received: bool = False
+    ) -> SearchOutput:
         await self.url_policy.validate_query(arguments.query)
-        raw = await self._post("search", arguments.model_dump())
+        raw = await self._post("search", arguments.model_dump(exclude={"refresh"}))
         retrieved = datetime.now(UTC)
         try:
             response = _SearchResponse.model_validate(raw)
@@ -288,17 +313,17 @@ class DeepSeekResearchClient:
                     published_at=result.date,
                     text_budget_bytes=source_text_bytes,
                     include_content=arguments.need_content,
+                    retain_received=retain_received,
                 )
             )
-        return self._bounded(
-            SearchOutput(
-                query=arguments.query,
-                retrieved_at=retrieved,
-                results=tuple(sources),
-                provider_result_count=len(response.results),
-                filtered_result_count=filtered,
-            )
+        output = SearchOutput(
+            query=arguments.query,
+            retrieved_at=retrieved,
+            results=tuple(sources),
+            provider_result_count=len(response.results),
+            filtered_result_count=filtered,
         )
+        return output if retain_received else self._bounded(output)
 
     async def fetch(self, arguments: FetchInput) -> FetchOutput:
         try:
@@ -309,7 +334,11 @@ class DeepSeekResearchClient:
                 "research_timeout", "The fetch exceeded its deadline", retryable=True
             ) from None
 
-    async def _fetch(self, arguments: FetchInput) -> FetchOutput:
+    async def fetch_received(self, arguments: FetchInput) -> FetchOutput:
+        """Host-only received evidence, bounded by max_response_bytes on the wire."""
+        return await self._fetch(arguments, retain_received=True)
+
+    async def _fetch(self, arguments: FetchInput, *, retain_received: bool = False) -> FetchOutput:
         url = await self.url_policy.validate(arguments.url)
         raw = await self._post("fetch", {"url": url})
         retrieved = datetime.now(UTC)
@@ -321,15 +350,15 @@ class DeepSeekResearchClient:
             ) from None
         if not response.content.strip():
             raise DomainError("page_unavailable", "The provider did not return usable page content")
-        return self._bounded(
-            FetchOutput(
-                requested_url=url,
-                source=self._source(
-                    url=url,
-                    title=response.title,
-                    content=response.content,
-                    operation="fetch",
-                    retrieved_at=retrieved,
-                ),
-            )
+        output = FetchOutput(
+            requested_url=url,
+            source=self._source(
+                url=url,
+                title=response.title,
+                content=response.content,
+                operation="fetch",
+                retrieved_at=retrieved,
+                retain_received=retain_received,
+            ),
         )
+        return output if retain_received else self._bounded(output)

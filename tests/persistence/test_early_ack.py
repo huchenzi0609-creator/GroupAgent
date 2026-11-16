@@ -29,7 +29,7 @@ def store() -> PostgresStore:
     if not dsn:
         pytest.skip("Set GROUPAGENT_TEST_DSN for real PostgreSQL early ACK tests")
     result = PostgresStore(dsn)
-    assert result.migrate() == 13
+    assert result.migrate() == 14
     return result
 
 
@@ -195,10 +195,38 @@ def test_upgrade_preserves_final_reply_and_enforces_two_source_bound_text_slots(
         request = source(scoped, actor)
         with scoped.transaction(actor) as tx:
             final = tx.enqueue_reply(request.id, "Existing final answer")
-        assert scoped.migrate() == 13 and scoped.migrate() == 13
+        latest = max(
+            int(path.name.split("_", 1)[0])
+            for path in migration_dir.iterdir()
+            if path.name.endswith(".sql")
+        )
+        assert scoped.migrate() == latest and scoped.migrate() == latest
         with scoped.transaction(actor) as tx:
             assert tx.get_delivery(final.id).payload_ref == "text:Existing final answer"
             early = tx.enqueue_early_ack(request.id, "Late synthetic acknowledgement")
+            # Older writers and event/delivery codecs need no new policy fields.
+            tx.conn.execute(
+                "INSERT INTO ga_conversation_policy(group_id,subject_id,quiet) VALUES(%s,%s,false)",
+                (actor.group_id, actor.member_id),
+            )
+            tx.conn.execute(
+                "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason) VALUES(%s,%s,false,'old-writer')",
+                (actor.group_id, request.id),
+            )
+            assert (
+                tx.conn.execute(
+                    "SELECT quiet_since_sequence FROM ga_conversation_policy WHERE group_id=%s",
+                    (actor.group_id,),
+                ).fetchone()["quiet_since_sequence"]
+                is None
+            )
+            assert (
+                tx.conn.execute(
+                    "SELECT invocation_root_event_id FROM ga_participation_log WHERE group_id=%s",
+                    (actor.group_id,),
+                ).fetchone()["invocation_root_event_id"]
+                is None
+            )
         for payload, key, event_id, error in (
             (
                 "text:third",

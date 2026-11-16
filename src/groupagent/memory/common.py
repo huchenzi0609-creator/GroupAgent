@@ -7,6 +7,8 @@ from typing import Any
 from groupagent.domain import ActorContext, DomainError, GroupEvent, Role
 from groupagent.persistence import PostgresStore, UnitOfWork
 
+from .causality import causal_sources
+
 Row = dict[str, Any]
 
 
@@ -82,6 +84,15 @@ def source_rows(
     ).fetchall()
     if len(rows) != len(event_ids):
         raise DomainError("not_found", "A source event was not found in this group")
+    parents = causal_sources(tx, set(event_ids)) - set(event_ids)
+    if parents:
+        source_rows(
+            tx,
+            sorted(parents),
+            shared=shared,
+            allow_expired=allow_expired,
+            require_complete=require_complete,
+        )
     for row in rows:
         if tx.get_event(row["id"]).content_state not in (
             {"active", "expired"} if allow_expired else {"active"}

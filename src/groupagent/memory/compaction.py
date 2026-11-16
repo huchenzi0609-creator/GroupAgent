@@ -113,6 +113,9 @@ class CompactionMethods:
                 selected.append(row)
                 used += cost
             source_ids = [row["id"] for row in selected]
+            source_fingerprints = {
+                identifier: tx.event_fingerprint(identifier) for identifier in source_ids
+            }
             request = SummaryInput(
                 group_id=actor.group_id,
                 topic_id=topic_id,
@@ -191,6 +194,13 @@ class CompactionMethods:
                         "memory_changed", "Memory changed while the summary provider was running"
                     )
                 source_rows(tx, source_ids, shared=topic is None or topic["visibility"] == "group")
+                if any(
+                    tx.event_fingerprint(identifier) != fingerprint
+                    for identifier, fingerprint in source_fingerprints.items()
+                ):
+                    raise DomainError(
+                        "memory_changed", "A selected source changed during compaction"
+                    )
                 summary = tx.conn.execute(
                     "INSERT INTO ga_memory_summaries(id,group_id,topic_id,text,source_event_ids,first_sequence,last_sequence,provider,model,usage,created_by) "
                     "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",

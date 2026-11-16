@@ -260,7 +260,7 @@ async def test_quiet_defers_notices_but_allows_explicit_replies(runtime_env):
     env = runtime_env
     app, _ = app_for(env, {})
     _, _, notice = waiting_work(env, app)
-    direct = event(env, "请直接回答我的问题")
+    direct = event(env, "Pot，请直接回答我的问题")
     with env.store.transaction(env.actor) as tx:
         tx.ingest_event(direct, direct.id, "1", 0)
         reply = tx.enqueue_reply(direct.id, "Synthetic direct reply")
@@ -310,7 +310,8 @@ async def test_quiet_applies_to_already_queued_proactive_reply(runtime_env):
             )
         assert await app.dispatcher.tick() == 0
         with env.store.transaction(env.actor) as tx:
-            assert tx.get_delivery(intent).state == DeliveryState.PENDING
+            assert tx.get_delivery(intent).state == DeliveryState.REJECTED
+            assert tx.get_delivery(intent).reason == "quiet_barrier"
     finally:
         await app.close()
 

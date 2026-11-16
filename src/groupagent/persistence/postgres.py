@@ -656,6 +656,7 @@ class UnitOfWork:
             "ignore",
             "observe",
             "reply",
+            "command",
             "clarify",
             "start_work",
             "update_work",
@@ -2061,9 +2062,6 @@ class UnitOfWork:
                 task_id,
             ),
         ).fetchone()
-        self.conn.execute(
-            "UPDATE ga_memory_epochs SET epoch=epoch+1 WHERE group_id=%s", (self.group_id,)
-        )
         self._audit("team_task_claimed", task_id, owner_id=self.actor.member_id)
         return TeamTask.model_validate(updated)
 
@@ -2181,9 +2179,6 @@ class UnitOfWork:
             ),
         ).fetchone()
         assert updated is not None
-        self.conn.execute(
-            "UPDATE ga_memory_epochs SET epoch=epoch+1 WHERE group_id=%s", (self.group_id,)
-        )
         self._audit(
             "team_task_updated", task_id, owner_id=updated["owner_id"], revision=updated["revision"]
         )

@@ -13,6 +13,10 @@ class SearchInput(ToolData):
     query: str = Field(min_length=1, max_length=128)
     count: int = Field(default=5, ge=1, le=10)
     need_content: bool = False
+    refresh: bool = Field(
+        default=False,
+        description="Request a fresh external observation instead of reusing this work's saved evidence",
+    )
 
     @field_validator("query")
     @classmethod
@@ -28,6 +32,20 @@ class SearchInput(ToolData):
 
 class FetchInput(ToolData):
     url: str = Field(min_length=1, max_length=8192)
+    refresh: bool = Field(
+        default=False,
+        description="Request a fresh external observation instead of reusing this work's saved evidence",
+    )
+
+
+class EvidenceRef(ToolData):
+    """Host-created immutable local evidence reference, never a filesystem capability."""
+
+    version: Literal[1] = 1
+    source_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    scope_key: str = Field(pattern=r"^[a-f0-9]{64}$")
+    content_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    content_bytes: int = Field(ge=0, le=2_000_000)
 
 
 class ResearchSource(ToolData):
@@ -59,6 +77,7 @@ class ResearchSource(ToolData):
     truncated_fields: tuple[str, ...] = ()
     # DeepSeek fetch has no final URL. Direct public HTTP records checked redirects.
     final_url: str | None = None
+    evidence_ref: EvidenceRef | None = None
 
 
 class SearchOutput(ToolData):
@@ -69,6 +88,7 @@ class SearchOutput(ToolData):
     filtered_result_count: int = Field(ge=0)
     untrusted_content: Literal[True] = True
     budget_receipt: str | None = None
+    request_key: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class FetchOutput(ToolData):
@@ -76,3 +96,17 @@ class FetchOutput(ToolData):
     source: ResearchSource
     untrusted_content: Literal[True] = True
     budget_receipt: str | None = None
+    request_key: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class SourceReadInput(ToolData):
+    source_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    query: str = Field(default="", max_length=512)
+    offset: int = Field(default=0, ge=0, description="UTF-8 byte offset in the saved source")
+    limit: int = Field(default=12_000, ge=1, le=32_000, description="Maximum returned UTF-8 bytes")
+
+
+class SourceReadOutput(ToolData):
+    source: ResearchSource
+    next_offset: int | None = Field(default=None, ge=0)
+    untrusted_content: Literal[True] = True

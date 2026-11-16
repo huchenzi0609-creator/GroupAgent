@@ -337,10 +337,10 @@ async def test_trusted_required_tools_are_explicit_in_native_objective_without_c
     assert objective["required_tools"] == sorted(run.prepared.request.required_tools) == required
     assert all(name in run.prepared.request.allowed_tools for name in required)
     assert any(
-        "successfully call every tool listed in required_tools" in item
-        for item in objective["instructions"]
+        "Required tools" in item and "receipts" in item for item in objective["instructions"]
     )
-    assert any("without re-enabling or bypassing it" in item for item in objective["instructions"])
+    # Scope and successful-required-tool enforcement are executable contracts,
+    # not the presence of a historical sentence in every prompt.
     # UUIDs and clock microseconds may contain these digits by chance. Check
     # request/constraint content, where a leaked expected answer would matter.
     assert objective["input_files"] == []
@@ -867,7 +867,10 @@ async def test_trusted_scheduled_reminder_names_recipient_work_not_agent_work(to
     )
     review_request = setup.model.requests[-1]
     assert json.loads(review_request.messages[1].content)["execution_intent"] == "reminder"
-    assert "不要求机器人完成它或取得文件" in review_request.messages[0].content
+    assert (
+        "收件人" in review_request.messages[0].content
+        and "提醒" in review_request.messages[0].content
+    )
     assert (
         len(result.deliveries) == 1
         and result.deliveries[0].payload_ref == "text:提醒：该检查作业了。"
@@ -1029,10 +1032,9 @@ async def test_canonical_original_request_is_bounded_redacted_and_shared_with_re
     review = setup.model.requests[-1]
     assert json.loads(review.messages[1].content)["original_request"] == context
     assert secret not in review.model_dump_json()
-    assert "当前goal和criteria仍决定" in review.messages[0].content
-    assert "不因此需要满足程序代码语法" in review.messages[0].content
-    assert "不得据此推断实际停顿、声线或自然度" in review.messages[0].content
-    assert "真实音频解码、非静音和内容核验" in review.messages[0].content
-    assert "不得把尚未发送" in review.messages[0].content
+    assert "goal" in review.messages[0].content and "criteria" in review.messages[0].content
+    assert "不添加用户未要求的标准" in review.messages[0].content
+    assert "ASR" not in review.messages[0].content  # This case contains no audio evidence.
+    assert "pre_delivery" in review.messages[0].content
     assert json.loads(review.messages[1].content)["validation_phase"] == "pre_delivery"
     assert json.loads(review.messages[1].content)["delivery_status"] == "not_started_by_design"

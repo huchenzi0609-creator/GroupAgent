@@ -6,6 +6,7 @@ from uuid import uuid4
 from psycopg.types.json import Jsonb
 
 from groupagent.domain import ActorContext, DomainError, Role
+from groupagent.memory.causality import after_boundary_sql, causal_sequence_sql
 from groupagent.memory.common import invalidate_summaries, memory_lock, source_rows, topic_row
 from groupagent.memory.models import MemoryHit, SourceReference, Topic
 from groupagent.persistence import PostgresStore, UnitOfWork
@@ -36,22 +37,33 @@ def visible_events(
     limit: int = 100,
     public_only: bool = False,
     newest_first: bool = False,
+    through_sequence: int | None = None,
 ):
     topic_row(tx, topic_id)
     pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     rows = tx.conn.execute(
         "SELECT e.* FROM ga_events e WHERE e.group_id=%s AND e.memory_state='active' AND e.sequence>%s "
+        "AND (%s::bigint IS NULL OR NOT " + after_boundary_sql("e") + ") "
         "AND e.kind IN ('text','quote','image','audio','file','forwarded','unsupported_video') "
         "AND (%s::text IS NULL OR EXISTS (SELECT 1 FROM ga_topic_events r WHERE r.group_id=e.group_id AND r.event_id=e.id AND r.topic_id=%s)) "
         "AND NOT EXISTS (SELECT 1 FROM ga_topic_events r JOIN ga_memory_topics t ON t.group_id=r.group_id AND t.id=r.topic_id "
         "WHERE r.group_id=e.group_id AND r.event_id=e.id AND t.visibility='participants' "
         "AND (%s OR NOT (%s OR t.created_by=%s OR t.participant_ids ? %s))) "
         "AND e.body->>'text' ILIKE %s ORDER BY "
-        + ("e.occurred_at DESC,e.sequence DESC" if newest_first else "e.sequence")
+        + (
+            "(" + causal_sequence_sql("e") + ") DESC,e.sequence DESC"
+            if newest_first and through_sequence is not None
+            else "e.occurred_at DESC,e.sequence DESC"
+            if newest_first
+            else "e.sequence"
+        )
         + " LIMIT %s",
         (
             tx.group_id,
             after_sequence,
+            through_sequence,
+            through_sequence,
+            through_sequence,
             topic_id,
             topic_id,
             public_only,
@@ -168,6 +180,7 @@ class RetrievalMethods:
         topic_id: str | None = None,
         limit: int = 20,
         include_tasks: bool = True,
+        through_sequence: int | None = None,
     ) -> list[MemoryHit]:
         if len(query) > 1000 or not 1 <= limit <= 100:
             raise DomainError("invalid_input", "Retrieval query or result limit is too large")
@@ -178,7 +191,12 @@ class RetrievalMethods:
                 "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
             )
             for row in visible_events(
-                tx, topic_id=topic_id, query=query, limit=limit, newest_first=True
+                tx,
+                topic_id=topic_id,
+                query=query,
+                limit=limit,
+                newest_first=True,
+                through_sequence=through_sequence,
             ):
                 hits.append(
                     MemoryHit(
@@ -199,6 +217,9 @@ class RetrievalMethods:
                     + " f LEFT JOIN ga_memory_topics t ON t.group_id=f.group_id AND t.id=f.topic_id "
                     "WHERE f.group_id=%s AND f.state='active' AND (%s::text IS NULL OR f.topic_id=%s) "
                     "AND (t.id IS NULL OR t.visibility='group' OR %s OR t.created_by=%s OR t.participant_ids ? %s) "
+                    "AND (%s::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM ga_events s WHERE s.group_id=f.group_id AND "
+                    + after_boundary_sql("s")
+                    + " AND f.source_event_ids ? s.id)) "
                     "AND (" + text_column + ") ILIKE %s ORDER BY f.created_at DESC LIMIT %s",
                     (
                         actor.group_id,
@@ -207,6 +228,9 @@ class RetrievalMethods:
                         actor.role == Role.OWNER,
                         actor.member_id,
                         actor.member_id,
+                        through_sequence,
+                        through_sequence,
+                        through_sequence,
                         pattern,
                         limit,
                     ),
@@ -245,6 +269,22 @@ class RetrievalMethods:
                     )
             if include_tasks and topic_id is None:
                 for task in tx.find_team_tasks(query, limit=limit):
+                    if (
+                        through_sequence is not None
+                        and task.source_event_ids
+                        and tx.conn.execute(
+                            "SELECT 1 FROM ga_events e WHERE e.group_id=%s AND e.id=ANY(%s) AND "
+                            + after_boundary_sql("e")
+                            + " LIMIT 1",
+                            (
+                                tx.group_id,
+                                task.source_event_ids,
+                                through_sequence,
+                                through_sequence,
+                            ),
+                        ).fetchone()
+                    ):
+                        continue
                     try:
                         if task.source_event_ids:
                             source_rows(

@@ -2,6 +2,8 @@
 
 import pytest
 
+from groupagent.control import WorkSelector
+from groupagent.coordinator import Decision
 from groupagent.domain import DomainError, WorkState
 
 from .test_app import app_for, event
@@ -43,14 +45,28 @@ async def test_pause_question_uses_actual_preparation_error_instead_of_cost_gues
                 expected_revision=work.revision,
                 reason="ambiguous_attachment",
             )
+
+        class StatusInterpreter:
+            async def decide(self, event, context):
+                return Decision(
+                    kind="query_work",
+                    reason_code="status_question",
+                    work_selector=WorkSelector(
+                        basis="query", states=(WorkState.PAUSED,), ownership="group"
+                    ),
+                    directness="direct",
+                    confidence=1,
+                )
+
+        app.coordinator.provider_factory = lambda *_: StatusInterpreter()
         question = event(env, "为什么？是什么原因导致的暂停")
         await intake(app, env, question)
         result = await app.coordinator.process(question)
-        assert result.decision.reason_code == "durable_work_diagnostic"
+        assert result.decision.reason_code == "work_status_query"
         assert "附件版本" in result.decision.response
         assert "费用" not in result.decision.response and not model.requests
-        context = app.coordinator._context(env.actor, question)
-        assert context["works"][0]["status_detail"]["code"] == "ambiguous_attachment"
+        assert result.action_result["states"] == ["paused"]
+        assert result.action_result["work_ids"] == [work.id]
     finally:
         await app.close()
 
@@ -82,7 +98,7 @@ async def test_true_attachment_ambiguity_waits_for_input_without_finance_pause(r
 async def test_background_preparation_waits_until_useful_admission_is_accepted(runtime_env):
     env = runtime_env
     app, model, _ = setup_chat(env)
-    app.supervisor.work_ready = app._admission_delivered
+    app.supervisor.work_ready = app._foreground_ready
     request = event(env, "找两张“松鼠”的表情包给我。")
     try:
         await intake(app, env, request)

@@ -83,6 +83,8 @@ class ToolReceipt(ToolData):
     # Added only by the host Gateway from reviewed registration + fresh policy.
     # Model arguments and output dictionaries cannot populate receipt metadata.
     required_tool_evidence: frozenset[Literal["process_run", "shell_command"]] = frozenset()
+    # Only a registered host toolset loader can populate this presentation metadata.
+    loaded_tools: frozenset[str] = frozenset()
 
 
 ISOLATED_PROCESS_TOOLS = frozenset({"process_run", "shell_command"})
@@ -186,6 +188,7 @@ class ToolDefinition(Generic[InputT, OutputT]):
     required_roles: frozenset[Role] = frozenset({Role.OWNER, Role.MEMBER})
     resource_scopes: tuple[str, ...] = ("group", "work", "workspace")
     risk_class: str = "local_draft"
+    concurrency_safe: bool = False
     timeout_seconds: float = 60.0
     max_input_bytes: int = 256_000
     max_output_bytes: int = 256_000
@@ -197,6 +200,7 @@ class ToolDefinition(Generic[InputT, OutputT]):
     control_kind: Literal["request_input"] | None = None
     may_request_input: bool = False
     required_tool_family: Literal["isolated_process"] | None = None
+    toolset_loader: bool = False
 
     def describe(self) -> dict[str, Any]:
         return {

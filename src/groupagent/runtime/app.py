@@ -26,6 +26,7 @@ from groupagent.channels.local import LocalChannel
 from groupagent.config import AppConfig, ConfigError
 from groupagent.conversation.intent import explicitly_requires_execution, new_work_intent
 from groupagent.conversation.participation import outside_quotes
+from groupagent.conversation.policy import policy_intent
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import CoordinationResult, Decision
@@ -100,7 +101,7 @@ class RuntimeApp:
             default_valid_days=self.config.schedule.default_valid_days,
         )
         if self.config.runtime.channel == "agentwechat":
-            self.supervisor.work_ready = self._admission_delivered
+            self.supervisor.work_ready = self._foreground_ready
         self.stop = asyncio.Event()
         self.instance_id = "runtime:" + uuid4().hex
         self._last_arrival = self._first_arrival = 0.0
@@ -143,15 +144,19 @@ class RuntimeApp:
             pass  # Revalidate membership and restore/policy fences on every use.
         return actor
 
-    def _admission_delivered(self, work) -> bool:
-        """Keep native attachment I/O behind the useful initial work response."""
+    def _foreground_ready(self, work) -> bool:
+        """Give the initial reply a head start without making speech a work dependency."""
         with self.store.transaction(self.technical) as tx:
             row = tx.conn.execute(
-                "SELECT state FROM ga_deliveries WHERE group_id=%s AND request_event_id=%s "
+                "SELECT state,created_at FROM ga_deliveries WHERE group_id=%s AND request_event_id=%s "
                 "AND idempotency_key=%s",
                 (tx.group_id, work.request_event_id, "reply:" + work.request_event_id + ":1"),
             ).fetchone()
-        return row is None or row["state"] == "accepted"
+        return (
+            row is None
+            or row["state"] in {"accepted", "rejected"}
+            or (datetime.now(UTC) - row["created_at"]).total_seconds() >= 2
+        )
 
     async def start(self) -> None:
         self._fence_application()
@@ -445,7 +450,20 @@ class RuntimeApp:
             event
             for event in events
             if event.kind in {EventKind.TEXT, EventKind.QUOTE}
-            and control_request(event.text, identity=self.identity) is not None
+            and (
+                control_request(event.text, identity=self.identity) is not None
+                or policy_intent(
+                    event,
+                    {
+                        **self.identity.context(),
+                        "role": "owner"
+                        if event.actor_id in self.config.group.owner_ids
+                        else "member",
+                        "group_time_zone": self.config.group.time_zone,
+                    },
+                )
+                is not None
+            )
         ]
         if controls:
             await self._process(controls[0])
@@ -927,6 +945,8 @@ def build_app(
         chunk_characters=config.runtime.message_chunk_characters,
         time_zone=config.group.time_zone,
         quiet_hours=config.group.quiet_hours,
+        participation_mode=config.group.participation_mode,
+        identity=BotIdentity.from_runtime(config.runtime),
     )
     app = RuntimeApp(
         coordinator,

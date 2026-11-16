@@ -27,7 +27,7 @@ from .test_toolkit_contract import toolkit_setup as toolkit_setup
 
 QUESTION = "请联网检索官方资料，简短说明两个操作的区别，提供实际来源链接和访问时间。"
 URL = "https://example.com/reference"
-WEB_TOOLS = {"request_input", "web_search", "web_fetch", "browser_open"}
+WEB_TOOLS = {"request_input", "web_search", "web_fetch", "web_read", "browser_open"}
 
 
 @pytest.mark.parametrize(

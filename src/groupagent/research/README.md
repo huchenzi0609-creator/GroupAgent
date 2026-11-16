@@ -35,11 +35,58 @@ Search additionally shares a 16,000-byte UTF-8 budget across all returned titles
 snippets, summaries and content, divided equally among admitted results; original
 prefixes carry explicit truncation markers while URLs, timestamps and provenance
 are retained, and the normalized-output hard limit still applies.
+When content is requested, metadata has separate shares so a long snippet cannot
+consume the entire body allowance.
 The low-level client performs no implicit retries. Timeout, rate-limit,
 authentication, insufficient balance, unavailable-page and policy errors remain
 distinct and sanitized.
 `cost_meter` identifies provider request accounting; read-only does not mean free.
 Daily monetary budgets remain a control-plane responsibility.
+
+## Received evidence and research sessions (2026-11-16)
+
+`register_research_tools(...)` now returns a `ResearchSession`. Its optional
+`session=` argument accepts `ResearchSession(client, EvidenceStore(root),
+question=work.goal)`; alternatively pass `evidence_store=`. Existing calls keep
+working and use `.research-evidence` inside the scoped work workspace. Registration
+does not add any tool to a work grant. `web_read` is a separately granted local
+continuation tool alongside `web_search` and `web_fetch`.
+
+The host-only `search_received`/`fetch_received` transport methods preserve
+received source bodies under the existing 2,000,000-byte HTTP response guard.
+The session saves immutable UTF-8 blobs before projecting model-visible text.
+The default scope storage bound is 32,000,000 bytes. Receipt `evidence_ref`
+manifests bind group/work/member, source URL, operation, evidence kind, retrieval
+time and full-body hash; they contain no model-chosen filesystem paths. Source
+identities and byte hashes are checked on restore and every local/cache read,
+and symlinks are refused. The response's normal `content_sha256` still hashes
+only the actual returned excerpt; `evidence_ref.content_sha256` hashes the saved
+received body. Neither proves that an upstream page was complete.
+
+Successful reads cache by actual normalized provider arguments and canonical
+URL, rather than model call ID. Concurrent duplicate requests join one in-flight
+read. Each invocation still passes current gateway authorization; a hit returns
+the original retrieval time, citation and actual fee receipt without another
+HTTP request or reservation. Failures, unknown fees and failed attempts are not
+cached or refunded. `refresh=true` explicitly requests a new external observation;
+it is a session control and is never forwarded as a provider API parameter.
+Restoration uses successful trusted gateway receipts and their manifests, so
+JSON key order has no semantic effect and no new business database is required.
+
+Model projections share a deterministic CJK/identifier passage ranker with
+`project_research_sources`, the independent review projection. Search text has
+per-field shares and a collection bound; fetching keeps a small relevant view.
+`web_read(source_id, query=...)` locates other saved passages without network
+access. Without a query, `offset` and `limit` are UTF-8 byte positions/bounds and
+`next_offset` permits exact continuation. A saved search body remains a search
+observation even when read locally. Stored content remains untrusted data.
+
+`tests/research/test_session.py` verifies cache/singleflight fee accounting,
+JSON-order-independent restart, actual citation preservation, local tail reads,
+Chinese ranking, field/UTF-8 bounds, explicit refresh, independent partial failure,
+fresh authorization, work separation, tampering and symlink rejection using only
+synthetic data and `httpx.MockTransport`. This is offline evidence, not live web
+quality, native delivery or production acceptance.
 
 Protocol references checked 2026-11-13: [Search and Fetch guide](https://api-docs.deepseek.com/guides/search/),
 [Search API](https://api-docs.deepseek.com/api/search/), and
@@ -133,14 +180,18 @@ fixed content profiles accept HTML for discovery and JPEG/PNG/WebP/GIF for
 import. Private/ambiguous targets, credentials, non-image MIME, authentication
 denials, access challenges and encoded responses fail explicitly. Every redirect
 is checked again, including a public image CDN redirect. Owned HTTP clients close
-after each request operation. The default discovery cap is 1 MiB per page, six
-page attempts and 100 retained candidate IDs per execution; retained distinct
-images use the media service's configured byte/pixel/count limits (at most
-15 MiB, 40 MP and ten images). Download attempts have a separate cap of
-`min(12, max_images * 3)`: a MIME failure consumes one attempt without occupying a
-retained-image slot, so the four-image PoT profile can still find replacement
-images. Image imports run serially within the service and share the existing
-isolated worker. No generic binary-download tool is exposed.
+after each request operation. The default discovery bound is 1 MiB per page and
+twenty returned candidate IDs per observation. Resident metadata uses LRU frames
+of six pages, 100 candidates and 100 imported references. Eviction is not a task
+quota: the registrar restores an evicted requested page/candidate and its validated
+import from scoped trusted receipts without another HTTP request or decode.
+Default cumulative image, download and discovery quotas are disabled (`None`).
+Owners may explicitly set positive `max_images`, `max_download_attempts` and
+`max_discovery_attempts`; those quotas still account for actual failed attempts
+and survive receipt restoration. The media service's configured image count
+bounds a single analysis batch, not all imports in a work. Single-image byte and
+pixel bounds remain at most 15 MiB and 40 MP. Imports run serially and share the
+existing isolated worker. No generic binary-download tool is exposed.
 
 Untrusted image bytes go through `MediaService.ingest_image` and the existing
 `image_validate` sandbox operation before artifact registration. Declared MIME
@@ -178,7 +229,11 @@ inert discovery, work/actor scope, receipt recovery and source withdrawal. The
 RecordingGateway regression uses an in-memory registry fixture to check that two
 successful imports, MIME failures, final selections and historical limit/recovery
 errors survive repeated restoration. Separate tests verify replacement images,
-distinct-image cardinality and both page/download limits across restarts. The
+distinct-image cardinality and explicit page/download quotas across restarts.
+The default profile also verifies thirteen failed candidate downloads followed
+by ten distinct imports while the analysis batch remains four and the decoder
+peak remains one. A deliberately small LRU frame verifies bounded metadata and
+receipt-based reuse of evicted targets across eight pages and a restart. The
 fixture worker calls the real decoder in process only for these generated test
 bytes; this is not new Docker isolation, live web coverage, rendered Word or
 native channel acceptance evidence. No live provider request or production data

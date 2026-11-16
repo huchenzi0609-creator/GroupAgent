@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from groupagent.domain import DomainError
+from groupagent.runtime.tool_profiles import build_tool_profile
 from groupagent.runtime.toolkit import (
     _has_internal_research_metrics,
     _research_metrics_requested,
@@ -198,7 +199,19 @@ async def test_long_actual_fetch_retains_separate_byte_and_codepoint_evidence(
     review = setup.model.requests[0]
     payload = json.loads(review.messages[1].content)
     narrative = payload["tool_evidence"][0]["output"]
-    assert len(narrative) == 5000 and "content_bytes_returned" not in narrative
+    assert 0 < len(narrative) <= 5000
+    manifest = json.loads(narrative)
+    assert len(manifest["sources"]) == 1
+    recorded_source = manifest["sources"][0]
+    assert recorded_source["source_id"] == source["source_id"]
+    assert recorded_source["citation"] == source["citation"]
+    assert recorded_source["content_sha256"] == source["content_sha256"]
+    assert recorded_source["evidence_ref"] == source["evidence_ref"]
+    assert "content" not in recorded_source and "content_bytes_returned" not in narrative
+    body = payload["research_source_content"]
+    assert len(body) == 1 and body[0]["received_content_excerpt"] == raw_content
+    assert body[0]["excerpt_complete_for_received_content"]
+    assert not body[0]["omitted_received_content"]
     metrics = payload["research_source_metrics"]
     assert len(metrics) == 1
     actual = metrics[0]
@@ -209,13 +222,19 @@ async def test_long_actual_fetch_retains_separate_byte_and_codepoint_evidence(
     assert actual["observed_content_utf8_bytes"] == len(content.encode("utf-8"))
     assert actual["observed_content_unicode_codepoints"] == len(content)
     assert actual["truncated_fields"] == ["content"]
-    assert (
-        "UTF-8字节" in review.messages[0].content and "Unicode码点数" in review.messages[0].content
+    guidance = review.messages[0].content
+    assert all(
+        name in guidance
+        for name in (
+            "UTF-8",
+            "receipt_content_bytes_",
+            "observed_content_unicode_codepoints",
+        )
     )
     instructions = json.loads(run.prepared.request.objective)["instructions"]
-    assert any(
-        "omit unrequested internal fetch/read/truncation sizes" in item for item in instructions
-    )
+    profile = build_tool_profile(run.prepared.request.allowed_tools)
+    assert profile.families == ("research",)
+    assert set(profile.instructions) <= set(instructions)
 
 
 @pytest.mark.postgres
@@ -242,7 +261,9 @@ async def test_requested_literal_and_translation_reach_semantic_review_unchanged
     assert accepted.checks["result"] and len(setup.model.requests) == 1
     payload = json.loads(setup.model.requests[-1].messages[1].content)
     assert payload["answer"] == answer and payload["research_source_metrics"]
-    assert "被引用数据" in setup.model.requests[-1].messages[0].content
+    assert payload["original_request"]["text"] == request
+    assert payload["validation_phase"] == "pre_delivery"
+    assert payload["research_source_content"]
     setup.model.passed = False
     bad_answer = answer + "\nThe tool returned 15000 bytes."
     with pytest.raises(DomainError):
