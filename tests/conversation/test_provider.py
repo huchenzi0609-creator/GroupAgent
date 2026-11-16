@@ -112,22 +112,37 @@ async def test_empty_attachment_and_file_catalogs_remain_explicit_during_repair(
         assert catalog["attachment_event_ids"] == catalog["file_versions"] == []
         assert event.id in catalog["source_event_ids"]
         schema = json.loads(request.messages[0].content.split("Decision schema:\n", 1)[1])
-        assert schema["properties"]["input_event_ids"]["maxItems"] == 0
-        assert schema["properties"]["input_versions"]["maxItems"] == 0
+        fields = next(
+            item["properties"]
+            for item in schema["oneOf"]
+            if item["properties"]["kind"]["const"] == "start_work"
+        )
+        assert fields["input_event_ids"]["maxItems"] == 0
+        assert fields["input_versions"]["maxItems"] == 0
 
 
 def test_catalog_specific_input_schema_is_bounded_without_changing_static_compatibility():
     dynamic = decision_schema(
         {"attachment_event_ids": ["synthetic-b", "synthetic-a"], "file_versions": ["version-a"]}
     )
-    assert dynamic["properties"]["input_event_ids"]["items"] == {
+    fields = next(
+        item["properties"]
+        for item in dynamic["oneOf"]
+        if item["properties"]["kind"]["const"] == "start_work"
+    )
+    assert fields["input_event_ids"]["items"] == {
         "type": "string",
         "enum": ["synthetic-a", "synthetic-b"],
     }
-    assert dynamic["properties"]["input_versions"]["items"]["enum"] == ["version-a"]
+    assert fields["input_versions"]["items"]["enum"] == ["version-a"]
     static = decision_schema()
-    assert static["properties"]["input_event_ids"]["items"] == {"type": "string"}
-    assert static["properties"]["input_versions"]["maxItems"] == 20
+    fields = next(
+        item["properties"]
+        for item in static["oneOf"]
+        if item["properties"]["kind"]["const"] == "start_work"
+    )
+    assert fields["input_event_ids"]["items"] == {"type": "string"}
+    assert fields["input_versions"]["maxItems"] == 20
 
 
 def decision(kind="reply", **values):

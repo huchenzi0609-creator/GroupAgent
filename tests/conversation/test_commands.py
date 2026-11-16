@@ -105,9 +105,7 @@ def test_live_command_has_action_and_backend_text_while_legacy_actions_stay_read
         )
         assert Decision.model_validate_json(value.model_dump_json()) == value
     schema = decision_schema()
-    conditions = {
-        item["if"]["properties"]["kind"]["const"]: item["then"] for item in schema["allOf"]
-    }
+    conditions = {item["properties"]["kind"]["const"]: item for item in schema["oneOf"]}
     assert "action" in conditions["command"]["required"]
-    assert conditions["command"]["properties"]["response"] == {"type": "null"}
-    assert conditions["reply"]["properties"]["action"] == {"type": "null"}
+    assert "response" not in conditions["command"]["properties"]
+    assert "action" not in conditions["reply"]["properties"]

@@ -23,7 +23,17 @@ dependencies = [
 groupagent = "groupagent.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8.3,<10", "pytest-asyncio>=1,<2", "ruff>=0.11,<1", "mypy>=1.15,<2", "hypothesis>=6,<7", "hatchling==1.33.0", "pip-audit>=2.9,<3", "pip-licenses>=5,<6"]
+dev = [
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=1,<2",
+    "ruff>=0.11,<1",
+    "mypy>=1.15,<2",
+    "hypothesis>=6,<7",
+    "hatchling==1.33.0",
+    "pip-audit>=2.9,<3",
+    "pip-licenses>=5,<6",
+    "jsonschema==4.26.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/groupagent"]

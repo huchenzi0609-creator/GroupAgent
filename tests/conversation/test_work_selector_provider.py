@@ -149,13 +149,11 @@ def test_live_schema_requires_selector_while_internal_legacy_decision_remains_re
     schema = decision_schema()
     assert "WorkSelector" in schema["$defs"]
     condition = next(
-        item["then"]
-        for item in schema["allOf"]
-        if item["if"]["properties"]["kind"]["const"] == "control_work"
+        item for item in schema["oneOf"] if item["properties"]["kind"]["const"] == "control_work"
     )
     assert "work_selector" in condition["required"]
     assert "target_work_id" not in condition["required"]
-    assert condition["properties"]["target_work_id"] == {"type": "null"}
+    assert "target_work_id" not in condition["properties"]
 
 
 def test_selector_and_legacy_exact_target_cannot_disagree():
@@ -215,14 +213,12 @@ def test_query_schema_and_candidate_require_backend_state_instead_of_model_statu
     assert Decision.model_validate_json(rendered.model_dump_json()) == rendered
     schema = decision_schema()
     condition = next(
-        item["then"]
-        for item in schema["allOf"]
-        if item["if"]["properties"]["kind"]["const"] == "query_work"
+        item for item in schema["oneOf"] if item["properties"]["kind"]["const"] == "query_work"
     )
     assert "work_selector" in condition["required"]
     assert "expected_revision" not in condition["required"]
     for name in ("response", "goal", "action", "control", "target_work_id"):
-        assert condition["properties"][name] == {"type": "null"}
+        assert name not in condition["properties"]
 
 
 def test_legacy_query_exact_reference_is_internal_read_compatibility():

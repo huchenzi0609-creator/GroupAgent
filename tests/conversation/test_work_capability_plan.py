@@ -69,21 +69,23 @@ def test_other_decision_kinds_cannot_carry_a_work_capability_plan(kind, fields):
 
 def test_live_schema_requests_work_plan_without_changing_selector_or_output_contracts():
     schema = decision_schema()
-    for condition in schema["allOf"]:
-        kind = condition["if"]["properties"]["kind"]["const"]
-        then = condition["then"]
+    for then in schema["oneOf"]:
+        kind = then["properties"]["kind"]["const"]
         if kind in {"start_work", "update_work"}:
             assert "work_capabilities" in then["required"]
         else:
-            assert then["properties"]["work_capabilities"] == {"type": "array", "maxItems": 0}
-            assert then["properties"]["public_image_count"] == {"type": "null"}
+            assert "work_capabilities" not in then["properties"]
+            assert "public_image_count" not in then["properties"]
     assert schema["$defs"]["WorkSelector"]["required"] == [
         "basis",
         "states",
         "requester_scope",
         "quantifier",
     ]
-    assert schema["properties"]["outputs"]["items"]["properties"]["format"]["enum"] == [
+    work_branch = next(
+        item for item in schema["oneOf"] if item["properties"]["kind"]["const"] == "start_work"
+    )
+    assert work_branch["properties"]["outputs"]["items"]["properties"]["format"]["enum"] == [
         "text",
         "md",
         "docx",
