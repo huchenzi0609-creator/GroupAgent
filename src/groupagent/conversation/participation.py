@@ -20,6 +20,25 @@ from .text import QUOTED as _QUOTED
 from .text import outside_quotes as outside_quotes
 from .turns import verified_human_addressee as verified_human_addressee
 
+
+def explicit_policy_intent(event: GroupEvent, context: dict[str, Any]) -> PolicyIntent | None:
+    """Reserve synchronous handling for standalone participation controls."""
+    if event.kind not in {EventKind.TEXT, EventKind.QUOTE} or _QUOTED.search(event.text):
+        return None
+    text = BotIdentity.from_context(context).strip_address(event.text).strip(" 。！!\t\n")
+    if not re.fullmatch(
+        r"(?:(?:请|先|暂时|对我|我这边)\s*)*"
+        r"(?:(?:保持(?:安静|静默)|静默|安静|别说话|别插话)(?:[，,]\s*等我叫你)?|解除(?:安静|静默)|"
+        r"没叫你就别(?:回应|回复)[，,]\s*(?:先)?(?:安静|静默)|"
+        r"(?:不用|无需|不必)再?(?:保持)?(?:安静|静默)(?:了)?|"
+        r"恢复正常(?:参与|交流)|(?:暂停|停止|关闭|启用|恢复|开启)全群处理|"
+        r"重新启用(?:本群|这个群|当前群|全群))",
+        text,
+    ):
+        return None
+    return policy_intent(event, context)
+
+
 _OUTER_ASK = re.compile(r"解释|翻译|分析|总结|评价|判断|比较|核对|为什么|如何|怎么|[?？]")
 _SOURCE_LABEL = re.compile(r"^(?:引用|引述|转述|转发)(?:的)?(?:原文|原话|内容|消息)?\s*[：:]")
 _SOURCE_DISCLAIMER = re.compile(

@@ -13,13 +13,13 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from pydantic import AwareDatetime, Field, JsonValue
+from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
 from groupagent.domain import ActorContext, DomainError, ExecutionLease, Role, WorkOrder
 from groupagent.memory.common import memory_lock, source_rows
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.scheduling import Scheduler
-from groupagent.scheduling.models import Schedule, Timing
+from groupagent.scheduling.models import PreparedMessage, Schedule, Timing
 from groupagent.scheduling.triggers import EventTriggerService, TriggerRule, TriggerType
 from groupagent.tools import IdempotencyMode, ToolContext, ToolData, ToolDefinition, ToolGateway
 from groupagent.tools.models import ToolFailure
@@ -32,10 +32,26 @@ class ListRules(ToolData):
 
 class CreateSchedule(ToolData):
     title: str = Field(min_length=1, max_length=200)
-    goal: str = Field(min_length=1, max_length=4096)
+    goal: str | None = Field(default=None, min_length=1, max_length=4096)
+    prepared_message: PreparedMessage | None = None
+    fact_source_ids: list[str] = Field(default_factory=list, max_length=20)
+    allow_silent_result: bool = Field(
+        default=False,
+        strict=True,
+        description="Enable only if the requester explicitly allows future work to finish silently "
+        "when there is nothing to report.",
+    )
     timing: Timing
     time_zone: str = Field(default="Asia/Shanghai", min_length=1, max_length=100)
     valid_until: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def single_payload(self) -> CreateSchedule:
+        if (self.goal is None) == (self.prepared_message is None):
+            raise ValueError("Provide one future goal or prepared message")
+        if self.allow_silent_result and self.prepared_message is not None:
+            raise ValueError("Only a future goal may allow a silent result")
+        return self
 
 
 class UpdateSchedule(ToolData):
@@ -43,6 +59,13 @@ class UpdateSchedule(ToolData):
     expected_revision: int = Field(ge=1, strict=True)
     title: str | None = Field(default=None, min_length=1, max_length=200)
     goal: str | None = Field(default=None, min_length=1, max_length=4096)
+    prepared_message: PreparedMessage | None = None
+    fact_source_ids: list[str] | None = Field(default=None, max_length=20)
+    allow_silent_result: bool | None = Field(
+        default=None,
+        strict=True,
+        description="Omit to keep the existing setting. Set false to require a delivered result.",
+    )
     timing: Timing | None = None
     time_zone: str | None = Field(default=None, min_length=1, max_length=100)
     valid_until: AwareDatetime | None = None
@@ -67,9 +90,12 @@ class RuleReceipt(ToolData):
     id: str
     revision: int
     state: str
+    next_due_at: AwareDatetime | None = None
+    time_zone: str | None = None
     valid_until: AwareDatetime
     recorded_at: AwareDatetime
     replayed: bool = False
+    allow_silent_result: bool | None = None
 
 
 class RuleList(ToolData):
@@ -90,8 +116,13 @@ def _receipt(value: Schedule | TriggerRule, now: datetime) -> RuleReceipt:
         id=value.id,
         revision=value.revision,
         state=value.state,
+        next_due_at=value.next_due_at if isinstance(value, Schedule) else None,
+        time_zone=value.time_zone if isinstance(value, Schedule) else None,
         valid_until=value.valid_until if isinstance(value, Schedule) else value.expires_at,
         recorded_at=now,
+        allow_silent_result=value.scope.get("allow_silent_result") is True
+        if isinstance(value, Schedule)
+        else None,
     )
 
 
@@ -108,6 +139,11 @@ def _rule_sources(tx: UnitOfWork, value: Schedule | TriggerRule) -> None:
             raise DomainError(
                 "scope_violation", "Private-topic rules are not exposed by these tools"
             )
+    if isinstance(value, Schedule) and "schedule_fact_source_ids" in value.scope:
+        # Timer grants survive expiry of the original chat text. A tool control
+        # requires its new human request and the current rule revision.
+        tx._scope(value.scope)
+        return
     fingerprints = value.scope.get("source_fingerprints", {})
     if not isinstance(fingerprints, dict):
         raise DomainError("source_unavailable", "Rule source scope is invalid")
@@ -259,8 +295,10 @@ def register_scheduling_tools(
         def action(tx: UnitOfWork, current: WorkOrder, now: datetime, key: str) -> RuleReceipt:
             raw = current.scope.get("source_fingerprints", {})
             assert isinstance(raw, dict)
-            fingerprints = dict(raw)
-            fingerprints[current.request_event_id] = tx.event_fingerprint(current.request_event_id)
+            if len(set(value.fact_source_ids)) != len(value.fact_source_ids) or not set(
+                value.fact_source_ids
+            ) <= set(raw):
+                raise DomainError("source_unavailable", "Schedule evidence was not in this work")
             result = scheduler.in_tx(tx).create(
                 actor,
                 value.title,
@@ -271,12 +309,17 @@ def register_scheduling_tools(
                 valid_until=_ttl(value.valid_until, now),
                 request_key=key,
                 budget=current.budget,
+                prepared_message=value.prepared_message,
+                authorization_event_id=current.request_event_id,
+                allow_silent_result=value.allow_silent_result,
                 scope={
                     "allowed_group_ids": [actor.group_id],
                     "delivery_target": "origin_group",
                     "external_account_changes": False,
-                    "source_fingerprints": fingerprints,
-                    "source_event_ids": list(fingerprints),
+                    "source_fingerprints": {key: raw[key] for key in value.fact_source_ids},
+                    "schedule_fact_source_ids": [
+                        identifier for identifier in value.fact_source_ids
+                    ],
                     "origin_source_work_id": current.id,
                     "derived_depth": 1,
                     "schedule_creation_allowed": False,
@@ -291,12 +334,23 @@ def register_scheduling_tools(
             service = scheduler.in_tx(tx)
             original = service.get(actor, value.schedule_id)
             _rule_sources(tx, original)
+            raw = current.scope.get("source_fingerprints", {})
+            assert isinstance(raw, dict)
+            sources = value.fact_source_ids
+            if sources is not None and (
+                len(set(sources)) != len(sources) or not set(sources) <= set(raw)
+            ):
+                raise DomainError("source_unavailable", "Schedule evidence was not in this work")
             result = service.update(
                 actor,
                 value.schedule_id,
                 expected_revision=value.expected_revision,
                 title=value.title,
                 goal=value.goal,
+                prepared_message=value.prepared_message,
+                authorization_event_id=current.request_event_id,
+                fact_source_ids=sources,
+                allow_silent_result=value.allow_silent_result,
                 timing=value.timing,
                 time_zone=value.time_zone,
                 valid_until=_ttl(value.valid_until or original.valid_until, now),
@@ -382,7 +436,9 @@ def register_scheduling_tools(
             "schedule_create",
             CreateSchedule,
             create_schedule,
-            "Create a finite at/every/daily/weekly follow-up, expiring within 30 days.",
+            "Create a finite at/every/daily/weekly rule. Supply prepared_message for text ready now, "
+            "or goal for work that requires a future execution. Mark explicit_reminder only when the "
+            "source directly grants the reminder and contains its exact wording.",
         ),
         (
             "schedule_update",

@@ -98,7 +98,7 @@ class DeepSeekHTTPModel:
         }
         if request.tools:
             body["tools"] = list(request.tools)
-            body["tool_choice"] = "auto"
+            body["tool_choice"] = request.tool_choice
         try:
             async with self._client.stream(
                 "POST",

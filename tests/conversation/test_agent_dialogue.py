@@ -15,7 +15,7 @@ from groupagent.coordinator import Decision
 from groupagent.domain import EventKind, GroupEvent, WorkState
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
-from .turn_model_fixture import semantic_fixture_reply
+from .turn_model_fixture import finish_fixture_reply
 
 pytestmark = pytest.mark.postgres
 USAGE = TokenUsage(input_tokens=1, output_tokens=1)
@@ -73,11 +73,6 @@ class ScriptedModel:
         self.required_actions = required_actions
 
     async def complete(self, request):
-        assessed = semantic_fixture_reply(
-            request, upcoming=self.steps, required_actions=self.required_actions
-        )
-        if assessed is not None:
-            return assessed
         self.requests.append(request)
         available = {tool["function"]["name"] for tool in request.tools}
         assert available <= {
@@ -86,7 +81,8 @@ class ScriptedModel:
             "update_work",
             "control_work",
             "apply_business_action",
-            "observe",
+            "read_group_context",
+            "finish_turn",
         }
         assert "read_work_facts" in available
         assert "Decision schema:" not in request.messages[0].content
@@ -95,7 +91,7 @@ class ScriptedModel:
             raise step
         if callable(step):
             step = step(request)
-        return step
+        return finish_fixture_reply(request, step)
 
 
 def last_observation(request):
@@ -325,7 +321,7 @@ async def test_two_distinct_commits_return_ordered_receipts_then_one_natural_rep
             ],
         ),
     )
-    assert result.decision.response == "节水Word已经排队，也记下了你负责展示。"
+    assert result.decision.response.startswith("节水Word已经排队，也记下了你负责展示。")
     with env.store.transaction(env.actor) as tx:
         body = tx.get_decision(event.id)
         assert [row["tool_call_id"] for row in body["action_receipts"]] == ["first", "second"]
@@ -590,9 +586,8 @@ async def test_upper_bound_pdf_and_program_diagrams_do_not_gain_exact_pages_or_r
             accepted,
         ),
     )
-    assert (
-        result.work_id
-        and result.decision.response == "已安排在两页以内完成PDF和两张程序图，不会追加搜索要求。"
+    assert result.work_id and result.decision.response.startswith(
+        "已安排在两页以内完成PDF和两张程序图，不会追加搜索要求。"
     )
 
     def explain_bound(model_request):

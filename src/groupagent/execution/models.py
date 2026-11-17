@@ -79,6 +79,7 @@ class ModelRequest(EngineData):
     messages: tuple[ModelMessage, ...]
     tools: tuple[dict[str, Any], ...]
     max_output_tokens: int = Field(ge=1)
+    tool_choice: Literal["auto", "required"] = "auto"
 
 
 class ModelReply(EngineData):

@@ -40,6 +40,7 @@ from groupagent.domain import (
     TeamTaskState,
     WorkOrder,
     WorkState,
+    allows_silent_result,
     check_transition,
 )
 from groupagent.persistence.delivery_knowledge import projected_delivery_state
@@ -1529,8 +1530,21 @@ class UnitOfWork:
                 "AND reason IS NOT DISTINCT FROM 'candidate_superseded_before_dispatch')",
                 (self.group_id, work_id, row["goal_revision"]),
             ).fetchall()
-            if not deliveries or any(
-                item["state"] != DeliveryState.ACCEPTED for item in deliveries
+            silent = (
+                not deliveries
+                and reason == "authorized_silence"
+                and lease is not None
+                and allows_silent_result(row["scope"])
+                and self.conn.execute(
+                    "SELECT 1 FROM ga_work_validations WHERE group_id=%s AND work_id=%s "
+                    "AND goal_revision=%s AND check_key='silent_result' AND passed AND fencing_token=%s",
+                    (self.group_id, work_id, row["goal_revision"], lease.fencing_token),
+                ).fetchone()
+                is not None
+            )
+            if not silent and (
+                not deliveries
+                or any(item["state"] != DeliveryState.ACCEPTED for item in deliveries)
             ):
                 raise DomainError("delivery_incomplete", "Required delivery is not accepted")
         updated = self.conn.execute(

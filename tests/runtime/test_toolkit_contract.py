@@ -818,14 +818,14 @@ async def test_semantic_review_evidence_is_version_bound_redacted_and_privacy_re
         assert "_runtime_semantic_reviews" not in tx.get_work(run.work.id).scope
 
 
-async def test_trusted_scheduled_reminder_names_recipient_work_not_agent_work(toolkit_setup):
+async def test_preupgrade_reminder_work_keeps_recipient_scope_and_literal_validation(toolkit_setup):
     setup, env = toolkit_setup, toolkit_setup.env
     authorization = source(env, "一小时后只提醒我检查作业，不需要代我检查")
     now = datetime.now(UTC)
     scheduler = Scheduler(env.store)
     with env.store.transaction(env.actor) as tx:
         fingerprints = {authorization.id: tx.event_fingerprint(authorization.id)}
-    scheduler.create(
+    rule = scheduler.create(
         env.actor,
         "Synthetic reminder",
         "检查作业",
@@ -838,11 +838,21 @@ async def test_trusted_scheduled_reminder_names_recipient_work_not_agent_work(to
             "source_fingerprints": fingerprints,
         },
     )
-    occurrence = scheduler.due(env.actor, now + timedelta(hours=1))[0]
     with env.store.transaction(env.actor) as tx:
-        work = tx.get_work(occurrence.work_id)
-        lease = tx.claim_work(work.id, "reminder-fixture", ttl_seconds=300)
-        work = tx.get_work(work.id)
+        # Represent an already-admitted WorkOrder from the previous scheduler.
+        # A fresh wakeup would enqueue this verified literal directly.
+        row = scheduler._row(tx, rule.id)
+        due_at = now + timedelta(hours=1)
+        occurrence = scheduler._occurrence(tx, row, due_at)
+        assert occurrence is not None
+        work_id = scheduler._admit_goal(tx, row, occurrence, due_at, fingerprints)
+        tx.conn.execute(
+            "UPDATE ga_schedule_occurrences SET state='enqueued',work_id=%s "
+            "WHERE group_id=%s AND id=%s",
+            (work_id, tx.group_id, occurrence["id"]),
+        )
+        lease = tx.claim_work(work_id, "reminder-fixture", ttl_seconds=300)
+        work = tx.get_work(work_id)
     workspace = env.root / work.id
     workspace.mkdir()
     prepared = await setup.toolkit.prepare(work, lease, env.actor, workspace)

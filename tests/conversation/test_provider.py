@@ -29,7 +29,7 @@ from groupagent.conversation.timeparse import normalize_time, shift_timing
 from groupagent.domain import DomainError, EventKind, GroupEvent
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
-from .turn_model_fixture import semantic_fixture_reply
+from .turn_model_fixture import finish_fixture_reply
 
 
 def test_catalog_specific_input_schema_is_bounded_without_changing_static_compatibility():
@@ -465,14 +465,11 @@ class ModelFixture:
         self.steps, self.requests = list(steps), []
 
     async def complete(self, request):
-        assessed = semantic_fixture_reply(request, upcoming=self.steps)
-        if assessed is not None:
-            return assessed
         self.requests.append(request)
         step = self.steps.pop(0)
         if isinstance(step, BaseException):
             raise step
-        return step(request) if callable(step) else step
+        return finish_fixture_reply(request, step(request) if callable(step) else step)
 
 
 def text_reply(text):
@@ -503,14 +500,7 @@ async def test_ordinary_natural_text_survives_without_decision_json_or_actions(e
     result = await ModelDecisionProvider(model).decide(environment.event, environment.context)
     assert result.kind == "reply" and result.response == answer and result.action is None
     request = model.requests[0]
-    assert {tool["function"]["name"] for tool in request.tools} == {
-        "read_work_facts",
-        "start_work",
-        "update_work",
-        "control_work",
-        "apply_business_action",
-        "observe",
-    }
+    assert {tool["function"]["name"] for tool in request.tools} == {"finish_turn"}
     assert "Decision schema:" not in request.messages[0].content
 
 
@@ -539,7 +529,13 @@ async def test_invalid_action_is_observation_then_model_answers_current_question
         after_rejection,
     )
     provider = ModelDecisionProvider(model)
-    result = await provider.decide(environment.event, environment.context)
+
+    async def unexpected_apply(candidate, identifier):
+        raise AssertionError("A candidate without an authorization must not be executed")
+
+    result = await provider.decide(
+        environment.event, {**environment.context, "_apply_business_action": unexpected_apply}
+    )
     assert result.response == "你当前没有给另一位成员分工的权限。"
     assert provider.diagnostics[0]["code"] == "business_action_rejected"
 

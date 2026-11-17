@@ -29,8 +29,8 @@ from groupagent.billing.prices import deepseek_20261114
 from groupagent.channels import AgentWechatAdapter, AgentWechatConfig, MemberRecord
 from groupagent.channels.local import LocalChannel
 from groupagent.config import AppConfig, ConfigError
-from groupagent.conversation.intent import new_work_intent
-from groupagent.conversation.policy import policy_intent, trusted_invocation_in_tx
+from groupagent.conversation.participation import explicit_policy_intent
+from groupagent.conversation.policy import trusted_invocation_in_tx
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import CoordinationResult, Decision
@@ -65,6 +65,7 @@ from .effect_reconciler import UnpublishedDraftReconciler
 from .executor import WorkSupervisor
 from .inputs import InputProcessor
 from .notices import NoticeService
+from .observers import ProactiveObserver
 from .resource_profile import controller_resources_ready, worker_limits
 from .roster import RosterRefresher
 from .state import RuntimeState
@@ -296,6 +297,7 @@ class RuntimeApp:
             self.resolve_actor,
             interval_seconds=self.config.conversation.min_progress_interval_seconds,
         )
+        self.observer: ProactiveObserver | None = None
 
     def resolve_actor(self, member_id: str) -> ActorContext:
         group = self.config.group
@@ -602,14 +604,7 @@ class RuntimeApp:
             pass
 
     def _bypass_batch(self, event: GroupEvent) -> bool:
-        """Prioritize an existing admission or trusted invocation, without grants."""
-        if (
-            event.kind == EventKind.TEXT
-            and not event.reply_to
-            and not event.attachments
-            and new_work_intent(event.text, identity=self.identity) is not None
-        ):
-            return True
+        """Prioritize a trusted invocation, without adding semantic grants."""
         with self.store.transaction(self.technical) as tx:
             return (
                 trusted_invocation_in_tx(
@@ -630,7 +625,7 @@ class RuntimeApp:
             if event.kind in {EventKind.TEXT, EventKind.QUOTE}
             and (
                 control_request(event.text, identity=self.identity) is not None
-                or policy_intent(
+                or explicit_policy_intent(
                     event,
                     {
                         **self.identity.context(),
@@ -662,17 +657,6 @@ class RuntimeApp:
             if echo:
                 await self._process(next(item for item in events if item.id == echo["id"]))
                 return 1
-        identities = [
-            event
-            for event in events
-            if self.coordinator._fast_identity_reply(event, self.identity.context()) is not None
-            and self._bypass_batch(event)
-        ]
-        if identities:
-            # A verified name response performs no model/tool call, so it can
-            # use the same responsive lane as controls during a slow dialogue.
-            await self._process(identities[0])
-            return 1
         if controls_only or not events:
             return 0
         now = time.monotonic()
@@ -691,13 +675,54 @@ class RuntimeApp:
             self._first_arrival = 0
         return 1
 
+    async def schedule_tick(self) -> float:
+        # The clock has its own bounded transaction and may wake work while an
+        # existing worker or maintenance batch is still active.
+        idle_check_seconds = 1.0
+        if self._closing or not self.config.features.durable_schedules:
+            return idle_check_seconds
+
+        def wake() -> float:
+            if self.coordinator.current_mode() in {"paused", "disabled"}:
+                return idle_check_seconds
+            scheduler = self.coordinator.scheduler
+            deadline = scheduler.next_wake(self.owner, fence=self._fence_application)
+            now = datetime.now(UTC)
+            if deadline is not None and deadline > now:
+                return min(idle_check_seconds, (deadline - now).total_seconds())
+            if deadline is not None and self._maintenance_lane.busy:
+                # The cleanup handler already yields between jobs. Do not let
+                # it start another batch while a due occurrence needs the lock.
+                self._maintenance_lane.request_stop()
+            scheduler.wake(self.owner, fence=self._fence_application)
+            return idle_check_seconds
+
+        operation = asyncio.create_task(asyncio.to_thread(wake))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await _drain_future(operation)
+            raise
+
+    async def observation_tick(self) -> None:
+        if (
+            self.observer is None
+            or self._closing
+            or self._processing
+            or self._maintenance_lane.busy
+            or self.coordinator.current_mode() in {"paused", "disabled"}
+        ):
+            return
+        if self.worker_governor and not controller_resources_ready(self.worker_governor):
+            return
+        await self.observer.tick()
+
     async def execute_tick(self) -> None:
         self._fence_application()
         if self._maintenance_lane.busy:
             return  # The foreground may chat; do not add another heavy writer.
         active = self.coordinator.current_mode() not in {"paused", "disabled"}
         if active and self.config.features.durable_schedules:
-            self.coordinator.scheduler.due(self.owner)
             self.triggers.poll(self.technical)
         if active:
             await self.supervisor.tick()
@@ -742,6 +767,7 @@ class RuntimeApp:
         memory.expire(
             self.technical,
             before=datetime.now(UTC) - timedelta(days=self.config.retention.raw_message_days),
+            limit=32 if self.config.resources.enabled else 1000,
         )
         self._fence_application()
         if self.cleanup:
@@ -781,11 +807,14 @@ class RuntimeApp:
             handler.artifacts.root, max_file_bytes=handler.artifacts.max_file_bytes
         ) as artifacts:
             handler.artifacts = artifacts
-            return await cleanup.run(self.technical)
+            return await cleanup.run(
+                self.technical, limit=12 if self.config.resources.enabled else 100
+            )
 
     async def step(self) -> dict[str, int]:
         received = await self.poll_intake()
         processed = await self.process_pending(batched=False)
+        await self.schedule_tick()
         await self.execute_tick()
         sent = await self.dispatcher.tick()
         return {"received": received, "processed": processed, "sent": sent}
@@ -802,14 +831,16 @@ class RuntimeApp:
             raise DomainError("runtime_busy", "Another application owns this group")
         self._application_lease = lease
 
-        async def loop(operation, delay, stop_event=None):
+        async def loop(operation, delay, stop_event=None, *, adaptive=False):
             stop_event = stop_event or self.stop
             failures = 0
             while not stop_event.is_set():
                 next_delay = delay
                 try:
                     self._fence_application()
-                    await operation()
+                    result = await operation()
+                    if adaptive:
+                        next_delay = max(0.025, float(result))
                     failures = 0
                 except DomainError as error:
                     if error.code in {"stale_lease", "policy_changed", "restore_pending"}:
@@ -817,7 +848,11 @@ class RuntimeApp:
                         self._maintenance_lane.request_stop()
                         raise
                     if error.code == "resource_deferred":
-                        next_delay = max(delay, self.config.resources.retry_seconds)
+                        if adaptive and self._maintenance_lane.busy:
+                            self._maintenance_lane.request_stop()
+                        next_delay = (
+                            delay if adaptive else max(delay, self.config.resources.retry_seconds)
+                        )
                     else:
                         self.state.alert(self.technical, error.code)
                         failures += 1
@@ -854,9 +889,14 @@ class RuntimeApp:
                     (self.roster.sync_pending, self.config.runtime.poll_seconds),
                     (self.execute_tick, self.config.runtime.poll_seconds),
                     (self.dispatcher.tick, self.config.runtime.poll_seconds),
+                    (self.observation_tick, max(3.0, self.config.runtime.poll_seconds)),
                     (self.maintenance, self.config.resources.maintenance_interval_seconds),
                 )
             )
+            if self.config.features.durable_schedules:
+                self._tasks.append(
+                    asyncio.create_task(loop(self.schedule_tick, 0.25, adaptive=True))
+                )
             done, _ = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
@@ -1217,6 +1257,7 @@ def build_app(
         identity=BotIdentity.from_runtime(config.runtime),
         bot_member_id=config.group.bot_member_id,
         shared_account=config.group.shared_account,
+        proactive_mode=config.conversation.proactive_mode,
     )
     app = RuntimeApp(
         coordinator,
@@ -1230,6 +1271,23 @@ def build_app(
         if config.resources.enabled
         else None,
     )
+
+    if config.conversation.proactive_mode != "off":
+
+        async def observe(source, observation, context):
+            return await decision_provider(owner, source).observe_event(
+                observation,
+                {
+                    **BotIdentity.from_runtime(config.runtime).context(),
+                    "group_time_zone": config.group.time_zone,
+                    "short_reply_style": config.conversation.short_reply_style,
+                    **context,
+                },
+            )
+
+        app.observer = ProactiveObserver(
+            store, owner, config, observe, fence=app._fence_application
+        )
 
     def busy(work_ids, event_ids):
         return bool(

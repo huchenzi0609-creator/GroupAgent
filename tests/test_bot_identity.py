@@ -194,7 +194,7 @@ def test_existing_identity_markers_are_normalized_once(text):
 
 
 async def test_actual_router_request_knows_its_name_and_preserves_human_self_claim():
-    requests, committed, assessments = [], [], []
+    requests, committed = [], []
 
     async def apply(candidate, identifier):
         committed.append(candidate)
@@ -209,35 +209,6 @@ async def test_actual_router_request_knows_its_name_and_preserves_human_self_cla
 
         async def complete(self, request):
             usage = TokenUsage(input_tokens=1, output_tokens=1)
-            marker = request.messages[0].content or ""
-            if marker.startswith("TURN_CONTRACT_V1"):
-                assessments.append(request)
-                return ModelReply(
-                    text=json.dumps(
-                        {
-                            "recipient": "agent",
-                            "intent": "action",
-                            "required_actions": [{"kind": "business", "operation": "claim_task"}],
-                        }
-                    ),
-                    usage=usage,
-                )
-            if marker.startswith("TURN_OUTCOME_V1"):
-                assessments.append(request)
-                evidence = json.loads(request.messages[1].content)["host_receipts"]
-                assert committed and evidence[0]["committed"]
-                assert evidence[0]["operation"] == "claim_task"
-                return ModelReply(
-                    text=json.dumps(
-                        {
-                            "outcome": "committed",
-                            "reply_required": True,
-                            "explanation": "Explicit synthetic human-task receipt.",
-                            "required_actions": [{"kind": "business", "operation": "claim_task"}],
-                        }
-                    ),
-                    usage=usage,
-                )
             requests.append(request)
             if len(requests) == 1:
                 return ModelReply(
@@ -259,19 +230,32 @@ async def test_actual_router_request_knows_its_name_and_preserves_human_self_cla
                 )
             )
             assert committed and observation["status"] == "committed"
-            return ModelReply(text="已记下你的分工。", usage=usage)
+            return ModelReply(
+                tool_calls=(
+                    ModelToolCall(
+                        id="finished",
+                        name="finish_turn",
+                        arguments={
+                            "disposition": "reply",
+                            "response": "已记下你的分工。",
+                            "reports": [{"tool_call_id": "human-self-claim", "phase": "committed"}],
+                        },
+                    ),
+                ),
+                finish_reason="tool_calls",
+                usage=usage,
+            )
 
     result = await ModelDecisionProvider(ExplicitOfflineModel()).decide(
         source("Pot，PPT我来负责，不用你代写。"), context(_apply_business_action=apply)
     )
     assert len(requests) == 2 and len(committed) == 1
-    assert len(assessments) == 2
     assert result.kind == "reply" and result.action is None
     assert result.response == "已记下你的分工。"
     system = requests[0].messages[0].content
     payload = json.loads(requests[0].messages[1].content)
     assert "Decision schema:" not in system
-    assert "正文不加context.bot_badge" in system
+    assert "正文不加身份标识" in system
     assert payload["context"]["agent_name"] == "Pot"
     assert "Pot" in payload["context"]["agent_aliases"]
     assert payload["context"]["bot_badge"] == "【Pot】"

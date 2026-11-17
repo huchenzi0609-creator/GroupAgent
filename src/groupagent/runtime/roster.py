@@ -83,6 +83,8 @@ class RosterRefresher:
                         fresh=result.state == "complete",
                         source="remote_refresh",
                         error_code=result.error_code,
+                        _memory_epoch_before=result.memory_epoch_before,
+                        _memory_epoch_after=result.memory_epoch_after,
                     )
                 except DomainError as error:
                     if error.code in {"stale_lease", "policy_changed", "restore_pending"}:

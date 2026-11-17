@@ -30,6 +30,7 @@ from groupagent.domain import (
     ExecutionLease,
     WorkOrder,
     WorkState,
+    allows_silent_result,
 )
 from groupagent.execution import (
     EngineCheckpoint,
@@ -1884,6 +1885,9 @@ class WorkSupervisor:
                 if (
                     not set(work.required_checks).issubset(candidate.checks)
                     or not candidate.deliveries
+                    and not candidate.silent_evidence
+                    or candidate.silent_evidence is not None
+                    and (candidate.deliveries or not allows_silent_result(work.scope))
                 ):
                     raise DomainError(
                         "validation_failed", "Validator omitted required checks or delivery"
@@ -1905,9 +1909,25 @@ class WorkSupervisor:
                 current = tx.get_work(work.id)
                 for name, evidence in candidate.checks.items():
                     tx.record_validation(work.id, lease, evidence, check_key=name, passed=True)
-                tx.transition_work(
+                if candidate.silent_evidence:
+                    tx.record_validation(
+                        work.id,
+                        lease,
+                        candidate.silent_evidence,
+                        check_key="silent_result",
+                        passed=True,
+                    )
+                validating = tx.transition_work(
                     work.id, WorkState.DELIVERING, expected_revision=current.revision, lease=lease
                 )
+                if candidate.silent_evidence:
+                    return tx.transition_work(
+                        work.id,
+                        WorkState.COMPLETED,
+                        expected_revision=validating.revision,
+                        lease=lease,
+                        reason="authorized_silence",
+                    )
                 self.state.enqueue_bundle_in_tx(tx, lease, candidate.deliveries)
             self._delivering[work.id] = owned
             return self._get(actor, work.id)

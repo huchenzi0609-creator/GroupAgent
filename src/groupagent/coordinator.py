@@ -104,6 +104,13 @@ class Decision(BaseModel):
         max_length=8,
         description="Requested capability families for this work plan, not permission or tool grants. The backend intersects the plan with trusted configuration and authorization.",
     )
+    required_work_tools: list[
+        Literal["python_compute", "process_run", "web_search", "web_fetch", "web_image_import"]
+    ] = Field(
+        default_factory=list,
+        max_length=5,
+        description="Actual tool methods required by the human. Use an empty list if no specific tool method is required. This evidence requirement does not grant tool access.",
+    )
     public_image_count: int | None = Field(
         default=None,
         ge=1,
@@ -124,7 +131,7 @@ class Decision(BaseModel):
         if self.kind in {"start_work", "update_work"} and not (self.goal and self.goal.strip()):
             _invalid_decision("decision_goal_required")
         if self.kind not in {"start_work", "update_work"}:
-            if self.work_capabilities:
+            if self.work_capabilities or self.required_work_tools:
                 _invalid_decision("decision_capabilities_kind")
             if self.public_image_count is not None or self.public_image_count_evidence is not None:
                 _invalid_decision("decision_image_count_kind")

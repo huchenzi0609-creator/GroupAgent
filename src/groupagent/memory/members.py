@@ -217,7 +217,7 @@ class MemberService:
             return RosterSyncResult(run_key=key, state="failed", error_code=code)
         with self.store.transaction(actor) as tx:
             technical(tx)
-            memory_lock(tx)
+            epoch_before = memory_lock(tx)
             names_changed = False
             for member in snapshot.members:
                 # Cached presence/absence never overrides reliable departure;
@@ -256,6 +256,7 @@ class MemberService:
                         snapshot.partial,
                     ),
                 )
+            epoch_after = epoch_before + int(names_changed)
             result = {"updated_members": len(snapshot.members), "partial": snapshot.partial}
             tx.conn.execute(
                 "UPDATE ga_roster_runs SET state='complete',result=%s,finished_at=clock_timestamp() "
@@ -277,6 +278,8 @@ class MemberService:
                 state="complete",
                 updated_members=len(snapshot.members),
                 partial=snapshot.partial,
+                memory_epoch_before=epoch_before,
+                memory_epoch_after=epoch_after,
             )
 
     def apply_membership(

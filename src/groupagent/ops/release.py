@@ -24,13 +24,32 @@ def config_digest(config: AppConfig) -> str:
     ).hexdigest()
 
 
-def verify_implementation_only_change(before: AppConfig, after: AppConfig) -> None:
+def verify_implementation_only_change(
+    before: AppConfig, after: AppConfig, *, react_test_rollout: bool = False
+) -> None:
+    if react_test_rollout:
+        if before.deployment_mode != "test" or after.deployment_mode != "test":
+            raise DomainError("policy_changed", "ReAct rollout requires a test deployment")
+        rollout_states = {
+            (config.conversation.proactive_mode, config.runtime.evolution_enabled)
+            for config in (before, after)
+        }
+        if rollout_states != {("off", False), ("shadow", True)} or any(
+            config.runtime.evolution_manifest is not None for config in (before, after)
+        ):
+            raise DomainError(
+                "policy_changed", "Test rollout requires the reversible off-to-shadow configuration"
+            )
+
     def authority(config):
         body = config.model_dump(mode="json")
         for name in ("engine", "worker_image", "harness_image"):
             body["runtime"].pop(name, None)
         for name in ("candidate", "approved_runtime_version"):
             body["engine"].pop(name, None)
+        if react_test_rollout:
+            del body["conversation"]["proactive_mode"]
+            del body["runtime"]["evolution_enabled"]
         return body
 
     if authority(before) != authority(after):
@@ -48,6 +67,7 @@ def register_implementation_change(
     expected_previous_digest: str,
     before_snapshot: dict[str, Any] | None = None,
     after_snapshot: dict[str, Any] | None = None,
+    react_test_rollout: bool = False,
 ) -> str:
     reviewed_snapshot = (
         before.model_dump(mode="json") if before_snapshot is None else before_snapshot
@@ -62,7 +82,7 @@ def register_implementation_change(
         raise DomainError(
             "configuration_changed", "Before configuration is not bound to its reviewed digest"
         )
-    verify_implementation_only_change(before, after)
+    verify_implementation_only_change(before, after, react_test_rollout=react_test_rollout)
     if (
         actor.role != Role.OWNER
         or actor.member_id not in after.group.owner_ids
@@ -121,6 +141,11 @@ def main() -> None:
     parser.add_argument("--after-config", type=Path, required=True)
     parser.add_argument("--dsn-file", type=Path, required=True)
     parser.add_argument("--expected-digest", required=True)
+    parser.add_argument(
+        "--react-test-rollout",
+        action="store_true",
+        help="Allow the reviewed off-to-shadow test configuration and its rollback",
+    )
     args = parser.parse_args()
     before_snapshot = json.loads(args.before_config.read_text())
     before = AppConfig.model_validate(before_snapshot)
@@ -140,6 +165,7 @@ def main() -> None:
         expected_previous_digest=args.expected_digest,
         before_snapshot=before_snapshot,
         after_snapshot=after_snapshot,
+        react_test_rollout=args.react_test_rollout,
     )
     print(json.dumps({"configuration_digest": digest, "authorization_revision_preserved": True}))
 

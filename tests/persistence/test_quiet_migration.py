@@ -80,7 +80,7 @@ async def test_upgrade_seeds_existing_quiet_and_preserves_new_explicit_invocatio
                 "AND (%s='*' OR actor_id=%s)",
                 (group, subject, subject),
             ).fetchone()["sequence"]
-        assert store.migrate() == 16 and store.migrate() == 16
+        assert store.migrate() == 19 and store.migrate() == 19
         with store.transaction(actor) as tx:
             policy = tx.conn.execute(
                 "SELECT quiet_since_sequence FROM ga_conversation_policy WHERE group_id=%s",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from groupagent.domain import DomainError
@@ -30,6 +32,24 @@ async def ask(env, app, text):
         return request, tx.get_decision(request.id)["result"]["decision"]
 
 
+def answer_from_memory(model, predicate, *, before_finish=None):
+    complete = model.complete
+
+    async def use_fact(request):
+        payload = json.loads(request.messages[1].content)
+        matches = [row for row in payload["context"]["memory"] if row.get("predicate") == predicate]
+        assert len(matches) == 1
+        fact = matches[0]
+        assert fact["subject_id"] == payload["context"]["requester_member_id"]
+        model.text = f"我记下的{predicate}是{fact['value']}。"
+        reply = await complete(request)
+        if before_finish is not None:
+            before_finish(fact)
+        return reply
+
+    model.complete = use_fact
+
+
 @pytest.mark.parametrize(
     "predicate,value,question",
     [
@@ -37,7 +57,7 @@ async def ask(env, app, text):
         ("席位数", 12, "Pot，席位数是多少？"),
     ],
 )
-async def test_unique_exact_groupwide_scalar_is_read_without_model(
+async def test_unique_exact_groupwide_scalar_is_grounded_in_one_model_turn(
     runtime_env, predicate, value, question
 ):
     env = runtime_env
@@ -45,9 +65,10 @@ async def test_unique_exact_groupwide_scalar_is_read_without_model(
     try:
         fact, source = remember(env, app, predicate, value)
         assert fact.subject_id == env.actor.member_id and fact.topic_id is None
+        answer_from_memory(model, predicate)
         request, result = await ask(env, app, question)
-        assert result["reason_code"] == "exact_known_fact"
-        assert result["response"] == f"我记下的{predicate}是{value}。" and model.requests == []
+        assert result["response"] == f"我记下的{predicate}是{value}。"
+        assert len(model.requests) == 1
         with env.store.transaction(env.actor) as tx:
             assert source.id in tx.get_decision(request.id)["source_fingerprints"]
         assert len(intents(env)) == 1 and intents(env)[0].request_event_id == request.id
@@ -60,7 +81,9 @@ async def test_corrected_record_uses_current_value_revision_and_source(runtime_e
     app, model, _ = setup_chat(env)
     try:
         fact, _ = remember(env, app, "项目简称", "合成旧值")
-        await ask(env, app, "Pot，项目简称是什么？")
+        answer_from_memory(model, "项目简称")
+        _, old = await ask(env, app, "Pot，项目简称是什么？")
+        assert old["response"] == "我记下的项目简称是合成旧值。"
         replacement = event(env, "明确更正合成事实。")
         with env.store.transaction(env.actor) as tx:
             tx.ingest_event(replacement, replacement.id, "1", 0)
@@ -73,7 +96,8 @@ async def test_corrected_record_uses_current_value_revision_and_source(runtime_e
             explicit=True,
         )
         request, result = await ask(env, app, "Pot，项目简称是啥？请用一句话回答。")
-        assert result["response"] == "我记下的项目简称是合成新值。" and model.requests == []
+        assert result["response"] == "我记下的项目简称是合成新值。"
+        assert len(model.requests) == 2
         with env.store.transaction(env.actor) as tx:
             assert replacement.id in tx.get_decision(request.id)["source_fingerprints"]
     finally:
@@ -137,20 +161,17 @@ async def test_withdrawn_source_is_not_fast_answered_or_exposed_to_model(runtime
         await app.close()
 
 
-async def test_correction_between_fast_read_and_commit_blocks_stale_reply(runtime_env, monkeypatch):
+async def test_correction_during_model_response_blocks_stale_reply(runtime_env):
     env = runtime_env
     app, model, _ = setup_chat(env)
     fact, source = remember(env, app, "项目简称", "合成旧值")
     request = event(env, "Pot，项目简称是什么？")
     await intake(app, env, request)
-    original = app.coordinator._fast_fact_reply
-    changed = False
 
-    def racing(value, context, actor, *, tx=None):
-        nonlocal changed
-        result = original(value, context, actor, tx=tx)
-        if result is not None and tx is None and not changed:
-            changed = True
+    def racing(observed):
+        if observed["revision"] == 1:
+            assert observed["value"] == "合成旧值"
+            # Reuse the source event so only the logical fact revision changes.
             app.coordinator.memory.correct_fact(
                 env.actor,
                 fact.id,
@@ -159,14 +180,15 @@ async def test_correction_between_fast_read_and_commit_blocks_stale_reply(runtim
                 source_event_ids=[source.id],
                 explicit=True,
             )
-        return result
 
-    monkeypatch.setattr(app.coordinator, "_fast_fact_reply", racing)
+    answer_from_memory(model, "项目简称", before_finish=racing)
     try:
         with pytest.raises(DomainError) as error:
             await app.coordinator.process(request)
-        assert error.value.code == "memory_changed" and intents(env) == [] and model.requests == []
+        assert error.value.code == "memory_changed" and intents(env) == []
+        assert len(model.requests) == 1
         result = await app.coordinator.process(request)
         assert result.decision.response == "我记下的项目简称是合成新值。"
+        assert len(model.requests) == 2
     finally:
         await app.close()

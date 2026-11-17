@@ -6,13 +6,13 @@ import asyncio
 import json
 
 import pytest
+from conversation.turn_model_fixture import finish_fixture_reply
 
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import Decision
 from groupagent.domain import DeliveryState, WorkState
 from groupagent.execution.models import ModelReply, TokenUsage
 
-from .foreground_model_fixture import semantic_fixture_reply
 from .test_app import app_for, event
 from .test_application_controls import admit
 
@@ -43,15 +43,11 @@ class StructuredModelFixture:
             self.release.set()
 
     async def complete(self, request):
-        assessed = semantic_fixture_reply(request)
-        if assessed is not None:
-            return assessed
         self.requests.append(request)
         self.entered.set()
         await self.release.wait()
-        return ModelReply(
-            text=self.text,
-            usage=TokenUsage(input_tokens=10, output_tokens=10),
+        return finish_fixture_reply(
+            request, ModelReply(text=self.text, usage=TokenUsage(input_tokens=10, output_tokens=10))
         )
 
 
@@ -90,16 +86,18 @@ def sent(env):
     ]
 
 
-async def test_exact_name_question_returns_configured_identity_without_model_or_placeholder(
+async def test_exact_name_question_uses_configured_identity_in_one_model_turn(
     runtime_env,
 ):
     env = runtime_env
     app, model, _ = setup_chat(env)
     request = event(env, "Pot，请告诉我你叫什么名字，用一句话回答")
+    model.text = "我叫Pot。"
     try:
         await intake(app, env, request)
         assert await app.process_pending(batched=True) == 1
-        assert model.requests == []
+        assert len(model.requests) == 1
+        assert json.loads(model.requests[0].messages[1].content)["context"]["agent_name"] == "Pot"
         assert await app.early_ack_tick() == 0
         assert await app.dispatcher.tick() == 1
         assert sent(env) == ["【Pot】我叫Pot。"]
@@ -180,7 +178,7 @@ async def test_historical_accepted_ack_does_not_suppress_final_through_real_rout
         await app.close()
 
 
-async def test_name_question_uses_control_lane_while_another_real_router_is_waiting(runtime_env):
+async def test_explicit_quiet_uses_control_lane_while_foreground_model_is_waiting(runtime_env):
     env = runtime_env
     app, model, probe = setup_chat(env, waiting=True)
     slow = event(env, "Pot，请解释变量是什么？")
@@ -188,12 +186,11 @@ async def test_name_question_uses_control_lane_while_another_real_router_is_wait
     route = asyncio.create_task(app.process_pending(batched=True))
     try:
         await asyncio.wait_for(model.entered.wait(), 3)
-        name = event(env, "Pot，请告诉我你叫什么名字，用一句话回答")
-        await intake(app, env, name)
+        quiet = event(env, "Pot，先保持安静。")
+        await intake(app, env, quiet)
         assert await app.process_pending(controls_only=True) == 1
         assert not route.done() and len(model.requests) == 1
-        assert await app.dispatcher.tick() == 1
-        assert sent(env) == ["【Pot】我叫Pot。"]
+        assert await app.dispatcher.tick() == 0 and not sent(env)
         assert max(probe.counts) == 2 and probe.counts[-1] == 1
     finally:
         model.release.set()

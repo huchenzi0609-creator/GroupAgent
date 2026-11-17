@@ -14,6 +14,8 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from groupagent.scheduling.models import PreparedMessage
+
 from .quiet import validate_windows
 
 
@@ -64,9 +66,25 @@ class TaskBatch(ActionData):
 class CreateSchedule(ActionData):
     op: Literal["create_schedule"]
     title: str = Field(min_length=1, max_length=300)
-    goal: str = Field(min_length=1, max_length=3000)
+    goal: str | None = Field(default=None, min_length=1, max_length=3000)
+    prepared_message: PreparedMessage | None = None
+    fact_source_ids: list[str] = Field(default_factory=list, max_length=20)
+    allow_silent_result: bool = Field(
+        default=False,
+        strict=True,
+        description="Enable only for a future goal when the requester explicitly allows no message "
+        "if the completed check finds nothing to report.",
+    )
     timing: dict[str, JsonValue]
     valid_until: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def single_payload(self) -> CreateSchedule:
+        if (self.goal is None) == (self.prepared_message is None):
+            raise ValueError("Provide one future goal or prepared message")
+        if self.allow_silent_result and self.prepared_message is not None:
+            raise ValueError("Only a future goal may allow a silent result")
+        return self
 
 
 class ChangeSchedule(ActionData):
@@ -75,6 +93,14 @@ class ChangeSchedule(ActionData):
     expected_revision: int = Field(ge=1)
     timing: dict[str, JsonValue] | None = None
     goal: str | None = Field(default=None, max_length=3000)
+    prepared_message: PreparedMessage | None = None
+    fact_source_ids: list[str] | None = Field(default=None, max_length=20)
+    allow_silent_result: bool | None = Field(
+        default=None,
+        strict=True,
+        description="Omit to keep the existing setting. Set true only for an explicitly "
+        "authorized future goal. Set false to require a delivered result.",
+    )
     valid_until: AwareDatetime | None = None
 
 

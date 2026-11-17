@@ -98,6 +98,7 @@ class ConversationConfig(StrictModel):
     idle_batch_seconds: PositiveInt = 2
     max_batch_wait_seconds: PositiveInt = 5
     proactive_messages_per_10_minutes: Annotated[int, Field(strict=True, ge=0)] = 2
+    proactive_mode: Literal["off", "shadow", "active"] = "off"
     min_progress_interval_seconds: PositiveInt = 60
     hard_reply_character_limit: None = None
     short_reply_style: Literal["one_to_three_short_sentences"] = "one_to_three_short_sentences"
@@ -287,6 +288,8 @@ class RuntimeConfig(StrictModel):
     browser_hosts: list[str] = Field(default_factory=list, max_length=30)
     image_generation_price_id: str | None = None
     semantic_validation: bool = True
+    evolution_enabled: bool = False
+    evolution_manifest: str | None = None
     local_member_names: dict[str, str] = Field(default_factory=dict)
     pg_bin_dir: str | None = None
 
@@ -328,6 +331,10 @@ class RuntimeConfig(StrictModel):
     def coherent_bot_identity(self) -> RuntimeConfig:
         if self.bot_badge != f"【{self.bot_name}】":
             raise ValueError("Bot badge must match the configured bot name")
+        if self.evolution_manifest is not None and (
+            not self.evolution_enabled or not Path(self.evolution_manifest).is_absolute()
+        ):
+            raise ValueError("A development manifest requires evolution and an absolute path")
         return self
 
     @field_validator("worker_image", "harness_image")

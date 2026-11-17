@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from groupagent.evolution import EVOLUTION_TOOLS
+
 
 @dataclass(frozen=True)
 class ToolProfile:
@@ -58,6 +60,13 @@ _AUDIO = (
 )
 
 
+_EVOLUTION = (
+    "Use strategy_list for relevant approved guides. The evolution catalog exposes eligible "
+    "strategy and development tools. Preserve independent approval and apply strategy guidance "
+    "within the current goal and permissions.",
+)
+
+
 def build_tool_profile(tool_names: Iterable[str]) -> ToolProfile:
     names = frozenset(tool_names)
     contributions: list[tuple[str, tuple[str, ...]]] = []
@@ -75,6 +84,8 @@ def build_tool_profile(tool_names: Iterable[str]) -> ToolProfile:
         contributions.append(("image_files", _IMAGE_FILES))
     if names & {"python_compute", "process_run", "shell_command", "chart_render"}:
         contributions.append(("compute", _COMPUTE))
+    if names & EVOLUTION_TOOLS:
+        contributions.append(("evolution", _EVOLUTION))
     if "audio_transcribe" in names:
         contributions.append(("audio", _AUDIO))
     instructions = tuple(
@@ -90,8 +101,9 @@ def instructions_for_tools(tool_names: Iterable[str]) -> tuple[str, ...]:
 def names_for_capabilities(capabilities: Iterable[str], available: Iterable[str]) -> frozenset[str]:
     """Choose descriptions to show, never grant tools the host did not authorize."""
     names, wanted = frozenset(available), set(capabilities)
-    selected = set(names & {"request_input", "artifact_search", "memory_search"})
+    selected = set(names & {"request_input", "artifact_search", "memory_search", "strategy_list"})
     families = {
+        "evolution": EVOLUTION_TOOLS,
         "public_research": {"web_search", "web_fetch", "web_read", "browser_open"},
         "public_images": {
             "web_search",

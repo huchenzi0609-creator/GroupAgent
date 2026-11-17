@@ -83,10 +83,17 @@ def test_priority_uses_shared_invocation_result_without_content_filters(monkeypa
     assert calls == [source.id]
 
 
-def test_existing_independent_work_admission_needs_no_priority_lookup():
-    app = RuntimeApp.__new__(RuntimeApp)
-    app.identity = BotIdentity()
-    assert app._bypass_batch(sample("请生成一份介绍太阳系的三页PPT。"))
+@pytest.mark.postgres
+async def test_unaddressed_work_uses_regular_model_queue(runtime_env):
+    env = runtime_env
+    app, _ = app_for(env, {})
+    try:
+        request = await incoming(env, app, "请生成一份介绍太阳系的三页PPT。")
+        assert not app._bypass_batch(request)
+        assert await app.process_pending() == 0
+        assert await app.process_pending(batched=False) == 1
+    finally:
+        await app.close()
 
 
 async def incoming(env, app, text, **changes):

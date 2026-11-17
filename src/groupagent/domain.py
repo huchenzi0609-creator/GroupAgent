@@ -23,6 +23,19 @@ from pydantic import (
 Identifier = Annotated[str, Field(min_length=1)]
 
 
+def allows_silent_result(scope: dict[str, JsonValue]) -> bool:
+    """Accept silence only for a durable scheduled goal with that grant."""
+    source = scope.get("origin_schedule_id")
+    return (
+        isinstance(source, str)
+        and bool(source)
+        and type(scope.get("derived_depth")) is int
+        and scope["derived_depth"] == 1
+        and scope.get("allow_silent_result") is True
+        and scope.get("reminder_only") is not True
+    )
+
+
 class DomainError(Exception):
     def __init__(
         self,

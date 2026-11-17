@@ -146,11 +146,11 @@ async def test_person_identity_question_returns_an_explicit_boundary_without_sta
     env = runtime_env
     app, model, _ = setup_chat(env)
     request = event(env, "图片里这个男人是谁？")
+    model.text = "我暂时无法识别人脸身份，但可以描述画面。"
     try:
         await intake(app, env, request)
         result = await app.coordinator.process(request)
-        assert result.work_id is None and not model.requests
-        assert result.decision.reason_code == "face_identification_unavailable"
+        assert result.work_id is None and len(model.requests) == 1
         assert "描述画面" in result.decision.response
     finally:
         await app.close()

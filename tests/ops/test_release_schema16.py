@@ -129,9 +129,7 @@ def test_schema15_legacy_parts_remain_exact_nullable_and_idempotent(
 def test_executable_release_orders_old_backup_before_candidate_migration(tmp_path, verify_fails):
     script = SCRIPT.read_text()
     begin = script.index("# Finish only the proven local phase")
-    end = script.index(
-        'maintenance "$next" -c \'import json,sys; from pathlib import Path; from groupagent.config import AppConfig; d=json.loads(Path("/before.json")'
-    )
+    end = script.index("# Materialize the reviewed candidate configuration", begin)
     body = script[begin:end]
     log = tmp_path / "calls.jsonl"
     prefix = r"""

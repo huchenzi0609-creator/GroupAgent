@@ -60,6 +60,8 @@ class RosterSyncResult(DomainModel):
     partial: bool = True
     error_code: str | None = None
     cached: bool = False
+    memory_epoch_before: int | None = Field(default=None, exclude=True)
+    memory_epoch_after: int | None = Field(default=None, exclude=True)
 
 
 class Topic(DomainModel):

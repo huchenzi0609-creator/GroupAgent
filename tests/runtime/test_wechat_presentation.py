@@ -14,7 +14,7 @@ from groupagent.domain import DeliveryState, WorkState
 from groupagent.runtime.contracts import DeliveryDraft
 from groupagent.runtime.dispatch import Dispatcher, split_text
 from groupagent.runtime.text import render_wechat_text
-from groupagent.scheduling import EveryTiming, Scheduler
+from groupagent.scheduling import EveryTiming, PreparedMessage, Scheduler
 
 from .conftest import source
 
@@ -89,7 +89,7 @@ async def test_all_text_delivery_origins_render_at_the_shared_sender(runtime_env
     assert await dispatcher.tick() == 0
 
 
-async def test_scheduled_reminder_and_background_work_bundles_use_the_same_plain_text_boundary(
+async def test_prepared_reminder_and_background_work_share_native_text_delivery(
     runtime_env,
 ):
     env = runtime_env
@@ -98,57 +98,52 @@ async def test_scheduled_reminder_and_background_work_bundles_use_the_same_plain
     scheduler = Scheduler(env.store)
     now = datetime.now(UTC)
     with env.store.transaction(env.actor) as tx:
-        fingerprint = tx.event_fingerprint(event.id)
         background = tx.create_work("Synthetic background work", event.id)
     scheduler.create(
         env.actor,
         "Synthetic literal reminder",
-        body,
+        None,
         EveryTiming(interval_seconds=3600),
         now=now,
-        scope={
-            "reminder_only": True,
-            "reminder_body_literal": True,
-            "reminder_body_source_event_id": event.id,
-            "source_fingerprints": {event.id: fingerprint},
-        },
+        authorization_event_id=event.id,
+        prepared_message=PreparedMessage(text=body, purpose="explicit_reminder"),
     )
     occurrence = scheduler.due(env.actor, now + timedelta(hours=1))[0]
-    intents = []
-    for work_id, output in ((background.id, "# 结果\n\n" + body), (occurrence.work_id, body)):
-        with env.store.transaction(env.actor) as tx:
-            lease = tx.claim_work(work_id, "synthetic-output-validator", ttl_seconds=300)
-            current = tx.get_work(work_id)
-            validating = tx.transition_work(
-                work_id, WorkState.VALIDATING, expected_revision=current.revision, lease=lease
-            )
-            tx.record_validation(work_id, lease, "synthetic:literal-body-validated")
-            tx.transition_work(
-                work_id, WorkState.DELIVERING, expected_revision=validating.revision, lease=lease
-            )
-            intents.extend(
-                env.state.enqueue_bundle_in_tx(
-                    tx,
-                    lease,
-                    (
-                        DeliveryDraft(
-                            "text:" + output,
-                            hashlib.sha256(output.encode()).hexdigest(),
-                            "synthetic:final-text:" + work_id,
-                        ),
-                    ),
-                )
-            )
-    assert await sender(env).tick() == 2
+    assert occurrence.work_id is None and occurrence.delivery_id is not None
+    output = "# 结果\n\n" + body
+    with env.store.transaction(env.actor) as tx:
+        assert [work.id for work in tx.list_work()] == [background.id]
+        reminder = tx.get_delivery(occurrence.delivery_id)
+        lease = tx.claim_work(background.id, "synthetic-output-validator", ttl_seconds=300)
+        current = tx.get_work(background.id)
+        validating = tx.transition_work(
+            background.id, WorkState.VALIDATING, expected_revision=current.revision, lease=lease
+        )
+        tx.record_validation(background.id, lease, "synthetic:body-validated")
+        tx.transition_work(
+            background.id, WorkState.DELIVERING, expected_revision=validating.revision, lease=lease
+        )
+        (work_intent,) = env.state.enqueue_bundle_in_tx(
+            tx,
+            lease,
+            (
+                DeliveryDraft(
+                    "text:" + output,
+                    hashlib.sha256(output.encode()).hexdigest(),
+                    "synthetic:final-text:" + background.id,
+                ),
+            ),
+        )
+    dispatcher = sender(env)
+    assert await dispatcher.tick() == 2
     outputs = spool(env)
-    for intent in intents:
-        part = parts(env, intent)[0]
-        expected = "【Pot】" + render_wechat_text(intent.payload_ref[5:])
+    rendered_output = "【Pot】结果\n\n检查 report_file：资料（https://example.test/source_a）"
+    for intent, expected in ((work_intent, rendered_output), (reminder, "【Pot】" + body)):
+        (part,) = parts(env, intent)
         assert part["rendered_text"] == expected
         assert outputs[part["idempotency_key"]]["payload"]["text"] == expected
-        assert "检查 report_file：资料（https://example.test/source_a）" in expected
-    with env.store.transaction(env.actor) as tx:
-        assert tx.get_work(occurrence.work_id).goal == body
+        assert dispatcher.is_bot_message(env.actor, part["platform_message_id"])
+    assert await dispatcher.tick() == 0
 
 
 async def test_render_once_before_chunking_with_one_badge_per_frozen_part(runtime_env, monkeypatch):

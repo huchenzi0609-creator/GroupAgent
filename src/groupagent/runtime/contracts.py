@@ -32,6 +32,7 @@ class ValidatedCandidate:
     # validation evidence references, not model claims or unchecked paths.
     checks: dict[str, str]
     deliveries: tuple[DeliveryDraft, ...]
+    silent_evidence: str | None = None
 
 
 @dataclass(frozen=True)

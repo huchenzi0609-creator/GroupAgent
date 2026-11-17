@@ -10,7 +10,6 @@ import pytest
 
 from groupagent.coordinator import Decision
 from groupagent.domain import DeliveryState, DomainError, WorkState
-from groupagent.scheduling.reminders import get_reminder_body
 
 from .test_app import app_for, event
 from .test_application_controls import admit, waiting_work
@@ -157,7 +156,7 @@ async def test_named_reminder_preserves_quoted_pot_call_as_recipient_data(runtim
                 action={
                     "op": "create_schedule",
                     "title": "合成提醒",
-                    "goal": "模型提供的正文不能覆盖原文",
+                    "prepared_message": {"text": "并Pot生成PDF", "purpose": "explicit_reminder"},
                     "timing": {"kind": "at", "at": when.isoformat()},
                 },
                 directness="direct",
@@ -169,16 +168,18 @@ async def test_named_reminder_preserves_quoted_pot_call_as_recipient_data(runtim
         await admit(app, env, request)
         rules = app.coordinator.scheduler.list(env.actor)
         assert len(rules) == 1 and rules[0].goal == "并Pot生成PDF"
-        assert rules[0].scope["reminder_only"] is True
-        assert rules[0].scope["reminder_body_literal"] is True
+        assert rules[0].execution_kind.value == "explicit_reminder"
+        assert rules[0].scope["prepared_message_source_id"] == request.id
         occurrence = app.coordinator.scheduler.due(env.actor, when)[0]
         with env.store.transaction(env.actor) as tx:
-            work = tx.get_work(occurrence.work_id)
-            assert get_reminder_body(work.scope) == "并Pot生成PDF"
-            assert work.scope["derived_depth"] == 1
+            assert occurrence.work_id is None and occurrence.delivery_id
+            assert tx.get_delivery(occurrence.delivery_id).payload_ref == "text:并Pot生成PDF"
+            assert tx.list_work() == []
         assert not models
-        assert await app.dispatcher.tick() == 1
-        assert_pot_texts(outgoing(env))
+        assert await app.dispatcher.tick() == 2
+        outputs = outgoing(env)
+        assert_pot_texts(outputs)
+        assert any(row["payload"]["text"] == "【Pot】并Pot生成PDF" for row in outputs)
     finally:
         await app.close()
 

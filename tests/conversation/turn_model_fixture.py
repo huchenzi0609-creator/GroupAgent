@@ -1,88 +1,42 @@
-"""Explicit offline assessment bridge for typed protocol tests, not intent evidence."""
+"""Translate legacy synthetic response scripts into the foreground finish protocol."""
 
 import json
+from uuid import uuid4
 
-from groupagent.execution.models import ModelReply, TokenUsage
+from groupagent.conversation.turns import receipt_phase
+from groupagent.execution.models import ModelReply, ModelToolCall
 
 
-def semantic_fixture_reply(
-    request,
-    *,
-    upcoming=(),
-    recipient=None,
-    intent=None,
-    outcome=None,
-    required_actions=None,
-    work_context_required=False,
-    information_basis="stable_knowledge",
-):
-    system = request.messages[0].content or ""
-    if system.startswith("TURN_CONTRACT_V1"):
-        payload = json.loads(request.messages[1].content)
-        evidence = payload["trusted_recipient"]
-        direction = recipient or (
-            evidence["recipient"] if evidence["source"] != "unresolved" else "agent"
-        )
-        requirements = []
-        for step in upcoming:
-            if not isinstance(step, ModelReply):
-                continue
-            for call in step.tool_calls:
-                if call.name in {"start_work", "update_work", "control_work", "read_work_facts"}:
-                    requirement = {"kind": call.name}
-                elif call.name == "apply_business_action":
-                    requirement = {"kind": "business", "operation": call.arguments["action"]["op"]}
-                else:
-                    continue
-                if requirement not in requirements:
-                    requirements.append(requirement)
-        if required_actions is not None:
-            requirements = required_actions
-        mode = intent or ("action" if requirements else "conversation")
-        if direction == "other" and not requirements:
-            mode = "observe"
-        value = {
-            "recipient": direction,
-            "intent": mode,
-            "required_actions": requirements,
-            "work_context_required": work_context_required,
-            "information_basis": information_basis,
-        }
-    elif system.startswith("TURN_OUTCOME_V1"):
-        payload = json.loads(request.messages[1].content)
-        accepted = any(receipt.get("committed") for receipt in payload["host_receipts"])
-        requirements = list(required_actions or [])
-        if required_actions is None:
-            for step in upcoming:
-                if not isinstance(step, ModelReply):
-                    continue
-                for call in step.tool_calls:
-                    if call.name in {
-                        "start_work",
-                        "update_work",
-                        "control_work",
-                        "read_work_facts",
-                    }:
-                        item = {"kind": call.name}
-                    elif call.name == "apply_business_action":
-                        item = {"kind": "business", "operation": call.arguments["action"]["op"]}
-                    else:
-                        continue
-                    if item not in requirements:
-                        requirements.append(item)
-            for receipt in payload["host_receipts"]:
-                item = {"kind": receipt["kind"]}
-                if receipt.get("operation") is not None:
-                    item["operation"] = receipt["operation"]
-                if item not in requirements:
-                    requirements.append(item)
-        value = {
-            "outcome": outcome
-            or ("committed" if accepted or not payload["host_receipts"] else "blocked"),
-            "explanation": "Explicit synthetic host-receipt assessment.",
-            "required_actions": requirements,
-            "reply_required": payload["trusted_recipient"]["recipient"] == "agent",
-        }
-    else:
-        return None
-    return ModelReply(text=json.dumps(value), usage=TokenUsage(input_tokens=1, output_tokens=1))
+def finish_fixture_reply(request, reply):
+    if reply.finish_reason not in {"stop", "tool_calls"}:
+        return reply
+    if reply.tool_calls and all(call.name != "observe" for call in reply.tool_calls):
+        return reply
+    observe = bool(reply.tool_calls)
+    reports = []
+    payload = json.loads(request.messages[1].content)
+    observations = list(payload.get("prior_receipts", []))
+    observations.extend(
+        json.loads(message.content)
+        for message in request.messages
+        if message.role == "tool" and message.content
+    )
+    for row in observations:
+        identifier = row.get("tool_call_id")
+        if identifier and (phase := receipt_phase(row)):
+            reports.append({"tool_call_id": identifier, "phase": phase})
+    return ModelReply(
+        tool_calls=(
+            ModelToolCall(
+                id=uuid4().hex,
+                name="finish_turn",
+                arguments={
+                    "disposition": "observe" if observe else "reply",
+                    "response": None if observe else reply.text,
+                    "reports": [] if observe else reports,
+                },
+            ),
+        ),
+        finish_reason="tool_calls",
+        usage=reply.usage,
+    )

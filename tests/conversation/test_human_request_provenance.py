@@ -8,8 +8,7 @@ from groupagent.coordinator import Decision
 from groupagent.domain import DomainError
 from groupagent.execution.models import ModelReply, ModelToolCall
 
-from .test_agent_dialogue import ScriptedModel, source
-from .test_turn_contract import USAGE, reply
+from .test_agent_dialogue import USAGE, ScriptedModel, reply, source
 
 pytestmark = pytest.mark.postgres
 
