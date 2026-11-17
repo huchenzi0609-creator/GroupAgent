@@ -405,9 +405,46 @@ def test_every_frozen_check_handles_nullable_evidence_without_implicit_pass():
         assert set(case["checks"]) <= set(result["checks"])
 
 
-def test_participation_metrics_use_real_gate_and_separate_fixed_denominators():
+def test_participation_metrics_use_real_gate_and_separate_fixed_denominators(monkeypatch):
+    import inspect
+    from functools import wraps
+
+    import pytest
+
+    from groupagent.conversation.service import ConversationCoordinator
     from groupagent.coordinator import Decision
 
+    original_gate = ConversationCoordinator._gate
+    roster_projections = []
+
+    @wraps(original_gate)
+    def checked_gate(self, tx, event, decision, context):
+        execute = tx.conn.execute
+        projections = []
+
+        def record_projection(query, params=()):
+            if " FROM ga_members " in query:
+                projections.append((query, params))
+            return execute(query, params)
+
+        tx.conn.execute = record_projection
+        result = original_gate(self, tx, event, decision, context)
+        for query, params in projections:
+            assert params == (event.group_id,)
+            roster_projections.append(query)
+            for forbidden_query, forbidden_params in (
+                (query, ("another-fixture-group",)),
+                ("SELECT * FROM ga_members", ()),
+                ("SELECT * FROM ga_members JOIN ga_events ON true", ()),
+                ("SELECT * FROM GA_MEMBERS JOIN ga_events ON true", ()),
+                (query + "; DELETE FROM ga_members", params),
+                ("UPDATE ga_members SET room_name='changed'", ()),
+            ):
+                with pytest.raises(AssertionError):
+                    execute(forbidden_query, forbidden_params)
+        return result
+
+    monkeypatch.setattr(ConversationCoordinator, "_gate", checked_gate)
     cases = []
     for identifier, text, kinds, directness in (
         ("yes", "请解释可靠性是什么意思", ["reply"], "direct"),
@@ -460,7 +497,11 @@ def test_participation_metrics_use_real_gate_and_separate_fixed_denominators():
     assert result["effective"]["no"]["kind"] == "observe"
     assert result["other_13"]["denominator"] == 1
     assert result["provider_calls"] == result["business_writes_applied"] == 0
-    import pytest
+    assert roster_projections
+    assert (
+        result["source_gate_sha256"]
+        == hashlib.sha256(inspect.getsource(original_gate).encode()).hexdigest()
+    )
 
     with pytest.raises(ValueError):
         CHECKS.evaluate_interaction_participation(data, records)
