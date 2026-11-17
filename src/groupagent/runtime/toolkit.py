@@ -30,6 +30,7 @@ from groupagent.conversation.image_requirements import (
     is_public_image_work,
     projected_image_quantity,
 )
+from groupagent.delivery import group_delivery_policy, group_reply_instruction
 from groupagent.domain import ActorContext, DomainError, ExecutionLease, GroupEvent, WorkOrder
 from groupagent.execution import ExecutionRequest, LangGraphEngine, RunSnapshot
 from groupagent.execution.models import ExecutionBudget
@@ -52,6 +53,7 @@ from groupagent.research import (
     validate_research_citations,
 )
 from groupagent.research.browser import ControlledBrowser, PublicPageBroker
+from groupagent.research.citations import CitationProvenance
 from groupagent.research.deepseek import DeepSeekResearchClient
 from groupagent.research.image_transforms import (
     ImageTransformService,
@@ -1049,6 +1051,9 @@ class WorkToolkit:
                     "group_time_zone": self.config.group.time_zone,
                     "acceptance_criteria": work.acceptance_criteria,
                     "required_outputs": _output_requirements(work, original_event),
+                    "delivery_policy": group_delivery_policy(
+                        self.config.conversation.short_reply_style
+                    ),
                     "required_tools": sorted(required_tools),
                     "requested_image_count": image_quantity.count,
                     "image_quantity_requirement": image_quantity.fields(),
@@ -1062,6 +1067,7 @@ class WorkToolkit:
                         if execution_intent == "reminder"
                         else "Complete the accepted goal with actual tools.",
                         _REQUEST_CONTEXT_INSTRUCTION,
+                        group_reply_instruction(self.config.conversation.short_reply_style),
                         BotIdentity.from_runtime(self.config.runtime).instruction(),
                         *instructions_for_tools(
                             visible_tools if visible_tools is not None else allowed
@@ -1498,6 +1504,10 @@ class WorkToolkit:
                         retained_public_images.append((version, lineage))
                         excerpts[-1]["public_image_source"] = {
                             "source_sha256": lineage.source_sha256,
+                            "page_url": lineage.public_image["page_final_url"],
+                            "page_retrieved_at": lineage.public_image["page_retrieved_at"],
+                            "image_url": lineage.public_image["final_url"],
+                            "retrieved_at": lineage.public_image["retrieved_at"],
                             "page_citation": lineage.page_citation,
                             "image_citation": lineage.image_citation,
                         }
@@ -1553,7 +1563,6 @@ class WorkToolkit:
                 "This runtime has no external-account action capability; do not claim one completed",
             )
         observations = []
-        source_urls: set[str] = set()
         research_sources: list[dict[str, Any]] = []
         research_metrics: list[dict[str, Any]] = []
         candidate_images = {
@@ -1619,7 +1628,6 @@ class WorkToolkit:
                 if isinstance(sources, list):
                     for source in sources:
                         if isinstance(source, dict) and isinstance(source.get("url"), str):
-                            source_urls.add(str(source["url"]))
                             research_sources.append(source)
                             research_metrics.append(
                                 {
@@ -1649,7 +1657,6 @@ class WorkToolkit:
                     content_bytes_returned=0,
                     truncated_fields=("content",),
                 ).model_dump(mode="json")
-                source_urls.add(str(source["url"]))
                 research_sources.append(source)
             if receipt.tool_name == "web_image_import":
                 image_version = self.artifacts.get(
@@ -1679,13 +1686,23 @@ class WorkToolkit:
                     content_bytes_returned=0,
                     truncated_fields=("content",),
                 ).model_dump(mode="json")
-                source_urls.add(str(source["url"]))
                 research_sources.append(source)
             observations.append(tool_observation(receipt))
         # A validated artifact retains its original image observation even when
         # the current checkpoint no longer carries its discovery/import receipt.
         # The page's historic body size is unknown here and is never fabricated.
+        retained_page_sources: list[CitationProvenance] = []
+        retained_page_citations: list[str] = []
         for version, lineage in retained_public_images:
+            retained_page_sources.append(
+                CitationProvenance(
+                    url=str(lineage.public_image["page_final_url"]),
+                    retrieved_at=datetime.fromisoformat(
+                        str(lineage.public_image["page_retrieved_at"]).replace("Z", "+00:00")
+                    ),
+                )
+            )
+            retained_page_citations.append(lineage.page_citation)
             image_url = str(lineage.public_image["final_url"])
             if any(
                 item.get("evidence_kind") == "public_image" and item.get("url") == image_url
@@ -1710,15 +1727,32 @@ class WorkToolkit:
                     truncated_fields=("content",),
                 ).model_dump(mode="json")
             )
-            source_urls.add(image_url)
-        if research_evidence_required(work):
+        if research_evidence_required(work) and not research_sources:
+            raise DomainError(
+                "validation_failed",
+                "Requested research requires actual research tool evidence with retrieval provenance",
+            )
+        if research_sources:
             full_answer = answer + "\n" + "\n".join(str(item.get("text", "")) for item in excerpts)
-            if not source_urls or not any(url in full_answer for url in source_urls):
-                raise DomainError(
-                    "validation_failed",
-                    "Requested research requires actual research tool evidence and citations to retrieved sources",
-                )
-            validate_research_citations(full_answer, research_sources, require_access_time=True)
+            # Receipts retain their complete, actual provenance independently
+            # of the brief group answer. Every displayed link/time is checked,
+            # but a bibliography is not itself proof that the facts are sound.
+            citation_sources: list[dict[str, Any] | CitationProvenance] = [
+                *research_sources,
+                *retained_page_sources,
+            ]
+            validate_research_citations(
+                "\n".join(
+                    [
+                        *(str(source.get("citation", "")) for source in research_sources),
+                        *retained_page_citations,
+                    ]
+                ),
+                citation_sources,
+                require_access_time=True,
+            )
+            validate_research_citations(full_answer, citation_sources, require_citation=False)
+        if research_evidence_required(work):
             if (
                 not outputs
                 and not _research_metrics_requested(original_event.text)
@@ -1742,7 +1776,7 @@ class WorkToolkit:
             ):
                 raise DomainError(
                     "validation_failed",
-                    "This request asks for a concise sourced explanation, not extra examples; remove unsolicited code/demonstrations and keep the requested facts with their actual citations and retrieval times",
+                    "This request asks for a concise sourced explanation, not extra examples; remove unsolicited code/demonstrations and keep the requested facts with their actual supporting evidence",
                 )
         if self.config.runtime.semantic_validation:
             with self.store.transaction(actor) as tx:
@@ -1759,6 +1793,10 @@ class WorkToolkit:
                     if _execution_intent(work) == "reminder"
                     else "Complete the authorized work described by the goal and criteria.",
                     "criteria": work.acceptance_criteria,
+                    "required_outputs": requirements,
+                    "delivery_policy": group_delivery_policy(
+                        self.config.conversation.short_reply_style
+                    ),
                     "image_quantity_requirement": image_quantity.fields(),
                     "answer": answer,
                     "artifacts": excerpts,
@@ -1778,7 +1816,7 @@ class WorkToolkit:
             )
             await self._semantic_review(work, lease, actor, request, outputs, answer)
 
-        if outputs:
+        if outputs and not answer:
             answer = (
                 "文件已准备好。"
                 if work.scope.get("delivery_artifacts", True)
@@ -1787,10 +1825,7 @@ class WorkToolkit:
             if is_public_image_work(work) and not (
                 required_formats & {"md", "docx", "pdf", "pptx"}
             ):
-                citations = list(
-                    dict.fromkeys(lineage.page_citation for _, lineage in retained_public_images)
-                )
-                answer = "图片已准备好。\n来源：\n" + "\n".join(citations)
+                answer = "图片已准备好。"
         answer = visible_text(redact_credentials(answer))
         drafts.insert(
             0,

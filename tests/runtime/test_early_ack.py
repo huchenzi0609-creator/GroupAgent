@@ -12,6 +12,7 @@ from groupagent.coordinator import Decision
 from groupagent.domain import DeliveryState, WorkState
 from groupagent.execution.models import ModelReply, TokenUsage
 
+from .foreground_model_fixture import semantic_fixture_reply
 from .test_app import app_for, event
 from .test_application_controls import admit
 
@@ -42,6 +43,9 @@ class StructuredModelFixture:
             self.release.set()
 
     async def complete(self, request):
+        assessed = semantic_fixture_reply(request)
+        if assessed is not None:
+            return assessed
         self.requests.append(request)
         self.entered.set()
         await self.release.wait()

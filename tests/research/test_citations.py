@@ -17,6 +17,7 @@ from groupagent.research import (
     source_citation,
     validate_research_citations,
 )
+from groupagent.research.citations import CitationProvenance
 
 URL = "https://docs.python.org/3/howto/sorting.html"
 SECOND_URL = "https://docs.python.org/zh-cn/3.14/howto/sorting.html"
@@ -193,6 +194,67 @@ def test_source_and_citation_cannot_be_invented_when_no_successful_observation_e
         validate_research_citations("A source-free assertion", [source()], require_access_time=True)
 
 
+def test_brief_delivery_may_omit_visible_links_but_still_validates_internal_provenance():
+    validate_research_citations("简短结论。", [source()], require_citation=False)
+    validate_research_citations(URL, [source()], require_citation=False)
+    with pytest.raises(DomainError, match="actual source citation"):
+        validate_research_citations("简短结论。", [source()])
+    with pytest.raises(DomainError, match="actual source citation"):
+        validate_research_citations(
+            "简短结论。", [source()], require_citation=False, require_access_time=True
+        )
+    with pytest.raises(DomainError, match="no successful research provenance"):
+        validate_research_citations(
+            "来源：https://invented.example.com/reference", [source()], require_citation=False
+        )
+
+
+@pytest.mark.parametrize(
+    "reported",
+    [
+        "2099-01-01T00:00:00Z",
+        "2026-11-14T16:09:23Z",
+        "2026-11-14T16:08:23.999999Z",
+        "2026-11-15T01:08:23+08:00",
+        "2026-11-14 16:08:23",
+        "2026-99-99T16:08:23Z",
+    ],
+)
+def test_optional_display_does_not_allow_invented_or_ambiguous_retrieval_times(reported):
+    with pytest.raises(DomainError, match="displayed retrieval time"):
+        validate_research_citations(
+            URL + "（访问时间：" + reported + "）", [source()], require_citation=False
+        )
+
+
+def test_optional_display_accepts_actual_local_time_without_forcing_an_extra_utc_copy():
+    validate_research_citations(
+        URL + "（访问时间：2026-11-15T00:08:23+08:00）",
+        [source()],
+        require_citation=False,
+    )
+    validate_research_citations(
+        URL + "（发布时间：2020-01-01T00:00:00Z）", [source()], require_citation=False
+    )
+    with pytest.raises(DomainError, match="displayed retrieval time"):
+        validate_research_citations(
+            source_citation(source()) + "\n" + SECOND_URL + "（访问时间：2099-01-01T00:00:00Z）",
+            [source(), source(SECOND_URL)],
+            require_citation=False,
+        )
+
+
+def test_verified_artifact_page_binding_needs_no_invented_body_size_or_read_claim():
+    provenance = CitationProvenance(url=URL, retrieved_at=RECEIVED)
+    validate_research_citations(source_citation(provenance), [provenance], require_access_time=True)
+    assert set(provenance.model_dump()) == {"url", "retrieved_at", "operation"}
+    with pytest.raises(DomainError, match="provenance is invalid"):
+        validate_research_citations(URL, [provenance.model_dump()], require_citation=False)
+    naive = provenance.model_copy(update={"retrieved_at": datetime(2026, 11, 14, 16, 8, 23)})
+    with pytest.raises(DomainError, match="aware retrieval time"):
+        validate_research_citations("简短结论。", [naive], require_citation=False)
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -212,6 +274,7 @@ def test_invalid_or_naive_sources_fail_closed_with_static_repairable_error(bad):
     for call in (
         lambda: source_citation(bad),
         lambda: validate_research_citations(URL, [bad], require_access_time=True),
+        lambda: validate_research_citations("简短结论。", [bad], require_citation=False),
     ):
         with pytest.raises(DomainError) as caught:
             call()

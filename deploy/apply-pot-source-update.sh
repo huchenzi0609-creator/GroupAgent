@@ -188,28 +188,9 @@ printf 'old_controller_removed=%s\ngroup_hash=%s\nmanaged_workers_absent=true\n'
 # Placeholder for the read-only bind used by the common maintenance launcher.
 cp "$release/config.before.canonical.json" "$release/config.after.json"
 chown 994:990 "$release/config.after.json"
-# Build the reviewed maintenance reader after physical quiescence. No controller,
-# source, config or configuration bookmark is switched until backup verifies.
-{
-  printf 'FROM %s\n' "$previous"
-  if test -d "$release/source/deps"; then
-    printf 'COPY deps /usr/local/lib/python3.13/site-packages/\n'
-  fi
-  printf 'RUN rm -rf /usr/local/lib/python3.13/site-packages/groupagent\n'
-  printf 'COPY src/groupagent /usr/local/lib/python3.13/site-packages/groupagent\n'
-  printf 'COPY src/groupagent/sandbox/supervisor.py /opt/groupagent-worker.py\n'
-  printf 'ENV LANGSMITH_TRACING=false LANGCHAIN_TRACING_V2=false\n'
-  printf 'RUN python3 -m pip check\n'
-} > "$release/source/Dockerfile"
-DOCKER_BUILDKIT=0 docker build --network=none --memory=512m --memory-swap=512m \
-  --cpu-period=100000 --cpu-quota=50000 --iidfile "$release/image.after" \
-  "$release/source" > "$release/build.log" 2>&1
-next=$(cat "$release/image.after")
-[[ "$next" =~ ^sha256:[a-f0-9]{64}$ ]]
-maintenance "$next" -c 'from importlib.metadata import version; from groupagent.runtime.app import RuntimeApp; assert version("langchain")=="1.5.0"; assert version("langgraph")=="1.2.22"; print("standard_core_import_verified")' > "$release/import-check.log"
 # Finish only the proven local phase of canonical queued erasures. Unsupported
 # upstream erasure remains pending; no job is declared complete to make backup pass.
-maintenance "$next" -c '
+maintenance "$previous" -c '
 import asyncio,json
 from collections import Counter
 from pathlib import Path
@@ -253,7 +234,7 @@ async def main():
   artifacts.close()
 asyncio.run(main())
 ' > "$release/cleanup-local-proof.json" 2> "$release/cleanup-local-proof.log"
-maintenance "$next" -m groupagent.cli backup --config /etc/pot-test2/config.json \
+maintenance "$previous" -m groupagent.cli backup --config /etc/pot-test2/config.json \
   --dsn-file /etc/pot-test2/database.dsn --root /var/lib/pot-test2/app --pg-bin "$pg_bin" \
   > "$release/backup.json" 2> "$release/backup.log"
 backup_id=$(python3 - "$release/backup.json" <<'PY'
@@ -261,9 +242,66 @@ import json,sys
 print(json.load(open(sys.argv[1]))['id'])
 PY
 )
-maintenance "$next" -m groupagent.cli backup-verify --config /etc/pot-test2/config.json \
+maintenance "$previous" -m groupagent.cli backup-verify --config /etc/pot-test2/config.json \
   --dsn-file /etc/pot-test2/database.dsn --root /var/lib/pot-test2/app --pg-bin "$pg_bin" \
   --backup-id "$backup_id" > "$release/backup-verified.json" 2> "$release/backup-verify.log"
+# Only after the known-compatible previous reader verifies the old-schema backup,
+# build the candidate. No source/config/bookmark handoff has happened.
+{
+  printf 'FROM %s\n' "$previous"
+  if test -d "$release/source/deps"; then
+    printf 'COPY deps /usr/local/lib/python3.13/site-packages/\n'
+  fi
+  printf 'RUN rm -rf /usr/local/lib/python3.13/site-packages/groupagent\n'
+  printf 'COPY src/groupagent /usr/local/lib/python3.13/site-packages/groupagent\n'
+  printf 'COPY src/groupagent/sandbox/supervisor.py /opt/groupagent-worker.py\n'
+  printf 'ENV LANGSMITH_TRACING=false LANGCHAIN_TRACING_V2=false\n'
+  printf 'RUN python3 -m pip check\n'
+} > "$release/source/Dockerfile"
+DOCKER_BUILDKIT=0 docker build --network=none --memory=512m --memory-swap=512m \
+  --cpu-period=100000 --cpu-quota=50000 --iidfile "$release/image.after" \
+  "$release/source" > "$release/build.log" 2>&1
+next=$(cat "$release/image.after")
+[[ "$next" =~ ^sha256:[a-f0-9]{64}$ ]]
+maintenance "$next" -c 'from importlib.metadata import version; from groupagent.runtime.app import RuntimeApp; assert version("langchain")=="1.5.0"; assert version("langgraph")=="1.2.22"; assert version("markdown-it-py")=="4.3.0"; assert version("mdurl")=="0.1.2"; print("standard_core_and_text_renderer_import_verified")' > "$release/import-check.log"
+# Explicit migration boundary: the original schema/receipts are already backed
+# up and verified. Nullable frozen text must neither backfill nor rewrite them.
+maintenance "$next" -c '
+import hashlib,json
+from pathlib import Path
+from groupagent.config import AppConfig
+from groupagent.persistence import PostgresStore
+c=AppConfig.model_validate_json(Path("/etc/pot-test2/config.json").read_text())
+s=PostgresStore(Path("/etc/pot-test2/database.dsn").read_text().strip())
+def parts():
+ with s.connect() as conn:
+  conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+  rows=conn.execute("SELECT jsonb_build_array(group_id,intent_id,position)::text AS key,(to_jsonb(p)-%s)::text AS legacy FROM ga_delivery_parts p WHERE group_id=%s",("rendered_text",c.group.internal_id)).fetchall()
+  return {row["key"]:hashlib.sha256(row["legacy"].encode()).hexdigest() for row in rows}
+def frozen():
+ with s.connect() as conn:
+  exists=conn.execute("SELECT 1 FROM information_schema.columns WHERE table_schema=%s AND table_name=%s AND column_name=%s",("public","ga_delivery_parts","rendered_text")).fetchone()
+  if not exists: return None
+  rows=conn.execute("SELECT jsonb_build_array(group_id,intent_id,position)::text AS key,rendered_text FROM ga_delivery_parts WHERE group_id=%s",(c.group.internal_id,)).fetchall()
+  return {row["key"]:row["rendered_text"] for row in rows}
+with s.connect() as conn:
+ before_version=conn.execute("SELECT max(version) AS version FROM ga_schema_migrations").fetchone()["version"]
+before=parts()
+before_frozen=frozen()
+version=s.migrate()
+after=parts()
+assert before==after,"Migration changed an existing part, receipt, key or payload hash"
+if before_frozen is not None:
+ assert before_frozen==frozen(),"Migration rewrote already frozen wire text"
+with s.connect() as conn:
+ column=conn.execute("SELECT data_type,is_nullable FROM information_schema.columns WHERE table_schema=%s AND table_name=%s AND column_name=%s",("public","ga_delivery_parts","rendered_text")).fetchone()
+ assert column and column["data_type"]=="text" and column["is_nullable"]=="YES"
+ if before_version<16:
+  frozen=conn.execute("SELECT count(*) AS count FROM ga_delivery_parts WHERE group_id=%s AND rendered_text IS NOT NULL",(c.group.internal_id,)).fetchone()["count"]
+  assert frozen==0,"Migration backfilled legacy text"
+ assert version>=16
+print(json.dumps({"schema_before":before_version,"schema_after":version,"legacy_parts":len(before),"legacy_part_rows_and_receipts_unchanged":True,"nullable_frozen_text_verified":True,"legacy_backfill":False}))
+' > "$release/migration-verified.json" 2> "$release/migration.log"
 maintenance "$next" -c 'import json,sys; from pathlib import Path; from groupagent.config import AppConfig; d=json.loads(Path("/before.json").read_text()); d["runtime"].update(engine="langgraph",worker_image=sys.argv[1],harness_image=None); d["engine"].update(candidate="langgraph",approved_runtime_version="langchain1.5.0/langgraph1.2.22"); print(AppConfig.model_validate(d).model_dump_json(indent=2))' "$next" > "$release/config.after.pending.json"
 chown 994:990 "$release/config.after.pending.json"
 mv "$release/config.after.pending.json" "$release/config.after.json"

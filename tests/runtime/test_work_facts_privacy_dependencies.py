@@ -23,7 +23,7 @@ from groupagent.memory import MemberService, MemoryService
 from groupagent.runtime.work_facts import WorkFacts
 from groupagent.scheduling import Scheduler
 
-from .foreground_model_fixture import candidate_reply, observation_reply
+from .foreground_model_fixture import candidate_reply, observation_reply, semantic_fixture_reply
 from .test_app import event
 
 pytestmark = [pytest.mark.postgres, pytest.mark.work_awareness]
@@ -37,7 +37,7 @@ def emit(env, text, *, actor=None, at=None):
         return tx.ingest_event(value, "metadata-privacy:" + value.id, "1", 0).event
 
 
-def harness(env, decide):
+def harness(env, decide, *, required_actions=()):
     class ForegroundFixture:
         name = "synthetic-metadata-privacy-router"
 
@@ -45,6 +45,13 @@ def harness(env, decide):
             self.requests = []
 
         async def complete(self, request):
+            assessed = semantic_fixture_reply(
+                request,
+                required_actions=list(required_actions),
+                work_context_required=True,
+            )
+            if assessed is not None:
+                return assessed
             final = observation_reply(request)
             if final is not None:
                 return final
@@ -146,7 +153,7 @@ async def test_overview_aliases_historical_requester_without_any_roster_entry(ru
             ).fetchone()
             is None
         )
-    request = emit(env, "Pot，聊两句吧。")
+    request = emit(env, "Pot，围绕已有工作聊两句吧。")
     result = await h.coordinator.process(request)
     assert result.decision.kind == "reply" and result.delivery_id
     assert len(h.model.requests) == 1
@@ -179,7 +186,7 @@ async def test_archived_title_lookup_reply_is_revoked_with_its_secondary_source(
             confidence=1,
         )
 
-    h = harness(env, decide)
+    h = harness(env, decide, required_actions=[{"kind": "read_work_facts"}])
     request = emit(env, "Pot，季度报告现在是什么状态？")
     context = h.coordinator._context(env.actor, request)
     assert secondary.id not in context["_snapshot"]["source_fingerprints"]
@@ -227,10 +234,12 @@ async def test_overview_metadata_provenance_revokes_reply_and_derived_work(runti
             confidence=1,
         )
 
-    h = harness(env, decide)
+    h = harness(
+        env, decide, required_actions=[{"kind": "start_work"}] if consumer == "child_work" else []
+    )
     request = emit(
         env,
-        "Pot，说句鼓励的话吧。"
+        "Pot，围绕概览里的主题说句鼓励的话吧。"
         if consumer == "reply"
         else "Pot，基于概览里的主题单独做一份简短说明。",
     )

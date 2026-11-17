@@ -11,6 +11,7 @@ from groupagent.memory.deletions import DeletionSink
 from groupagent.memory.models import CleanupJob, ForgetResult
 from groupagent.memory.task_privacy import redact_tasks, task_dependents, task_markers
 from groupagent.persistence import PostgresStore, UnitOfWork
+from groupagent.persistence.text_parts import redact_removed_text
 
 _PRIVACY_RANK = {"active": 0, "expired": 1, "recalled": 2, "forgotten": 3}
 
@@ -678,6 +679,7 @@ class ForgetMethods:
                     notice_ids,
                 ),
             )
+            redact_removed_text(tx.conn, tx.group_id)
         if forget_facts:
             tx.conn.execute(
                 "UPDATE ga_schedules SET title='[source removed]',goal='[source removed]',acceptance_criteria='[]',state='cancelled',pause_reason=NULL,revision=revision+1,updated_at=clock_timestamp() WHERE group_id=%s AND id=ANY(%s)",

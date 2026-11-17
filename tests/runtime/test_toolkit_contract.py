@@ -486,28 +486,19 @@ async def test_research_claim_without_actual_receipt_cannot_pass(toolkit_setup):
     assert not setup.model.requests
     fetched = await call(run, "web_fetch", {"url": "https://example.com/source"})
     assert fetched.success and len(setup.http_calls) == 1
-    with pytest.raises(DomainError, match="actual retrieval time in UTC"):
-        await setup.toolkit.validate(
-            run.work,
-            run.lease,
-            setup.env.actor,
-            candidate(run, "The source is https://example.com/source", (fetched,)),
-            run.workspace,
-        )
-    assert not setup.model.requests
     accepted = await setup.toolkit.validate(
         run.work,
         run.lease,
         setup.env.actor,
         candidate(
             run,
-            "The synthetic observation is documented at " + fetched.output["source"]["citation"],
+            "The source is https://example.com/source",
             (fetched,),
         ),
         run.workspace,
     )
     assert accepted.checks["result"] and len(setup.model.requests) == 1
-    with pytest.raises(DomainError, match="actual research tool evidence"):
+    with pytest.raises(DomainError, match="no successful research provenance"):
         await setup.toolkit.validate(
             run.work,
             run.lease,
@@ -731,7 +722,7 @@ async def test_semantic_rejection_and_no_send_policy_are_not_overridden_by_forma
             run.work,
             run.lease,
             setup.env.actor,
-            candidate(run, receipts=(generated, selected)),
+            candidate(run, "草稿已准备好，按你的要求暂不发送文件。", (generated, selected)),
             run.workspace,
         )
     setup.model.passed = True
@@ -739,7 +730,7 @@ async def test_semantic_rejection_and_no_send_policy_are_not_overridden_by_forma
         run.work,
         run.lease,
         setup.env.actor,
-        candidate(run, receipts=(generated, selected)),
+        candidate(run, "草稿已准备好，按你的要求暂不发送文件。", (generated, selected)),
         run.workspace,
     )
     assert len(result.deliveries) == 1 and result.deliveries[0].payload_ref.startswith("text:")

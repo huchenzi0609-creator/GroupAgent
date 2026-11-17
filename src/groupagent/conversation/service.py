@@ -75,8 +75,14 @@ from .intent import (
     task_write_request,
 )
 from .participation import fast_observe, outside_quotes, policy_intent, verified_human_addressee
-from .policy import apply_quiet_barrier_in_tx, ingress_admission, interpret_policy
+from .policy import (
+    apply_quiet_barrier_in_tx,
+    ingress_admission,
+    interpret_policy,
+    recipient_evidence_in_tx,
+)
 from .references import resolve_work_selection
+from .turns import TurnContract
 from .work_queries import query_work_in_tx, render_work_query
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
@@ -202,7 +208,7 @@ class ConversationCoordinator(Coordinator):
             query = replace(
                 query, new_request=False, continuation=True, resources=query.resources | {"works"}
             )
-        return ContextBuilder(
+        context = ContextBuilder(
             self.config,
             self.store,
             self.memory,
@@ -211,6 +217,28 @@ class ConversationCoordinator(Coordinator):
             self.artifacts,
             self.clock,
         ).build(actor, event, query)
+        with self.store.transaction(actor, trace_id=event.id) as tx:
+            admission = ingress_admission(
+                tx,
+                event,
+                self.identity,
+                time_zone=self.config.group.time_zone,
+                quiet_hours=self.config.group.quiet_hours,
+                default_mode=self.config.group.participation_mode,
+                now=self.clock(),
+                bot_member_id=self.config.group.bot_member_id,
+                shared_account=self.config.group.shared_account,
+            )
+        if admission.recipient is not None:
+            context["_recipient_evidence"] = admission.recipient
+            context["_invocation"] = {
+                **context.get("_invocation", {}),
+                "addressed": admission.recipient.recipient == "agent",
+                "quoted_bot": admission.recipient.source == "bot_reply",
+                "continuing_work": admission.recipient.source == "continuation",
+            }
+        context["short_reply_style"] = self.config.conversation.short_reply_style
+        return context
 
     def _fast_new_work(self, event: GroupEvent, context: dict) -> Decision | None:
         if (
@@ -554,7 +582,14 @@ class ConversationCoordinator(Coordinator):
         observed = fast_observe(event, context)
         if observed is not None:
             return observed
-        if verified_human_addressee(event.text, context) is not None:
+        contract = context.get("_turn_contract")
+        if isinstance(contract, TurnContract):
+            decision = decision.model_copy(update={"directness": contract.directness})
+            if not contract.visible and decision.action is None:
+                return Decision(
+                    kind="observe", reason_code="turn_observed", directness=contract.directness
+                )
+        elif verified_human_addressee(event.text, context) is not None:
             decision = decision.model_copy(update={"directness": "other"})
         write = decision.action is not None or decision.kind in {
             "start_work",
@@ -627,6 +662,8 @@ class ConversationCoordinator(Coordinator):
                 quiet_hours=self.config.group.quiet_hours,
                 now=now,
                 default_mode=self.config.group.participation_mode,
+                bot_member_id=self.config.group.bot_member_id,
+                shared_account=self.config.group.shared_account,
             )
             if not admission.allowed:
                 return Decision(kind="observe", reason_code=admission.reason_code)
@@ -1176,6 +1213,15 @@ class ConversationCoordinator(Coordinator):
         )
         if intent is None:
             return None
+        recipient = recipient_evidence_in_tx(
+            tx,
+            event,
+            self.identity,
+            bot_member_id=self.config.group.bot_member_id,
+            shared_account=self.config.group.shared_account,
+        )
+        if recipient.recipient == "other":
+            return None
         recipient_context = {
             **self.identity.context(),
             "requester_member_id": tx.actor.member_id,
@@ -1420,6 +1466,17 @@ class ConversationCoordinator(Coordinator):
                     if text and previous.decision.kind not in {"ignore", "observe"}
                     else Decision(kind="observe", reason_code="agent_turn_silent", confidence=1)
                 )
+        saved_contract = (
+            context.get("_turn_contract")
+            if context is not None
+            else TurnContract.model_validate(body["turn_contract"])
+            if body.get("turn_contract")
+            else None
+        )
+        if isinstance(saved_contract, TurnContract) and not saved_contract.visible:
+            final = Decision(
+                kind="observe", reason_code="turn_observed", directness=saved_contract.directness
+            )
         admission = ingress_admission(
             tx,
             event,
@@ -1428,6 +1485,8 @@ class ConversationCoordinator(Coordinator):
             quiet_hours=self.config.group.quiet_hours,
             now=self.clock(),
             default_mode=self.config.group.participation_mode,
+            bot_member_id=self.config.group.bot_member_id,
+            shared_account=self.config.group.shared_account,
         )
         if not admission.allowed:
             final = Decision(kind="observe", reason_code=admission.reason_code, confidence=1)
@@ -1448,7 +1507,13 @@ class ConversationCoordinator(Coordinator):
                     final.directness == "proactive",
                     final.reason_code,
                     self.clock(),
-                    admission.invocation_root_event_id,
+                    admission.invocation_root_event_id
+                    or (
+                        event.id
+                        if isinstance(saved_contract, TurnContract)
+                        and saved_contract.recipient == "agent"
+                        else None
+                    ),
                 ),
             )
         controlled = list(
@@ -1486,7 +1551,10 @@ class ConversationCoordinator(Coordinator):
             "kind": final.kind,
             "result": result.model_dump(mode="json"),
             "agent_pending_response": False,
+            "agent_needs_execution": False,
         }
+        if context is not None and context.get("_turn_outcome"):
+            body["turn_outcome"] = context["_turn_outcome"]
         if context is not None:
             body["source_event_ids"] = sorted(
                 set(body.get("source_event_ids", []))
@@ -1532,13 +1600,15 @@ class ConversationCoordinator(Coordinator):
                     decision=Decision(kind="ignore", reason_code="source_unavailable"),
                     duplicate=True,
                 )
-            previous = tx.get_decision(event.id)
+            previous: dict[str, Any] | None = tx.get_decision(event.id)
             if previous:
                 if previous.get("agent_pending_response"):
-                    return self._finish_agent_response_in_tx(tx, event, previous)
-                return CoordinationResult.model_validate(previous["result"]).model_copy(
-                    update={"duplicate": True}
-                )
+                    if not previous.get("agent_needs_execution"):
+                        return self._finish_agent_response_in_tx(tx, event, previous)
+                else:
+                    return CoordinationResult.model_validate(previous["result"]).model_copy(
+                        update={"duplicate": True}
+                    )
             echo = bool(
                 event.platform_message_id
                 and (
@@ -1596,8 +1666,17 @@ class ConversationCoordinator(Coordinator):
                     quiet_hours=self.config.group.quiet_hours,
                     now=self.clock(),
                     default_mode=self.config.group.participation_mode,
+                    bot_member_id=self.config.group.bot_member_id,
+                    shared_account=self.config.group.shared_account,
                 )
                 if not admission.allowed:
+                    if previous and previous.get("agent_pending_response"):
+                        return self._finish_agent_response_in_tx(
+                            tx,
+                            event,
+                            previous,
+                            decision=Decision(kind="observe", reason_code=admission.reason_code),
+                        )
                     result = CoordinationResult(
                         event_id=event.id,
                         decision=Decision(kind="observe", reason_code=admission.reason_code),
@@ -1609,6 +1688,26 @@ class ConversationCoordinator(Coordinator):
         if event.kind == EventKind.RECALL:
             self.memory.recall(self.service_actor, event.id, now=self.clock())
         context = self._context(actor, event)
+        if previous and previous.get("agent_needs_execution"):
+            if previous.get("turn_contract"):
+                context["_turn_contract"] = TurnContract.model_validate(previous["turn_contract"])
+            context["_prior_action_receipts"] = [
+                self._model_aliases(
+                    {
+                        "kind": receipt.get("kind")
+                        or receipt.get("result", {}).get("decision", {}).get("kind"),
+                        "operation": receipt.get("operation"),
+                        "committed": bool(
+                            receipt.get("result", {}).get("work_id")
+                            or receipt.get("result", {}).get("action_result") is not None
+                        ),
+                        "result": receipt.get("result", {}),
+                    },
+                    context,
+                )
+                for receipt in previous.get("action_receipts", [])
+            ]
+            context["prior_action_receipts"] = context["_prior_action_receipts"]
         if self.refresh_roster is not None and not echo:
             roster_status = await self.refresh_roster(actor, event, context)
             if roster_status is not None:
@@ -1683,10 +1782,21 @@ class ConversationCoordinator(Coordinator):
                 try:
                     decision = immediate or await provider.decide(event, context)
                 except Exception:
+                    if context.get("_turn_execution_pending"):
+                        if context.get("_agent_applied") or previous:
+                            with self.store.transaction(actor, trace_id=event.id) as tx:
+                                pending = tx.get_decision(event.id)
+                                if pending is not None:
+                                    pending["agent_needs_execution"] = True
+                                    tx.conn.execute(
+                                        "UPDATE ga_decisions SET body=%s WHERE group_id=%s AND event_id=%s",
+                                        (Jsonb(pending), actor.group_id, event.id),
+                                    )
+                        raise
                     if context.get("_agent_applied"):
                         return self._finish_agent_response(actor, event, context=context)
                     raise
-        if context.get("_agent_applied"):
+        if context.get("_agent_applied") or previous and previous.get("agent_pending_response"):
             return self._finish_agent_response(actor, event, decision=decision, context=context)
         return self._apply_decision(actor, event, decision, context, fast_admitted=fast_admitted)
 
@@ -1709,6 +1819,8 @@ class ConversationCoordinator(Coordinator):
             self.memory.prepare_in_tx(tx)
             self.execution_guard(tx)
             previous: dict[str, Any] | None = tx.get_decision(event.id)
+            receipt_kind = "business" if decision.action is not None else decision.kind
+            receipt_operation = decision.action.get("op") if decision.action else None
             candidate_digest = hashlib.sha256(decision.model_dump_json().encode()).hexdigest()
             if previous:
                 if tool_call_id and previous.get("agent_pending_response"):
@@ -2263,6 +2375,8 @@ class ConversationCoordinator(Coordinator):
                     quiet_hours=self.config.group.quiet_hours,
                     now=self.clock(),
                     default_mode=self.config.group.participation_mode,
+                    bot_member_id=self.config.group.bot_member_id,
+                    shared_account=self.config.group.shared_account,
                 )
                 if not admission.allowed:
                     decision = (
@@ -2289,7 +2403,13 @@ class ConversationCoordinator(Coordinator):
                         decision.directness == "proactive",
                         decision.reason_code,
                         self.clock(),
-                        admission.invocation_root_event_id,
+                        admission.invocation_root_event_id
+                        or (
+                            event.id
+                            if isinstance(context.get("_turn_contract"), TurnContract)
+                            and context["_turn_contract"].recipient == "agent"
+                            else None
+                        ),
                     ),
                 )
             if (
@@ -2308,6 +2428,8 @@ class ConversationCoordinator(Coordinator):
                     quiet_hours=self.config.group.quiet_hours,
                     now=self.clock(),
                     default_mode=self.config.group.participation_mode,
+                    bot_member_id=self.config.group.bot_member_id,
+                    shared_account=self.config.group.shared_account,
                 )
                 if media_admission.allowed and media_admission.invocation_root_event_id:
                     tx.conn.execute(
@@ -2354,6 +2476,10 @@ class ConversationCoordinator(Coordinator):
                     **context["_snapshot"].get("source_task_revisions", {}),
                 },
             }
+            if isinstance(context.get("_turn_contract"), TurnContract):
+                body["turn_contract"] = context["_turn_contract"].model_dump(mode="json")
+            if context.get("_turn_outcome"):
+                body["turn_outcome"] = context["_turn_outcome"]
             if tool_call_id is not None:
                 # Refresh witnesses changed by our own accepted mutation. A later
                 # tool still revalidates all sources against concurrent changes.
@@ -2378,11 +2504,14 @@ class ConversationCoordinator(Coordinator):
                     *(previous.get("action_receipts", []) if previous else []),
                     {
                         "tool_call_id": tool_call_id,
+                        "kind": receipt_kind,
+                        "operation": receipt_operation,
                         "candidate_sha256": candidate_digest,
                         "result": result.model_dump(mode="json"),
                     },
                 ]
                 body["agent_pending_response"] = decision.reason_code != "quiet_enabled"
+                body["agent_needs_execution"] = bool(context.get("_turn_execution_pending"))
                 body["agent_context_revoked"] = bool(context.get("_agent_context_revoked"))
                 if previous:
                     tx.conn.execute(

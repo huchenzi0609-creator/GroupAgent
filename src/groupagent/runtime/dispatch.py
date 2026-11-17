@@ -18,6 +18,7 @@ from .artifacts import ArtifactRegistry
 from .contracts import ActorResolver, ProcessLease
 from .notices import check_notice
 from .state import RuntimeState
+from .text import render_wechat_text
 
 
 class DeliveryPort(Protocol):
@@ -84,6 +85,8 @@ class Dispatcher:
         quiet_hours: list[str] | None = None,
         participation_mode: str = "natural",
         identity: BotIdentity | None = None,
+        bot_member_id: str | None = None,
+        shared_account: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not badge.strip():
@@ -98,6 +101,7 @@ class Dispatcher:
         self.time_zone, self.quiet_hours = time_zone, quiet_hours or []
         self.participation_mode = participation_mode
         self.identity = identity or BotIdentity(badge=badge)
+        self.bot_member_id, self.shared_account = bot_member_id, shared_account
         self._clock, self._retry_at, self._channel_failures = clock, 0.0, 0
 
     async def tick(self, *, limit: int = 20) -> int:
@@ -223,8 +227,21 @@ class Dispatcher:
             text = intent.payload_ref[5:]
             if hashlib.sha256(text.encode()).hexdigest() != intent.payload_hash:
                 raise DomainError("source_unavailable", "Outgoing text was changed or removed")
-            chunks = split_text(without_bot_badge(text, self.badge), maximum=self.chunk_characters)
-            return tuple(
+            parts = self._parts(actor, intent.id)
+            if parts and all(part["rendered_text"] is not None for part in parts):
+                # Render/chunk settings may change after restart. The exact stored
+                # text and its existing key/hash remain the sending authority.
+                payloads = tuple(("text", part["rendered_text"], None) for part in parts)
+                self._check_text_parts(parts, payloads)
+                return payloads
+            if any(part["rendered_text"] is not None for part in parts):
+                raise DomainError("idempotency_conflict", "Outgoing text freeze is incomplete")
+            # Legacy parts have hashes but no frozen text. Reconstruct only their
+            # original recipe, and fail closed if settings no longer reproduce it.
+            # In particular, never re-render an accepted/unknown legacy part.
+            body = text if parts else render_wechat_text(without_bot_badge(text, self.badge))
+            chunks = split_text(without_bot_badge(body, self.badge), maximum=self.chunk_characters)
+            payloads = tuple(
                 (
                     "text",
                     self.badge + (f"（{i + 1}/{len(chunks)}）" if len(chunks) > 1 else "") + part,
@@ -232,6 +249,9 @@ class Dispatcher:
                 )
                 for i, part in enumerate(chunks)
             )
+            if parts:
+                self._check_text_parts(parts, payloads)
+            return payloads
         if intent.payload_ref.startswith("artifact:"):
             version, data = self.artifacts.read(
                 actor, intent.payload_ref[9:], require_validated=True
@@ -249,6 +269,17 @@ class Dispatcher:
             )
             return ((kind, version.name, data),)
         raise DomainError("invalid_delivery", "Unknown outgoing payload reference")
+
+    def _check_text_parts(
+        self, parts: list[dict], payloads: tuple[tuple[str, str, bytes | None], ...]
+    ) -> None:
+        if len(parts) != len(payloads) or any(
+            part["position"] != index or part["payload_hash"] != self._hash(payload)
+            for index, (part, payload) in enumerate(zip(parts, payloads, strict=True))
+        ):
+            raise DomainError(
+                "idempotency_conflict", "Outgoing frozen text does not match its hash"
+            )
 
     @staticmethod
     def _hash(payload: tuple[str, str, bytes | None]) -> str:
@@ -286,14 +317,28 @@ class Dispatcher:
                 )
                 digest = self._hash(payload)
                 tx.conn.execute(
-                    "INSERT INTO ga_delivery_parts(group_id,intent_id,position,idempotency_key,payload_hash) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                    (actor.group_id, intent.id, index, key, digest),
+                    "INSERT INTO ga_delivery_parts(group_id,intent_id,position,idempotency_key,payload_hash,rendered_text) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                    (
+                        actor.group_id,
+                        intent.id,
+                        index,
+                        key,
+                        digest,
+                        payload[1] if payload[0] == "text" else None,
+                    ),
                 )
                 stored = tx.conn.execute(
-                    "SELECT payload_hash FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s AND position=%s",
+                    "SELECT payload_hash,rendered_text FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s AND position=%s",
                     (actor.group_id, intent.id, index),
                 ).fetchone()
-                if stored is None or stored["payload_hash"] != digest:
+                if (
+                    stored is None
+                    or stored["payload_hash"] != digest
+                    or (
+                        stored["rendered_text"] is not None
+                        and stored["rendered_text"] != payload[1]
+                    )
+                ):
                     raise DomainError("idempotency_conflict", "Outgoing segment contents changed")
             row = tx.conn.execute(
                 "SELECT count(*) AS n FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s",
@@ -344,6 +389,8 @@ class Dispatcher:
                     time_zone=self.time_zone,
                     quiet_hours=self.quiet_hours,
                     default_mode=self.participation_mode,
+                    bot_member_id=self.bot_member_id,
+                    shared_account=self.shared_account,
                 )
                 if not admission.allowed:
                     if admission.retire:
@@ -471,6 +518,8 @@ class Dispatcher:
                 time_zone=self.time_zone,
                 quiet_hours=self.quiet_hours,
                 default_mode=self.participation_mode,
+                bot_member_id=self.bot_member_id,
+                shared_account=self.shared_account,
             )
             if not admission.allowed:
                 if admission.retire:
@@ -621,6 +670,8 @@ class Dispatcher:
                 time_zone=self.time_zone,
                 quiet_hours=self.quiet_hours,
                 default_mode=self.participation_mode,
+                bot_member_id=self.bot_member_id,
+                shared_account=self.shared_account,
             )
             if not admission.allowed:
                 if admission.retire:

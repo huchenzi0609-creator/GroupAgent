@@ -254,9 +254,13 @@ def select_focus(
         sources = (quoted_reference["source_event_id"],) if identifiers else ()
         return ContextFocus("quote" if identifiers else "unavailable", identifiers, sources)
     previous = [row for row in recent if row.get("id") != event.id]
-    addressed = identity.mentioned(outside_quotes(event.text))
+    addressed = identity.directly_addressed(outside_quotes(event.text))
     quoted = next((row for row in previous if row.get("id") == event.reply_to), None)
-    if quoted is not None and quoted.get("speaker", "human") == "human":
+    if (
+        quoted is not None
+        and quoted.get("speaker", "human") == "human"
+        and quoted.get("actor_id") != event.actor_id
+    ):
         return ContextFocus("human_discussion")
     for row in reversed(previous):
         if (
@@ -1162,7 +1166,7 @@ class ContextBuilder:
                     "_focus_work_ids": focus.work_ids,
                     "_quoted_work_id": quoted_work_id,
                     "_invocation": {
-                        "addressed": self.identity.mentioned(outside_quotes(event.text)),
+                        "addressed": self.identity.directly_addressed(outside_quotes(event.text)),
                         "quoted_bot": bool(
                             event.reply_to
                             and any(

@@ -21,6 +21,7 @@ from groupagent.memory.common import memory_lock
 from groupagent.memory.deletions import DeletionSink
 from groupagent.ops.cleanup_proof import local_cleanup_proof, record_local_cleanup
 from groupagent.persistence import PostgresStore, UnitOfWork
+from groupagent.persistence.text_parts import redact_removed_text
 
 
 def _digest(value: str) -> str:
@@ -404,6 +405,7 @@ class RuntimeCleanupHandler:
     @staticmethod
     def _redact_rows(tx, job: CleanupJob, plan: dict[str, Any]) -> None:
         work_ids = list(plan["works"])
+        redact_removed_text(tx.conn, job.group_id)
         tx.conn.execute(
             "UPDATE ga_runtime_checkpoints SET body='{}',invalidated=true WHERE group_id=%s AND (work_id=ANY(%s) OR ((%s=ANY(source_event_ids) OR source_fingerprints ? %s) AND (%s<>'expired' OR saved_at<=%s)))",
             (

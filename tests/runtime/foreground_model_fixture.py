@@ -3,11 +3,36 @@
 import json
 from uuid import uuid4
 
+from conversation.turn_model_fixture import semantic_fixture_reply
+
 from groupagent.conversation.work_queries import render_work_query
 from groupagent.coordinator import Decision
+from groupagent.execution import ScriptedFakeModel
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
 _USAGE = TokenUsage(input_tokens=1, output_tokens=1)
+
+
+class ForegroundScriptedModel(ScriptedFakeModel):
+    """Keep legacy protocol scripts explicit while answering new assessment calls."""
+
+    def __init__(self, replies, *, work_context_required=False, **kwargs):
+        replies = list(replies)
+        super().__init__(replies, **kwargs)
+        self.future_replies = list(replies)
+        self.work_context_required = work_context_required
+
+    async def complete(self, request):
+        assessed = semantic_fixture_reply(
+            request,
+            upcoming=self.future_replies[:1],
+            work_context_required=self.work_context_required,
+        )
+        if assessed is not None:
+            return assessed
+        result = await super().complete(request)
+        self.future_replies.pop(0)
+        return result
 
 
 def natural_reply(text):

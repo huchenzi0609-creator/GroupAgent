@@ -23,6 +23,8 @@ from groupagent.coordinator import Decision
 from groupagent.domain import EventKind, GroupEvent
 from groupagent.execution.models import ModelReply, TokenUsage
 
+from .turn_model_fixture import semantic_fixture_reply
+
 
 class NeverCalledFixtureModel:
     name = "explicit-no-provider-expected"
@@ -45,6 +47,9 @@ class RecipientCandidateFixtureModel:
 
     async def complete(self, request):
         self.requests.append(request)
+        assessed = semantic_fixture_reply(request, recipient="other", intent="observe")
+        if assessed is not None:
+            return assessed
         return ModelReply(
             text=json.dumps(self.candidate, ensure_ascii=False),
             usage=TokenUsage(input_tokens=100, output_tokens=50),

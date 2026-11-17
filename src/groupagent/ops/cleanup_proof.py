@@ -16,6 +16,7 @@ from groupagent.domain import DomainError, GroupEvent
 from groupagent.memory import CleanupJob
 from groupagent.ops.common import digest
 from groupagent.persistence import UnitOfWork
+from groupagent.persistence.text_parts import removed_text_is_redacted
 
 LOCAL_CLEANUP_ACTION = "runtime_local_cleanup_verified"
 LOCAL_CLEANUP_CONTRACT = "runtime-local-cleanup-v1"
@@ -48,6 +49,8 @@ def local_cleanup_binding(conn, job: CleanupJob) -> dict[str, str] | None:
         or job.state != "pending"
         or job.resource_kind == "backup_tombstone"
     ):
+        return None
+    if not removed_text_is_redacted(conn, job.group_id):
         return None
     event = conn.execute(
         "SELECT body,memory_state FROM ga_events WHERE group_id=%s AND id=%s",

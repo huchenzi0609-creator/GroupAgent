@@ -497,7 +497,7 @@ async def test_execution_receipt_reaches_the_real_graph_before_any_success_deliv
     """The host proves effects; the scripted model's language is explicit evidence."""
     from groupagent.conversation.provider import ModelDecisionProvider
 
-    from .foreground_model_fixture import candidate_reply, natural_reply
+    from .foreground_model_fixture import candidate_reply, natural_reply, semantic_fixture_reply
 
     env = runtime_env
     value = event(env, "请用Python实际运行2加3，并发回文件")
@@ -524,6 +524,9 @@ async def test_execution_receipt_reaches_the_real_graph_before_any_success_deliv
             self.requests, self.validated_receipts = [], []
 
         async def complete(self, request):
+            assessed = semantic_fixture_reply(request, upcoming=[candidate_reply(plan)])
+            if assessed is not None:
+                return assessed
             self.requests.append(request)
             if len(self.requests) == 1:
                 return candidate_reply(plan)

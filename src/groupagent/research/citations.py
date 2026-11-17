@@ -10,8 +10,10 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict
 
 from groupagent.domain import DomainError
 
@@ -29,17 +31,37 @@ _STAMP = re.compile(
 )
 
 
-def _source(value: ResearchSource | Mapping[str, Any]) -> ResearchSource:
+class CitationProvenance(BaseModel):
+    """URL/time from verified artifact lineage, without invented body metrics.
+
+    Construct only after the host validates the immutable public-image lineage.
+    This is a citation binding, not evidence of reading the source page's body.
+    Plain mappings still require the complete ResearchSource receipt contract.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    url: str
+    retrieved_at: AwareDatetime
+    operation: Literal["search", "fetch"] = "fetch"
+
+
+def _source(
+    value: ResearchSource | CitationProvenance | Mapping[str, Any],
+) -> ResearchSource | CitationProvenance:
     try:
         # Revalidate instances too: model_copy/model_construct must not turn a
         # naive time into a local-clock assumption. Never expose body inputs in
         # a Pydantic exception or serialization warning.
         supplied = (
             value.model_dump(mode="python", warnings=False)
-            if isinstance(value, ResearchSource)
+            if isinstance(value, ResearchSource | CitationProvenance)
             else value
         )
-        source = ResearchSource.model_validate(supplied)
+        source = (
+            CitationProvenance.model_validate(supplied)
+            if isinstance(value, CitationProvenance)
+            else ResearchSource.model_validate(supplied)
+        )
         parsed = urlsplit(source.url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("Invalid source URL")
@@ -77,7 +99,7 @@ def _citation_urls(text: str) -> list[tuple[str, int, int]]:
     return urls
 
 
-def source_citation(value: ResearchSource | Mapping[str, Any]) -> str:
+def source_citation(value: ResearchSource | CitationProvenance | Mapping[str, Any]) -> str:
     """Render a second-precision UTC citation from unchanged aware retrieved_at."""
     source = _source(value)
     stamp = source.retrieved_at.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -85,43 +107,47 @@ def source_citation(value: ResearchSource | Mapping[str, Any]) -> str:
     return f"{source.url}（{operation} UTC：{stamp}）"
 
 
+def _matches_time(record: str, match: re.Match[str], stamp: datetime, *, require_utc: bool) -> bool:
+    token = match[1]
+    prefix, suffix = record[: match.start()], record[match.end() :]
+    if not _ACCESS.search(prefix):
+        return False
+    try:
+        candidate = datetime.fromisoformat(token.upper().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if candidate.tzinfo is None:
+        if not (
+            re.search(r"(?<![A-Za-z0-9_])UTC\s*[：:（）()\s]*$", prefix, re.I)
+            or re.match(r"\s*UTC\b", suffix, re.I)
+        ):
+            return False
+        candidate = candidate.replace(tzinfo=UTC)
+    # Mandatory canonical audit records disclose UTC. Optional displayed times
+    # may use a truthful explicit local offset without adding another UTC copy.
+    if require_utc and candidate.utcoffset() != timedelta(0):
+        return False
+    expected = stamp.astimezone(candidate.tzinfo)
+    precision = re.sub(r"(?:Z|[+-]\d{2}:?\d{2})$", "", token, flags=re.I)
+    if "." not in precision:
+        expected = expected.replace(microsecond=0)
+        if precision.count(":") == 1:
+            expected = expected.replace(second=0)
+    return candidate == expected
+
+
 def _matches_utc_time(record: str, stamp: datetime) -> bool:
-    for match in _STAMP.finditer(record):
-        token = match[1]
-        prefix, suffix = record[: match.start()], record[match.end() :]
-        if not _ACCESS.search(prefix):
-            continue
-        try:
-            candidate = datetime.fromisoformat(token.upper().replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if candidate.tzinfo is None:
-            if not (
-                re.search(r"(?<![A-Za-z0-9_])UTC\s*[：:（）()\s]*$", prefix, re.I)
-                or re.match(r"\s*UTC\b", suffix, re.I)
-            ):
-                continue
-            candidate = candidate.replace(tzinfo=UTC)
-        # A local-time-only citation can be truthful, but the canonical source
-        # record must also disclose UTC. A nonzero offset is not a UTC label.
-        if candidate.utcoffset() != timedelta(0):
-            continue
-        expected = stamp.astimezone(UTC)
-        precision = re.sub(r"(?:Z|[+-]\d{2}:?\d{2})$", "", token, flags=re.I)
-        if "." not in precision:
-            expected = expected.replace(microsecond=0)
-            if precision.count(":") == 1:
-                expected = expected.replace(second=0)
-        if candidate == expected:
-            return True
-    return False
+    return any(
+        _matches_time(record, match, stamp, require_utc=True) for match in _STAMP.finditer(record)
+    )
 
 
 def validate_research_citations(
     text: str,
-    sources: Iterable[ResearchSource | Mapping[str, Any]],
+    sources: Iterable[ResearchSource | CitationProvenance | Mapping[str, Any]],
     *,
     require_access_time: bool = False,
+    require_citation: bool = True,
 ) -> None:
     """Require actual provenance for every URL; optionally bind its UTC time.
 
@@ -130,8 +156,10 @@ def validate_research_citations(
     checked separately on its own citation line, up to the next URL. Minute/second
     precision is compared at that precision; explicit fractional seconds must
     match exactly. Extra local-time displays are allowed alongside canonical UTC.
-    Only research deliveries or an explicit access-time request should opt in;
-    ordinary conversation must not gain an access-time requirement.
+    With require_citation=False, a brief sourced answer may omit visible links;
+    all supplied provenance is still validated. Any displayed retrieval timestamp
+    alongside a link must be truthful even when displaying times is optional.
+    The mandatory UTC audit contract remains opt-in.
     """
     if not isinstance(text, str):
         raise DomainError("validation_failed", "Research citation text must be a string")
@@ -147,23 +175,37 @@ def validate_research_citations(
         observed.setdefault(_url(source.url), []).append(source.retrieved_at)
     matches = _citation_urls(text)
     if not matches:
-        raise DomainError("validation_failed", "Research delivery needs an actual source citation")
+        if require_citation or require_access_time:
+            raise DomainError(
+                "validation_failed", "Research delivery needs an actual source citation"
+            )
+        return
     cited = {_url(match[0]) for match in matches}
     if not cited.issubset(observed):
         raise DomainError("validation_failed", "A cited URL has no successful research provenance")
-    if not require_access_time:
-        return
     verified: set[str] = set()
     for index, match in enumerate(matches):
         url = _url(match[0])
         end = matches[index + 1][1] if index + 1 < len(matches) else len(text)
         record = text[match[2] : end].split("\n", 1)[0][:1000]
+        if not require_access_time:
+            for time in _STAMP.finditer(record):
+                # A nearby publication date is not a runtime access claim.
+                clause = re.split(r"[，,;；。！？!?]", record[: time.start()])[-1]
+                if _ACCESS.search(clause) and not any(
+                    _matches_time(record, time, stamp, require_utc=False) for stamp in observed[url]
+                ):
+                    raise DomainError(
+                        "validation_failed",
+                        "A displayed retrieval time does not match actual research provenance",
+                    )
+            continue
         try:
             if any(_matches_utc_time(record, stamp) for stamp in observed[url]):
                 verified.add(url)
         except ValueError:
             continue
-    if verified != cited:
+    if require_access_time and verified != cited:
         raise DomainError(
             "validation_failed",
             "Each cited URL needs its own actual retrieval time in UTC; copy source.citation, optionally adding local time",

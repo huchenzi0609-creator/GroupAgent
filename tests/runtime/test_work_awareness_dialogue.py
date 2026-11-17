@@ -42,7 +42,7 @@ from groupagent.tools import (
 )
 
 from .conftest import source
-from .foreground_model_fixture import candidate_reply, observation_reply
+from .foreground_model_fixture import candidate_reply, observation_reply, semantic_fixture_reply
 from .test_app import app_for, event
 from .test_async_delivery_supervision import NativeQueueFixture, prepared_supervisor
 from .test_early_ack import intake
@@ -87,6 +87,23 @@ def foreground_model(harness):
         name = "synthetic-work-awareness-router"
 
         async def complete(self, request):
+            marker = request.messages[0].content or ""
+            if marker.startswith("TURN_OUTCOME_V1"):
+                return semantic_fixture_reply(request)
+            if marker.startswith("TURN_CONTRACT_V1"):
+                payload = json.loads(request.messages[1].content)
+                current_intent = harness.scenarios[payload["event"]["id"]]["intent"]
+                required = (
+                    [{"kind": "start_work"}]
+                    if current_intent in {"start_profile", "start_memes"}
+                    else ([{"kind": "read_work_facts"}] if current_intent == "query_memes" else [])
+                )
+                return semantic_fixture_reply(
+                    request,
+                    required_actions=required,
+                    intent="observe" if current_intent == "peer_conversation" else None,
+                    work_context_required=bool(required),
+                )
             final = observation_reply(request)
             if final is not None:
                 return final

@@ -14,24 +14,25 @@ from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
 from groupagent.coordinator import Decision
 from groupagent.domain import DomainError, EventKind, GroupEvent, WorkState
-from groupagent.execution import ModelReply, ScriptedFakeModel, TokenUsage
+from groupagent.execution import ModelReply, TokenUsage
 from groupagent.memory import MemberService, MemoryService
 from groupagent.scheduling import EveryTiming, Scheduler
 
-from .foreground_model_fixture import candidate_reply, natural_reply
+from .foreground_model_fixture import ForegroundScriptedModel, candidate_reply, natural_reply
 
 pytestmark = pytest.mark.postgres
 
 
 def harness(env, *, response="合成夹具答复"):
-    model = ScriptedFakeModel(
+    model = ForegroundScriptedModel(
         [
             ModelReply(
                 text=response,
                 usage=TokenUsage(input_tokens=1, output_tokens=1),
             )
             for _ in range(5)
-        ]
+        ],
+        work_context_required=True,
     )
     provider = ModelDecisionProvider(model)
     memory = MemoryService(env.store)
@@ -605,7 +606,7 @@ async def test_realistic_completed_history_keeps_router_payload_bounded_and_new_
         directness="direct",
         confidence=1,
     )
-    model = ScriptedFakeModel(
+    model = ForegroundScriptedModel(
         [candidate_reply(reply), candidate_reply(action), natural_reply("独立合成说明已经排队。")]
     )
     provider = ModelDecisionProvider(model)

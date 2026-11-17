@@ -29,7 +29,7 @@ _DISCOVERY = (
 
 _RESEARCH = (
     "Use search to discover sources, fetch when the requested claim needs page evidence, and web_read to inspect saved sections without another external read. Reuse evidence once it resolves the request; a search observation is not proof of reading the full page.",
-    "Cite the exact source.citation returned with each used source, preserving its URL and actual retrieval time. Give requested facts and examples in your own words. Every extra factual claim needs support; a recommendation or example does not establish a requirement. Explain actual evidence gaps qualitatively; retrieval sizes and token budgets belong only in an explicit diagnostic answer.",
+    "Preserve source.citation, its exact URL and actual retrieved_at in internal evidence. Follow delivery_policy for the group-facing answer: include links, retrieval times and detailed references when the human requests them; do not append every observed source. Any displayed URL or retrieval time must match actual successful research provenance. Give requested facts and examples in your own words. Every extra factual claim needs support; a recommendation or example does not establish a requirement. Explain actual evidence gaps qualitatively; retrieval sizes and token budgets belong only in an explicit diagnostic answer.",
 )
 
 _DOCUMENTS = (

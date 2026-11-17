@@ -68,6 +68,21 @@ async def test_stable_platform_id_ignores_local_profile_id_and_payload_role(adap
     assert first.trusted_actor_origin == "agentwechat_authenticated_message_metadata"
 
 
+async def test_normalized_mentions_use_native_ids_without_parsing_names_or_quoted_text(
+    adapter, daemon
+):
+    daemon.messages["local-1"].update(
+        {
+            "body": "我看到了Pot的说明。",
+            "mentions": {"state": "known", "userIds": ["synthetic-peer"], "self": False},
+        }
+    )
+    native = await adapter.read_message("local-1")
+    assert native.mentioned_member_ids == ["synthetic-peer"]
+    daemon.messages["local-1"]["mentions"]["state"] = "unknown"
+    assert (await adapter.read_message("local-1")).mentioned_member_ids == []
+
+
 async def test_local_id_fallback_changes_with_source_epoch(config, daemon):
     daemon.messages["local-1"]["serverId"] = None
     async with httpx.AsyncClient(transport=httpx.MockTransport(daemon)) as client:

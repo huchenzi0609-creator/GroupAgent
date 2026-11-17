@@ -14,6 +14,8 @@ import pytest
 from groupagent.domain import EventKind, GroupEvent, WorkState
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
+from .turn_model_fixture import semantic_fixture_reply
+
 pytestmark = pytest.mark.postgres
 USAGE = TokenUsage(input_tokens=1, output_tokens=1)
 
@@ -65,10 +67,16 @@ def fact_call(title="湿地", *, evidence=False):
 class ScriptedModel:
     name = "offline-natural-dialogue-through-real-langgraph"
 
-    def __init__(self, *steps):
+    def __init__(self, *steps, required_actions=None):
         self.steps, self.requests = list(steps), []
+        self.required_actions = required_actions
 
     async def complete(self, request):
+        assessed = semantic_fixture_reply(
+            request, upcoming=self.steps, required_actions=self.required_actions
+        )
+        if assessed is not None:
+            return assessed
         self.requests.append(request)
         assert {tool["function"]["name"] for tool in request.tools} == {
             "read_work_facts",
@@ -301,7 +309,19 @@ async def test_two_distinct_commits_return_ordered_receipts_then_one_natural_rep
         assert last_observation(request)["status"] == "committed"
         return reply("节水Word已经排队，也记下了你负责展示。")
 
-    event, result = await turn(env, text, ScriptedModel(first, after_first, after_second))
+    event, result = await turn(
+        env,
+        text,
+        ScriptedModel(
+            first,
+            after_first,
+            after_second,
+            required_actions=[
+                {"kind": "start_work"},
+                {"kind": "business", "operation": "claim_task"},
+            ],
+        ),
+    )
     assert result.decision.response == "节水Word已经排队，也记下了你负责展示。"
     with env.store.transaction(env.actor) as tx:
         body = tx.get_decision(event.id)
@@ -336,7 +356,8 @@ async def test_crash_after_commit_replays_receipt_and_finalizes_once(conversatio
         assert tx.get_decision(event.id)["agent_pending_response"]
         assert event.id in {row.id for row in tx.list_pending_events()}
         assert len(tx.list_work()) == 1 and not tx.list_delivery()
-    # No model call on replay, so a newly generated tool ID cannot create a second work.
+    # A resumed turn validates the durable receipt before its one final reply.
+    env.models[event.id] = ScriptedModel(reply("文档已排队，完成后发来。"))
     result = await env.coordinator.process(event)
     assert result.delivery_id
     with env.store.transaction(env.actor) as tx:
@@ -414,7 +435,11 @@ async def test_tool_call_and_same_action_replays_never_create_duplicate_work(con
 
     def finish(request):
         observed = last_observation(request)
-        assert observed["status"] == "rejected" and observed["code"] == "invalid_input"
+        assert observed["status"] == "rejected"
+        assert (
+            observed.get("code") == "invalid_input"
+            or observed["issues"][0]["code"] == "action_not_requested_this_turn"
+        )
         return reply("节水文档已排队；重复调用没有新增任务。")
 
     event, result = await turn(
@@ -501,7 +526,12 @@ async def test_forget_inside_open_turn_drops_pre_forget_receipts_and_old_model_t
         assert observed["status"] == "committed"
         return reply("已经处理，旧模型仍然记着：" + marker)
 
-    env.models[request.id] = ScriptedModel(first, after_create, after_forget)
+    env.models[request.id] = ScriptedModel(
+        first,
+        after_create,
+        after_forget,
+        required_actions=[{"kind": "start_work"}, {"kind": "business", "operation": "forget"}],
+    )
     result = await env.coordinator.process(request)
     assert marker not in (result.decision.response or "")
     with env.store.transaction(env.actor) as tx:

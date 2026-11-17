@@ -155,7 +155,7 @@ async def test_toolkit_accepts_jpeg_to_trusted_png_results_and_real_delivery_dra
         run.work,
         run.lease,
         setup.env.actor,
-        candidate(run, receipts=(*receipts, unused_page)),
+        candidate(run, "图片已准备好。", (*receipts, unused_page)),
         run.workspace,
     )
     drafts = [draft for draft in accepted.deliveries if draft.payload_ref.startswith("artifact:")]
@@ -176,16 +176,45 @@ async def test_toolkit_accepts_jpeg_to_trusted_png_results_and_real_delivery_dra
             item.sha256 for item in originals
         }
     assert setup.http_calls == []
-    assert (
-        "https://example.com/page（页面访问时间 UTC：2026-11-16T00:00:00Z）"
-        in accepted.deliveries[0].payload_ref
-    )
+    assert accepted.deliveries[0].payload_ref == "text:图片已准备好。"
     assert "unused.example.com" not in accepted.deliveries[0].payload_ref
     review = setup.model.requests[-1]
     assert "public_image_source" in review.messages[1].content
+    assert "2026-11-16T00:00:00Z" in review.messages[1].content
     assert all(
         receipt.output["page_citation"] and receipt.output["image_citation"]
         for receipt in receipts[:-1]
+    )
+
+
+@pytest.mark.parametrize("show_time", [False, True])
+async def test_requested_source_page_survives_reviewed_reused_image_delivery(
+    conversion_setup, show_time
+):
+    setup = conversion_setup
+    request = "交付两张PNG图片，在群里给出原始来源页面链接。"
+    if show_time:
+        request += "保留页面实际访问时间。"
+    run, originals = await imported_jpegs(setup, request_text=request)
+    receipts = await convert_and_select(run, originals)
+    page = "https://example.com/page"
+    if show_time:
+        page += "（页面访问时间 UTC：2026-11-16T00:00:00Z）"
+    answer = "图片已准备好。\n" + page
+    accepted = await setup.toolkit.validate(
+        run.work,
+        run.lease,
+        setup.env.actor,
+        candidate(run, answer, receipts),
+        run.workspace,
+    )
+    assert accepted.deliveries[0].payload_ref == "text:" + answer
+    assert len(accepted.deliveries) == 3
+    assert not setup.http_calls
+    review = json.loads(setup.model.requests[-1].messages[1].content)
+    assert review["original_request"]["text"] == request
+    assert all(
+        "page_retrieved_at" in artifact["public_image_source"] for artifact in review["artifacts"]
     )
 
 
