@@ -125,7 +125,7 @@ def local_cleanup_binding(conn, job: CleanupJob) -> dict[str, str] | None:
     )
     media = _rows(
         conn,
-        "SELECT * FROM ga_media_inputs WHERE group_id=%s AND (event_id=%s OR source_fingerprints ? %s) ORDER BY event_id",
+        "SELECT * FROM ga_media_inputs WHERE group_id=%s AND (event_id=%s OR source_fingerprints ? %s) ORDER BY event_id,attachment_id",
         (job.group_id, job.event_id, job.event_id or ""),
     )
     catalog = _rows(

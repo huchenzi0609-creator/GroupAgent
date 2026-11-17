@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from psycopg.conninfo import make_conninfo
 from psycopg.types.json import Jsonb
 
 from groupagent.artifacts import ArtifactStore
@@ -16,6 +17,7 @@ from groupagent.ops.cleanup_proof import (
     LOCAL_CLEANUP_ACTION,
     local_cleanup_proof,
 )
+from groupagent.persistence import PostgresStore
 from groupagent.runtime.cleanup import RuntimeCleanupHandler
 
 from .test_runtime_cleanup import catalog, seed
@@ -237,3 +239,72 @@ async def test_more_than_one_batch_of_unsupported_upstream_jobs_does_not_starve_
         )
     backup = manager.create(actor)
     assert manager.verify(actor, backup.id).archive_bytes > 0
+
+
+async def test_overlapping_media_cleanup_preserves_proof_when_heap_order_changes(
+    store, actor, member, tmp_path
+):
+    # PostgreSQL is free to choose a sequential scan. Updating an already
+    # redacted sibling must not make a list with tied event_id ordering differ.
+    store = PostgresStore(
+        make_conninfo(store.dsn, options="-c enable_indexscan=off -c enable_bitmapscan=off")
+    )
+    root, artifacts, first, _, _, _ = seed(store, member, tmp_path, expired=True, channel=True)
+    now = datetime.now(UTC)
+    events = {}
+    with store.transaction(member) as tx:
+        for name in ("overlap", "media_owner"):
+            identity = uuid4().hex
+            stamp = now if name == "media_owner" else now - timedelta(days=40)
+            event = GroupEvent(
+                id=identity,
+                source_key="synthetic-media-order:" + identity,
+                group_id=member.group_id,
+                actor_id=member.member_id,
+                kind=EventKind.TEXT,
+                text="synthetic source",
+                occurred_at=stamp,
+                received_at=stamp,
+                platform_message_id="synthetic-platform:" + identity,
+                channel_account_id="synthetic-account",
+            )
+            tx.ingest_event(event, identity, "1", 0)
+            events[name] = event
+        for attachment, sources in (
+            ("first", [first.id, events["overlap"].id]),
+            ("second", [first.id]),
+        ):
+            tx.conn.execute(
+                "INSERT INTO ga_media_inputs(group_id,event_id,attachment_id,body,source_fingerprints) VALUES(%s,%s,%s,%s,%s)",
+                (
+                    actor.group_id,
+                    events["media_owner"].id,
+                    attachment,
+                    Jsonb({"raw": "synthetic media payload"}),
+                    Jsonb({source: "synthetic-fingerprint" for source in sources}),
+                ),
+            )
+    memory = MemoryService(store)
+    memory.expire(actor, before=now - timedelta(days=30))
+    jobs = {job.event_id: job for job in memory.pending_cleanup(actor)}
+    handler = RuntimeCleanupHandler(store, artifacts, root, technical=actor)
+    with pytest.raises(DomainError) as caught:
+        await handler.purge(jobs[first.id])
+    assert caught.value.code == "upstream_cleanup_unsupported"
+    with store.transaction(actor) as tx:
+        assert local_cleanup_proof(tx.conn, jobs[first.id]) is not None
+        before = tx.conn.execute("SELECT * FROM ga_media_inputs ORDER BY attachment_id").fetchall()
+        before_heap = tx.conn.execute(
+            "SELECT attachment_id FROM ga_media_inputs ORDER BY ctid"
+        ).fetchall()
+    with pytest.raises(DomainError) as caught:
+        await handler.purge(jobs[events["overlap"].id])
+    assert caught.value.code == "upstream_cleanup_unsupported"
+    with store.transaction(actor) as tx:
+        after = tx.conn.execute("SELECT * FROM ga_media_inputs ORDER BY attachment_id").fetchall()
+        after_heap = tx.conn.execute(
+            "SELECT attachment_id FROM ga_media_inputs ORDER BY ctid"
+        ).fetchall()
+        assert before == after and before_heap != after_heap
+        assert local_cleanup_proof(tx.conn, jobs[first.id]) is not None
+        assert local_cleanup_proof(tx.conn, jobs[events["overlap"].id]) is not None
