@@ -26,9 +26,11 @@ class CleanupRunner:
         *,
         journal: DeletionJournal | None = None,
         backups: BackupManager | None = None,
+        checkpoint: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.memory, self.handler, self.journal = memory, handler, journal
         self.backups = backups
+        self.checkpoint = checkpoint
 
     async def run(self, actor: ActorContext, *, now=None, limit: int = 100) -> CleanupResult:
         synced = self.journal.sync(self.memory.store, actor) if self.journal else 0
@@ -63,6 +65,10 @@ class CleanupRunner:
                     upstream_jobs.append(job)
             jobs.extend(upstream_jobs[: batch_limit - len(jobs)])
         for job in jobs:
+            if self.checkpoint is not None:
+                # The runtime supplies an owner-loop authority/cancellation
+                # boundary. Do not absorb a lost fence as a per-job failure.
+                await self.checkpoint()
             try:
                 if job.resource_kind == "backup_tombstone":
                     if self.backups is None:
@@ -124,6 +130,8 @@ class CleanupRunner:
                     )
         retention = getattr(self.handler, "expire_artifacts", None)
         if retention is not None:
+            if self.checkpoint is not None:
+                await self.checkpoint()
             retention_result: Any = retention(actor, now=now, limit=limit)
             retained: Any = (
                 await retention_result
