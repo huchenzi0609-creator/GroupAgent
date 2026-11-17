@@ -1,21 +1,19 @@
 """Bounded pure-inference recovery; no provider, database or sandbox is contacted."""
 
 import asyncio
-import json
-from types import SimpleNamespace
 
 import pytest
 
 from groupagent.domain import DomainError
 from groupagent.execution import (
     ExecutionBudget,
-    HarnessEngine,
     ModelMessage,
     ModelReply,
     ModelRequest,
     ModelToolCall,
     RunState,
     ScopedToolEngine,
+    ScriptedFakeModel,
     TokenUsage,
 )
 from groupagent.execution.engine import SYSTEM_PROMPT
@@ -222,369 +220,17 @@ async def test_timeout_with_late_model_result_is_never_retried_or_dispatched(
     assert not (await engine.inspect(run_id)).receipts
 
 
-class ActiveProcess:
-    async def wait(self):
-        await asyncio.Event().wait()
-
-
-def harness_fixture(request, gateway, model, budget):
-    # Only the host relay is exercised. This runner is never invoked.
-    engine = HarnessEngine(model, gateway, object(), model_budget=budget)
-    run = engine._create(retry_request(request))
-    run.active_since = asyncio.get_running_loop().time()
-    engine._bridges[request.attempt_id] = SimpleNamespace(process=ActiveProcess())
-    tools = gateway.describe(run.scope)
-    payload = {
-        "messages": [{"role": "user", "content": request.objective}],
-        "tools": [
-            {
-                **tool,
-                "function": {
-                    **tool["function"],
-                    "name": "mcp__groupagent__" + tool["function"]["name"],
-                },
-            }
-            for tool in tools
-        ],
-    }
-    return engine, run, payload
-
-
-@pytest.mark.parametrize("failure", [unavailable, malformed])
-async def test_host_harness_retries_only_model_and_preserves_previous_tool_receipt(
-    execution_request, gateway, failure
-):
-    model = ModelSequence([write_reply("mcp__groupagent__"), failure(), final_reply()])
-    budget = RecordingBudget()
-    engine, run, payload = harness_fixture(execution_request, gateway, model, budget)
-    proposed = await engine._relay_model(run, payload)
-    receipt = await engine._relay_tool(
-        run,
-        {"name": "workspace_write_text", "arguments": proposed.tool_calls[0].arguments},
-        list(proposed.tool_calls),
-        run.revision,
-    )
-    payload["messages"].append({"role": "user", "content": str(receipt)})
-    reply = await engine._relay_model(run, payload)
-    assert reply.text == "Synthetic candidate" and len(run.receipts) == 1
-    assert model.requests[1] == model.requests[2]
-    assert run.usage.rounds == 3 and run.usage.tokens == 30 + budget.reserved["2"] + 15
-    assert budget.settled["2"] is None
-    assert run.backend_state["uncertain_model_usage"] is True
-    assert run.backend_state["model_recovery_pending"] is False
-
-
-@pytest.mark.parametrize(
-    "outcomes,expected",
-    [
-        ([unavailable(), ModelRejected(0), unavailable()], "provider_unavailable"),
-        ([malformed()] * 3, "invalid_model_response"),
-    ],
-)
-async def test_host_harness_exhaustion_preserves_unknown_fees_without_execution_fence(
-    execution_request, gateway, outcomes, expected
-):
-    model = ModelSequence(outcomes)
-    budget = RecordingBudget()
-    engine, run, payload = harness_fixture(execution_request, gateway, model, budget)
-    with pytest.raises(DomainError) as failure:
-        await engine._relay_model(run, payload)
-    assert failure.value.code == expected
-    assert len(model.requests) == run.usage.rounds == 3 and run.safe_to_resume
-    assert run.usage.tokens == sum(budget.reserved.values())
-    assert run.backend_state["model_recovery_pending"] is False
-    assert run.backend_state["uncertain_model_usage"] is True
-    assert all(value is None for value in budget.settled.values())
-    await engine._finish(run, RunState.PAUSED, expected)
-    assert engine._checkpoint(run).safe_to_resume and len(model.requests) == 3
-
-
-@pytest.mark.parametrize("backend", ["core", "harness"])
 @pytest.mark.parametrize("code", ["permission_denied", "scope_violation", "invalid_model_reply"])
 async def test_live_model_recovery_does_not_retry_policy_or_reply_errors(
-    execution_request, gateway, backend, code
+    execution_request, gateway, code
 ):
     model = ModelSequence([DomainError(code, "Synthetic non-retryable boundary"), final_reply()])
     budget = RecordingBudget()
-    if backend == "core":
-        engine = ScopedToolEngine(model, gateway, model_budget=budget)
-        result = await engine.wait(await engine.start(retry_request(execution_request)))
-        assert result.error_code == code and not result.checkpoint.safe_to_resume
-    else:
-        engine, run, payload = harness_fixture(execution_request, gateway, model, budget)
-        with pytest.raises(DomainError) as failure:
-            await engine._relay_model(run, payload)
-        assert failure.value.code == code and not run.safe_to_resume
+    engine = ScopedToolEngine(model, gateway, model_budget=budget)
+    result = await engine.wait(await engine.start(retry_request(execution_request)))
+    assert result.error_code == code and not result.checkpoint.safe_to_resume
     assert len(model.requests) == len(budget.reserved) == 1
     assert budget.settled == {"1": None}
-
-
-class SyntheticHarnessProcess:
-    """In-memory SDK protocol fixture; never starts a native worker or Docker."""
-
-    def __init__(self):
-        self.commands = asyncio.Queue()
-        self.stdout = asyncio.StreamReader()
-        self.stdin = self
-        self.returncode = None
-        self.ended = asyncio.Event()
-
-    def write(self, data):
-        self.commands.put_nowait(json.loads(data))
-
-    async def drain(self):
-        pass
-
-    def is_closing(self):
-        return self.returncode is not None
-
-    async def wait(self):
-        await self.ended.wait()
-        return self.returncode
-
-    def kill(self):
-        self.returncode = 0
-        self.ended.set()
-
-    def emit(self, message):
-        self.stdout.feed_data(json.dumps(message).encode() + b"\n")
-
-
-class SyntheticHarnessRunner:
-    def __init__(self, process):
-        self.process = process
-
-    async def preflight(self):
-        return {"harness_sdk": "0.2.2rc2"}
-
-    def _argv(self, *args, **kwargs):
-        return ["synthetic-image"]
-
-    def _env(self, home):
-        return {}
-
-    def track_container(self, *args):
-        pass
-
-    async def remove_container(self, *args):
-        self.process.kill()
-
-
-async def test_finished_harness_can_resume_after_exhausted_inference_with_unknown_fees(
-    execution_request, gateway, monkeypatch
-):
-    """Native protocol fixture, with one durable write and separately charged recovery."""
-    first_process, second_process = SyntheticHarnessProcess(), SyntheticHarnessProcess()
-    processes = iter((first_process, second_process))
-
-    async def create_process(*args, **kwargs):
-        return next(processes)
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
-    budget = RecordingBudget()
-    first_model = ModelSequence([write_reply("mcp__groupagent__"), *[unavailable()] * 3])
-    first = HarnessEngine(
-        first_model, gateway, SyntheticHarnessRunner(first_process), model_budget=budget
-    )
-
-    async def first_protocol():
-        initial = await first_process.commands.get()
-        tools = [
-            {
-                **tool,
-                "function": {
-                    **tool["function"],
-                    "name": "mcp__groupagent__" + tool["function"]["name"],
-                },
-            }
-            for tool in initial["tools"]
-        ]
-        payload = {"messages": [{"role": "user", "content": initial["prompt"]}], "tools": tools}
-        first_process.emit(
-            {"type": "request", "id": "first", "method": "model", "payload": payload}
-        )
-        reply = await first_process.commands.get()
-        call = reply["result"]["choices"][0]["message"]["tool_calls"][0]
-        first_process.emit(
-            {
-                "type": "request",
-                "id": "write",
-                "method": "tool",
-                "payload": {
-                    "name": "workspace_write_text",
-                    "arguments": json.loads(call["function"]["arguments"]),
-                },
-            }
-        )
-        await first_process.commands.get()
-        first_process.emit({"type": "request", "id": "lost", "method": "model", "payload": payload})
-        failure = await first_process.commands.get()
-        assert failure["error"] == "provider_unavailable"
-        first_process.emit(
-            {
-                "type": "finished",
-                "finish_reason": "error",
-                "text": None,
-                "sessions": "native-checkpoint-after-write",
-            }
-        )
-
-    protocol = asyncio.create_task(first_protocol())
-    paused = await asyncio.wait_for(
-        first.wait(await first.start(retry_request(execution_request))), 2
-    )
-    await protocol
-    assert paused.state == RunState.PAUSED and paused.error_code == "provider_unavailable"
-    assert paused.checkpoint.safe_to_resume and len(paused.receipts) == 1
-    assert paused.checkpoint.backend_state["uncertain_model_usage"] is True
-    assert all(budget.settled[key] is None for key in ("2", "3", "4"))
-
-    second_model = ModelSequence([final_reply()])
-    second = HarnessEngine(
-        second_model, gateway, SyntheticHarnessRunner(second_process), model_budget=budget
-    )
-
-    async def second_protocol():
-        initial = await second_process.commands.get()
-        assert initial["sessions"] == "native-checkpoint-after-write"
-        tools = [
-            {
-                **tool,
-                "function": {
-                    **tool["function"],
-                    "name": "mcp__groupagent__" + tool["function"]["name"],
-                },
-            }
-            for tool in initial["tools"]
-        ]
-        second_process.emit(
-            {
-                "type": "request",
-                "id": "continue",
-                "method": "model",
-                "payload": {
-                    "messages": [{"role": "user", "content": initial["prompt"]}],
-                    "tools": tools,
-                },
-            }
-        )
-        response = await second_process.commands.get()
-        second_process.emit(
-            {
-                "type": "finished",
-                "finish_reason": "completed",
-                "text": response["result"]["choices"][0]["message"]["content"],
-                "sessions": "native-checkpoint-complete",
-            }
-        )
-
-    protocol = asyncio.create_task(second_protocol())
-    result = await asyncio.wait_for(
-        second.wait(
-            await second.resume(
-                paused.checkpoint, execution_request.actor, attempt_id="fresh-funded-inference"
-            )
-        ),
-        2,
-    )
-    await protocol
-    assert result.state == RunState.CANDIDATE and len(result.receipts) == 1
-    assert len(second_model.requests) == 1 and result.usage.rounds == 5
-    assert result.usage.tokens == paused.usage.tokens + 15
-    assert all(budget.settled[key] is None for key in ("2", "3", "4"))
-    assert (execution_request.workspace / "once.txt").read_text() == "Synthetic content"
-
-
-@pytest.mark.parametrize("failure", [unavailable, malformed])
-async def test_host_harness_finished_checkpoint_separates_unknown_fees_from_safe_execution(
-    execution_request, gateway, monkeypatch, failure
-):
-    process = SyntheticHarnessProcess()
-
-    async def create_process(*args, **kwargs):
-        return process
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
-    model = ModelSequence([write_reply("mcp__groupagent__"), failure(), final_reply()])
-    budget = RecordingBudget()
-    checkpoints = []
-
-    async def save(checkpoint):
-        checkpoints.append(checkpoint)
-
-    engine = HarnessEngine(
-        model,
-        gateway,
-        SyntheticHarnessRunner(process),
-        model_budget=budget,
-        checkpoint_sink=save,
-    )
-
-    async def native_protocol_fixture():
-        initial = await process.commands.get()
-        tools = [
-            {
-                **tool,
-                "function": {
-                    **tool["function"],
-                    "name": "mcp__groupagent__" + tool["function"]["name"],
-                },
-            }
-            for tool in initial["tools"]
-        ]
-        payload = {"messages": [{"role": "user", "content": initial["prompt"]}], "tools": tools}
-        process.emit({"type": "request", "id": "first", "method": "model", "payload": payload})
-        first = await process.commands.get()
-        call = first["result"]["choices"][0]["message"]["tool_calls"][0]
-        process.emit(
-            {
-                "type": "request",
-                "id": "effect",
-                "method": "tool",
-                "payload": {
-                    "name": call["function"]["name"].removeprefix("mcp__groupagent__"),
-                    "arguments": json.loads(call["function"]["arguments"]),
-                },
-            }
-        )
-        effect = await process.commands.get()
-        payload["messages"].append({"role": "user", "content": json.dumps(effect["result"])})
-        process.emit({"type": "request", "id": "next", "method": "model", "payload": payload})
-        recovered = await process.commands.get()
-        assert recovered["response_to"] == "next" and "error" not in recovered
-        process.emit(
-            {
-                "type": "finished",
-                "finish_reason": "completed",
-                "text": recovered["result"]["choices"][0]["message"]["content"],
-                "sessions": "synthetic-native-session-checkpoint",
-            }
-        )
-
-    protocol = asyncio.create_task(native_protocol_fixture())
-    try:
-        result = await asyncio.wait_for(
-            engine.wait(await engine.start(retry_request(execution_request))), 2
-        )
-        await protocol
-    finally:
-        protocol.cancel()
-        await asyncio.gather(protocol, return_exceptions=True)
-    assert result.state == RunState.CANDIDATE and result.checkpoint.safe_to_resume
-    assert result.checkpoint.backend_state["sessions"] == "synthetic-native-session-checkpoint"
-    assert result.checkpoint.backend_state["uncertain_model_usage"] is True
-    assert result.checkpoint.backend_state["model_recovery_pending"] is False
-    persisted = checkpoints[-1]
-    assert persisted.state == RunState.CANDIDATE and persisted.safe_to_resume
-    assert persisted.usage == result.usage and persisted.receipts == result.receipts
-    assert persisted.backend_state == result.checkpoint.backend_state
-    assert any(
-        not item.safe_to_resume and item.backend_state.get("uncertain_model_usage") is True
-        for item in checkpoints[:-1]
-    )
-    assert len(result.receipts) == result.usage.tool_calls == 1
-    assert result.usage.rounds == 3 and result.usage.tokens == 30 + budget.reserved["2"] + 15
-    assert budget.settled["2"] is None and set(budget.reserved) == {"1", "2", "3"}
 
 
 async def test_settlement_failure_never_triggers_a_second_model_request(execution_request, gateway):
@@ -625,3 +271,167 @@ async def test_retry_reservation_denial_does_not_clear_the_previous_unknown_boun
     assert result.checkpoint.backend_state["model_recovery_pending"] is False
     assert len(model.requests) == result.usage.rounds == 1
     assert result.usage.tokens == budget.reserved["1"] and budget.settled["1"] is None
+
+
+async def test_accounting_returns_and_replays_retained_reply_without_second_inference(
+    execution_request, gateway
+):
+    from groupagent.execution import accounting_recovery_checkpoint
+
+    class RecoverableOfflineLedger:
+        def __init__(self):
+            self.reserved = []
+            self.settled = {}
+            self.recovered = []
+            self.lose_reply = True
+
+        async def reserve(self, request, *, round_number, input_tokens, output_tokens):
+            identifier = f"reservation-{round_number}"
+            self.reserved.append(identifier)
+            return identifier
+
+        async def settle(self, reservation_id, usage):
+            assert reservation_id not in self.settled
+            self.settled[reservation_id] = usage
+            if self.lose_reply:
+                self.lose_reply = False
+                raise OSError("Synthetic response lost after the ledger committed")
+
+        async def recover(self, request, reservation_id, usage):
+            assert request.actor == execution_request.actor
+            assert self.settled[reservation_id] == usage
+            self.recovered.append(reservation_id)
+
+    ledger = RecoverableOfflineLedger()
+    model = ModelSequence([write_reply()])
+    engine = ScopedToolEngine(model, gateway, model_budget=ledger)
+    paused = await engine.wait(await engine.start(retry_request(execution_request)))
+    assert paused.error_code == "billing_unavailable" and not paused.checkpoint.safe_to_resume
+    assert accounting_recovery_checkpoint(paused.checkpoint)
+    assert not (execution_request.workspace / "once.txt").exists()
+    assert (
+        paused.checkpoint.backend_state["pending_model_settlement"]["reply"]["tool_calls"][0]["id"]
+        == "known-write"
+    )
+
+    resumed_model = ModelSequence([final_reply()])
+    resumed = ScopedToolEngine(resumed_model, gateway, model_budget=ledger)
+    result = await resumed.wait(
+        await resumed.resume(
+            paused.checkpoint, execution_request.actor, attempt_id="ledger-returned"
+        )
+    )
+    assert result.state == RunState.CANDIDATE and result.checkpoint.safe_to_resume
+    assert result.usage.rounds == 2 and result.usage.tokens == 45
+    assert len(model.requests) == len(resumed_model.requests) == 1
+    assert ledger.reserved == ["reservation-1", "reservation-2"]
+    assert ledger.recovered == ["reservation-1"]
+    assert result.usage.tool_calls == 1 and len(result.receipts) == 1
+    assert (execution_request.workspace / "once.txt").read_text() == "Synthetic content"
+    assert "pending_model_settlement" not in result.checkpoint.backend_state
+    assert "recovered_model_reply" not in result.checkpoint.backend_state
+
+
+async def test_preserved_inflight_checkpoint_reconciles_unknown_charge_after_controller_stops(
+    execution_request, gateway
+):
+    from groupagent.execution import EngineCheckpoint, reconcile_quiesced_inference_checkpoint
+
+    class IdempotentOfflineLedger:
+        def __init__(self):
+            self.settlements = {}
+            self.recoveries = []
+
+        async def reserve(self, request, *, round_number, input_tokens, output_tokens):
+            return f"held-{round_number}"
+
+        async def settle(self, reservation_id, usage):
+            if reservation_id in self.settlements:
+                assert self.settlements[reservation_id] == usage
+            self.settlements[reservation_id] = usage
+
+        async def recover(self, request, reservation_id, usage):
+            self.recoveries.append((reservation_id, usage))
+            await self.settle(reservation_id, usage)
+
+    ledger = IdempotentOfflineLedger()
+    model = ScriptedFakeModel([write_reply()], delay_seconds=100)
+    initial = ScopedToolEngine(model, gateway, model_budget=ledger)
+    run_id = await initial.start(retry_request(execution_request))
+    await model.started.wait()
+    # Preserve the last durable in-flight boundary, as a killed process would
+    # leave it. Join the fixture's old controller before host reconciliation.
+    checkpoint = EngineCheckpoint.model_validate_json(
+        (await initial.flush_checkpoint(run_id)).model_dump_json()
+    )
+    await initial.cancel(run_id, execution_request.actor)
+    await initial.wait(run_id)
+    assert initial.is_quiescent(run_id)
+    reconciled = reconcile_quiesced_inference_checkpoint(checkpoint)
+    assert reconciled.usage == checkpoint.usage and not reconciled.safe_to_resume
+    assert reconciled.backend_state["pending_model_settlement"]["usage"] is None
+    resumed_model = ModelSequence([final_reply()])
+    resumed = ScopedToolEngine(resumed_model, gateway, model_budget=ledger)
+    result = await resumed.wait(
+        await resumed.resume(reconciled, execution_request.actor, attempt_id="stopped-inference")
+    )
+    assert result.state == RunState.CANDIDATE and result.checkpoint.safe_to_resume
+    assert ledger.recoveries == [("held-1", None)]
+    assert result.usage.tokens == checkpoint.usage.tokens + 15
+    assert result.usage.rounds == 2 and len(resumed_model.requests) == 1
+    assert not (execution_request.workspace / "once.txt").exists()
+    assert result.checkpoint.backend_state["uncertain_model_usage"] is True
+
+
+async def test_pre_admission_key_is_durable_when_reservation_commit_reply_is_lost(
+    execution_request, gateway
+):
+    from groupagent.execution import EngineCheckpoint, accounting_recovery_checkpoint
+
+    checkpoints = []
+
+    async def save(checkpoint):
+        checkpoints.append(EngineCheckpoint.model_validate_json(checkpoint.model_dump_json()))
+
+    class KeyedOfflineLedger:
+        def __init__(self):
+            self.failed_once = False
+            self.recoveries = []
+
+        def recovery_key(self, request, *, round_number):
+            return f"engine:{request.work_id}:{request.attempt_id}:{round_number}"
+
+        async def reserve(self, request, *, round_number, input_tokens, output_tokens):
+            assert checkpoints[-1].backend_state["inflight_model_reservation"][
+                "reservation_id"
+            ] == self.recovery_key(request, round_number=round_number)
+            if not self.failed_once:
+                self.failed_once = True
+                raise OSError("Synthetic loss after ledger reservation committed")
+            return f"reservation-{round_number}"
+
+        async def recover(self, request, reservation_id, usage):
+            assert reservation_id == f"engine:{request.work_id}:attempt-1:1" and usage is None
+            self.recoveries.append(reservation_id)
+
+        async def settle(self, reservation_id, usage):
+            assert reservation_id == "reservation-2" and usage == final_reply().usage
+
+    ledger = KeyedOfflineLedger()
+    model = ModelSequence([])
+    initial = ScopedToolEngine(model, gateway, model_budget=ledger, checkpoint_sink=save)
+    paused = await initial.wait(await initial.start(retry_request(execution_request)))
+    assert paused.error_code == "billing_unavailable" and accounting_recovery_checkpoint(
+        paused.checkpoint
+    )
+    assert model.requests == []
+    resumed_model = ModelSequence([final_reply()])
+    resumed = ScopedToolEngine(resumed_model, gateway, model_budget=ledger, checkpoint_sink=save)
+    result = await resumed.wait(
+        await resumed.resume(
+            paused.checkpoint, execution_request.actor, attempt_id="keyed-recovery"
+        )
+    )
+    assert result.state == RunState.CANDIDATE and len(resumed_model.requests) == 1
+    assert ledger.recoveries == [f"engine:{execution_request.work_id}:attempt-1:1"]
+    assert result.usage.rounds == 2 and result.usage.tokens == paused.usage.tokens + 15

@@ -32,10 +32,10 @@ from groupagent.coordinator import Coordinator, Decision, ScriptedDecisionProvid
 from groupagent.domain import ActorContext, DeliveryState, EventKind, GroupEvent, Role, WorkState
 from groupagent.execution import (
     ExecutionRequest,
+    LangGraphEngine,
     ModelReply,
     ModelToolCall,
     RunState,
-    ScopedToolEngine,
     ScriptedFakeModel,
     TokenUsage,
 )
@@ -202,7 +202,7 @@ async def run_demo(
         temp.write_text(checkpoint.model_dump_json(), encoding="utf-8")
         temp.replace(target)
 
-    engine = ScopedToolEngine(model, gateway, checkpoint_sink=checkpoint_sink)
+    engine = LangGraphEngine(model, gateway, checkpoint_sink=checkpoint_sink)
     run_id = await engine.start(
         ExecutionRequest(
             work_id=work.id,

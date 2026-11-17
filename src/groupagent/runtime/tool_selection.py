@@ -1,9 +1,9 @@
-"""Small conservative catalogs for already imported inputs; not an authority layer.
+"""Trusted tool authority and a small, semantic initial description set.
 
-Call after input import and feature filtering, immediately before ExecutionRequest.
-Only controller Work fields and validated input formats are inspected. Input text,
-filenames and provider output never choose tools. Ambiguous/complex work keeps the
-general catalog; required tools must already exist in the supplied eligible set.
+Authorized tools come from the host's registered, feature-filtered catalog and
+source-bound business grants. Goal text, acceptance prose, files and model output
+never grant or remove authority. The agent can discover every remaining authorized
+tool with the catalog loader instead of receiving every schema at once.
 """
 
 from __future__ import annotations
@@ -12,6 +12,9 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
+from groupagent.control import WorkCapability
 from groupagent.conversation.image_requirements import is_public_image_work
 from groupagent.conversation.intent import (
     main_request,
@@ -19,60 +22,27 @@ from groupagent.conversation.intent import (
     requires_research,
     task_write_request,
 )
-from groupagent.domain import DomainError, WorkOrder
+from groupagent.domain import ActorContext, DomainError, Role, WorkOrder
 from groupagent.identity import DEFAULT_IDENTITY, BotIdentity
 from groupagent.scheduling.reminders import get_reminder_body
 
+from .tool_profiles import names_for_capabilities
+
 _IMAGE = frozenset({"png", "jpg", "jpeg", "webp", "gif"})
 _AUDIO = frozenset({"wav", "mp3", "ogg", "flac", "m4a", "aac"})
-_IMAGE_TOOLS = frozenset({"request_input", "image_analyze", "media_ocr", "provider_ocr"})
-_AUDIO_TOOLS = frozenset({"request_input", "audio_transcribe"})
-_WEB_TOOLS = frozenset({"request_input", "web_search", "web_fetch", "web_read", "browser_open"})
-_PUBLIC_IMAGE_TOOLS = frozenset(
-    {
-        "request_input",
-        "web_search",
-        "web_read",
-        "web_image_candidates",
-        "web_image_import",
-        "image_analyze",
-        "artifact_search",
-        "artifact_deliver",
-    }
-)
-_REMINDER_TOOLS = frozenset({"request_input"})
 _DOCUMENT_FORMATS = frozenset({"md", "docx", "pdf", "pptx"})
-_DOCUMENT_TOOLS = frozenset(
-    {
-        "request_input",
-        "document_generate",
-        "document_read",
-        "document_search",
-        "document_edit",
-        "document_validate",
-        "document_extract_image",
-        "pdf_combine",
-        "chart_render",
-        "artifact_search",
-        "artifact_import",
-        "artifact_export",
-        "artifact_from_workspace",
-        "artifact_deliver",
-        "workspace_read_text",
-        "workspace_write_text",
-        "python_compute",
-        "process_run",
-        "shell_command",
-    }
-)
-_MEDIA_REQUIREMENT = re.compile(
-    r"图片|图像|照片|表情包|壁纸|插图|插画|语音|音频|转写|转录|视频|浏览器|image|photo|meme|wallpaper|illustrat|audio|speech|transcrib|ocr|video|browser",
-    re.I,
-)
 _TEAM_WRITES = frozenset({"team_task_create", "team_task_claim", "team_task_update"})
 _SCHEDULE_WRITES = frozenset(
-    {"schedule_create", "schedule_update", "schedule_control", "trigger_create", "trigger_control"}
+    {
+        "schedule_create",
+        "schedule_update",
+        "schedule_control",
+        "trigger_create",
+        "trigger_control",
+    }
 )
+_NOTIFICATION_TOOLS = frozenset({"request_input"})
+
 
 _COMPUTE = re.compile(
     r"(?:运行|执行|调用|启动|使用|采用|通过|用)\s*(?:受控的?\s*)?(?:python|shell)"
@@ -97,19 +67,9 @@ _MEMORY = re.compile(
 _MEMORY_SOURCE_PROHIBITION = re.compile(
     r"(?:不要|不得|不能|不许|禁止|不)\s*(?:仅|只)?\s*(?:凭|依赖)\s*(?:仅|只)?\s*记忆"
 )
-_BUSINESS = re.compile(
-    r"登记|认领|分配|分工|落库|负责人|群成员|群昵称|团队|查(?:询|看).{0,12}(?:任务|成员|名单|日程|提醒)"
-    r"|更新.{0,12}(?:任务|进度)|标记.{0,12}完成|team\s*task|assign|claim\s*(?:a\s*)?task|roster",
-    re.I,
-)
 _SCHEDULING = re.compile(
     r"提醒|通知|日程|定时|到期|安排.{0,12}(?:时间|任务)|(?:每天|每周|每月|每小时).{0,20}(?:执行|运行|搜索|生成|发来)"
     r"|(?:完成|失败|收到|上传).{0,20}(?:后|时|触发)|schedule|remind|recurr|follow.up",
-    re.I,
-)
-_TRANSCRIPTION = re.compile(r"转写|转录|逐字|语音识别|听写|transcrib|speech.to.text|\basr\b", re.I)
-_REMINDER_GOAL = re.compile(
-    r"^(?:(?:请|到时|届时|到点后|按时|定时|定期)[，,:：\s]*)*(?:提醒(?:我|我们|大家|成员)?|通知(?:我|我们|大家)|remind\b|notify\b)",
     re.I,
 )
 
@@ -169,6 +129,19 @@ def message_only_research_request(text: str, *, identity: BotIdentity = DEFAULT_
     )
 
 
+def _requires_memory(text: str) -> bool:
+    # Used only by message_only_research_request's existing output-admission
+    # compatibility rule, never by authority or schema visibility selection.
+    return bool(_MEMORY.search(_MEMORY_SOURCE_PROHIBITION.sub("", text)))
+
+
+def _names(values: Iterable[str]) -> frozenset[str]:
+    names = frozenset(values)
+    if any(not isinstance(name, str) or not name for name in names):
+        raise DomainError("invalid_input", "Eligible tool names must be nonempty strings")
+    return names
+
+
 def _required(work: WorkOrder, available: frozenset[str]) -> frozenset[str]:
     raw = work.scope.get("required_tools", [])
     if (
@@ -180,25 +153,104 @@ def _required(work: WorkOrder, available: frozenset[str]) -> frozenset[str]:
     required = frozenset(str(name) for name in raw)
     if not required.issubset(available):
         raise DomainError(
-            "tool_not_registered", "A required tool is absent from the eligible catalog"
+            "tool_not_registered", "A required tool is absent from the authorized catalog"
         )
     return required
 
 
-def _text_only(work: WorkOrder) -> bool:
-    outputs = work.scope.get("outputs", [])
-    return (
-        isinstance(outputs, list)
-        and all(isinstance(item, dict) and item.get("format") == "text" for item in outputs)
-        and not any(check.startswith("artifact:") for check in work.required_checks)
-        and not work.scope.get("speech_requested")
+def _derived(work: WorkOrder) -> bool:
+    depth = work.scope.get("derived_depth", 0)
+    if type(depth) is not int or depth < 0:
+        raise DomainError(
+            "scope_violation", "Derived work depth must be a trusted nonnegative integer"
+        )
+    return bool(
+        depth or work.scope.get("origin_schedule_id") or work.scope.get("origin_trigger_rule_id")
     )
 
 
-def _requires_memory(text: str) -> bool:
-    # Only suppress this narrow ban on an unsupported knowledge source. Other
-    # mentions of remembered facts or actual conversation history remain needs.
-    return bool(_MEMORY.search(_MEMORY_SOURCE_PROHIBITION.sub("", text)))
+def _notification_only(work: WorkOrder) -> bool:
+    """Match the controller's actual occurrence intent, never an orphan hint."""
+    origin = work.scope.get("origin_schedule_id") or work.scope.get("origin_trigger_rule_id")
+    return (
+        work.scope.get("reminder_only") is True
+        and isinstance(origin, str)
+        and bool(origin.strip())
+        and type(work.scope.get("derived_depth")) is int
+        and work.scope["derived_depth"] == 1
+    )
+
+
+def _literal_notification(work: WorkOrder) -> bool:
+    return (
+        _notification_only(work)
+        and work.scope.get("reminder_body_literal") is True
+        and get_reminder_body(work.scope) == work.goal
+    )
+
+
+def authorized_tools(
+    work: WorkOrder,
+    registered_names: Iterable[str],
+    *,
+    actor: ActorContext,
+) -> frozenset[str]:
+    """Intersect trusted registration with actual source/role business grants.
+
+    The caller first filters disabled features and unavailable routes. Native
+    gateway handlers still check actor, lease, group and individual source IDs on
+    every invocation. A semantic capability or required-tool plan is not a grant.
+    """
+    if (actor.group_id, actor.member_id) != (work.group_id, work.requester_id):
+        raise DomainError(
+            "scope_violation", "Tool authority requires the exact requester work scope"
+        )
+    if actor.role not in {Role.MEMBER, Role.OWNER}:
+        raise DomainError("permission_denied", "A read-only actor cannot execute background tools")
+    eligible = _names(registered_names)
+    selected = set(eligible)
+    derived = _derived(work)
+    if derived or work.scope.get("team_task_write_allowed") is not True:
+        selected.difference_update(_TEAM_WRITES)
+    if derived or work.scope.get("schedule_creation_allowed") is not True:
+        selected.difference_update(_SCHEDULE_WRITES)
+    if _notification_only(work):
+        # The notification body is the recipient's job. Neither words such as
+        # Python nor separate prose criteria turn it into agent delegation.
+        selected.intersection_update(_NOTIFICATION_TOOLS)
+        if _literal_notification(work):
+            selected.clear()
+    authorized = frozenset(selected)
+    required = _required(work, eligible)
+    if not required.issubset(authorized):
+        raise DomainError(
+            "permission_denied", "Required tools exceed the source's actual tool grant"
+        )
+    return authorized
+
+
+def _planned_capabilities(work: WorkOrder) -> frozenset[WorkCapability]:
+    raw = work.scope.get("work_capabilities", [])
+    if not isinstance(raw, list) or len(raw) > 8:
+        raise DomainError("invalid_input", "Stored work capability plan is invalid")
+    try:
+        return frozenset(TypeAdapter(list[WorkCapability]).validate_python(raw, strict=True))
+    except ValidationError:
+        raise DomainError("invalid_input", "Stored work capability plan is invalid") from None
+
+
+def research_evidence_required(work: WorkOrder) -> bool:
+    """Use the semantic plan, retaining the old flag only for no-plan work.
+
+    Older records always stored default empty capability arrays. A nonempty valid
+    plan is the authoritative execution intent; stale lexical flags cannot turn a
+    compute/document task into a web-research task. This changes evidence duties,
+    never the source/role tool allowlist.
+    """
+    capabilities = _planned_capabilities(work)
+    if capabilities:
+        return bool(capabilities & {"public_research", "public_images"})
+    return work.scope.get("research_required") is True
 
 
 def select_tools(
@@ -208,177 +260,37 @@ def select_tools(
     *,
     identity: BotIdentity = DEFAULT_IDENTITY,
 ) -> frozenset[str]:
-    """Return only existing eligible names; never alter grants or budgets.
+    """Choose initial descriptions only, from an already authorized catalog.
 
-    reminder_only is a controller hint for a currently authorized reminder goal.
-    Rule updates must recompute it. It must not come from file/OCR content.
+    Missing/old plans start with a few navigation tools and can discover another
+    family. Imported formats and structured outputs may add relevant descriptions;
+    their names, textual contents, goal spelling and criteria never select tools.
+    ``identity`` remains accepted for callers upgrading from the old planner.
     """
-    available = frozenset(registered_names)
-    if any(not isinstance(name, str) or not name for name in available):
-        raise DomainError("invalid_input", "Eligible tool names must be nonempty strings")
+    available = _names(registered_names)
     required = _required(work, available)
-    goal = work.goal.strip()
-    criteria = "\n".join(work.acceptance_criteria)
-    requirements = "\n".join((goal, criteria))
-    derived = bool(work.scope.get("origin_schedule_id") or work.scope.get("origin_trigger_rule_id"))
-    team_write = work.scope.get("team_task_write_allowed") is True
-    research = work.scope.get("research_required") is True
-    business = team_write or bool(_BUSINESS.search(requirements)) or _requires_memory(requirements)
-    text_only = _text_only(work)
-    raw_formats = [ref.get("format") if isinstance(ref, Mapping) else None for ref in input_refs]
-    formats = [value.casefold() if isinstance(value, str) else None for value in raw_formats]
-    profile: frozenset[str] | None = None
-    declared_outputs = work.scope.get("outputs", [])
-    image_document = (
-        isinstance(declared_outputs, list)
-        and bool(declared_outputs)
-        and all(
-            isinstance(item, dict) and item.get("format") in _DOCUMENT_FORMATS
-            for item in declared_outputs
-        )
-    )
-    if (
-        image_document
-        and formats
-        and all(value in _IMAGE for value in formats)
-        and all(ref.get("public_image") for ref in input_refs)
-        and not research
-        and not business
-        and not requires_research(requirements)
-        and not _COMPUTE.search(requirements)
-    ):
-        image_document_tools = _DOCUMENT_TOOLS | _IMAGE_TOOLS
-        if required.issubset(image_document_tools):
-            return available & image_document_tools
-    if (
-        is_public_image_work(work)
-        and text_only
-        and not input_refs
-        and not business
-        and required.issubset(_PUBLIC_IMAGE_TOOLS)
-    ):
-        return available & _PUBLIC_IMAGE_TOOLS
-    if work.scope.get("research_message_only") is True and work.goal_revision == 1:
-        if (
-            not research
-            or not text_only
-            or input_refs
-            or work.input_versions
-            or work.scope.get("attachment_event_ids")
-            or derived
-            or team_write
-        ):
-            raise DomainError("scope_violation", "Message-only research scope is inconsistent")
-        if not required.issubset(_WEB_TOOLS):
-            raise DomainError(
-                "permission_denied", "Message-only research cannot require file or execution tools"
-            )
-        return available & _WEB_TOOLS
-
-    # A reminder tells the requester to act. Its quoted/action text is not an
-    # instruction for the agent to execute Python, inspect files or do that job.
-    reminder = derived and (
-        work.scope.get("reminder_only") is True or bool(_REMINDER_GOAL.search(goal))
-    )
-    literal_reminder = (
-        reminder
-        and type(work.scope.get("derived_depth")) is int
-        and work.scope["derived_depth"] == 1
-        and work.scope.get("reminder_body_literal") is True
-        and get_reminder_body(work.scope) == goal
-    )
-    if (
-        reminder
-        and text_only
-        and not research
-        and not team_write
-        and (literal_reminder or not identity.additional_request(goal))
-        and not _requires_memory(criteria)
-        and not requires_research(criteria)
-        # Criteria describe work the agent must actually satisfy, even when
-        # the short goal only asks it to remind the requester.
-        and not any(
-            pattern.search(criteria)
-            for pattern in (
-                _COMPUTE,
-                _FILE_OUTPUT,
-                _BUSINESS,
-                _SCHEDULING,
-                _TRANSCRIPTION,
-            )
-        )
-        and required.issubset(_REMINDER_TOOLS)
-    ):
-        # A source-bound literal notification already has its complete body and
-        # recipient authorization. Offering request_input here can turn an
-        # optional follow-up question into a blocking material requirement.
-        profile = frozenset() if literal_reminder and not required else _REMINDER_TOOLS
-    elif (
-        text_only
-        and not business
-        and not _COMPUTE.search(requirements)
-        and not _FILE_OUTPUT.search(requirements)
-        and not _SCHEDULING.search(requirements)
-    ):
-        if (
-            formats
-            and all(format in _IMAGE for format in formats)
-            and not research
-            and not requires_research(requirements)
-        ):
-            profile = _IMAGE_TOOLS
-        elif (
-            formats
-            and all(format in _AUDIO for format in formats)
-            and _TRANSCRIPTION.search(requirements)
-            and not research
-            and not requires_research(requirements)
-        ):
-            profile = _AUDIO_TOOLS
-        elif (
-            research
-            and not _MEDIA_REQUIREMENT.search(requirements)
-            and not input_refs
-            and not work.input_versions
-            and not work.scope.get("attachment_event_ids")
-        ):
-            profile = _WEB_TOOLS
-
+    planned = _planned_capabilities(work)
+    capabilities = set(planned)
     outputs = work.scope.get("outputs", [])
-    if (
-        profile is None
-        and isinstance(outputs, list)
-        and bool(outputs)
-        and all(
-            isinstance(item, dict) and item.get("format") in _DOCUMENT_FORMATS for item in outputs
-        )
-        and all(format in _DOCUMENT_FORMATS for format in formats)
-        and not (not input_refs and (work.input_versions or work.scope.get("attachment_event_ids")))
-        and not business
-        and not research
-        and not work.scope.get("speech_requested")
-        and not _MEDIA_REQUIREMENT.search(requirements)
-        and not requires_research(requirements)
-        and not _SCHEDULING.search(requirements)
-        and required.issubset(_DOCUMENT_TOOLS)
+    if isinstance(outputs, list) and any(
+        isinstance(item, dict) and item.get("format") in _DOCUMENT_FORMATS for item in outputs
     ):
-        # This retains all native editing/version routes, scoped workspace access,
-        # Python/process/shell, charts and PDF composition. It only removes
-        # unrelated catalogs; an extra required capability keeps the general set.
-        profile = _DOCUMENT_TOOLS
-
-    if profile is not None and required.issubset(profile):
-        return (available & profile) | required
-
-    # Complex workflows retain media/file/computation/retrieval routes. These
-    # exclusions only reduce irrelevant writes; actual invocation still fences
-    # scope, identity and lease in the existing gateway/backend.
-    selected = set(available)
-    if not team_write or derived:
-        selected.difference_update(_TEAM_WRITES)
-    # An eligible authorized event follow-up need not use our schedule keywords.
-    # Keep its existing tools in the general catalog; the backend still checks
-    # the creator, source, lease, quota and derived-depth restriction.
-    if derived or work.scope.get("schedule_creation_allowed") is not True:
-        selected.difference_update(_SCHEDULE_WRITES)
-    return frozenset(selected | required)
+        capabilities.add("documents")
+    for reference in input_refs:
+        format_name = reference.get("format") if isinstance(reference, Mapping) else None
+        if not isinstance(format_name, str):
+            continue
+        format_name = format_name.casefold()
+        if format_name in _IMAGE:
+            capabilities.add("image_analysis")
+        elif format_name in _AUDIO:
+            capabilities.add("audio_transcription")
+        elif format_name in _DOCUMENT_FORMATS:
+            capabilities.add("documents")
+    if not planned and research_evidence_required(work):
+        capabilities.add("public_research")
+    if is_public_image_work(work):
+        capabilities.add("public_images")
+    if work.scope.get("team_task_write_allowed") is True:
+        capabilities.add("team_tasks")
+    return names_for_capabilities(capabilities, available) | required

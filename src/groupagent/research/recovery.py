@@ -7,7 +7,13 @@ from pydantic import ValidationError
 
 from groupagent.domain import DomainError
 from groupagent.execution.models import EngineCheckpoint, RunState
-from groupagent.tools.models import EffectState, IdempotencyMode, ToolDefinition, ToolReceipt
+from groupagent.tools.models import (
+    EffectState,
+    IdempotencyMode,
+    ToolDefinition,
+    ToolFailureDisposition,
+    ToolReceipt,
+)
 
 _RESEARCH_READS = frozenset({"web_search", "web_fetch"})
 
@@ -82,7 +88,16 @@ def reconcile_legacy_research_checkpoint(
         refuse("Legacy failed reads lack matching unknown ledger entries")
 
     reconciled = {
-        key: receipt.model_copy(update={"effect_state": EffectState.NO_EFFECT})
+        key: receipt.model_copy(
+            update={
+                "effect_state": EffectState.NO_EFFECT,
+                "failure": receipt.failure.model_copy(
+                    update={"disposition": ToolFailureDisposition.REPAIR}
+                )
+                if receipt.failure is not None
+                else None,
+            }
+        )
         for key, receipt in unknown.items()
     }
     by_call = {receipt.call_id: receipt for receipt in unknown.values()}

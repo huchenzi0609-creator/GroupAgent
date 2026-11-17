@@ -5,15 +5,25 @@ from __future__ import annotations
 import os
 import shlex
 import stat
+from typing import Literal
 
 from pydantic import Field
 
 from groupagent.domain import DomainError
 from groupagent.sandbox import ProcessSpec, SandboxRunner
-from groupagent.sandbox.models import ProcessOutput
+from groupagent.sandbox.models import OutputContractIssue, ProcessOutput, UnpublishedDraftError
+from groupagent.security import redact_credentials
 
 from .gateway import ToolGateway
-from .models import IdempotencyMode, ToolContext, ToolData, ToolDefinition, ToolFailure
+from .models import (
+    IdempotencyMode,
+    ToolContext,
+    ToolData,
+    ToolDefinition,
+    ToolFailure,
+    ToolFailureDisposition,
+    ToolFailureOrigin,
+)
 from .paths import open_parent, scoped_path
 
 
@@ -43,14 +53,25 @@ class ComputeOutput(ToolData):
     stdout: str
     stderr: str
     outputs: tuple[ProcessOutput, ...] = ()
+    output_issues: tuple[OutputContractIssue, ...] = ()
+    publication_state: Literal["unpublished", "published"] = "unpublished"
+
+
+def _proposal_failure(code: str, message: str, *, capability: bool = False) -> ToolFailure:
+    """The trusted handler has not launched a process or published a draft."""
+    return ToolFailure(
+        code,
+        message,
+        no_effect=True,
+        origin=ToolFailureOrigin.CAPABILITY if capability else ToolFailureOrigin.ARGUMENTS,
+        disposition=ToolFailureDisposition.REPAIR,
+    )
 
 
 def _preflight(spec: ProcessSpec, context: ToolContext) -> None:
     """No process has started here: these errors are safely correctable inputs."""
     if len(set(spec.output_paths)) != len(spec.output_paths):
-        raise ToolFailure(
-            "invalid_input", "output_paths must contain distinct new filenames", no_effect=True
-        )
+        raise _proposal_failure("invalid_input", "output_paths must contain distinct new filenames")
     for field, values in (("input_paths", spec.input_paths), ("output_paths", spec.output_paths)):
         for index, name in enumerate(values):
             try:
@@ -76,12 +97,11 @@ def _preflight(spec: ProcessSpec, context: ToolContext) -> None:
                         else:
                             raise ValueError("Output already exists")
             except (DomainError, OSError, ValueError):
-                raise ToolFailure(
+                raise _proposal_failure(
                     "invalid_path",
                     f"{field}[{index}] must be a relative path under cwd=/work. "
                     "Use a new top-level output filename (for example result.txt) or an existing "
                     "parent directory; inputs must exist. Do not use /work/workspace or absolute paths.",
-                    no_effect=True,
                 ) from None
     try:
         invalid = any(
@@ -90,8 +110,8 @@ def _preflight(spec: ProcessSpec, context: ToolContext) -> None:
     except UnicodeError:
         invalid = True
     if invalid:
-        raise ToolFailure(
-            "invalid_input", "Arguments cannot contain NUL or exceed the byte limit", no_effect=True
+        raise _proposal_failure(
+            "invalid_input", "Arguments cannot contain NUL or exceed the byte limit"
         )
 
 
@@ -112,28 +132,46 @@ def register_compute_tools(
 
     async def execute(spec: ProcessSpec, context: ToolContext) -> ComputeOutput:
         _preflight(spec, context)
-        result = await runner.run(spec, context)
-        if result.cancelled:
-            raise DomainError("cancelled", "Isolated computation was cancelled")
-        if result.timed_out:
-            raise DomainError("tool_timeout", "Isolated computation exceeded its deadline")
-        if result.output_limited:
-            raise DomainError("output_too_large", "Isolated computation exceeded its output limit")
-        if result.exit_code != 0:
-            raise ToolFailure(
-                "process_failed",
-                "Isolated computation did not complete successfully",
-                output=ComputeOutput(
-                    exit_code=result.exit_code or -1,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                    outputs=(),
-                ),
-                no_effect=True,
-            )
-        return ComputeOutput(
-            exit_code=0, stdout=result.stdout, stderr=result.stderr, outputs=result.outputs
+        try:
+            result = await runner.run(spec, context)
+        except UnpublishedDraftError as error:
+            raise ToolFailure(error.code, error.message, no_effect=True) from None
+        output = ComputeOutput(
+            exit_code=result.exit_code if result.exit_code is not None else -1,
+            stdout=redact_credentials(result.stdout),
+            stderr=redact_credentials(result.stderr),
+            outputs=result.outputs,
+            output_issues=result.output_issues,
+            publication_state=result.publication_state,
         )
+        code, message = (
+            ("cancelled", "Isolated computation was cancelled")
+            if result.cancelled
+            else ("tool_timeout", "Isolated computation exceeded its deadline")
+            if result.timed_out
+            else ("output_too_large", "Isolated computation exceeded its output limit")
+            if result.output_limited
+            else (
+                "output_contract_failed",
+                "Declared outputs failed validation. Inspect stdout/stderr and output_issues; "
+                "create every declared output as a private regular file within the size limits, "
+                "or correct the declaration. No draft outputs were published.",
+            )
+            if result.error_code == "output_contract_failed"
+            else ("worker_failed", "The isolated worker stopped before publishing draft outputs")
+            if result.error_code == "worker_failed"
+            else ("process_failed", "Isolated computation did not complete successfully")
+        )
+        if not result.succeeded:
+            raise ToolFailure(
+                code,
+                message,
+                output=output,
+                no_effect=result.publication_state == "unpublished",
+                origin=ToolFailureOrigin.EXECUTION,
+                disposition=ToolFailureDisposition.REPAIR,
+            )
+        return output
 
     async def python(args: PythonInput, context: ToolContext) -> ComputeOutput:
         return await execute(
@@ -149,25 +187,34 @@ def register_compute_tools(
 
     async def process(args: ProcessInput, context: ToolContext) -> ComputeOutput:
         if args.program not in allowed_programs:
-            raise ToolFailure(
-                "permission_denied", "Executable is not in this tool's allowlist", no_effect=True
+            raise _proposal_failure(
+                "permission_denied",
+                "Executable is unavailable through this capability. Available programs: "
+                + ", ".join(sorted(allowed_programs))
+                + ". Use an available tool or an installed Python library via python_compute.",
+                capability=True,
             )
         return await execute(ProcessSpec(**args.model_dump()), context)
 
     async def shell(args: ShellInput, context: ToolContext) -> ComputeOutput:
         if any(character in args.command for character in ";&|<>$`\n\r"):
-            raise ToolFailure(
-                "permission_denied", "Shell expansion and chaining are disabled", no_effect=True
+            raise _proposal_failure(
+                "permission_denied",
+                "This capability accepts one literal approved command. Pass literal arguments "
+                "with process_run, or use python_compute for multi-step isolated computation.",
+                capability=True,
             )
         try:
             argv = shlex.split(args.command)
         except ValueError:
-            raise ToolFailure(
-                "invalid_input", "The command quoting is invalid", no_effect=True
-            ) from None
+            raise _proposal_failure("invalid_input", "The command quoting is invalid") from None
         if not argv or argv[0] not in allowed_programs:
-            raise ToolFailure(
-                "permission_denied", "Command is not in this tool's allowlist", no_effect=True
+            raise _proposal_failure(
+                "permission_denied",
+                "Command is unavailable through this capability. Available programs: "
+                + ", ".join(sorted(allowed_programs))
+                + ". Use an available tool or an installed Python library via python_compute.",
+                capability=True,
             )
         return await execute(
             ProcessSpec(
@@ -192,13 +239,15 @@ def register_compute_tools(
         (
             "process_run",
             "Run one approved executable with literal argv inside an isolated worker, cwd=/work. "
-            "Declare input/output paths relative to /work, never /work/workspace or absolute paths.",
+            "Declare input/output paths relative to /work, never /work/workspace or absolute paths. "
+            "Available executables: " + ", ".join(sorted(allowed_programs)) + ".",
             ProcessInput,
             process,
         ),
         (
             "shell_command",
-            "Run one approved command; no pipes, redirection, expansion or host shell access.",
+            "Run one literal approved command; no pipes, redirection, expansion or host shell access. "
+            "Available commands: " + ", ".join(sorted(allowed_programs)) + ".",
             ShellInput,
             shell,
         ),
@@ -214,6 +263,7 @@ def register_compute_tools(
                 max_input_bytes=512_000,
                 max_output_bytes=2_000_000,
                 idempotency_mode=IdempotencyMode.RECONCILE_BEFORE_RETRY,
+                resource_scopes=("group", "work", "workspace", "isolated_worker"),
                 required_tool_family="isolated_process"
                 if name in {"process_run", "shell_command"}
                 else None,

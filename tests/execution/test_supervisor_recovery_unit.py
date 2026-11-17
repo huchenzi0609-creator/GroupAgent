@@ -6,7 +6,7 @@ import pytest
 
 from groupagent.domain import ActorContext, DomainError, Role, WorkOrder, WorkState
 from groupagent.execution import EngineCheckpoint, ExecutionRequest, ModelMessage, RunState
-from groupagent.execution.models import UsageTotals
+from groupagent.execution.models import PendingModelSettlement, UsageTotals
 from groupagent.runtime.executor import WorkSupervisor
 from groupagent.runtime.recovery import (
     RECOVERY_SCOPE_KEY,
@@ -133,6 +133,42 @@ def test_unknown_inference_cost_is_preserved_when_quiescent_checkpoint_is_safe(r
     assert safe_recovery_checkpoint(checkpoint)
     assert checkpoint.usage == recovery_checkpoint.usage
     assert checkpoint.backend_state["uncertain_model_usage"] is True
+
+
+def test_accounting_wait_is_runnable_only_with_typed_quiescent_pending_settlement(
+    recovery_checkpoint,
+):
+    pending = PendingModelSettlement(
+        reservation_id="synthetic-held-charge", round_number=1, reserved_tokens=20
+    )
+    checkpoint = recovery_checkpoint.model_copy(
+        update={
+            "safe_to_resume": False,
+            "error_code": "billing_unavailable",
+            "backend_state": {
+                "model_recovery_pending": True,
+                "model_call_quiescent": True,
+                "pending_model_settlement": pending.model_dump(mode="json"),
+            },
+        }
+    )
+    assert safe_recovery_checkpoint(checkpoint)
+    assert is_automatic_recovery_reason("billing_unavailable")
+    for changes in (
+        {"model_call_quiescent": False},
+        {"pending_model_settlement": {"reservation_id": "synthetic-held-charge"}},
+    ):
+        assert not safe_recovery_checkpoint(
+            checkpoint.model_copy(update={"backend_state": {**checkpoint.backend_state, **changes}})
+        )
+    receipt = ToolReceipt(
+        call_id="external-write",
+        tool_name="native_send",
+        idempotency_key="never-replay",
+        success=False,
+        effect_state=EffectState.UNKNOWN,
+    )
+    assert not safe_recovery_checkpoint(checkpoint.model_copy(update={"receipts": (receipt,)}))
 
 
 def test_strategy_update_is_idempotent_preserves_usage_and_uses_pending_tool_boundary(

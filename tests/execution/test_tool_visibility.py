@@ -1,6 +1,7 @@
 """Tool visibility is a lazy model view, never another authority boundary."""
 
 import asyncio
+import json
 from dataclasses import replace
 
 import pytest
@@ -189,14 +190,18 @@ async def test_untrusted_or_failed_loader_output_never_installs_tools(
     assert result.receipts[0].output["tool_names"] and result.receipts[0].output["loaded_tools"]
 
 
-async def test_model_can_still_call_a_known_authorized_tool_outside_initial_view(execution_request):
+async def test_inactive_known_tool_is_repaired_through_authorized_discovery(execution_request):
     gateway, observed = ToolGateway(), []
     register(gateway, observed)
-    model = ScriptedFakeModel([reply("hidden"), reply()])
+    model = ScriptedFakeModel([reply("hidden"), reply("catalog"), reply("hidden"), reply()])
     engine = ScopedToolEngine(model, gateway)
     result = await engine.wait(await engine.start(request_for(execution_request)))
-    assert result.state == RunState.CANDIDATE and observed == ["hidden"]
-    assert all(names(request) == {"catalog"} for request in model.requests)
+    assert result.state == RunState.CANDIDATE and observed == ["catalog", "hidden"]
+    assert names(model.requests[0]) == names(model.requests[1]) == {"catalog"}
+    assert names(model.requests[2]) == names(model.requests[3]) == {"catalog", "hidden"}
+    feedback = json.loads(model.requests[1].messages[-1].content)
+    assert feedback["issues"][0]["code"] == "tool_not_available"
+    assert not feedback["batch_executed"] and result.usage.tool_calls == 2
 
 
 @pytest.mark.parametrize("restored", [False, True])

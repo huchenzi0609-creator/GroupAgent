@@ -13,8 +13,16 @@ from psycopg import IsolationLevel
 from groupagent.domain import ActorContext, DomainError, WorkOrder, WorkState
 from groupagent.memory.causality import after_boundary_sql
 from groupagent.persistence import PostgresStore, UnitOfWork
+from groupagent.persistence.delivery_knowledge import projected_delivery_state
+from groupagent.security import redact_credentials
+from groupagent.tools.models import ToolFailureMetadata
 
-from .recovery import automatic_recovery_pending
+from .recovery import (
+    RECONCILIATION_CODES,
+    automatic_recovery_pending,
+    reconciliation_metadata,
+    recovery_metadata,
+)
 from .work_status import work_status_detail
 
 _LIVE = ("queued", "running", "waiting_input", "waiting_external", "validating", "delivering")
@@ -276,7 +284,9 @@ class WorkFacts:
             "SELECT e.kind,e.created_at,e.body#>>'{payload,name}' AS requested_name,"
             "e.body#>>'{payload,receipt,tool_name}' AS finished_name,"
             "e.body#>'{payload,receipt,success}' AS success,"
-            "e.body#>>'{payload,receipt,error_code}' AS error_code "
+            "e.body#>>'{payload,receipt,error_code}' AS error_code,"
+            "e.body#>>'{payload,receipt,effect_state}' AS effect_state,"
+            "e.body#>'{payload,receipt,failure}' AS failure "
             "FROM ga_runtime_events e JOIN ga_execution_attempts a "
             "ON a.group_id=e.group_id AND a.id=e.attempt_id AND a.work_id=e.work_id "
             "WHERE e.group_id=%s AND e.work_id=%s AND a.goal_revision=%s "
@@ -296,7 +306,7 @@ class WorkFacts:
                 or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", name) is None
             ):
                 continue
-            item = {
+            item: dict[str, Any] = {
                 "tool_name": name,
                 "observed_at": event["created_at"].isoformat(),
                 "status": "requested"
@@ -311,6 +321,15 @@ class WorkFacts:
                 r"[a-z][a-z0-9_]{0,79}", event["error_code"]
             ):
                 item["error_code"] = event["error_code"]
+            if event["effect_state"] in {"not_started", "no_effect", "succeeded", "unknown"}:
+                item["effect_state"] = event["effect_state"]
+            if isinstance(event["failure"], dict):
+                try:
+                    item["failure"] = ToolFailureMetadata.model_validate(
+                        event["failure"]
+                    ).model_dump(mode="json")
+                except ValueError:
+                    pass
             activity.append(item)
         outputs = tx.conn.execute(
             "SELECT count(*) AS candidate_count,count(*) FILTER (WHERE "
@@ -328,8 +347,98 @@ class WorkFacts:
             "WHERE r.group_id=a.group_id AND r.event_id=src.id AND t.visibility='participants'))",
             (tx.group_id, work.id, work.goal_revision),
         ).fetchone()
-        states = tx.delivery_states(work.id, goal_revision=work.goal_revision)
+        artifacts = tx.conn.execute(
+            "SELECT a.file_id,a.version_id,a.name,a.format,a.sha256,a.byte_length,"
+            "COALESCE(o.validation,a.validation)->>'passed' AS validated,a.created_at "
+            "FROM ga_work_outputs o JOIN ga_artifact_catalog a "
+            "ON a.group_id=o.group_id AND a.version_id=o.version_id "
+            "WHERE o.group_id=%s AND o.work_id=%s AND o.goal_revision=%s AND a.available "
+            "AND o.purpose IN ('candidate','result') "
+            "AND (a.expires_at IS NULL OR a.expires_at>clock_timestamp()) "
+            "AND NOT EXISTS (SELECT 1 FROM unnest(a.source_event_ids) src(id) "
+            "LEFT JOIN ga_events s ON s.group_id=a.group_id AND s.id=src.id "
+            "WHERE s.id IS NULL OR s.memory_state NOT IN ('active','expired') "
+            "OR EXISTS(SELECT 1 FROM ga_topic_events r JOIN ga_memory_topics t "
+            "ON t.group_id=r.group_id AND t.id=r.topic_id "
+            "WHERE r.group_id=a.group_id AND r.event_id=src.id AND t.visibility='participants')) "
+            "ORDER BY a.created_at DESC,a.version_id DESC LIMIT 9",
+            (tx.group_id, work.id, work.goal_revision),
+        ).fetchall()
+        native = tx.conn.execute(
+            "SELECT id,state,platform_message_id,platform_job_id,accepted_at,reason,updated_at "
+            "FROM ga_deliveries WHERE group_id=%s AND work_id=%s AND goal_revision=%s "
+            "AND NOT (state='rejected' AND reason IS NOT DISTINCT FROM 'candidate_superseded_before_dispatch') "
+            "ORDER BY created_at,id LIMIT 9",
+            (tx.group_id, work.id, work.goal_revision),
+        ).fetchall()
+        attempt = tx.conn.execute(
+            "SELECT id,state,heartbeat_at,expires_at,expires_at>clock_timestamp() AS lease_live "
+            "FROM ga_execution_attempts WHERE group_id=%s AND work_id=%s AND goal_revision=%s "
+            "ORDER BY attempt_no DESC LIMIT 1",
+            (tx.group_id, work.id, work.goal_revision),
+        ).fetchone()
+        required = work.scope.get("outputs", [])
+        required = required if isinstance(required, list) else []
+        required_outputs = []
+        for value in required[:20]:
+            if not isinstance(value, dict) or value.get("format") not in {
+                "text",
+                "md",
+                "docx",
+                "pdf",
+                "pptx",
+                "png",
+                "jpeg",
+                "wav",
+                "ogg",
+            }:
+                continue
+            item = {"format": value["format"]}
+            for unit_kind in ("exact_units", "min_units", "max_units"):
+                units = value.get(unit_kind)
+                if type(units) is int and 1 <= units <= 200:
+                    item[unit_kind] = units
+            expected = value.get("expected_text", [])
+            if isinstance(expected, list):
+                item["expected_text"] = [
+                    redact_credentials(text)[:200] for text in expected[:8] if isinstance(text, str)
+                ]
+                item["expected_text_complete"] = len(expected) <= 8 and all(
+                    isinstance(text, str) and len(text) <= 200 for text in expected
+                )
+            required_outputs.append(item)
+        recovery: dict[str, Any] = {}
+        try:
+            recovery = recovery_metadata(work)
+            reconciliation = reconciliation_metadata(work)
+            next_wake = (
+                reconciliation.get("next_check_at")
+                if reconciliation.get("goal_revision") == work.goal_revision
+                and reconciliation.get("reason") == work.pause_reason
+                else None
+            )
+            if work.state == WorkState.QUEUED or (
+                work.state == WorkState.PAUSED and recovery.get("error_code") == work.pause_reason
+            ):
+                next_wake = next_wake or recovery.get("next_retry_at")
+            reconciliation_required = work.pause_reason in RECONCILIATION_CODES
+        except DomainError:
+            next_wake, reconciliation_required = None, True
+        if not next_wake and work.state in {WorkState.QUEUED, WorkState.WAITING_EXTERNAL}:
+            for key in ("_runtime_resource_wait", "_runtime_preparation"):
+                wait = work.scope.get(key)
+                if isinstance(wait, dict) and isinstance(wait.get("next_retry_at"), str):
+                    next_wake = wait["next_retry_at"]
+                    break
+        if work.state.value in _CLOSED:
+            next_wake, reconciliation_required = None, False
+        native_states = {
+            value["id"]: projected_delivery_state(value["state"], value["parts"] or ())
+            for value in tx._work_delivery_rows(work.id, work.goal_revision)
+        }
+        states = tuple(native_states.values())
         counts = Counter(state.value for state in states)
+        reconciliation_required = reconciliation_required or bool(counts["unknown"])
         accepted_outputs = tx.conn.execute(
             "SELECT count(*) FILTER (WHERE d.state='accepted' AND a.version_id IS NOT NULL) "
             "AS artifact_accepted,count(*) FILTER (WHERE d.state='accepted' "
@@ -389,6 +498,29 @@ class WorkFacts:
             "created_at": work.created_at.isoformat(),
             "updated_at": work.updated_at.isoformat(),
             "status_detail": detail,
+            "requirements": {
+                "acceptance_criteria": [
+                    redact_credentials(value)[:500] for value in work.acceptance_criteria[:12]
+                ],
+                "required_checks": [
+                    redact_credentials(value)[:120] for value in work.required_checks[:20]
+                ],
+                "required_outputs": required_outputs,
+                "complete": len(work.acceptance_criteria) <= 12
+                and len(work.required_checks) <= 20
+                and len(required) == len(required_outputs),
+            },
+            "execution": {
+                "attempt_id": attempt["id"] if attempt else None,
+                "attempt_state": attempt["state"] if attempt else None,
+                "lease_live": bool(
+                    attempt and attempt["state"] == "active" and attempt["lease_live"]
+                ),
+                "next_wake_at": next_wake,
+                "reconciliation_required": reconciliation_required,
+                "interruption_reason": work.pause_reason
+                or (recovery.get("error_code") if work.state == WorkState.QUEUED else None),
+            },
             "presentation": {
                 "phase": detail["phase"],
                 "background_processing": automatic_recovery_pending(work),
@@ -398,6 +530,22 @@ class WorkFacts:
                 "complete": len(events) <= 4 and len(activity) == len(events),
             },
             "outputs": dict(outputs or {"candidate_count": 0, "validated_count": 0}),
+            "artifacts": {
+                "items": [
+                    {
+                        "file_id": artifact["file_id"],
+                        "version_id": artifact["version_id"],
+                        "name": redact_credentials(artifact["name"])[:240],
+                        "format": artifact["format"],
+                        "sha256": artifact["sha256"],
+                        "byte_length": artifact["byte_length"],
+                        "validated": artifact["validated"] == "true",
+                        "created_at": artifact["created_at"].isoformat(),
+                    }
+                    for artifact in artifacts[:8]
+                ],
+                "complete": len(artifacts) <= 8,
+            },
             "delivery": {
                 "total": len(states),
                 **{
@@ -405,6 +553,28 @@ class WorkFacts:
                     for state in ("accepted", "pending", "dispatching", "unknown", "rejected")
                 },
                 "phase": phase,
+                "receipts": [
+                    {
+                        "intent_id": receipt["id"],
+                        "state": native_states[receipt["id"]].value,
+                        "ledger_state": receipt["state"],
+                        "platform_message_id": redact_credentials(
+                            receipt["platform_message_id"] or ""
+                        )[:256]
+                        or None,
+                        "platform_job_id": redact_credentials(receipt["platform_job_id"] or "")[
+                            :256
+                        ]
+                        or None,
+                        "accepted_at": receipt["accepted_at"].isoformat()
+                        if receipt["accepted_at"]
+                        else None,
+                        "reason": redact_credentials(receipt["reason"] or "")[:160] or None,
+                        "updated_at": receipt["updated_at"].isoformat(),
+                    }
+                    for receipt in native[:8]
+                ],
+                "receipts_complete": len(native) <= 8,
                 **dict(accepted_outputs or {"artifact_accepted": 0, "image_accepted": 0}),
             },
         }

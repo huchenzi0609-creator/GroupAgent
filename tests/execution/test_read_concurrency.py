@@ -107,7 +107,8 @@ async def test_two_read_limit_preflight_and_intent_precede_every_handler(executi
         assert (
             context.idempotency_key == latest.backend_state["scoped_tool_intents"][context.call_id]
         )
-        assert len(latest.backend_state["scoped_tool_intents"]) == 2
+        assert 1 <= len(latest.backend_state["scoped_tool_intents"]) <= 2
+        assert "preflight:" + str(arguments.item) in trace
         trace.append("start:" + str(arguments.item))
         active += 1
         maximum = max(maximum, active)
@@ -121,8 +122,9 @@ async def test_two_read_limit_preflight_and_intent_precede_every_handler(executi
     engine = ScopedToolEngine(model, gateway, checkpoint_sink=save)
     result = await engine.wait(await engine.start(requested(execution_request, {"read"})))
     assert result.state == RunState.CANDIDATE and maximum == 2 and active == 0
-    assert trace[:2] == ["preflight:0", "preflight:1"]
-    assert trace[4:6] == ["preflight:2", "preflight:3"]
+    assert all(
+        trace.index(f"preflight:{index}") < trace.index(f"start:{index}") for index in range(4)
+    )
     assert result.usage.tool_calls == 4 and len(model.requests) == 2
     assert not result.checkpoint.backend_state["scoped_tool_intents"]
     assert [
@@ -188,7 +190,7 @@ async def test_mutable_unflagged_and_nonpublic_tools_stay_serial(execution_reque
     assert order == list(range(6))
 
 
-async def test_mutable_barrier_never_overlaps_the_two_read_waves(execution_request):
+async def test_mixed_batch_is_serial_and_never_overlaps_mutable_effects(execution_request):
     active, maximum, writes = 0, 0, []
 
     async def observe(arguments, context):
@@ -210,7 +212,7 @@ async def test_mutable_barrier_never_overlaps_the_two_read_waves(execution_reque
     names = ("read", "read", "write", "read", "read")
     engine = ScopedToolEngine(ScriptedFakeModel([proposal(*names), answer()]), gateway)
     result = await engine.wait(await engine.start(requested(execution_request, names)))
-    assert result.state == RunState.CANDIDATE and maximum == 2 and writes == [2]
+    assert result.state == RunState.CANDIDATE and maximum == 1 and writes == [2]
 
 
 async def test_preflight_schema_failure_keeps_serial_error_diagnostics_and_valid_peer(
@@ -488,7 +490,10 @@ async def test_noncooperative_read_timeout_blocks_following_tools_and_resume_ove
     try:
         result = await asyncio.wait_for(engine.wait(run), 1)
         assert result.state == RunState.PAUSED and result.error_code == "work_busy"
-        assert not result.checkpoint.safe_to_resume and starts == [0, 1]
+        # ToolNode keeps two public-read slots busy until the timeout becomes
+        # observable. A fast peer may finish and admit the third read first.
+        assert not result.checkpoint.safe_to_resume and starts[:2] == [0, 1]
+        assert len(starts) <= 3 and len(starts) == len(set(starts))
         assert len(model.requests) == 1
         restored = ScopedToolEngine(ScriptedFakeModel([]), gateway)
         with pytest.raises(DomainError) as error:
@@ -548,8 +553,12 @@ async def test_preflight_does_not_bypass_policy_revoked_before_actual_dispatch(e
     engine = ScopedToolEngine(model, gateway)
     result = await engine.wait(await engine.start(requested(execution_request, {"read"})))
     assert result.state == RunState.FAILED and result.error_code == "permission_denied"
-    assert not handled and len(result.receipts) == 2 and not result.checkpoint.ledger
-    assert all(receipt.effect_state == EffectState.NOT_STARTED for receipt in result.receipts)
+    # The first read was dispatched under the still-active policy. Revocation
+    # at the second read's preflight must prevent that second handler.
+    assert handled == [0] and len(result.receipts) == 2
+    assert result.receipts[0].success
+    assert result.receipts[1].effect_state == EffectState.NOT_STARTED
+    assert result.receipts[1].error_code == "permission_denied"
 
 
 async def test_parallel_research_failure_retains_peer_evidence_and_each_real_fee(execution_request):

@@ -14,10 +14,13 @@ class CacheBoundary:
     def __init__(self, body, reservation_id=None):
         self.body, self.reservation_id = body, reservation_id
         self.writes = []
+        self.audits = []
 
     @contextmanager
     def transaction(self, actor):
-        yield SimpleNamespace(conn=self)
+        yield SimpleNamespace(
+            conn=self, _audit=lambda *args, **kwargs: self.audits.append((args, kwargs))
+        )
 
     def execute(self, query, parameters):
         if "FROM ga_media_inputs" in query:
@@ -60,11 +63,15 @@ def test_unpaid_refund_preserves_prior_attempt_and_cannot_refund_twice(monkeypat
     assert failed(value) is None and cache.body["attempts"] == 1
 
 
-def test_any_durable_reservation_prevents_refund_and_requests_reconciliation(monkeypatch):
+def test_any_durable_reservation_prevents_refund_and_retains_distinct_inference_attempt(
+    monkeypatch,
+):
     cache = CacheBoundary({"claim": "claim", "attempts": 2}, "durable-reservation")
     assert failed(processor(monkeypatch, cache)) == "durable-reservation"
     assert cache.body["attempts"] == 2
-    assert cache.body["error_code"] == "provider_reconciliation_required"
+    assert cache.body["error_code"] == "input_inference_retry"
+    assert cache.body["last_inference_reservation_id"] == "durable-reservation"
+    assert cache.audits[0][0][0] == "input_inference_retry_authorized"
 
 
 @pytest.mark.parametrize("body", [None, {"claim": "newer-claim", "attempts": 2}])

@@ -566,7 +566,7 @@ async def live_phase(args, report: Report):
         "live_channel_binding_required",
     )
     require(
-        config.resources.enabled and config.runtime.engine == "scoped", "server_profile_required"
+        config.resources.enabled and config.runtime.engine == "langgraph", "server_profile_required"
     )
     proof = read_object(args.live_evidence)
     require(proof.get("test_group") == "test_2", "test_group_attestation_missing")

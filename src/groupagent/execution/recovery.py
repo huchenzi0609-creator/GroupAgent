@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from groupagent.domain import DomainError
 from groupagent.tools import EffectState, ToolGateway, ToolScope
 from groupagent.tools.gateway import tool_call_fingerprint
-from groupagent.tools.models import ToolReceipt
+from groupagent.tools.models import ToolFailureDisposition, ToolReceipt
 
 from .models import EngineCheckpoint, RunState
 
@@ -100,7 +100,16 @@ def reconcile_read_only_checkpoint(
     proposals: set[str] = set()
     tool_messages: set[str] = set()
     reconciled = {
-        key: receipt.model_copy(update={"effect_state": EffectState.NO_EFFECT})
+        key: receipt.model_copy(
+            update={
+                "effect_state": EffectState.NO_EFFECT,
+                "failure": receipt.failure.model_copy(
+                    update={"disposition": ToolFailureDisposition.REPAIR}
+                )
+                if receipt.failure is not None
+                else None,
+            }
+        )
         for key, receipt in unknown.items()
     }
     messages = []

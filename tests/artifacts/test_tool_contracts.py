@@ -15,6 +15,8 @@ from groupagent.artifacts import (
 )
 from groupagent.artifacts.tools import DocumentCreateInput, register_document_tools
 from groupagent.domain import ActorContext, DomainError, Role
+from groupagent.resources import ResourceDeferred
+from groupagent.sandbox.models import DraftPublicationUnknown
 from groupagent.tools import EffectState, ToolContext, ToolGateway, ToolScope
 from groupagent.tools.models import ToolFailure
 
@@ -148,9 +150,77 @@ async def test_isolated_parser_validation_failure_is_known_no_effect(document_to
 
 async def test_unknown_worker_failure_is_not_blanket_marked_no_effect(document_tools):
     _, worker, _, gateway, context = document_tools
-    worker.failure = DomainError("unknown_worker_side_effect", "synthetic unknown outcome")
+    worker.failure = DomainError(
+        "unknown_worker_side_effect", "synthetic unknown outcome", effect_state="unknown"
+    )
     result = await gateway.invoke("document_generate", report(), context)
     assert result.effect_state == EffectState.UNKNOWN
+
+
+async def test_new_preparation_error_does_not_need_a_diagnostic_whitelist_entry(document_tools):
+    store, worker, _, gateway, context = document_tools
+    worker.failure = DomainError("new_preparation_precondition", "Untrusted worker text")
+    result = await gateway.invoke("document_generate", report(), context)
+    assert not result.success and result.effect_state == EffectState.NO_EFFECT
+    assert result.failure.origin.value == "precondition"
+    assert result.failure.disposition.value == "repair"
+    assert "document_read/search" in result.message and "Untrusted" not in result.message
+    assert not store.list(ArtifactScope(context.group_id, context.work_id, context.actor.member_id))
+
+
+@pytest.mark.parametrize(
+    "failure,expected",
+    [
+        (DraftPublicationUnknown("publication_unknown", "Unknown rollback"), EffectState.UNKNOWN),
+        (ResourceDeferred(), EffectState.NOT_STARTED),
+    ],
+)
+async def test_preparation_preserves_uncertainty_and_admission_control(
+    document_tools, failure, expected
+):
+    _, worker, _, gateway, context = document_tools
+    worker.failure = failure
+    result = await gateway.invoke("document_generate", report(), context)
+    assert result.effect_state == expected
+    assert result.failure.disposition.value == (
+        "reconcile" if expected == EffectState.UNKNOWN else "defer"
+    )
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "permission_denied",
+        "source_unavailable",
+        "stale_lease",
+        "policy_changed",
+        "scope_denied",
+        "source_deleted",
+    ],
+)
+async def test_preparation_authority_failures_are_fenced_not_repaired(document_tools, code):
+    _, worker, _, gateway, context = document_tools
+    worker.failure = DomainError(code, "Private authorization details")
+    result = await gateway.invoke("document_generate", report(), context)
+    assert not result.success and result.effect_state == EffectState.NO_EFFECT
+    assert result.failure.origin.value == "authorization"
+    assert result.failure.disposition.value == "fence"
+    assert "Private" not in result.message
+
+
+async def test_policy_guard_uses_authorization_phase_even_for_an_unlisted_actor_failure(
+    document_tools,
+):
+    _, worker, service, gateway, context = document_tools
+
+    async def actor_changed(context):
+        raise DomainError("actor_identity_changed", "Private actor details")
+
+    service.policy_guard = actor_changed
+    result = await gateway.invoke("document_generate", report(), context)
+    assert result.effect_state == EffectState.NO_EFFECT and not worker.calls
+    assert result.failure.origin.value == "authorization"
+    assert result.failure.disposition.value == "fence"
 
 
 async def test_failure_after_publication_keeps_unknown_effect(document_tools, monkeypatch):

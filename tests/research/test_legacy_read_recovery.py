@@ -18,7 +18,14 @@ from groupagent.execution import (
 from groupagent.execution.models import PendingInput, UsageTotals
 from groupagent.research.recovery import reconcile_legacy_research_checkpoint
 from groupagent.tools import EffectState, IdempotencyMode, ToolData, ToolDefinition, ToolGateway
-from groupagent.tools.models import ToolLedgerEntry, ToolReceipt
+from groupagent.tools.models import (
+    ToolFailureDisposition,
+    ToolFailureMetadata,
+    ToolFailureOrigin,
+    ToolLedgerEntry,
+    ToolReceipt,
+    failure_disposition,
+)
 
 
 async def never_called(arguments, context):
@@ -155,6 +162,40 @@ async def test_derived_checkpoint_passes_normal_engine_resume_without_repeating_
     assert outcome.usage.rounds == checkpoint.usage.rounds + 1
     assert outcome.usage.tokens == checkpoint.usage.tokens + 2
     assert outcome.checkpoint.receipts == derived.receipts
+
+
+def test_adjudicated_read_updates_typed_disposition_without_changing_original_proof(legacy):
+    checkpoint, definitions = legacy
+    old = checkpoint.receipts[-1]
+    uncertain = old.model_copy(
+        update={
+            "failure": ToolFailureMetadata(
+                origin=ToolFailureOrigin.EXECUTION, disposition=ToolFailureDisposition.RECONCILE
+            )
+        }
+    )
+    original = checkpoint.model_copy(
+        update={
+            "receipts": (*checkpoint.receipts[:-1], uncertain),
+            "ledger": (
+                *checkpoint.ledger[:-1],
+                checkpoint.ledger[-1].model_copy(update={"receipt": uncertain}),
+            ),
+            "messages": (
+                *checkpoint.messages[:-1],
+                checkpoint.messages[-1].model_copy(update={"content": uncertain.model_dump_json()}),
+            ),
+        }
+    )
+    before = original.model_dump_json()
+    derived = reconcile_legacy_research_checkpoint(original, definitions=definitions)
+    assert original.model_dump_json() == before
+    assert derived.receipts[-1].effect_state == EffectState.NO_EFFECT
+    assert failure_disposition(derived.receipts[-1]) == ToolFailureDisposition.REPAIR
+    assert derived.receipts[-1].error_code == old.error_code
+    assert derived.receipts[-1].output == old.output
+    assert derived.ledger[-1].receipt == derived.receipts[-1]
+    assert ToolReceipt.model_validate_json(derived.messages[-1].content) == derived.receipts[-1]
 
 
 @pytest.mark.parametrize(

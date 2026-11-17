@@ -7,6 +7,7 @@ not implementation mirrors or paid/provider/channel integration.
 from __future__ import annotations
 
 import asyncio
+import json
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
@@ -489,28 +490,84 @@ async def test_batch_rejection_rolls_back_earlier_human_task_and_derived_sources
         await app.close()
 
 
-async def test_router_cannot_claim_execution_or_send_without_effect_evidence(runtime_env):
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_execution_receipt_reaches_the_real_graph_before_any_success_delivery(
+    runtime_env, accepted
+):
+    """The host proves effects; the scripted model's language is explicit evidence."""
+    from groupagent.conversation.provider import ModelDecisionProvider
+
+    from .foreground_model_fixture import candidate_reply, natural_reply
+
     env = runtime_env
     value = event(env, "请用Python实际运行2加3，并发回文件")
-    false = "已运行Python，文件也已生成并发送。"
-    app, _ = app_for(
-        env,
-        {
-            value.id: Decision(
-                kind="reply",
-                reason_code="synthetic_false_claim",
-                response=false,
-                directness="direct",
-                confidence=1,
-            )
-        },
+    app, _ = app_for(env, {})
+    if not accepted:
+        app.config = app.config.model_copy(
+            update={"features": app.config.features.model_copy(update={"document_editing": False})}
+        )
+        app.coordinator.config = app.config
+    plan = Decision(
+        kind="start_work",
+        reason_code="synthetic_actual_execution",
+        goal=value.text,
+        outputs=[{"format": "md"}],
+        work_capabilities=["compute", "documents"],
+        directness="direct",
+        confidence=1,
     )
-    try:
-        await admit(app, env, value)
-        with env.store.transaction(env.actor) as tx:
-            assert all(d.payload_ref != "text:" + false for d in tx.list_delivery()), (
-                "Unexecuted tool claim entered the outbox"
+
+    class ReceiptAwareModel:
+        name = "offline-receipt-aware-foreground-model"
+
+        def __init__(self):
+            self.requests, self.validated_receipts = [], []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return candidate_reply(plan)
+            observation = json.loads(
+                next(
+                    message.content
+                    for message in reversed(request.messages)
+                    if message.role == "tool"
+                )
             )
+            assert observation["status"] == ("committed" if accepted else "rejected")
+            with env.store.transaction(env.actor) as tx:
+                works = tx.list_work()
+                assert len(works) == int(accepted)
+                assert not tx.list_delivery()  # The model's proposal was never delivered.
+                if accepted:
+                    assert works[0].state == WorkState.QUEUED
+                    assert not env.registry.outputs(env.actor, works[0].id, works[0].goal_revision)
+            self.validated_receipts.append(observation)
+            return natural_reply(
+                "已排队；还没有运行结果或已发送的文件。"
+                if accepted
+                else "文件功能已关闭，这次没有启动执行或发送文件。"
+            )
+
+    model = ReceiptAwareModel()
+    app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(model)
+    try:
+        result = await admit(app, env, value)
+        assert len(model.requests) == 2 and len(model.validated_receipts) == 1
+        with env.store.transaction(env.actor) as tx:
+            assert len(tx.list_work()) == int(accepted)
+            deliveries = tx.list_delivery()
+            assert len(deliveries) == 1 and deliveries[0].payload_ref.startswith("text:")
+            assert all(
+                "已运行Python，文件也已生成并发送。" not in row.payload_ref for row in deliveries
+            )
+            stored = tx.get_decision(value.id)
+            assert len(stored["action_receipts"]) == 1 and not stored["agent_pending_response"]
+        replay = await app.coordinator.process(value)
+        assert replay.duplicate and len(model.requests) == 2
+        with env.store.transaction(env.actor) as tx:
+            assert len(tx.list_work()) == int(accepted) and len(tx.list_delivery()) == 1
+        assert result["result"]["decision"]["response"]
     finally:
         await app.close()
 

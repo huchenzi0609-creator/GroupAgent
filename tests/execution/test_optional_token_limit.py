@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import asyncio
-from types import SimpleNamespace
-
 import pytest
 
 from groupagent.domain import DomainError, Role
 from groupagent.execution import (
     EngineCheckpoint,
     ExecutionBudget,
-    HarnessEngine,
     ModelMessage,
     ModelReply,
     RunState,
@@ -18,7 +14,6 @@ from groupagent.execution import (
     TokenUsage,
 )
 from groupagent.execution.models import UsageTotals
-from groupagent.sandbox import DockerSandbox
 from groupagent.tools import ToolGateway
 
 
@@ -103,40 +98,3 @@ async def test_member_cannot_remove_cap_through_direct_engine_resume(execution_r
             budget=ExecutionBudget(),
         )
     assert error.value.code == "permission_denied"
-
-
-@pytest.mark.parametrize("token_limit", [None, 1])
-async def test_harness_relay_keeps_money_reservations_with_optional_limit(
-    execution_request, token_limit
-):
-    request = execution_request.model_copy(
-        update={
-            "allowed_tools": frozenset(),
-            "budget": ExecutionBudget(max_tokens=token_limit, max_output_tokens=1500),
-        }
-    )
-    money, model = RecordingFakeBudget(), ScriptedFakeModel([answer()])
-    engine = HarnessEngine(
-        model, ToolGateway(), DockerSandbox("sha256:" + "a" * 64), model_budget=money
-    )
-    run = engine._create(request)
-    run.usage = UsageTotals(rounds=9, tokens=300000)
-
-    async def worker_wait():
-        await asyncio.Event().wait()
-
-    engine._bridges[request.attempt_id] = SimpleNamespace(process=SimpleNamespace(wait=worker_wait))
-    payload = {"tools": [], "messages": [{"role": "user", "content": "Synthetic retained context"}]}
-    if token_limit is not None:
-        with pytest.raises(DomainError) as error:
-            await engine._relay_model(run, payload)
-        assert error.value.code == "token_budget_exhausted" and not money.reservations
-        assert not model.requests
-    else:
-        assert await engine._relay_model(run, payload) == answer()
-        assert model.requests[0].max_output_tokens == 1500
-        assert money.reservations[0][2] > 0 and money.reservations[0][3] == 1500
-        assert run.usage.tokens == 300030 and run.usage.rounds == 10
-        assert money.settlements == [
-            ("synthetic-reservation", TokenUsage(input_tokens=20, output_tokens=10))
-        ]

@@ -132,7 +132,7 @@ jobs:
         # TTC face 2 is Noto Sans CJK SC; keep PDF's WQY font independent.
         run: sudo apt-get update && sudo apt-get install -y fonts-wqy-zenhei fonts-noto-cjk
       - run: uv sync --locked
-      - name: Build immutable workers from the reviewed lock and SDK hashes
+      - name: Build immutable worker from the reviewed dependency lock
         run: |
           set -euo pipefail
           mkdir -p runtime/ci
@@ -142,13 +142,10 @@ jobs:
           docker build --platform linux/amd64 --build-arg BASE_IMAGE=python@sha256:f3dac913ab53b78c64f26d5518fcd7043d5a1a46522d6a493b598c3ed12f62a6 -f deploy/worker/Dockerfile --iidfile runtime/ci/worker.iid --tag "$worker_build_tag" .
           test "$(docker image inspect --format '{{.Id}}' "$worker_build_tag")" = "$(cat runtime/ci/worker.iid)"
           test "$(docker image inspect --format '{{.Architecture}}' "$worker_build_tag")" = "amd64"
-          docker build --build-arg WORKER_IMAGE="$worker_build_tag" -f deploy/worker/Dockerfile.harness --iidfile runtime/ci/harness.iid .
-          test "$(docker image inspect --format '{{.Architecture}}' "$(cat runtime/ci/harness.iid)")" = "amd64"
           echo "GROUPAGENT_WORKER_IMAGE=$(cat runtime/ci/worker.iid)" >> "$GITHUB_ENV"
-          echo "GROUPAGENT_HARNESS_IMAGE=$(cat runtime/ci/harness.iid)" >> "$GITHUB_ENV"
-      - name: Verify genuine SDK, process isolation and artifact pipelines
-        # Provider/model/channel fixtures remain synthetic; Docker/SDK/file bytes are real.
-        run: uv run --no-sync pytest --strict-markers --strict-config tests/sandbox tests/execution/test_harness_real.py tests/artifacts/test_isolated_matrix.py tests/artifacts/test_chart_labels.py tests/media/test_sandbox_media.py tests/media/test_browser_worker.py tests/runtime/test_inputs.py -q --junitxml=runtime/ci/isolated-worker.xml
+      - name: Verify standard graph, process isolation and artifact pipelines
+        # Provider/model/channel fixtures remain synthetic; LangGraph/Docker/file bytes are real.
+        run: uv run --no-sync pytest --strict-markers --strict-config tests/sandbox tests/execution/test_langgraph_core.py tests/artifacts/test_isolated_matrix.py tests/artifacts/test_chart_labels.py tests/media/test_sandbox_media.py tests/media/test_browser_worker.py tests/runtime/test_inputs.py tests/runtime/test_durable_worker_pipeline.py -q --junitxml=runtime/ci/isolated-worker.xml
       - name: Require executed isolated-worker checks without skips
         run: |
           uv run --no-sync python - <<'PY'
@@ -157,6 +154,6 @@ jobs:
           cases = ElementTree.parse(Path("runtime/ci/isolated-worker.xml")).findall(".//testcase")
           assert cases, "Isolated worker job executed no tests"
           assert not any(case.find("skipped") is not None for case in cases), "Required isolated-worker checks skipped"
-          assert any("test_real_sdk_mcp_tool_loop" in case.attrib["name"] for case in cases), "Genuine SDK check missing"
+          assert any("test_langgraph_core" in case.attrib.get("classname", "") for case in cases), "Standard graph check missing"
           assert any("test_real_isolated_ten_case_matrix" in case.attrib["name"] for case in cases), "Isolated document matrix missing"
           PY

@@ -538,11 +538,36 @@ class InputProcessor:
                 )
             reconciliation = body.get("reconciliation_reservation_id")
             if isinstance(reconciliation, str) and reconciliation:
-                raise DomainError(
-                    "provider_reconciliation_required",
-                    "Audio preprocessing already has a paid reservation; reconcile before retry",
-                    effect_state="unknown",
-                    resource_ref=reconciliation,
+                reservation = tx.conn.execute(
+                    "SELECT state,operation,source_event_id FROM ga_budget_reservations "
+                    "WHERE group_id=%s AND id=%s",
+                    (actor.group_id, reconciliation),
+                ).fetchone()
+                if not (
+                    body.get("state") == "failed"
+                    and body.get("claim_until") == 0
+                    and reservation
+                    and reservation["operation"] == "media.asr"
+                    and reservation["source_event_id"] == event.id
+                ):
+                    raise DomainError(
+                        "provider_reconciliation_required",
+                        "Audio preprocessing has not confirmed termination of its prior inference",
+                        effect_state="unknown",
+                        resource_ref=reconciliation,
+                    )
+                # Legacy failed ASR claims were written after the awaited
+                # inference stopped. ASR has no external business write; the
+                # unknown charge remains in its original immutable reservation.
+                # A new authorized inference receives a distinct attempt key.
+                body["last_inference_reservation_id"] = reconciliation
+                body.pop("reconciliation_reservation_id")
+                tx._audit(
+                    "input_inference_retry_authorized",
+                    event.id,
+                    reservation_id=reconciliation,
+                    charge_state=reservation["state"],
+                    evidence="failed_asr_claim_after_awaited_inference",
                 )
             if (
                 body.get("state") == "processing"
@@ -566,11 +591,14 @@ class InputProcessor:
             memory_lock(tx)
             self._source(tx, event.id, fingerprint)
             body = self._active_claim(self._cache_row(tx, event, attachment, fingerprint), token)
-            attempt = int(body.get("attempts", 0)) + 1
-            if attempt > 2:
+            previous = body.get("attempts", 0)
+            if type(previous) is not int or previous < 0:
                 raise DomainError(
-                    "input_retry_exhausted", "Audio preprocessing has reached its two-attempt limit"
+                    "provider_reconciliation_required", "Audio attempt identity is invalid"
                 )
+            # This counter names distinct provider reservations. It is not an
+            # execution budget and must never saturate/reuse an old paid key.
+            attempt = previous + 1
             body["attempts"] = attempt
             self._put(tx, event, attachment, body)
             return attempt
@@ -610,8 +638,14 @@ class InputProcessor:
                             body["attempts"] = attempt - 1
                         else:
                             reservation_id = str(reservation["id"])
-                            code = "provider_reconciliation_required"
-                            body["reconciliation_reservation_id"] = reservation_id
+                            code = "input_inference_retry"
+                            body["last_inference_reservation_id"] = reservation_id
+                            tx._audit(
+                                "input_inference_retry_authorized",
+                                event.id,
+                                reservation_id=reservation_id,
+                                evidence="awaited_asr_call_terminated_before_resource_yield",
+                            )
                 body.update(state="failed", error_code=code, claim_until=0)
                 self._put(tx, event, attachment, body)
         return reservation_id
@@ -866,13 +900,14 @@ class InputProcessor:
                     unstarted_attempt=unstarted_attempt if deferred else None,
                 )
             if reservation_id is not None:
-                # A later local worker may be unstarted while this ASR attempt
-                # already owns a paid/unknown call. Never silently replay it or
-                # release its hold merely because the last operation was denied.
+                # Preserve the previous reservation and its uncertain charge.
+                # The awaited ASR operation stopped and has no external write;
+                # a later activation may use a distinct accounting attempt.
                 raise DomainError(
-                    "provider_reconciliation_required",
-                    "Audio preprocessing already has a paid reservation; reconcile before retry",
-                    effect_state="unknown",
+                    "input_inference_retry",
+                    "Audio inference stopped; retained charge evidence permits a fresh attempt",
+                    retryable=True,
+                    effect_state="no_effect",
                     resource_ref=reservation_id,
                 ) from error
             raise

@@ -46,16 +46,7 @@ class StructuredModelFixture:
         self.entered.set()
         await self.release.wait()
         return ModelReply(
-            text=json.dumps(
-                {
-                    "kind": "reply",
-                    "reason_code": "concept_explanation",
-                    "response": self.text,
-                    "directness": "direct",
-                    "confidence": 1,
-                },
-                ensure_ascii=False,
-            ),
+            text=self.text,
             usage=TokenUsage(input_tokens=10, output_tokens=10),
         )
 

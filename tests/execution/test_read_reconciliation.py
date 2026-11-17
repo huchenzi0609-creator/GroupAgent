@@ -422,3 +422,58 @@ async def test_noncooperative_serial_read_blocks_later_model_resume_and_new_star
     finally:
         release.set()
         await gateway.quiesce(engine._get(run).scope, timeout_seconds=0.2)
+
+
+async def test_proven_read_reconciliation_updates_trusted_disposition_without_losing_evidence(
+    legacy,
+):
+    from groupagent.tools.models import (
+        ToolFailureDisposition,
+        ToolFailureMetadata,
+        ToolFailureOrigin,
+    )
+
+    legacy, _original_gateway = legacy
+    original = legacy.receipts[0].model_copy(
+        update={
+            "failure": ToolFailureMetadata(
+                origin=ToolFailureOrigin.EXECUTION,
+                disposition=ToolFailureDisposition.RECONCILE,
+            )
+        }
+    )
+    checkpoint = legacy.model_copy(
+        update={
+            "receipts": (original,),
+            "ledger": (legacy.ledger[0].model_copy(update={"receipt": original}),),
+            "messages": tuple(
+                message.model_copy(update={"content": original.model_dump_json()})
+                if message.role == "tool"
+                else message
+                for message in legacy.messages
+            ),
+        }
+    )
+    gateway = ToolGateway()
+    register(gateway)
+    reconciled = reconcile_read_only_checkpoint(checkpoint, gateway=gateway)
+    assert checkpoint.receipts[0].effect_state == EffectState.UNKNOWN
+    assert checkpoint.receipts[0].failure.disposition == ToolFailureDisposition.RECONCILE
+    assert reconciled.receipts[0].effect_state == EffectState.NO_EFFECT
+    assert reconciled.receipts[0].failure == ToolFailureMetadata(
+        origin=ToolFailureOrigin.EXECUTION,
+        disposition=ToolFailureDisposition.REPAIR,
+    )
+    assert reconciled.receipts[0].output == original.output and reconciled.usage == checkpoint.usage
+    assert reconciled.ledger[0].receipt == reconciled.receipts[0]
+    model = ScriptedFakeModel([answer()])
+    engine = ScopedToolEngine(model, gateway)
+    result = await engine.wait(
+        await engine.resume(
+            reconciled,
+            reconciled.request.actor,
+            attempt_id="read-proof-classified",
+        )
+    )
+    assert result.state == RunState.CANDIDATE and len(model.requests) == 1
+    assert result.receipts[0].failure.disposition == ToolFailureDisposition.REPAIR

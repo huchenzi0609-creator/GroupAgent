@@ -62,26 +62,46 @@ class ChartInput(ToolData):
 
 
 class ImageInput(ArtifactReference):
-    alt_text: str = Field(min_length=1, max_length=500)
-    width_inches: float = Field(default=5.5, ge=1, le=6.5)
+    alt_text: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Visible caption immediately BELOW this image in DOCX/PDF reports; include its associated source URL here when requested below the image. Markdown/PPTX use it as image description metadata. Pixels come from the exact file_id/version_id.",
+    )
+    width_inches: float = Field(
+        default=5.5,
+        ge=1,
+        le=6.5,
+        description="Image width in inches; aspect ratio is preserved. Use a smaller width when several figures must fit a page limit.",
+    )
 
 
 class SectionInput(ToolData):
     title: str = Field(min_length=1, max_length=180)
     paragraphs: tuple[str, ...] = Field(
         max_length=50,
-        description="Plain text paragraphs; empty strings intentionally reserve blank form-writing space. For .md, do not put fenced code, headings or pipe tables here; write complete Markdown with workspace_write_text then artifact_from_workspace instead.",
+        description="Plain text rendered BEFORE this section's tables/images/charts. Captions and source URLs requested below an image belong in that image's alt_text. Empty strings reserve blank writing space. For .md, do not put fenced code, headings or pipe tables here; write complete Markdown with workspace_write_text then artifact_from_workspace instead.",
     )
     tables: tuple[TableInput, ...] = Field(default=(), max_length=5)
-    images: tuple[ImageInput, ...] = Field(default=(), max_length=3)
-    charts: tuple[ChartInput, ...] = Field(default=(), max_length=3)
+    images: tuple[ImageInput, ...] = Field(
+        default=(),
+        max_length=3,
+        description="Embed real scoped image bytes here: sections[].images=[{file_id,version_id,alt_text,width_inches}]. Copy exact artifact IDs from chart_render or image input results. Images are nested in a section, never a top-level document field.",
+    )
+    charts: tuple[ChartInput, ...] = Field(
+        default=(),
+        max_length=3,
+        description="Render and embed bar/line/pie chart data directly in this section; no external plotting package or illustration service is needed. Use images for existing image artifacts.",
+    )
 
 
 class SlideInput(ToolData):
     title: str = Field(min_length=1, max_length=90)
     bullets: tuple[str, ...] = Field(max_length=6)
     table: TableInput | None = None
-    image: ImageInput | None = None
+    image: ImageInput | None = Field(
+        default=None,
+        description="Embed the actual scoped image using its exact file_id/version_id, with alt_text and optional width_inches. For reports use sections[].images instead.",
+    )
     chart: ChartInput | None = None
 
 
@@ -89,6 +109,7 @@ class DocumentCreateInput(ToolData):
     validation_hints: ClassVar[dict[str, str]] = {
         "name": "name is a filename with extension: report.md/report.docx/report.pdf or slides.pptx, never a path or extensionless title.",
         "kind": "kind=report uses sections and .md/.docx/.pdf; kind=deck uses slides and .pptx.",
+        "images": "Embed images inside the document: report uses sections[].images=[{file_id,version_id,alt_text,width_inches}]; deck uses slides[].image={file_id,version_id,alt_text,width_inches}. Copy the exact file_id/version_id returned by chart_render or a scoped image input. Top-level images is unsupported; move the existing references into a section instead of dropping the figures. For new bar/line/pie charts you can also supply sections[].charts directly.",
         "value_error": "Match name/kind and sections/slides: report requires .md/.docx/.pdf plus nonempty sections; deck requires .pptx plus nonempty slides. Every table row must match its headers.",
         "*": 'Minimal report: {"name":"report.md","kind":"report","title":"Summary","sections":[{"title":"Findings","paragraphs":["Result 87."]}]}',
     }
@@ -101,7 +122,11 @@ class DocumentCreateInput(ToolData):
     kind: Literal["report", "deck"]
     title: str = Field(min_length=1, max_length=180)
     subtitle: str = Field(default="", max_length=500)
-    sections: tuple[SectionInput, ...] = Field(default=(), max_length=50)
+    sections: tuple[SectionInput, ...] = Field(
+        default=(),
+        max_length=50,
+        description="Report sections contain plain paragraphs, tables, images and charts. To include generated PNGs, put their exact file_id/version_id references in each section's images array.",
+    )
     slides: tuple[SlideInput, ...] = Field(default=(), max_length=100)
 
     @field_validator("name")
@@ -288,10 +313,23 @@ def register_document_tools(
     async def generate(arguments: DocumentCreateInput, context: ToolContext) -> ArtifactOutput:
         scope = await service._scope(context)
         document: Report | Deck
+        image_sources: list[dict[str, Any]] = []
+        image_events: set[str] = set()
 
-        def picture(value: ImageInput) -> ImageData:
+        def picture(value: ImageInput, location: str) -> ImageData:
+            version = service._get(scope, value.file_id, value.version_id)
+            pixels = service._read(scope, version.file_id, version.version_id)
+            image_sources.append(
+                {
+                    "location": location,
+                    "file_id": version.file_id,
+                    "version_id": version.version_id,
+                    "sha256": version.sha256,
+                }
+            )
+            image_events.update(service.store._source_events(version.provenance))
             return ImageData(
-                service._read(scope, value.file_id, value.version_id),
+                pixels,
                 value.alt_text,
                 value.width_inches,
             )
@@ -304,10 +342,13 @@ def register_document_tools(
                         section.title,
                         section.paragraphs,
                         tuple(table(value) for value in section.tables),
-                        tuple(picture(value) for value in section.images),
+                        tuple(
+                            picture(value, f"sections[{section_index}].images[{image_index}]")
+                            for image_index, value in enumerate(section.images)
+                        ),
                         tuple(chart(value) for value in section.charts),
                     )
-                    for section in arguments.sections
+                    for section_index, section in enumerate(arguments.sections)
                 ),
                 arguments.subtitle,
             )
@@ -319,10 +360,12 @@ def register_document_tools(
                         slide.title,
                         slide.bullets,
                         table(slide.table) if slide.table else None,
-                        picture(slide.image) if slide.image else None,
+                        picture(slide.image, f"slides[{slide_index}].image")
+                        if slide.image
+                        else None,
                         chart(slide.chart) if slide.chart else None,
                     )
-                    for slide in arguments.slides
+                    for slide_index, slide in enumerate(arguments.slides)
                 ),
             )
         provenance = (
@@ -330,6 +373,25 @@ def register_document_tools(
             if provenance_factory
             else {"work_id": context.work_id}
         )
+        if image_sources:
+            # Bind each placement to the exact scoped version whose bytes were
+            # read. Retain source-event dependencies so deletion/revocation also
+            # applies to this derived document, without copying image metadata.
+            provenance = {
+                **provenance,
+                "source_image_refs": image_sources,
+                "input_versions": list(
+                    dict.fromkeys(
+                        [
+                            *provenance.get("input_versions", ()),
+                            *(source["version_id"] for source in image_sources),
+                        ]
+                    )
+                ),
+                "source_event_ids": sorted(
+                    image_events | set(service.store._source_events(provenance))
+                ),
+            }
         return output(
             await service.generate(context, arguments.name, document, provenance=provenance)
         )
@@ -414,7 +476,15 @@ def register_document_tools(
         result = await service.validate(
             context, arguments.file_id, arguments.version_id, expected_text=arguments.expected_text
         )
-        return DocumentDataOutput.from_data(result.to_dict())
+        data = DocumentDataOutput.from_data(result.to_dict())
+        if not result.passed:
+            raise ToolFailure(
+                "document_validation_failed",
+                result.failure_summary,
+                output=data,
+                no_effect=True,
+            )
+        return data
 
     async def combine(arguments: DocumentCombineInput, context: ToolContext) -> ArtifactOutput:
         return output(
@@ -455,7 +525,7 @@ def register_document_tools(
         ),
         (
             "document_generate",
-            'Create a real scoped document; name MUST include its extension. Use kind=report for native DOCX/PDF reports, comparison tables, score sheets, rubrics and checklists. Sections support tables, blank cells and empty paragraphs for writing space; PDF uses managed CJK fonts and verified page layout. Prefer this to custom Python drawing for these supported layouts. For key=value observations, use name/value columns and one editable data row per observation unless the user explicitly requests a horizontal table. Minimal report: {"name":"report.md","kind":"report","title":"Summary","sections":[{"title":"Findings","paragraphs":["Result 87."]}]}. For PPTX use {"name":"slides.pptx","kind":"deck","title":"Summary","slides":[{"title":"Findings","bullets":["Result 87."]}]}. The deck title is document metadata; visible slide text comes only from supplied slide content, with no automatic title/page-number footer. Use document_validate before delivery.',
+            'Create an actual scoped document. name includes its extension: kind=report uses sections with .md/.docx/.pdf; kind=deck uses slides with .pptx. Reports support plain paragraphs, native tables, images and data charts. PDF uses managed CJK fonts and verified report layout. Embed existing image bytes with sections[].images, or slides[].image for decks; copy exact file_id/version_id from chart_render or scoped image results. Report section example (replace the reference placeholders): {"title":"Figures","paragraphs":[],"images":[{"file_id":"<returned file_id>","version_id":"<returned version_id>","alt_text":"Figure 1","width_inches":4.5}]}. To render new bar/line/pie charts directly, use sections[].charts. Use document_validate to verify actual content and layout before delivery.',
             DocumentCreateInput,
             ArtifactOutput,
             generate,

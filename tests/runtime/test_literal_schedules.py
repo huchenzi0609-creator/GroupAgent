@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from groupagent.coordinator import Decision
-from groupagent.runtime.tool_selection import select_tools
+from groupagent.runtime.tool_selection import authorized_tools, select_tools
 
 from .test_app import app_for, event
 from .test_tool_selection import CATALOG
@@ -88,7 +88,9 @@ async def test_literal_body_survives_router_paraphrase_and_schedule_updates(
             work = tx.get_work(occurrence.work_id)
         assert work.goal == expected and work.scope["reminder_body"] == expected
         assert work.scope["reminder_body_source_event_id"] == body_source
-        assert select_tools(work, [], CATALOG) == frozenset()
+        allowed = authorized_tools(work, CATALOG, actor=env.actor)
+        assert allowed == frozenset()
+        assert select_tools(work, [], allowed) == frozenset()
         assert len(scheduler.list(env.actor)) == 1 and not execution_models
     finally:
         await app.close()

@@ -7,7 +7,6 @@ agent's context. Failed cases and their actual output are retained unchanged.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import fcntl
 import hashlib
@@ -1219,26 +1218,6 @@ class MatrixRun:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--worker-image", required=True)
-    parser.add_argument("--harness-image", required=True)
-    parser.add_argument("--docker-host", required=True)
-    parser.add_argument("--timeout", type=int, default=300)
-    parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument(
-        "--case-ids",
-        help="Comma-separated focused smoke cases; includes their declared input dependencies",
+    raise SystemExit(
+        "This historical Harness matrix is retained for evidence readers only. Use scripts/live_durable_core_acceptance.py for the standard runtime."
     )
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument(
-        "--stop-on-failure",
-        action="store_true",
-        help="Retain the first checked FAIL and stop before paying for a later case",
-    )
-    parser.add_argument(
-        "--recheck-only",
-        action="store_true",
-        help="Recheck completed work without starting any new case or paid verification",
-    )
-    asyncio.run(MatrixRun(parser.parse_args()).run())

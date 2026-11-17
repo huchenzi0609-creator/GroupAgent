@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime
 from importlib.resources import files
 from typing import Any, Literal
 from uuid import uuid4
 
 import psycopg
+from psycopg.errors import LockNotAvailable
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import JsonValue
@@ -39,6 +43,44 @@ from groupagent.domain import (
     check_transition,
 )
 from groupagent.persistence.delivery_knowledge import projected_delivery_state
+
+
+@dataclass(frozen=True)
+class _OwnerLockWait:
+    thread_id: int
+    active: Callable[[], bool]
+    milliseconds: int
+
+
+_OWNER_LOCK_WAIT: ContextVar[_OwnerLockWait | None] = ContextVar("owner_lock_wait", default=None)
+
+
+@contextmanager
+def bounded_owner_lock_waits(
+    active: Callable[[], bool], *, milliseconds: int = 25
+) -> Iterator[None]:
+    """Runtime-only policy; inherited tasks retry contention without blocking their loop.
+
+    Worker threads may inherit ContextVars, but must retain normal database lock
+    semantics. Every connection remains private to its creating transaction.
+    """
+    if not 1 <= milliseconds <= 50:
+        raise ValueError("Owner lock waits must be between one and fifty milliseconds")
+    token = _OWNER_LOCK_WAIT.set(_OwnerLockWait(threading.get_ident(), active, milliseconds))
+    try:
+        yield
+    finally:
+        _OWNER_LOCK_WAIT.reset(token)
+
+
+def _owner_lock_wait() -> _OwnerLockWait | None:
+    policy = _OWNER_LOCK_WAIT.get()
+    return (
+        policy
+        if policy is not None and policy.thread_id == threading.get_ident() and policy.active()
+        else None
+    )
+
 
 Row = dict[str, Any]
 Connection = psycopg.Connection[Row]
@@ -86,7 +128,19 @@ class PostgresStore:
         self.dsn = dsn
 
     def connect(self) -> Connection:
-        return psycopg.connect(self.dsn, row_factory=dict_row)
+        conn = psycopg.connect(self.dsn, row_factory=dict_row)
+        policy = _owner_lock_wait()
+        if policy is not None:
+            try:
+                conn.execute(
+                    "SELECT set_config('lock_timeout',%s,false)",
+                    (str(policy.milliseconds) + "ms",),
+                )
+                conn.commit()  # Preserve the fresh connection's original IDLE contract.
+            except BaseException:
+                conn.close()
+                raise
+        return conn
 
     def migrate(self) -> int:
         """Apply packaged, checksum-verified migrations in one transaction.
@@ -158,11 +212,22 @@ class PostgresStore:
         self, actor: ActorContext, *, trace_id: str | None = None
     ) -> Iterator[UnitOfWork]:
         trace_id = trace_id or _id()
+        bounded_wait = _owner_lock_wait() is not None
         try:
             with self.connect() as conn:
                 unit = UnitOfWork(conn, actor, trace_id)
                 unit._check_group()
                 yield unit
+        except LockNotAvailable:
+            if bounded_wait:
+                # The connection context has already rolled back. This is a
+                # resource wait, not changed source evidence or a failed task.
+                raise DomainError(
+                    "resource_deferred",
+                    "Maintenance holds a required database resource; retry the durable operation",
+                    retryable=True,
+                ) from None
+            raise
         except DomainError as error:
             if error.code in {"restore_busy", "restore_pending"}:
                 raise  # The target schema may not exist yet; never mutate a restore snapshot.
@@ -681,7 +746,8 @@ class UnitOfWork:
     def list_pending_events(self, limit: int = 100) -> list[GroupEvent]:
         rows = self.conn.execute(
             "SELECT e.body FROM ga_events e WHERE e.group_id = %s AND e.memory_state='active' AND NOT EXISTS "
-            "(SELECT 1 FROM ga_decisions d WHERE d.group_id = e.group_id AND d.event_id = e.id) "
+            "(SELECT 1 FROM ga_decisions d WHERE d.group_id = e.group_id AND d.event_id = e.id "
+            "AND d.body->>'agent_pending_response' IS DISTINCT FROM 'true') "
             "ORDER BY e.sequence LIMIT %s",
             (self.group_id, min(max(limit, 1), 1000)),
         ).fetchall()

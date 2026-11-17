@@ -70,7 +70,7 @@ def test_explicit_file_media_or_actual_execution_requirements_keep_the_original_
     assert not message_only_research_request(text)
 
 
-def test_message_contract_never_falls_back_to_file_tools_for_conflicting_required_tools():
+def test_delivery_requirement_does_not_turn_a_text_output_contract_into_file_delivery_authority():
     current = catalog_work(
         QUESTION,
         outputs=[{"format": "text"}],
@@ -78,9 +78,12 @@ def test_message_contract_never_falls_back_to_file_tools_for_conflicting_require
         research_message_only=True,
         required_tools=["artifact_deliver"],
     )
-    with pytest.raises(DomainError) as failed:
-        select_tools(current, [], WEB_TOOLS | {"artifact_deliver", "workspace_write_text"})
-    assert failed.value.code == "permission_denied"
+    # Tool visibility is independent of the final output contract. The real
+    # validator below rejects any extra result artifact before critique/delivery.
+    selected = select_tools(current, [], WEB_TOOLS | {"artifact_deliver", "workspace_write_text"})
+    assert "artifact_deliver" in selected
+    assert current.scope["outputs"] == [{"format": "text"}]
+    assert current.scope["research_message_only"] is True
 
 
 async def admitted(setup, text, *, outputs=None, input_versions=()):
@@ -95,6 +98,7 @@ async def admitted(setup, text, *, outputs=None, input_versions=()):
         input_versions=list(input_versions),
         directness="direct",
         confidence=1,
+        work_capabilities=["public_research"],
     )
 
     class ExplicitProvider:
@@ -227,7 +231,11 @@ async def test_router_md_goal_and_criteria_cannot_expand_message_research_into_a
 
     async def factory(work, lease, actor, workspace):
         prepared = await setup.toolkit.prepare(work, lease, actor, workspace)
-        assert prepared.request.allowed_tools <= WEB_TOOLS
+        assert prepared.request.visible_tools <= WEB_TOOLS | {
+            "artifact_search",
+            "memory_search",
+            "tool_catalog",
+        }
         assert "web_search" in prepared.request.required_tools
         model = ExplicitResearchModel()
         models.append(model)
@@ -291,7 +299,11 @@ async def test_message_contract_rejects_an_extra_result_before_critic(toolkit_se
     workspace = env.root / current.id
     workspace.mkdir()
     prepared = await setup.toolkit.prepare(current, lease, env.actor, workspace)
-    assert prepared.request.allowed_tools <= WEB_TOOLS
+    assert prepared.request.visible_tools <= WEB_TOOLS | {
+        "artifact_search",
+        "memory_search",
+        "tool_catalog",
+    }
     extra = env.artifacts.create(
         ArtifactScope(env.actor.group_id, current.id, env.actor.member_id),
         "unrequested.md",

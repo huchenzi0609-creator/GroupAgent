@@ -17,9 +17,8 @@ from groupagent.conversation.participation import (
 )
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.conversation.service import ConversationCoordinator
-from groupagent.coordinator import Decision
 from groupagent.domain import EventKind, GroupEvent
-from groupagent.execution.models import ModelReply, TokenUsage
+from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 from groupagent.identity import BotIdentity, control_request, without_bot_badge
 from groupagent.scheduling.reminders import extract_reminder_body, is_time_only_reminder_change
 
@@ -195,33 +194,54 @@ def test_existing_identity_markers_are_normalized_once(text):
 
 
 async def test_actual_router_request_knows_its_name_and_preserves_human_self_claim():
-    requests = []
+    requests, committed = [], []
+
+    async def apply(candidate, identifier):
+        committed.append(candidate)
+        assert candidate.kind == "command" and candidate.action == {
+            "op": "claim_task",
+            "title": "PPT",
+        }
+        return {"status": "committed", "committed": True, "task_id": "synthetic-human-task"}
 
     class ExplicitOfflineModel:
         name = "offline-identity-fixture"
 
         async def complete(self, request):
             requests.append(request)
-            return ModelReply(
-                text=Decision(
-                    kind="reply",
-                    reason_code="synthetic_self_claim",
-                    response="已记下你的分工。",
-                    action={"op": "claim_task", "title": "PPT"},
-                    directness="direct",
-                    confidence=1,
-                ).model_dump_json(),
-                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            usage = TokenUsage(input_tokens=1, output_tokens=1)
+            if len(requests) == 1:
+                return ModelReply(
+                    tool_calls=(
+                        ModelToolCall(
+                            id="human-self-claim",
+                            name="apply_business_action",
+                            arguments={"action": {"op": "claim_task", "title": "PPT"}},
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                    usage=usage,
+                )
+            observation = json.loads(
+                next(
+                    message.content
+                    for message in reversed(request.messages)
+                    if message.role == "tool"
+                )
             )
+            assert committed and observation["status"] == "committed"
+            return ModelReply(text="已记下你的分工。", usage=usage)
 
     result = await ModelDecisionProvider(ExplicitOfflineModel()).decide(
-        source("Pot，PPT我来负责，不用你代写。"), context()
+        source("Pot，PPT我来负责，不用你代写。"), context(_apply_business_action=apply)
     )
-    assert result.kind == "reply" and result.action["op"] == "claim_task"
+    assert len(requests) == 2 and len(committed) == 1
+    assert result.kind == "reply" and result.action is None
+    assert result.response == "已记下你的分工。"
     system = requests[0].messages[0].content
     payload = json.loads(requests[0].messages[1].content)
-    assert "完整输出始终是Decision JSON对象" in system
-    assert "生成回复正文即可" not in system
+    assert "Decision schema:" not in system
+    assert "正文不加context.bot_badge" in system
     assert payload["context"]["agent_name"] == "Pot"
     assert "Pot" in payload["context"]["agent_aliases"]
     assert payload["context"]["bot_badge"] == "【Pot】"

@@ -1,8 +1,9 @@
 """Deterministic model-context projection; durable execution evidence stays untouched.
 
-This module only creates a smaller ``ModelRequest``. Callers must retain the
-original messages, receipts, ledger and native session for recovery and audits.
-No generated recap can authorize an action or stand in for a successful receipt.
+This module only creates a smaller ``ModelRequest``. The durable agent uses
+that projection as its bounded message channel; callers retain authoritative
+raw tool events, receipts and ledger outside it. No generated recap can
+authorize an action or stand in for a successful receipt.
 """
 
 from __future__ import annotations
@@ -85,6 +86,7 @@ _RECEIPT_KEYS = (
     "error_code",
     "replayed",
     "control",
+    "failure",
     "input_issues",
 )
 
@@ -235,6 +237,29 @@ def _archive(units: list[_Unit], *, include_excerpts: bool) -> ModelMessage:
     return ModelMessage(role="assistant", content=f"{_MARKER}\n{_EXPLANATION}\n{body}")
 
 
+def _bounded_archive(units: list[_Unit]) -> ModelMessage:
+    """A constant-size manifest when detailed metadata itself fills context.
+
+    Exact receipts live in the authoritative host ledger. This manifest claims
+    only that older observations were omitted, not what their contents prove.
+    It also collapses previous manifests instead of recursively quoting them.
+    """
+    digests = [
+        _digest(message.model_dump(mode="json")) for unit in units for message in unit.messages
+    ]
+    body = {
+        "archived_message_count": len(digests),
+        "archive_sha256": _digest(digests),
+        "recent_message_sha256": digests[-2:],
+        "receipt_details_omitted": True,
+        "retrieve_original_evidence_before_claiming_its_contents": True,
+    }
+    return ModelMessage(
+        role="assistant",
+        content=f"{_MARKER}\n{_EXPLANATION}\n" + json.dumps(body, separators=(",", ":")),
+    )
+
+
 def compact_model_request(request: ModelRequest, max_input_bytes: int) -> CompactionResult:
     """Bound an outbound request without mutating durable execution state.
 
@@ -277,6 +302,25 @@ def compact_model_request(request: ModelRequest, max_input_bytes: int) -> Compac
         size = _request_bytes(compacted)
         if size <= max_input_bytes:
             return CompactionResult(compacted, original_size, size, eligible)
+    # Detailed provenance can be larger than short source observations. Keep a
+    # bounded manifest rather than ending an unlimited Goal because archive
+    # metadata grew. Protected authority/latest/open tool exchanges stay exact.
+    messages = []
+    archived = []
+    for i, unit in enumerate(units):
+        if not unit.protected and i not in protected:
+            archived.append(unit)
+            continue
+        if archived:
+            messages.append(_bounded_archive(archived))
+            archived = []
+        messages.extend(unit.messages)
+    if archived:
+        messages.append(_bounded_archive(archived))
+    compacted = request.model_copy(update={"messages": tuple(messages)})
+    size = _request_bytes(compacted)
+    if size <= max_input_bytes:
+        return CompactionResult(compacted, original_size, size, eligible)
     return CompactionResult(
         request, original_size, original_size, diagnostic="model_context_too_large"
     )

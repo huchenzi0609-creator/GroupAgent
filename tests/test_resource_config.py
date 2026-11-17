@@ -25,10 +25,10 @@ def config_data(**sections):
     }
 
 
-def test_standard_profile_keeps_existing_engine_and_media_budgets():
+def test_standard_profile_uses_standard_loop_and_preserves_media_resources():
     config = AppConfig.model_validate(config_data())
     assert config.resources.profile == "standard" and not config.resources.enabled
-    assert config.runtime.engine == "harness"
+    assert config.runtime.engine == "langgraph"
     assert config.resources.worker_memory_mb == 1024
     assert config.resources.worker_cpus == 1
     assert config.resources.worker_cpu_shares == 1024
@@ -46,10 +46,10 @@ def test_standard_profile_keeps_existing_engine_and_media_budgets():
     assert config.limits.workspace_bytes == 512 * MIB
 
 
-def test_2gb_profile_selects_a_single_scoped_worker_and_smaller_input_limits():
+def test_2gb_profile_selects_standard_loop_and_single_heavy_worker():
     config = AppConfig.model_validate(config_data(resources={"profile": "server_2gb"}))
     assert config.resources.enabled
-    assert config.runtime.engine == "scoped"
+    assert config.runtime.engine == "langgraph"
     assert config.execution.max_concurrent_heavy_work == 1
     assert config.resources.worker_memory_mb == 512
     assert config.resources.worker_cpus == 0.75
@@ -108,7 +108,7 @@ def test_nested_models_receive_profile_defaults_only_for_unset_fields():
         )
     )
     assert config.resources.worker_memory_mb == 640
-    assert config.runtime.engine == "scoped"
+    assert config.runtime.engine == "langgraph"
     assert config.runtime.bot_aliases == ["组长"]
     assert config.limits.image_bytes == 4 * MIB
     assert config.limits.office_or_pdf_bytes == 16 * MIB
@@ -128,12 +128,11 @@ def test_applying_profile_does_not_modify_the_supplied_configuration():
 @pytest.mark.parametrize(
     "sections",
     [
-        {"runtime": {"engine": "harness"}},
         {"execution": {"max_concurrent_heavy_work": 2}},
     ],
 )
-def test_2gb_profile_rejects_resident_harness_or_multiple_heavy_work(sections):
-    with pytest.raises(ValidationError, match="2GB profile requires scoped execution"):
+def test_2gb_profile_rejects_multiple_heavy_work(sections):
+    with pytest.raises(ValidationError, match="2GB profile requires one active heavy work"):
         AppConfig.model_validate(config_data(resources={"profile": "server_2gb"}, **sections))
 
 
@@ -142,7 +141,7 @@ def test_a_smaller_standard_worker_does_not_enable_host_admission():
         config_data(resources={"profile": "standard", "worker_memory_mb": 512})
     )
     assert not config.resources.enabled
-    assert config.runtime.engine == "harness"
+    assert config.runtime.engine == "langgraph"
     assert config.limits.workspace_bytes == 512 * MIB
 
 
@@ -167,8 +166,8 @@ def test_unsafe_or_misspelled_resource_values_are_rejected(field, value):
 @pytest.mark.parametrize(
     "filename,profile,engine",
     [
-        ("config.example.json", "standard", "harness"),
-        ("config.server-2gb.example.json", "server_2gb", "scoped"),
+        ("config.example.json", "standard", "langgraph"),
+        ("config.server-2gb.example.json", "server_2gb", "langgraph"),
     ],
 )
 def test_examples_validate_with_explicit_pot_identity_and_closed_release_gates(
@@ -183,3 +182,17 @@ def test_examples_validate_with_explicit_pot_identity_and_closed_release_gates(
     assert config.limits.output_file_bytes == 25 * MIB
     assert "group_disabled" in config.production_blockers()
     assert "spend_limit_or_price_snapshot_missing" in config.production_blockers()
+
+
+@pytest.mark.parametrize("legacy", ["scoped", "harness"])
+def test_legacy_config_migrates_to_one_runtime_without_retaining_old_engine(legacy):
+    config = AppConfig.model_validate(
+        config_data(
+            resources={"profile": "server_2gb"},
+            runtime={"engine": legacy},
+            engine={"candidate": "deepseek_harness"},
+        )
+    )
+    assert config.runtime.engine == "langgraph"
+    assert config.engine.candidate == "langgraph"
+    assert config.model_dump()["runtime"]["engine"] == "langgraph"

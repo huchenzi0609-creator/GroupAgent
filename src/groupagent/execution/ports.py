@@ -50,6 +50,18 @@ class ModelBudgetPort(Protocol):
         ...
 
 
+class RecoverableModelBudgetPort(ModelBudgetPort, Protocol):
+    def recovery_key(self, request: ExecutionRequest, *, round_number: int) -> str:
+        """Return the exact durable admission key, journaled before reserve."""
+        ...
+
+    async def recover(
+        self, request: ExecutionRequest, reservation_id: str, usage: TokenUsage | None
+    ) -> None:
+        """Idempotently restore settlement after verifying the reservation's scope."""
+        ...
+
+
 class EnginePort(Protocol):
     async def start(self, request: ExecutionRequest) -> str: ...
 

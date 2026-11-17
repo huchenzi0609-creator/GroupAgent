@@ -23,7 +23,14 @@ from groupagent.resources import ResourceDeferred, ResourceGovernor, ResourceRes
 from groupagent.tools import ToolContext, ToolScope
 from groupagent.tools.paths import open_parent, scoped_path
 
-from .models import ProcessOutput, ProcessResult, ProcessSpec, SandboxLimits
+from .models import (
+    DraftPublicationUnknown,
+    ProcessOutput,
+    ProcessResult,
+    ProcessSpec,
+    SandboxLimits,
+    UnpublishedDraftError,
+)
 from .supervisor import PROGRAMS, relative_path
 
 
@@ -406,7 +413,10 @@ class DockerSandbox:
         )
 
     async def run(self, spec: ProcessSpec, context: ToolContext) -> ProcessResult:
-        self._validate(spec, context)
+        try:
+            self._validate(spec, context)
+        except DomainError as error:
+            raise UnpublishedDraftError(error.code, error.message) from None
         if context.cancelled.is_set():
             return ProcessResult(
                 image=self.image, exit_code=None, cancelled=True, elapsed_seconds=0
@@ -428,9 +438,15 @@ class DockerSandbox:
 
     async def _admitted_run(self, spec: ProcessSpec, context: ToolContext) -> ProcessResult:
         async with self._gate:
-            if self.policy_guard:
-                await self.policy_guard(context)
-            await self.preflight()
+            try:
+                if self.policy_guard:
+                    await self.policy_guard(context)
+                await self.preflight()
+            except ResourceDeferred:
+                raise
+            except DomainError as error:
+                # No process or output publication has started at this boundary.
+                raise UnpublishedDraftError(error.code, error.message) from None
             if context.cancelled.is_set():
                 return ProcessResult(
                     image=self.image, exit_code=None, cancelled=True, elapsed_seconds=0
@@ -452,7 +468,13 @@ class DockerSandbox:
             inputs, home = root / "inputs", root / "home"
             inputs.mkdir()
             home.mkdir()
-            manifest = self._stage_inputs(spec, context, inputs)
+            try:
+                manifest = self._stage_inputs(spec, context, inputs)
+            except (DomainError, OSError):
+                raise UnpublishedDraftError(
+                    "invalid_input",
+                    "Worker inputs could not be staged; inspect declared input paths",
+                ) from None
             payload = (
                 json.dumps(
                     {
@@ -553,15 +575,17 @@ class DockerSandbox:
                     elapsed_seconds=elapsed,
                 )
             if process.returncode:
-                raise DomainError("worker_failed", "Isolated worker exited without a valid result")
+                return ProcessResult(
+                    image=self.image,
+                    exit_code=process.returncode,
+                    error_code="worker_failed",
+                    elapsed_seconds=elapsed,
+                )
             try:
                 result = json.loads(raw)
                 if "error" in result:
                     raise ValueError("worker refused request")
-                if self.policy_guard:
-                    await self.policy_guard(context)
-                output_metadata = self._publish_outputs(spec, context, result)
-                return ProcessResult(
+                parsed = ProcessResult(
                     image=self.image,
                     exit_code=result["exit_code"],
                     stdout=result["stdout"],
@@ -569,14 +593,36 @@ class DockerSandbox:
                     timed_out=result["timed_out"],
                     cancelled=result.get("cancelled", False),
                     output_limited=result["output_limited"],
-                    outputs=output_metadata,
+                    error_code=result.get("error_code"),
+                    output_issues=result.get("output_issues", ()),
                     elapsed_seconds=elapsed,
                     resource_usage=result.get("resource_usage", {}),
                 )
+                if bool(parsed.output_issues) != (parsed.error_code == "output_contract_failed"):
+                    raise ValueError("Invalid output contract observation")
+                if self.policy_guard:
+                    await self.policy_guard(context)
+                output_metadata = self._publish_outputs(spec, context, result)
+                return parsed.model_copy(
+                    update={
+                        "outputs": output_metadata,
+                        "publication_state": "published" if output_metadata else "unpublished",
+                    }
+                )
             except (ValueError, TypeError, KeyError):
-                raise DomainError(
-                    "worker_failed", "Isolated worker returned an invalid result"
-                ) from None
+                # Container removal was acknowledged and publication either did
+                # not start or rolled back. Do not turn a rejected worker
+                # protocol into an uncertain external business effect.
+                return ProcessResult(
+                    image=self.image,
+                    exit_code=process.returncode,
+                    error_code="worker_failed",
+                    elapsed_seconds=elapsed,
+                )
+            except DraftPublicationUnknown:
+                raise
+            except DomainError as error:
+                raise UnpublishedDraftError(error.code, error.message) from None
 
     def _publish_outputs(
         self,
@@ -592,13 +638,14 @@ class DockerSandbox:
             or result["timed_out"]
             or result["output_limited"]
             or result.get("cancelled", False)
+            or result.get("error_code")
         ):
             if entries:
                 raise ValueError("Failed workers cannot publish files")
             return ()
         if [entry["path"] for entry in entries] != list(spec.output_paths):
             raise ValueError("Worker output manifest differs from requested outputs")
-        outputs, total = [], 0
+        outputs, total, prepared = [], 0, []
         for entry in entries:
             data = base64.b64decode(entry["data"], validate=True)
             total += len(data)
@@ -610,19 +657,7 @@ class DockerSandbox:
             if len(data) > self.limits.max_file_bytes or total > self.limits.max_artifact_bytes:
                 raise ValueError("Worker output exceeds byte limit")
             path = scoped_path(context.workspace, entry["path"])
-            # Host directories are created by the trusted caller. New output files
-            # use exclusive creation; a tool cannot overwrite an existing artifact.
-            with open_parent(context.workspace, entry["path"]) as (parent, leaf):
-                fd = os.open(
-                    leaf,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    mode=0o600,
-                    dir_fd=parent,
-                )
-                with os.fdopen(fd, "wb") as target:
-                    target.write(data)
-                    target.flush()
-                    os.fsync(target.fileno())
+            prepared.append((entry["path"], data))
             outputs.append(
                 ProcessOutput(
                     path=str(path.relative_to(context.workspace)),
@@ -630,4 +665,45 @@ class DockerSandbox:
                     sha256=entry["sha256"],
                 )
             )
+        # Validate every hash/path/size before making the first workspace file.
+        # Roll back only files created by this call, using their inode identities
+        # so a failed second output cannot remove a pre-existing user artifact.
+        created = []
+        try:
+            for name, data in prepared:
+                if context.cancelled.is_set():
+                    raise DomainError("cancelled", "Publication stopped by cancellation")
+                with open_parent(context.workspace, name) as (parent, leaf):
+                    fd = os.open(
+                        leaf,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        mode=0o600,
+                        dir_fd=parent,
+                    )
+                    info = os.fstat(fd)
+                    created.append((name, info.st_dev, info.st_ino))
+                    with os.fdopen(fd, "wb") as target:
+                        target.write(data)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    os.fsync(parent)
+        except BaseException as error:
+            try:
+                for name, device, inode in reversed(created):
+                    with open_parent(context.workspace, name) as (parent, leaf):
+                        info = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+                        if (info.st_dev, info.st_ino) != (device, inode):
+                            raise ValueError("Created draft identity changed")
+                        os.unlink(leaf, dir_fd=parent)
+                        os.fsync(parent)
+            except (OSError, ValueError, DomainError):
+                raise DraftPublicationUnknown(
+                    "publication_unknown", "Draft output publication requires reconciliation"
+                ) from None
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            raise UnpublishedDraftError(
+                "output_publication_failed",
+                "Draft outputs were not published; inspect output paths",
+            ) from None
         return tuple(outputs)

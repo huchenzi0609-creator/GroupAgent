@@ -1,16 +1,14 @@
 """Unlimited cumulative work with bounded per-call resources and loop recovery."""
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
 from groupagent.config import ExecutionConfig
-from groupagent.domain import DomainError, Role
+from groupagent.domain import Role
 from groupagent.execution import (
     ExecutionBudget,
-    HarnessEngine,
     ModelReply,
     ModelRequest,
     ModelToolCall,
@@ -112,7 +110,8 @@ async def test_identical_observations_pause_as_recoverable_anomalies(
     model = ScriptedFakeModel(replies)
     engine = ScopedToolEngine(model, gateway)
     result = await engine.wait(await engine.start(execution_request))
-    assert result.state == RunState.PAUSED and result.error_code == "execution_stalled"
+    assert result.state == RunState.PAUSED and result.error_code == "activation_yielded"
+    assert result.checkpoint.backend_state["activation_yield_reason"] == "execution_stalled"
     assert result.checkpoint.safe_to_resume
     assert result.usage.tool_calls == cycle + 6
     detector = result.checkpoint.backend_state["execution_progress_detector"]
@@ -131,7 +130,8 @@ async def test_repeated_failed_call_pauses_before_spending_more_model_rounds(
     )
     engine = ScopedToolEngine(model, gateway)
     result = await engine.wait(await engine.start(execution_request))
-    assert result.error_code == "execution_error_loop" and result.state == RunState.PAUSED
+    assert result.error_code == "activation_yielded" and result.state == RunState.PAUSED
+    assert result.checkpoint.backend_state["activation_yield_reason"] == "execution_error_loop"
     assert result.checkpoint.safe_to_resume and result.usage.rounds == 4
     assert all(not receipt.success for receipt in result.receipts)
 
@@ -186,11 +186,9 @@ async def test_outbound_history_compacts_without_rewriting_raw_evidence(executio
         "[groupagent-history-compaction:v1]" in item.model_dump_json() for item in model.requests
     )
     raw_request = ModelRequest(messages=result.checkpoint.messages, tools=(), max_output_tokens=1)
-    assert len(raw_request.model_dump_json().encode()) > budget.max_input_bytes
+    assert len(raw_request.model_dump_json().encode()) <= budget.max_input_bytes
     assert len(result.receipts) == len(result.checkpoint.ledger) == 8
-    assert all(
-        "x" * 3000 in item.content for item in result.checkpoint.messages if item.role == "tool"
-    )
+    assert all("x" * 3000 in receipt.output["text"] for receipt in result.receipts)
 
 
 async def test_loop_detector_survives_checkpoint_resume(execution_request, gateway):
@@ -217,91 +215,6 @@ async def test_loop_detector_survives_checkpoint_resume(execution_request, gatew
             first.checkpoint, owner, attempt_id="continued", budget=ExecutionBudget()
         )
     )
-    assert result.error_code == "execution_stalled" and result.usage.tool_calls == 7
+    assert result.error_code == "activation_yielded" and result.usage.tool_calls == 7
+    assert result.checkpoint.backend_state["activation_yield_reason"] == "execution_stalled"
     assert result.checkpoint.safe_to_resume
-
-
-class ActiveProcess:
-    async def wait(self):
-        await asyncio.Event().wait()
-
-
-async def test_harness_host_has_no_implicit_round_call_or_time_stop(execution_request, gateway):
-    model = ScriptedFakeModel(
-        [proposal(index, prefix="mcp__groupagent__") for index in range(65)] + [final()]
-    )
-    engine = HarnessEngine(model, gateway, object())
-    run = engine._create(execution_request)
-    run.active_since = asyncio.get_running_loop().time() - 1201
-    engine._bridges[execution_request.attempt_id] = SimpleNamespace(process=ActiveProcess())
-    tools = gateway.describe(run.scope)
-    payload = {
-        "messages": [{"role": "user", "content": execution_request.objective}],
-        "tools": [
-            {
-                **tool,
-                "function": {
-                    **tool["function"],
-                    "name": "mcp__groupagent__" + tool["function"]["name"],
-                },
-            }
-            for tool in tools
-        ],
-    }
-    for _index in range(65):
-        reply = await engine._relay_model(run, payload)
-        receipt = await engine._relay_tool(
-            run,
-            {"name": "workspace_write_text", "arguments": reply.tool_calls[0].arguments},
-            list(reply.tool_calls),
-            run.revision,
-        )
-        assert not receipt["isError"]
-    assert (await engine._relay_model(run, payload)).text == final().text
-    assert run.usage.rounds == 66 and run.usage.tool_calls == 65
-
-
-async def test_harness_same_failed_tool_is_detected(execution_request, gateway):
-    model = ScriptedFakeModel(
-        [
-            proposal(
-                index,
-                name="workspace_read_text",
-                arguments={"path": "missing.txt"},
-                prefix="mcp__groupagent__",
-            )
-            for index in range(4)
-        ]
-    )
-    engine = HarnessEngine(model, gateway, object())
-    run = engine._create(execution_request)
-    engine._bridges[execution_request.attempt_id] = SimpleNamespace(process=ActiveProcess())
-    tools = gateway.describe(run.scope)
-    payload = {
-        "messages": [{"role": "user", "content": execution_request.objective}],
-        "tools": [
-            {
-                **tool,
-                "function": {
-                    **tool["function"],
-                    "name": "mcp__groupagent__" + tool["function"]["name"],
-                },
-            }
-            for tool in tools
-        ],
-    }
-    for index in range(4):
-        reply = await engine._relay_model(run, payload)
-        operation = engine._relay_tool(
-            run,
-            {"name": "workspace_read_text", "arguments": {"path": "missing.txt"}},
-            list(reply.tool_calls),
-            run.revision,
-        )
-        if index < 3:
-            assert (await operation)["isError"]
-        else:
-            with pytest.raises(DomainError) as error:
-                await operation
-            assert error.value.code == "execution_error_loop"
-    assert run.usage.tool_calls == 4

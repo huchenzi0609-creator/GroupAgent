@@ -7,9 +7,14 @@ an explicit live-send flag and the production configuration gates.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
+import copy
 import hashlib
+import inspect
 import json
 import re
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -43,6 +48,7 @@ from groupagent.memory import (
 )
 from groupagent.ops import BackupManager, CleanupRunner, DeletionJournal
 from groupagent.persistence import PostgresStore
+from groupagent.persistence.postgres import bounded_owner_lock_waits
 from groupagent.research.deepseek import DeepSeekResearchClient
 from groupagent.resources import ResourceDeferred, ResourceGovernor, ResourcePolicy
 from groupagent.sandbox import DockerSandbox
@@ -55,6 +61,7 @@ from .artifacts import ArtifactRegistry
 from .cleanup import RuntimeCleanupHandler
 from .contracts import ProcessLease
 from .dispatch import Dispatcher
+from .effect_reconciler import UnpublishedDraftReconciler
 from .executor import WorkSupervisor
 from .inputs import InputProcessor
 from .notices import NoticeService
@@ -62,6 +69,171 @@ from .resource_profile import controller_resources_ready, worker_limits
 from .roster import RosterRefresher
 from .state import RuntimeState
 from .toolkit import WorkToolkit
+
+
+async def _drain_future(future: asyncio.Future) -> None:
+    """Cancellation of a waiter never acknowledges that its writer stopped."""
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    if future.done() and not future.cancelled():
+        future.exception()
+
+
+class _MaintenanceLane:
+    """One writer thread, with owner-affine callbacks and a real shutdown join."""
+
+    def __init__(self) -> None:
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="pot-maintenance"
+        )
+        self._active: asyncio.Future | None = None
+        self._owner_loop: asyncio.AbstractEventLoop | None = None
+        self._owner_context: contextvars.Context | None = None
+        self._owner_thread: int | None = None
+        self._worker_loop: asyncio.AbstractEventLoop | None = None
+        self._worker_task: asyncio.Task | None = None
+        self._worker_lock = threading.Lock()
+        self._cancel_requested = threading.Event()
+        self._closed = False
+
+    @property
+    def busy(self) -> bool:
+        # Remain single-flight until the actual executor function has finished,
+        # including when its original asyncio waiter has been cancelled.
+        return self._active is not None
+
+    def request_stop(self) -> None:
+        self._cancel_requested.set()
+        with self._worker_lock:
+            loop, task = self._worker_loop, self._worker_task
+            if loop is not None and task is not None:
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    if not loop.is_closed():
+                        raise
+
+    def _owner_future(self, operation: Callable, args: tuple, kwargs: dict):
+        if self._cancel_requested.is_set():
+            raise asyncio.CancelledError
+        loop, context = self._owner_loop, self._owner_context
+        if loop is None or context is None:
+            raise RuntimeError("Maintenance has no owning event loop")
+        response: concurrent.futures.Future = concurrent.futures.Future()
+
+        async def invoke():
+            result = operation(*args, **kwargs)
+            return await result if inspect.isawaitable(result) else result
+
+        def start():
+            # Explicitly preserve the owner's connection policy and task-local
+            # context rather than inheriting the maintenance thread's context.
+            task = loop.create_task(invoke(), context=context.copy())
+
+            def finished(done):
+                if done.cancelled():
+                    response.set_exception(asyncio.CancelledError())
+                elif done.exception() is not None:
+                    response.set_exception(done.exception())
+                else:
+                    response.set_result(done.result())
+
+            task.add_done_callback(finished)
+
+        loop.call_soon_threadsafe(start, context=context.copy())
+        return response
+
+    async def on_owner(self, operation: Callable, *args, **kwargs):
+        future = asyncio.wrap_future(self._owner_future(operation, args, kwargs))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # The callback may itself own quiescence or a channel operation.
+            # Join it on the live owner loop before acknowledging worker exit.
+            await _drain_future(future)
+            raise
+
+    def on_owner_sync(self, operation: Callable, *args, **kwargs):
+        if threading.get_ident() == self._owner_thread:
+            return operation(*args, **kwargs)
+        return self._owner_future(operation, args, kwargs).result()
+
+    def _execute(self, operation: Callable[[], Awaitable[Any]]):
+        async def execute():
+            with self._worker_lock:
+                self._worker_loop = asyncio.get_running_loop()
+                self._worker_task = asyncio.current_task()
+            if self._cancel_requested.is_set():
+                raise asyncio.CancelledError
+            return await operation()
+
+        try:
+            return asyncio.run(execute())
+        finally:
+            with self._worker_lock:
+                self._worker_loop = self._worker_task = None
+
+    async def run(self, operation: Callable[[], Awaitable[Any]]) -> None:
+        if self._closed or self.busy:
+            return
+        self._owner_loop = asyncio.get_running_loop()
+        self._owner_thread = threading.get_ident()
+        self._owner_context = contextvars.copy_context()
+        self._cancel_requested.clear()
+        future = asyncio.wrap_future(self._executor.submit(self._execute, operation))
+        self._active = future
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            self.request_stop()
+            await _drain_future(future)
+            caller = asyncio.current_task()
+            if caller is not None and caller.cancelling():
+                raise
+            # Foreground arrival can cooperatively interrupt maintenance. That
+            # is a completed pass interruption, not a failed application loop.
+        finally:
+            self._active = None
+
+    async def close(self) -> None:
+        self._closed = True
+        self.request_stop()
+        if self._active is not None:
+            await _drain_future(self._active)
+        # No worker function remains; shutdown cannot wait behind a writer or
+        # an owner-loop callback now. Never close shared resources before this.
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+
+class _OwnerSummarizer:
+    def __init__(self, provider, lane: _MaintenanceLane) -> None:
+        self.provider, self.lane = provider, lane
+
+    def __getattr__(self, name):
+        return getattr(self.provider, name)
+
+    async def summarize(self, request):
+        return await self.lane.on_owner(self.provider.summarize, request)
+
+
+class _OwnerCleanupChannel:
+    def __init__(self, channel, lane: _MaintenanceLane) -> None:
+        self.channel, self.lane = channel, lane
+
+    def __getattr__(self, name):
+        operation = getattr(self.channel, name)
+        if name != "purge_event":
+            return operation
+
+        async def purge(*args, **kwargs):
+            return await self.lane.on_owner(operation, *args, **kwargs)
+
+        return purge
 
 
 class RuntimeApp:
@@ -108,6 +280,11 @@ class RuntimeApp:
         self._processing: set[str] = set()
         self._tasks: list[asyncio.Task] = []
         self._application_lease: ProcessLease | None = None
+        self._maintenance_lane = _MaintenanceLane()
+        self._heartbeat_stop = asyncio.Event()
+        self._heartbeat_task: asyncio.Task | None = None
+        self._close_task: asyncio.Task | None = None
+        self._closing = False
         self.coordinator.execution_guard = self._fence_application
         self.roster = RosterRefresher(
             coordinator.members, channel, self.technical, self._fence_application
@@ -202,7 +379,18 @@ class RuntimeApp:
 
     async def poll_intake(self) -> int:
         self._fence_application()
-        batch = await self.intake.poll_once()
+        try:
+            batch = await self.intake.poll_once()
+        except DomainError as error:
+            if (
+                error.code == "resource_deferred"
+                and error.retryable
+                and self._maintenance_lane.busy
+            ):
+                # Ingest itself needs the privacy lock. Yield maintenance even
+                # before that commit succeeds; the failed poll sends no ACK.
+                self._maintenance_lane.request_stop()
+            raise
         self._fence_application()
         self.roster.changed(batch.roster_updates)
         if batch.event_ids:
@@ -210,6 +398,8 @@ class RuntimeApp:
             if not self._first_arrival:
                 self._first_arrival = now
             self._last_arrival = now
+            if self._maintenance_lane.busy:
+                self._maintenance_lane.request_stop()
         return len(batch.event_ids)
 
     def _publish_foreground(self) -> None:
@@ -260,7 +450,8 @@ class RuntimeApp:
             rows = tx.conn.execute(
                 "SELECT e.id FROM ga_events e LEFT JOIN ga_event_retry r ON r.group_id=e.group_id "
                 "AND r.event_id=e.id WHERE e.group_id=%s AND e.memory_state='active' "
-                "AND NOT EXISTS(SELECT 1 FROM ga_decisions d WHERE d.group_id=e.group_id AND d.event_id=e.id) "
+                "AND NOT EXISTS(SELECT 1 FROM ga_decisions d WHERE d.group_id=e.group_id AND d.event_id=e.id "
+                "AND d.body->>'agent_pending_response' IS DISTINCT FROM 'true') "
                 "AND (r.event_id IS NULL OR (NOT r.blocked AND r.next_attempt_at<=clock_timestamp())) "
                 "ORDER BY e.sequence LIMIT 100",
                 (tx.group_id,),
@@ -332,12 +523,10 @@ class RuntimeApp:
                 ).fetchone()
                 waiting_resource = error.code == "resource_deferred"
                 attempts = (row["attempts"] if row else 0) + (0 if waiting_resource else 1)
-                blocked = not temporary or attempts >= 3
-                if waiting_resource:
-                    blocked = False
-                # Waiting for an external attachment/receipt is not a paid-model retry.
-                if error.code in {"attachment_pending", "echo_reconciliation_pending"}:
-                    blocked = attempts >= 60
+                # A recoverable dependency wait is not a finite task budget.
+                # Backoff is durable, so a controller restart cannot create a
+                # hot retry loop or strand a previously committed action reply.
+                blocked = not temporary
                 tx.conn.execute(
                     "INSERT INTO ga_event_retry(group_id,event_id,attempts,next_attempt_at,blocked,code) "
                     "VALUES(%s,%s,%s,clock_timestamp()+%s*interval '1 second',%s,%s) ON CONFLICT(group_id,event_id) "
@@ -348,7 +537,7 @@ class RuntimeApp:
                         attempts,
                         self.config.resources.retry_seconds
                         if waiting_resource
-                        else min(30, 2 ** min(attempts, 5)),
+                        else min(300, 2 ** min(attempts, 9)),
                         blocked,
                         error.code,
                     ),
@@ -495,6 +684,8 @@ class RuntimeApp:
 
     async def execute_tick(self) -> None:
         self._fence_application()
+        if self._maintenance_lane.busy:
+            return  # The foreground may chat; do not add another heavy writer.
         active = self.coordinator.current_mode() not in {"paused", "disabled"}
         if active and self.config.features.durable_schedules:
             self.coordinator.scheduler.due(self.owner)
@@ -504,11 +695,16 @@ class RuntimeApp:
         self.notices.tick()
 
     async def maintenance(self, *, force: bool = False) -> None:
+        if self._closing or self._maintenance_lane.busy:
+            return
         self._fence_application()
         interval = self.config.resources.maintenance_interval_seconds
         if not force and time.monotonic() - self._last_maintenance < interval:
             return
         self._last_maintenance = time.monotonic()
+        task = getattr(self.supervisor, "_task", None)
+        if self._processing or (task is not None and not task.done()):
+            return
         if self.config.resources.enabled and (
             self._processing
             or self.supervisor.active_work_id is not None
@@ -518,21 +714,65 @@ class RuntimeApp:
             # No additional model/cleanup load while a foreground or isolated
             # job is active. Expiry is also enforced on reads until the next pass.
             return
+        await self._maintenance_lane.run(self._maintenance_pass)
+
+    async def _maintenance_pass(self) -> None:
+        """All database scans, row hashing and filesystem work belong to the lane."""
+        self._fence_application()
+        memory = copy.copy(self.coordinator.memory)
+        if memory.summarizer is not None:
+            memory.summarizer = _OwnerSummarizer(memory.summarizer, self._maintenance_lane)
         try:
             if self.coordinator.current_mode() not in {"paused", "disabled"}:
-                await self.coordinator.memory.compact(self.owner)
+                await memory.compact(self.owner)
         except DomainError as error:
             if error.code in {"stale_lease", "policy_changed", "restore_pending"}:
                 raise
             self.state.alert(self.technical, error.code, resource_id="memory_compaction")
-        self.coordinator.memory.expire(
+        self._fence_application()
+        memory.expire(
             self.technical,
             before=datetime.now(UTC) - timedelta(days=self.config.retention.raw_message_days),
         )
+        self._fence_application()
         if self.cleanup:
-            cleaned = await self.cleanup.run(self.technical)
+            cleaned = await self._cleanup_in_lane()
             for code in set(cleaned.errors.values()):
                 self.state.alert(self.technical, code, resource_id="data_cleanup")
+
+    async def _cleanup_in_lane(self):
+        cleanup = copy.copy(self.cleanup)
+        if isinstance(cleanup, CleanupRunner):
+
+            async def checkpoint():
+                await self._maintenance_lane.on_owner(self._fence_application)
+
+            cleanup.checkpoint = checkpoint
+        handler = getattr(cleanup, "handler", None)
+        if not isinstance(handler, RuntimeCleanupHandler):
+            return await cleanup.run(self.technical)
+        handler = copy.copy(handler)
+        cleanup.handler = handler
+        if handler.channel is not None:
+            handler.channel = _OwnerCleanupChannel(handler.channel, self._maintenance_lane)
+        if handler.quiesce is not None:
+            quiesce = handler.quiesce
+
+            async def quiesce_on_owner(*args):
+                self._fence_application()
+                return await self._maintenance_lane.on_owner(quiesce, *args)
+
+            handler.quiesce = quiesce_on_owner
+        if handler.is_busy is not None:
+            busy = handler.is_busy
+            handler.is_busy = lambda *args: self._maintenance_lane.on_owner_sync(busy, *args)
+        # Independent directory ownership; shared underlying immutable files
+        # still use the existing per-operation fd/flock and database barriers.
+        with ArtifactStore(
+            handler.artifacts.root, max_file_bytes=handler.artifacts.max_file_bytes
+        ) as artifacts:
+            handler.artifacts = artifacts
+            return await cleanup.run(self.technical)
 
     async def step(self) -> dict[str, int]:
         received = await self.poll_intake()
@@ -542,6 +782,10 @@ class RuntimeApp:
         return {"received": received, "processed": processed, "sent": sent}
 
     async def run(self) -> None:
+        with bounded_owner_lock_waits(lambda: self._maintenance_lane.busy):
+            await self._run()
+
+    async def _run(self) -> None:
         lease = self.state.claim_process(
             self.technical, "application", self.instance_id, ttl_seconds=30
         )
@@ -549,9 +793,10 @@ class RuntimeApp:
             raise DomainError("runtime_busy", "Another application owns this group")
         self._application_lease = lease
 
-        async def loop(operation, delay):
+        async def loop(operation, delay, stop_event=None):
+            stop_event = stop_event or self.stop
             failures = 0
-            while not self.stop.is_set():
+            while not stop_event.is_set():
                 next_delay = delay
                 try:
                     self._fence_application()
@@ -560,17 +805,21 @@ class RuntimeApp:
                 except DomainError as error:
                     if error.code in {"stale_lease", "policy_changed", "restore_pending"}:
                         self.stop.set()
+                        self._maintenance_lane.request_stop()
                         raise
-                    self.state.alert(self.technical, error.code)
-                    failures += 1
-                    next_delay = max(
-                        delay,
-                        30
-                        if error.code in {"auth_required", "invalid_credentials"}
-                        else min(30, 2 ** min(failures, 5)),
-                    )
+                    if error.code == "resource_deferred":
+                        next_delay = max(delay, self.config.resources.retry_seconds)
+                    else:
+                        self.state.alert(self.technical, error.code)
+                        failures += 1
+                        next_delay = max(
+                            delay,
+                            30
+                            if error.code in {"auth_required", "invalid_credentials"}
+                            else min(30, 2 ** min(failures, 5)),
+                        )
                 try:
-                    await asyncio.wait_for(self.stop.wait(), timeout=next_delay)
+                    await asyncio.wait_for(stop_event.wait(), timeout=next_delay)
                 except TimeoutError:
                     pass
 
@@ -585,7 +834,8 @@ class RuntimeApp:
             self._application_lease = lease
 
         try:
-            self._tasks = [asyncio.create_task(loop(heartbeat, 8))]
+            self._heartbeat_task = asyncio.create_task(loop(heartbeat, 8, self._heartbeat_stop))
+            self._tasks = [self._heartbeat_task]
             await self.start()
             self._tasks.extend(
                 asyncio.create_task(loop(fn, seconds))
@@ -602,8 +852,11 @@ class RuntimeApp:
             for task in done:
                 task.result()
         finally:
-            await self.close()
-            self.state.release_process(self.technical, lease)
+            try:
+                await self.close()
+            finally:
+                # close() joins the real maintenance writer even if cancelled.
+                self.state.release_process(self.technical, lease)
 
     def _fence_application(self, tx=None) -> None:
         lease = self._application_lease
@@ -620,17 +873,42 @@ class RuntimeApp:
                 raise DomainError("stale_lease", "Application no longer owns this group")
 
     async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        cancelled = False
+        while not self._close_task.done():
+            try:
+                await asyncio.shield(self._close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        self._close_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close(self) -> None:
+        self._closing = True
         self.stop.set()
         for task in self._tasks:
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        await self.supervisor.close()
-        self._publish_foreground()
-        governor_close = getattr(self.worker_governor, "aclose", None)
-        if callable(governor_close):
-            await governor_close()
-        for resource in self.resources:
-            await resource.aclose()
+            if task is not self._heartbeat_task:
+                task.cancel()
+        try:
+            await self._maintenance_lane.close()
+            await asyncio.gather(
+                *(task for task in self._tasks if task is not self._heartbeat_task),
+                return_exceptions=True,
+            )
+            await self.supervisor.close()
+            self._publish_foreground()
+            governor_close = getattr(self.worker_governor, "aclose", None)
+            if callable(governor_close):
+                await governor_close()
+            for resource in self.resources:
+                await resource.aclose()
+        finally:
+            self._heartbeat_stop.set()
+            if self._heartbeat_task is not None:
+                self._heartbeat_task.cancel()
+                await asyncio.gather(self._heartbeat_task, return_exceptions=True)
 
 
 def channel_config(config: AppConfig) -> AgentWechatConfig:
@@ -914,6 +1192,7 @@ def build_app(
         resource_retry_seconds=config.resources.retry_seconds,
         execution_backend=config.runtime.engine,
         release_attempt=toolkit.release_attempt,
+        reconcile_checkpoint=UnpublishedDraftReconciler(config, store),
     )
     dispatcher = Dispatcher(
         state,

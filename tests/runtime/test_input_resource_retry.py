@@ -130,21 +130,18 @@ async def test_only_not_started_resource_errors_qualify_for_an_attempt_refund(
         "resource_deferred", "Synthetic uncertain phase", effect_state=effect_state
     )
     try:
-        for attempt in (1, 2):
+        for attempt in range(1, 6):
             with pytest.raises(DomainError) as error:
                 await setup.processor.preprocess_audio(event)
             assert error.value.effect_state == effect_state
             assert rows(env, "ga_media_inputs")[0]["body"]["attempts"] == attempt
-        with pytest.raises(DomainError) as error:
-            await setup.processor.preprocess_audio(event)
-        assert error.value.code == "input_retry_exhausted"
         assert not setup.calls and not rows(env, "ga_budget_reservations")
     finally:
         await setup.http.aclose()
 
 
 @pytest.mark.parametrize("state", ["reserved", "inflight", "unknown", "settled", "released"])
-async def test_any_current_attempt_reservation_is_preserved_and_blocks_paid_replay(
+async def test_any_current_attempt_reservation_is_preserved_before_distinct_pure_inference_retry(
     runtime_env, state
 ):
     env, worker = runtime_env, DeferredAudioWorker()
@@ -182,21 +179,23 @@ async def test_any_current_attempt_reservation_is_preserved_and_blocks_paid_repl
     try:
         with pytest.raises(DomainError) as error:
             await setup.processor.preprocess_audio(event)
-        assert (
-            error.value.code == "provider_reconciliation_required"
-            and error.value.retryable is False
-        )
+        assert error.value.code == "input_inference_retry" and error.value.retryable is True
         assert error.value.resource_ref == original_reservation[0]["id"]
         body = rows(env, "ga_media_inputs")[0]["body"]
-        assert body["attempts"] == 1 and body["error_code"] == "provider_reconciliation_required"
-        assert body["reconciliation_reservation_id"] == original_reservation[0]["id"]
+        assert body["attempts"] == 1 and body["error_code"] == "input_inference_retry"
+        assert body["last_inference_reservation_id"] == original_reservation[0]["id"]
         assert rows(env, "ga_budget_reservations") == original_reservation
         for _ in range(3):
             with pytest.raises(DomainError) as blocked:
                 await setup.processor.preprocess_audio(event)
-            assert blocked.value.code == "provider_reconciliation_required"
-        assert rows(env, "ga_media_inputs")[0]["body"]["attempts"] == 1
-        assert rows(env, "ga_budget_reservations") == original_reservation
+            assert blocked.value.code == "input_inference_retry"
+        assert rows(env, "ga_media_inputs")[0]["body"]["attempts"] == 4
+        reservations = rows(env, "ga_budget_reservations")
+        assert len(reservations) == 4 and len({row["key"] for row in reservations}) == 4
+        assert (
+            next(row for row in reservations if row["id"] == original_reservation[0]["id"])
+            == original_reservation[0]
+        )
         assert not setup.calls and not rows(env, "ga_decisions")
     finally:
         await setup.http.aclose()

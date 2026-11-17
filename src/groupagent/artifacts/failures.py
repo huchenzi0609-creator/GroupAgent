@@ -6,7 +6,24 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from groupagent.domain import DomainError
-from groupagent.tools.models import ToolFailure
+from groupagent.resources import ResourceDeferred
+from groupagent.sandbox.models import DraftPublicationUnknown
+from groupagent.tools.models import (
+    LEGACY_FENCED_TOOL_ERRORS,
+    ToolFailure,
+    ToolFailureDisposition,
+    ToolFailureOrigin,
+    ToolInputRequired,
+)
+
+# These are authority failures even when a store read, rather than the policy
+# guard, detects them. Input diagnostics below never grant or change authority.
+_AUTHORITY_FAILURES = LEGACY_FENCED_TOOL_ERRORS | {
+    "invalid_scope",
+    "scope_denied",
+    "source_deleted",
+    "artifact_deleted",
+}
 
 _HINTS = {
     "invalid_name": "Field name must be a basename without folders, at most 240 UTF-8 bytes, with the correct extension.",
@@ -54,7 +71,9 @@ _HINTS = {
 
 
 @contextmanager
-def document_input_phase() -> Iterator[None]:
+def document_input_phase(
+    *, origin: ToolFailureOrigin = ToolFailureOrigin.PRECONDITION
+) -> Iterator[None]:
     """Use only around reads/validation/isolated preparation before store writes.
 
     Never wrap ArtifactStore.create/revise/record_validation: a publication or
@@ -63,11 +82,26 @@ def document_input_phase() -> Iterator[None]:
     try:
         yield
     except DomainError as error:
-        if isinstance(error, ToolFailure):
+        if (
+            isinstance(
+                error, (ToolFailure, ToolInputRequired, ResourceDeferred, DraftPublicationUnknown)
+            )
+            or error.effect_state == "unknown"
+        ):
             raise
-        hint = _HINTS.get(error.code)
-        if hint is None or error.effect_state == "unknown":
-            raise
+        fenced = origin == ToolFailureOrigin.AUTHORIZATION or error.code in _AUTHORITY_FAILURES
+        hint = (
+            "The scoped actor, policy, lease or source is no longer authorized; stop this work."
+            if fenced
+            else _HINTS.get(
+                error.code,
+                "The input or current document did not satisfy preparation checks. Read the current document with document_read/search; copy an editable locator and its exact expected_text before correcting the proposal.",
+            )
+        )
         raise ToolFailure(
-            error.code, "No artifact version was published. " + hint, no_effect=True
+            error.code,
+            "No artifact version was published. " + hint,
+            no_effect=True,
+            origin=ToolFailureOrigin.AUTHORIZATION if fenced else origin,
+            disposition=ToolFailureDisposition.FENCE if fenced else ToolFailureDisposition.REPAIR,
         ) from None

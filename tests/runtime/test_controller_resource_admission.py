@@ -25,7 +25,7 @@ from groupagent.execution import (
 from groupagent.media.isolation import IsolatedMediaWorker
 from groupagent.research import DeepSeekResearchClient, register_research_tools
 from groupagent.resources import MemorySnapshot, ResourceDeferred, ResourceGovernor, ResourcePolicy
-from groupagent.runtime.app import RuntimeApp
+from groupagent.runtime.app import RuntimeApp, _MaintenanceLane
 from groupagent.runtime.contracts import DeliveryDraft, PreparedExecution, ValidatedCandidate
 from groupagent.runtime.executor import WorkSupervisor
 from groupagent.runtime.resource_profile import controller_resources_ready, worker_limits
@@ -75,6 +75,8 @@ async def test_maintenance_uses_controller_headroom_when_foreground_is_idle():
         calls.append("compact")
 
     app = object.__new__(RuntimeApp)
+    app._closing = False
+    app._maintenance_lane = _MaintenanceLane()
     app.config = small_config()
     app._fence_application = lambda: None
     app._processing = set()
@@ -85,16 +87,21 @@ async def test_maintenance_uses_controller_headroom_when_foreground_is_idle():
     app.coordinator = SimpleNamespace(
         current_mode=lambda: "active",
         memory=SimpleNamespace(
-            compact=compact, expire=lambda *args, **kwargs: calls.append("expire")
+            summarizer=None,
+            compact=compact,
+            expire=lambda *args, **kwargs: calls.append("expire"),
         ),
     )
     app.cleanup = None
-    await app.maintenance(force=True)
-    assert calls == ["compact", "expire"]
-    calls.clear()
-    app._processing.add("foreground-request")
-    await app.maintenance(force=True)
-    assert calls == []
+    try:
+        await app.maintenance(force=True)
+        assert calls == ["compact", "expire"]
+        calls.clear()
+        app._processing.add("foreground-request")
+        await app.maintenance(force=True)
+        assert calls == []
+    finally:
+        await app._maintenance_lane.close()
 
 
 async def test_direct_document_validation_still_reserves_full_worker_before_render(tmp_path):

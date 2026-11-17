@@ -98,7 +98,7 @@ Validation on 2026-11-13: 67 research tests and 2 Harness probe tests passed;
 Ruff lint/format and mypy passed for the changed code. Reproduce with:
 
 ```sh
-.venv/bin/pytest tests/research tests/execution/test_harness_probe.py -q
+.venv/bin/pytest tests/research tests/execution/test_langgraph_core.py -q
 .venv/bin/ruff check src/groupagent/research tests/research
 .venv/bin/mypy src/groupagent/research
 ```

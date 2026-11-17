@@ -117,11 +117,18 @@ async def test_round_budget_cannot_be_reported_as_completion(execution_request, 
 async def test_truncation_and_usage_overrun_never_become_candidates(
     execution_request, gateway
 ) -> None:
-    engine = ScopedToolEngine(
-        ScriptedFakeModel([answer("Everything done", finish_reason="length")]), gateway
+    model = ScriptedFakeModel(
+        [
+            answer("Everything done", finish_reason="length"),
+            answer("Complete repaired answer"),
+        ]
     )
+    engine = ScopedToolEngine(model, gateway)
     result = await engine.wait(await engine.start(execution_request))
-    assert result.state == RunState.PAUSED and result.error_code == "model_output_truncated"
+    assert (
+        result.state == RunState.CANDIDATE and result.candidate_text == "Complete repaired answer"
+    )
+    assert len(model.requests) == 2 and "truncated" in model.requests[1].messages[-1].content
 
 
 async def test_provider_overrun_stops_before_tool_execution(execution_request, gateway) -> None:
@@ -136,21 +143,44 @@ async def test_provider_overrun_stops_before_tool_execution(execution_request, g
     assert result.receipts == () and not (execution_request.workspace / "never.txt").exists()
 
 
-async def test_forbidden_tool_stops_run_before_claimed_success(execution_request, gateway) -> None:
-    model = ScriptedFakeModel([call("bash", command="unsafe"), answer("It succeeded")])
+async def test_unknown_tool_repairs_the_plan_without_executing_it(
+    execution_request, gateway
+) -> None:
+    model = ScriptedFakeModel(
+        [
+            call("bash", command="unsafe"),
+            call(path="safe.md", text="Authorized file"),
+            answer("Authorized file is ready"),
+        ]
+    )
     engine = ScopedToolEngine(model, gateway)
     result = await engine.wait(await engine.start(execution_request))
-    assert result.state == RunState.FAILED and result.error_code == "tool_not_registered"
-    assert len(model.requests) == 1 and result.candidate_text is None
+    assert (
+        result.state == RunState.CANDIDATE and result.candidate_text == "Authorized file is ready"
+    )
+    assert (
+        len(model.requests) == 3 and "tool_not_registered" in model.requests[1].messages[-1].content
+    )
+    assert len(result.receipts) == 1 and result.receipts[0].tool_name == "workspace_write_text"
+    assert (execution_request.workspace / "safe.md").read_text() == "Authorized file"
 
 
 async def test_required_tool_cannot_be_satisfied_by_model_text(execution_request, gateway) -> None:
     execution_request = execution_request.model_copy(
         update={"required_tools": frozenset({"workspace_write_text"})}
     )
-    engine = ScopedToolEngine(ScriptedFakeModel([answer("I generated the document")]), gateway)
+    model = ScriptedFakeModel(
+        [
+            answer("I generated the document"),
+            call(path="verified.md", text="Verified actual output"),
+            answer("Verified actual output is ready"),
+        ]
+    )
+    engine = ScopedToolEngine(model, gateway)
     result = await engine.wait(await engine.start(execution_request))
-    assert result.state == RunState.FAILED and result.error_code == "validation_required"
+    assert result.state == RunState.CANDIDATE
+    assert "lacks successful tool evidence" in model.requests[1].messages[-1].content
+    assert (execution_request.workspace / "verified.md").exists()
 
 
 async def test_cancel_interrupts_model_and_prevents_new_tools(execution_request, gateway) -> None:
@@ -324,6 +354,9 @@ async def test_required_tool_error_cannot_be_covered_by_model_success_text(
         [
             call("workspace_read_text", path="missing.txt"),
             answer("All verified successfully"),
+            call(path="verified.md", text="Actual evidence", call_id="create-evidence"),
+            call("workspace_read_text", call_id="actual-verification", path="verified.md"),
+            answer("All verified successfully"),
         ]
     )
     engine = ScopedToolEngine(model, gateway)
@@ -331,7 +364,10 @@ async def test_required_tool_error_cannot_be_covered_by_model_success_text(
         update={"required_tools": frozenset({"workspace_read_text"})}
     )
     result = await engine.wait(await engine.start(request))
-    assert result.state == RunState.FAILED and result.error_code == "validation_required"
+    assert result.state == RunState.CANDIDATE
+    assert not result.receipts[0].success
+    assert result.receipts[-1].success
+    assert "lacks successful tool evidence" in model.requests[2].messages[-1].content
 
 
 async def test_failed_read_can_be_repaired_within_budget(execution_request, gateway):

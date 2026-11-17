@@ -20,7 +20,13 @@ from groupagent.domain import (
 from groupagent.execution.models import EngineCheckpoint, EngineEvent, RunState
 from groupagent.persistence import PostgresStore, UnitOfWork
 
-from .checkpoint_codec import CheckpointCodecError, decode_checkpoint, encode_checkpoint
+from .checkpoint_codec import (
+    CheckpointCodecError,
+    decode_checkpoint,
+    decode_event,
+    encode_checkpoint,
+    encode_event,
+)
 from .contracts import DeliveryDraft, ProcessLease
 from .recovery import safe_recovery_checkpoint
 
@@ -464,6 +470,7 @@ class RuntimeState:
     def append_event(self, actor: ActorContext, lease: ExecutionLease, event: EngineEvent) -> None:
         if event.work_id != lease.work_id or event.attempt_id != lease.attempt_id:
             raise DomainError("scope_violation", "Execution event does not match its lease")
+        body = encode_event(event)
         with self.store.transaction(actor) as tx:
             tx.assert_lease(lease)
             tx.conn.execute(
@@ -474,14 +481,18 @@ class RuntimeState:
                     lease.attempt_id,
                     event.sequence,
                     event.kind,
-                    Jsonb(event.model_dump(mode="json")),
+                    Jsonb(body),
                 ),
             )
             row = tx.conn.execute(
                 "SELECT body FROM ga_runtime_events WHERE group_id=%s AND work_id=%s AND attempt_id=%s AND sequence=%s",
                 (actor.group_id, lease.work_id, lease.attempt_id, event.sequence),
             ).fetchone()
-            if row is None or row["body"] != event.model_dump(mode="json"):
+            try:
+                identical = row is not None and decode_event(row["body"]) == event
+            except CheckpointCodecError:
+                identical = False
+            if not identical:
                 raise DomainError("idempotency_conflict", "Execution event sequence was reused")
 
     def alert(self, actor: ActorContext, code: str, *, resource_id: str = "group") -> None:
