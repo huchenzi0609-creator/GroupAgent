@@ -145,7 +145,7 @@ async def test_late_actual_source_reaches_critic_and_optional_is_not_required(
         assert body[0]["citation"] == fetched.output["source"]["citation"]
         assert body[0]["excerpt_complete_for_received_content"] is True
         assert sum(len(row["received_content_excerpt"].encode("utf-8")) for row in body) <= 12_000
-        assert payload["original_request"]["text"] == text
+        assert payload["human_requirements"]["requests"][0]["text"] == text
         assert payload["answer"] == answer
         guidance = request.messages[0].content
         assert "research_source_content" in guidance
@@ -153,7 +153,8 @@ async def test_late_actual_source_reaches_critic_and_optional_is_not_required(
         return ModelReply(
             text=json.dumps(
                 {
-                    "passed": not extra_required,
+                    "content_passed": not extra_required,
+                    "group_reply_passed": True,
                     "reason": "Actual source says optional, not uniquely required",
                 }
             ),

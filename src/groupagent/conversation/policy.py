@@ -19,6 +19,7 @@ from groupagent.persistence import UnitOfWork
 from .quiet import is_quiet
 from .text import EXPLANATION, outside_quotes
 from .timeparse import normalize_time
+from .turns import RecipientEvidence, TurnContract, verified_human_addressee
 
 _GROUP = re.compile(
     r"全群|本群|整个群|这个群|当前群|群内|群里所有|群的|群参与|群讨论|群消息|群处理"
@@ -195,6 +196,7 @@ class PolicyAdmission:
     allowed: bool
     reason_code: str = "policy_allows"
     invocation_root_event_id: str | None = None
+    recipient: RecipientEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -212,29 +214,57 @@ def _sequence(tx: UnitOfWork, event_id: str) -> int | None:
     return int(row["sequence"]) if row else None
 
 
-def trusted_invocation_in_tx(
+def recipient_evidence_in_tx(
     tx: UnitOfWork,
     event: GroupEvent,
     identity: BotIdentity = DEFAULT_IDENTITY,
     *,
     after_sequence: int | None = None,
-) -> str | None:
-    """An explicit call, authenticated bot quote, or uninterrupted human session."""
+    bot_member_id: str | None = None,
+    shared_account: bool = False,
+) -> RecipientEvidence:
+    """Resolve direction once from native facts, then natural address/session.
+
+    A shared account ID is a human identity, not proof of the Pot persona.
+    Only a bot delivery receipt can authenticate a quote of that persona.
+    """
     sequence = _sequence(tx, event.id)
     cutoff = after_sequence or 0
     if sequence is None or sequence <= cutoff:
-        return None
-    if identity.mentioned(outside_quotes(event.text)):
-        return event.id
+        return RecipientEvidence()
+    outside = outside_quotes(event.text)
+    if identity.directly_addressed(outside):
+        return RecipientEvidence(
+            recipient="agent",
+            source="direct_address",
+            invocation_root_event_id=event.id,
+        )
+    if event.trusted_actor_origin == "agentwechat_authenticated_message_metadata":
+        mentions = event.mentioned_member_ids
+        if mentions:
+            isolated_bot = not shared_account and bot_member_id in mentions
+            humans = [member for member in mentions if shared_account or member != bot_member_id]
+            if isolated_bot and not humans:
+                return RecipientEvidence(
+                    recipient="agent", source="native_mention", invocation_root_event_id=event.id
+                )
+            if humans:
+                return RecipientEvidence(
+                    recipient="other",
+                    source="native_mention",
+                    member_id=humans[0] if len(humans) == 1 else None,
+                )
     if event.reply_to:
         source = tx.conn.execute(
-            "SELECT body->>'platform_message_id' AS platform_message_id FROM ga_events "
+            "SELECT actor_id,body->>'platform_message_id' AS platform_message_id FROM ga_events "
             "WHERE group_id=%s AND id=%s AND memory_state='active'",
             (tx.group_id, event.reply_to),
         ).fetchone()
         platform_id = source["platform_message_id"] if source else event.reply_to
         if platform_id and tx.is_bot_message(platform_id):
-            return event.id
+            return RecipientEvidence(
+                recipient="agent", source="bot_reply", invocation_root_event_id=event.id
+            )
         # Native quote metadata comes from authenticated adapter normalization.
         # This also works before the bot's outgoing echo has been ingested;
         # quoted text and quoted display names never supply this evidence.
@@ -250,7 +280,45 @@ def trusted_invocation_in_tx(
                 for part in event.attachments
             )
         ):
-            return event.id
+            return RecipientEvidence(
+                recipient="agent", source="bot_reply", invocation_root_event_id=event.id
+            )
+        quote = next((part for part in event.attachments if part.get("kind") == "quote"), {})
+        quoted_sender = (
+            source["actor_id"]
+            if source
+            else (
+                quote.get("sender_id")
+                if event.trusted_actor_origin == "agentwechat_authenticated_message_metadata"
+                else None
+            )
+        )
+        if isinstance(quoted_sender, str) and quoted_sender and quoted_sender != event.actor_id:
+            return RecipientEvidence(
+                recipient="other", source="human_reply", member_id=quoted_sender
+            )
+    rows = tx.conn.execute(
+        "SELECT member_id,COALESCE(room_name,confirmed_name,'群昵称待补充') AS name,"
+        "CASE WHEN room_name IS NOT NULL THEN 'room_display_name' "
+        "WHEN confirmed_name IS NOT NULL THEN 'owner_confirmed' ELSE 'unknown' END AS name_source,"
+        "membership_state FROM ga_members "
+        "WHERE group_id=%s AND membership_state<>'left' ORDER BY member_id LIMIT 10000",
+        (tx.group_id,),
+    ).fetchall()
+    human = verified_human_addressee(
+        outside,
+        {
+            **identity.context(),
+            "requester_member_id": event.actor_id,
+            "members": rows,
+        },
+    )
+    if human:
+        return RecipientEvidence(recipient="other", source="human_address", member_id=human)
+    if identity.directly_addressed(outside):
+        return RecipientEvidence(
+            recipient="agent", source="direct_address", invocation_root_event_id=event.id
+        )
     previous = tx.conn.execute(
         "SELECT e.actor_id,e.memory_state,l.invocation_root_event_id,root.sequence AS root_sequence "
         "FROM ga_events e LEFT JOIN ga_participation_log l "
@@ -274,8 +342,32 @@ def trusted_invocation_in_tx(
         and previous["root_sequence"] is not None
         and previous["root_sequence"] > cutoff
     ):
-        return str(previous["invocation_root_event_id"])
-    return None
+        return RecipientEvidence(
+            recipient="agent",
+            source="continuation",
+            invocation_root_event_id=str(previous["invocation_root_event_id"]),
+        )
+    return RecipientEvidence()
+
+
+def trusted_invocation_in_tx(
+    tx: UnitOfWork,
+    event: GroupEvent,
+    identity: BotIdentity = DEFAULT_IDENTITY,
+    *,
+    after_sequence: int | None = None,
+    bot_member_id: str | None = None,
+    shared_account: bool = False,
+) -> str | None:
+    """Compatibility projection of the authoritative recipient evidence."""
+    return recipient_evidence_in_tx(
+        tx,
+        event,
+        identity,
+        after_sequence=after_sequence,
+        bot_member_id=bot_member_id,
+        shared_account=shared_account,
+    ).invocation_root_event_id
 
 
 def _policies(tx: UnitOfWork, member_id: str) -> list[dict]:
@@ -295,13 +387,23 @@ def ingress_admission(
     quiet_hours: list[str] | None = None,
     default_mode: str = "natural",
     now: datetime | None = None,
+    bot_member_id: str | None = None,
+    shared_account: bool = False,
 ) -> PolicyAdmission:
     policies = _policies(tx, event.actor_id)
     cutoff = max((row.get("quiet_since_sequence") or 0 for row in policies), default=0)
     sequence = _sequence(tx, event.id)
     if sequence is not None and sequence <= cutoff:
         return PolicyAdmission(False, "quiet_barrier")
-    root = trusted_invocation_in_tx(tx, event, identity, after_sequence=cutoff)
+    recipient = recipient_evidence_in_tx(
+        tx,
+        event,
+        identity,
+        after_sequence=cutoff,
+        bot_member_id=bot_member_id,
+        shared_account=shared_account,
+    )
+    root = recipient.invocation_root_event_id
     mode = next((row["mode"] for row in policies if row["subject_id"] == "*"), default_mode)
     if mode in {"paused", "disabled"}:
         return PolicyAdmission(False, "group_" + mode)
@@ -310,7 +412,7 @@ def ingress_admission(
         return PolicyAdmission(False, "quiet_barrier")
     if mode == "on_request" and root is None:
         return PolicyAdmission(False, "explicit_invocation_required")
-    return PolicyAdmission(True, invocation_root_event_id=root)
+    return PolicyAdmission(True, invocation_root_event_id=root, recipient=recipient)
 
 
 def delivery_admission_in_tx(
@@ -322,6 +424,8 @@ def delivery_admission_in_tx(
     quiet_hours: list[str] | None = None,
     default_mode: str = "natural",
     now: datetime | None = None,
+    bot_member_id: str | None = None,
+    shared_account: bool = False,
 ) -> DeliveryAdmission:
     """Derive purpose from durable provenance, never from model labels."""
     notice = tx.conn.execute(
@@ -341,6 +445,10 @@ def delivery_admission_in_tx(
     if not autonomous and work is not None:
         return DeliveryAdmission(True)
     if not autonomous and intent.request_event_id:
+        body = tx.get_decision(intent.request_event_id) or {}
+        saved_contract = body.get("turn_contract")
+        if saved_contract is not None and not TurnContract.model_validate(saved_contract).visible:
+            return DeliveryAdmission(False, "turn_not_addressed_to_agent", retire=True)
         admission = ingress_admission(
             tx,
             tx.get_event(intent.request_event_id),
@@ -349,6 +457,8 @@ def delivery_admission_in_tx(
             quiet_hours=quiet_hours,
             default_mode=default_mode,
             now=now,
+            bot_member_id=bot_member_id,
+            shared_account=shared_account,
         )
         return DeliveryAdmission(
             admission.allowed, admission.reason_code, retire=not admission.allowed

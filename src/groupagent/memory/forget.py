@@ -11,6 +11,7 @@ from groupagent.memory.deletions import DeletionSink
 from groupagent.memory.models import CleanupJob, ForgetResult
 from groupagent.memory.task_privacy import redact_tasks, task_dependents, task_markers
 from groupagent.persistence import PostgresStore, UnitOfWork
+from groupagent.persistence.text_parts import redact_removed_text
 
 _PRIVACY_RANK = {"active": 0, "expired": 1, "recalled": 2, "forgotten": 3}
 
@@ -20,7 +21,9 @@ class ForgetMethods:
     deletion_sink: DeletionSink | None = None
 
     @staticmethod
-    def _privacy_closure(tx: UnitOfWork, rows, extra_roots: list[str]):
+    def _privacy_closure(
+        tx: UnitOfWork, rows, extra_roots: list[str], *, include_human_requests: bool
+    ):
         """Follow stored provenance, never shared-account identity or text equality."""
         full = {row["id"]: row for row in rows}
         changed = set(full) | set(extra_roots)
@@ -94,8 +97,15 @@ class ForgetMethods:
                 ).fetchall()
             )
             work_rows = tx.conn.execute(
-                "SELECT id,request_event_id FROM ga_work_orders WHERE group_id=%s AND (id=ANY(%s) OR request_event_id=ANY(%s) OR scope->'source_fingerprints' ?| %s::text[]) ORDER BY id FOR UPDATE",
-                (tx.group_id, list(works), list(controls), list(controls)),
+                "SELECT id,request_event_id FROM ga_work_orders WHERE group_id=%s AND (id=ANY(%s) OR request_event_id=ANY(%s) OR scope->'source_fingerprints' ?| %s::text[] OR (%s AND COALESCE(scope->'human_request_event_ids','[]'::jsonb) ?| %s::text[])) ORDER BY id FOR UPDATE",
+                (
+                    tx.group_id,
+                    list(works),
+                    list(controls),
+                    list(controls),
+                    include_human_requests,
+                    list(controls),
+                ),
             ).fetchall()
             works.update(row["id"] for row in work_rows)
             machine_requests = tx.conn.execute(
@@ -390,7 +400,7 @@ class ForgetMethods:
         rows = list(by_id.values())
         ids = list(by_id)
         rows, quotes, related_ids, closure_works, schedule_ids, trigger_ids = self._privacy_closure(
-            tx, rows, referenced_event_ids or []
+            tx, rows, referenced_event_ids or [], include_human_requests=forget_facts
         )
         affected_tasks: set[str] = set(task_ids or [])
         changed_task_ids: set[str] = set()
@@ -412,6 +422,7 @@ class ForgetMethods:
                         tx,
                         rows,
                         list(set(related_ids) | set(extra) | set(referenced_event_ids or [])),
+                        include_human_requests=forget_facts,
                     )
                 )
         ids = [row["id"] for row in rows]
@@ -592,8 +603,8 @@ class ForgetMethods:
                 self._redact_decision(tx, event_id, reason)
             works = tx.conn.execute(
                 "SELECT id,state,scope FROM ga_work_orders WHERE group_id=%s AND "
-                "(id=ANY(%s) OR request_event_id=ANY(%s) OR COALESCE(scope->'source_fingerprints','{}'::jsonb) ?| %s::text[]) ORDER BY id FOR UPDATE",
-                (tx.group_id, closure_works, related_ids, related_ids),
+                "(id=ANY(%s) OR request_event_id=ANY(%s) OR COALESCE(scope->'source_fingerprints','{}'::jsonb) ?| %s::text[] OR (%s AND COALESCE(scope->'human_request_event_ids','[]'::jsonb) ?| %s::text[])) ORDER BY id FOR UPDATE",
+                (tx.group_id, closure_works, related_ids, related_ids, forget_facts, related_ids),
             ).fetchall()
             work_ids = [work["id"] for work in works]
             for work in works:
@@ -678,6 +689,7 @@ class ForgetMethods:
                     notice_ids,
                 ),
             )
+            redact_removed_text(tx.conn, tx.group_id)
         if forget_facts:
             tx.conn.execute(
                 "UPDATE ga_schedules SET title='[source removed]',goal='[source removed]',acceptance_criteria='[]',state='cancelled',pause_reason=NULL,revision=revision+1,updated_at=clock_timestamp() WHERE group_id=%s AND id=ANY(%s)",

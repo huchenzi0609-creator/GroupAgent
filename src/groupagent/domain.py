@@ -10,7 +10,15 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_serializer,
+)
 
 Identifier = Annotated[str, Field(min_length=1)]
 
@@ -84,6 +92,8 @@ class GroupEvent(DomainModel):
     occurred_at: AwareDatetime
     received_at: AwareDatetime
     reply_to: str | None = None
+    # Authenticated channel metadata only; names/text never populate this list.
+    mentioned_member_ids: list[str] = Field(default_factory=list)
     attachments: list[dict[str, JsonValue]] = Field(default_factory=list)
     channel_account_id: str | None = None
     source_epoch: str | None = None
@@ -92,6 +102,15 @@ class GroupEvent(DomainModel):
     trusted_actor_origin: str = "verified_channel_metadata"
     policy_revision: int = Field(default=1, ge=1)
     content_state: Literal["active", "forgotten", "expired", "recalled"] = "active"
+
+    @model_serializer(mode="wrap")
+    def _compatible_recipient_metadata(self, handler):
+        # Source witnesses hash this canonical projection. Adding absent
+        # recipient metadata must not invalidate historical work fingerprints.
+        value = handler(self)
+        if not self.mentioned_member_ids:
+            value.pop("mentioned_member_ids", None)
+        return value
 
 
 class EventCursor(DomainModel):

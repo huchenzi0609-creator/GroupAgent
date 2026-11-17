@@ -261,7 +261,7 @@ async def test_requested_literal_and_translation_reach_semantic_review_unchanged
     assert accepted.checks["result"] and len(setup.model.requests) == 1
     payload = json.loads(setup.model.requests[-1].messages[1].content)
     assert payload["answer"] == answer and payload["research_source_metrics"]
-    assert payload["original_request"]["text"] == request
+    assert payload["human_requirements"]["requests"][0]["text"] == request
     assert payload["validation_phase"] == "pre_delivery"
     assert payload["research_source_content"]
     setup.model.passed = False

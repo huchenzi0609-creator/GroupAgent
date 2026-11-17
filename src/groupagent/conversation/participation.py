@@ -11,13 +11,14 @@ from typing import Any
 
 from groupagent.coordinator import Decision
 from groupagent.domain import EventKind, GroupEvent
-from groupagent.identity import BotIdentity, trusted_name_source
+from groupagent.identity import BotIdentity
 
 from .policy import PolicyIntent as PolicyIntent
 from .policy import policy_intent as policy_intent
 from .text import EXPLANATION as _EXPLANATION
 from .text import QUOTED as _QUOTED
 from .text import outside_quotes as outside_quotes
+from .turns import verified_human_addressee as verified_human_addressee
 
 _OUTER_ASK = re.compile(r"解释|翻译|分析|总结|评价|判断|比较|核对|为什么|如何|怎么|[?？]")
 _SOURCE_LABEL = re.compile(r"^(?:引用|引述|转述|转发)(?:的)?(?:原文|原话|内容|消息)?\s*[：:]")
@@ -45,59 +46,6 @@ _NON_CASUAL_STATE = re.compile(
 
 def _agent_request(text: str, context: dict[str, Any]) -> bool:
     return BotIdentity.from_context(context).request_addressed(text)
-
-
-def verified_human_addressee(text: str, context: dict[str, Any]) -> str | None:
-    """Return a trusted leading human recipient, independent of business intent.
-
-    This is direction evidence, not an observe decision. A message to a peer
-    can still declare the current speaker's own work or an owner's assignment.
-    A trusted cached nickname remains useful when presence is unknown; an
-    explicit departure removes that recipient evidence.
-    """
-    outside = outside_quotes(text)
-    if len(text) > 16000 or not outside or _agent_request(outside, context):
-        return None
-    requester = context.get("requester_member_id")
-    if not isinstance(requester, str):
-        return None
-    names: dict[str, set[str]] = {}
-    members = context.get("members", [])
-    for member in members if isinstance(members, list) else ():
-        if (
-            not isinstance(member, dict)
-            or not trusted_name_source(member.get("name_source"))
-            or member.get("membership_state") not in {"active", "present", "unknown"}
-        ):
-            continue
-        name, identifier = member.get("name"), member.get("member_id")
-        if isinstance(name, str) and name and isinstance(identifier, str):
-            names.setdefault(name, set()).add(identifier)
-    excluded = {
-        "我",
-        "你",
-        "他",
-        "她",
-        "它",
-        "大家",
-        "同学",
-        "群昵称待补充",
-        "机器人",
-        "机器人组长",
-        "组长",
-        "小伴",
-    }
-    excluded.update(BotIdentity.from_context(context).names)
-    excluded = {name.casefold() for name in excluded}
-    for name, identities in names.items():
-        if len(identities) != 1 or requester in identities or name.casefold() in excluded:
-            continue
-        if re.match(
-            r"^(?:(?:请|麻烦|拜托)\s*)?@?" + re.escape(name) + r"(?=[，,：:\s]|先|帮|来|你)",
-            outside,
-        ):
-            return next(iter(identities))
-    return None
 
 
 def _source_quote_only(text: str, outside: str) -> bool:

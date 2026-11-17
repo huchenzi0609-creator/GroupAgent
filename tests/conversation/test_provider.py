@@ -29,6 +29,8 @@ from groupagent.conversation.timeparse import normalize_time, shift_timing
 from groupagent.domain import DomainError, EventKind, GroupEvent
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
+from .turn_model_fixture import semantic_fixture_reply
+
 
 def test_catalog_specific_input_schema_is_bounded_without_changing_static_compatibility():
     dynamic = decision_schema(
@@ -463,6 +465,9 @@ class ModelFixture:
         self.steps, self.requests = list(steps), []
 
     async def complete(self, request):
+        assessed = semantic_fixture_reply(request, upcoming=self.steps)
+        if assessed is not None:
+            return assessed
         self.requests.append(request)
         step = self.steps.pop(0)
         if isinstance(step, BaseException):

@@ -64,6 +64,7 @@ from .ports import ModelBudgetPort, ModelPort, estimate_input_tokens
 
 EventSink = Callable[[EngineEvent], Awaitable[None]]
 CheckpointSink = Callable[[EngineCheckpoint], Awaitable[None]]
+REPLY_ONLY_VALIDATION_KEY = "reply_only_validation"
 
 RETRYABLE_MODEL_ERRORS = frozenset(
     {
@@ -305,7 +306,33 @@ class LangGraphEngine:
         )
         visible = (initial | remembered) & allowed
         run.backend_state["active_tools"] = sorted(visible)
+        # Apply the host's candidate-revision restriction after remembered and
+        # catalog tools are merged. The underlying authorization stays exact.
+        if self._reply_only_validation(run):
+            return frozenset()
         return visible
+
+    @staticmethod
+    def _reply_only_validation(run: _Run) -> bool:
+        binding = run.backend_state.get(REPLY_ONLY_VALIDATION_KEY)
+        if binding is None:
+            return False
+        if not isinstance(binding, dict):
+            raise DomainError("recovery_required", "Invalid reply-only validation binding")
+        if binding.get("goal_revision") != run.revision:
+            run.backend_state.pop(REPLY_ONLY_VALIDATION_KEY, None)
+            return False
+        if (
+            binding.get("work_id") != run.request.work_id
+            or binding.get("content_passed") is not True
+            or binding.get("group_reply_passed") is not False
+            or any(
+                not isinstance(binding.get(key), str) or len(binding[key]) != 64
+                for key in ("candidate_sha256", "request_sha256")
+            )
+        ):
+            raise DomainError("recovery_required", "Invalid reply-only validation binding")
+        return True
 
     def _load_tools(self, run: _Run, receipt: ToolReceipt) -> None:
         if (
@@ -1419,6 +1446,11 @@ class LangGraphEngine:
                 run.admission.notify_all()
 
     async def _dispatch_tool(self, run: _Run, call: ModelToolCall, *, parallel: bool) -> str:
+        if self._reply_only_validation(run):
+            raise DomainError(
+                "permission_denied", "Only candidate reply text may change during this revision"
+            )
+
         # ToolNode owns the batch and its result ordering. Only an entirely
         # trusted public-read batch gets two slots; every mixed/effectful batch
         # holds the same lock through dispatch and settlement.

@@ -1375,6 +1375,9 @@ def evaluate_interaction_participation(
             return None
 
     class ReadOnlyPolicies:
+        def __init__(self, group_id):
+            self.group_id = group_id
+
         def execute(self, query, params=()):
             # Simulate the real gate's snapshot lock/epoch initialization only;
             # this fixture has no database or mutable business resources.
@@ -1385,6 +1388,20 @@ def evaluate_interaction_participation(
                 )
             ):
                 return Cursor(query)
+            if query == (
+                "SELECT member_id,COALESCE(room_name,confirmed_name,'群昵称待补充') AS name,"
+                "CASE WHEN room_name IS NOT NULL THEN 'room_display_name' "
+                "WHEN confirmed_name IS NOT NULL THEN 'owner_confirmed' ELSE 'unknown' END AS name_source,"
+                "membership_state FROM ga_members "
+                "WHERE group_id=%s AND membership_state<>'left' ORDER BY member_id LIMIT 10000"
+            ) and params == (self.group_id,):
+                # Only the recipient resolver's bounded roster projection for
+                # this fixture group. Other roster reads/writes still fail.
+                return Cursor(query)
+            if re.search(r"\bga_members\b", query, re.I):
+                raise AssertionError(
+                    "Offline roster reads require the exact current-group projection"
+                )
             if not query.lstrip().startswith("SELECT") or not any(
                 table in query
                 for table in (
@@ -1445,7 +1462,7 @@ def evaluate_interaction_participation(
             SimpleNamespace(
                 actor=actor,
                 group_id=actor.group_id,
-                conn=ReadOnlyPolicies(),
+                conn=ReadOnlyPolicies(actor.group_id),
                 is_bot_message=lambda _message_id: False,
             ),
             event,

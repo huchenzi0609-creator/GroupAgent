@@ -114,7 +114,13 @@ class FixtureSemanticReviewer:
         self.requests.append(request)
         assert not request.tools
         return ModelReply(
-            text=json.dumps({"passed": self.passed, "reason": "offline reviewer fixture"}),
+            text=json.dumps(
+                {
+                    "content_passed": self.passed,
+                    "group_reply_passed": True,
+                    "reason": "offline reviewer fixture",
+                }
+            ),
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )
 
@@ -486,28 +492,19 @@ async def test_research_claim_without_actual_receipt_cannot_pass(toolkit_setup):
     assert not setup.model.requests
     fetched = await call(run, "web_fetch", {"url": "https://example.com/source"})
     assert fetched.success and len(setup.http_calls) == 1
-    with pytest.raises(DomainError, match="actual retrieval time in UTC"):
-        await setup.toolkit.validate(
-            run.work,
-            run.lease,
-            setup.env.actor,
-            candidate(run, "The source is https://example.com/source", (fetched,)),
-            run.workspace,
-        )
-    assert not setup.model.requests
     accepted = await setup.toolkit.validate(
         run.work,
         run.lease,
         setup.env.actor,
         candidate(
             run,
-            "The synthetic observation is documented at " + fetched.output["source"]["citation"],
+            "The source is https://example.com/source",
             (fetched,),
         ),
         run.workspace,
     )
     assert accepted.checks["result"] and len(setup.model.requests) == 1
-    with pytest.raises(DomainError, match="actual research tool evidence"):
+    with pytest.raises(DomainError, match="no successful research provenance"):
         await setup.toolkit.validate(
             run.work,
             run.lease,
@@ -610,7 +607,7 @@ async def test_semantic_model_retries_respect_original_grant_and_keep_unknown_ch
         if len(calls) <= failures:
             raise DomainError("provider_unavailable", "Synthetic model transport failure")
         return ModelReply(
-            text='{"passed":true,"reason":"Synthetic content verified"}',
+            text='{"content_passed":true,"group_reply_passed":true,"reason":"Synthetic content verified"}',
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )
 
@@ -731,7 +728,7 @@ async def test_semantic_rejection_and_no_send_policy_are_not_overridden_by_forma
             run.work,
             run.lease,
             setup.env.actor,
-            candidate(run, receipts=(generated, selected)),
+            candidate(run, "草稿已准备好，按你的要求暂不发送文件。", (generated, selected)),
             run.workspace,
         )
     setup.model.passed = True
@@ -739,7 +736,7 @@ async def test_semantic_rejection_and_no_send_policy_are_not_overridden_by_forma
         run.work,
         run.lease,
         setup.env.actor,
-        candidate(run, receipts=(generated, selected)),
+        candidate(run, "草稿已准备好，按你的要求暂不发送文件。", (generated, selected)),
         run.workspace,
     )
     assert len(result.deliveries) == 1 and result.deliveries[0].payload_ref.startswith("text:")
@@ -757,7 +754,13 @@ async def test_semantic_review_evidence_is_version_bound_redacted_and_privacy_re
     )
     secret = "sk-" + "synthetic_only_" * 3
     reply = ModelReply(
-        text=json.dumps({"passed": False, "reason": "Missing footer; " + secret}),
+        text=json.dumps(
+            {
+                "content_passed": False,
+                "group_reply_passed": True,
+                "reason": "Missing footer; " + secret,
+            }
+        ),
         usage=TokenUsage(input_tokens=10, output_tokens=5),
     )
 
@@ -791,7 +794,13 @@ async def test_semantic_review_evidence_is_version_bound_redacted_and_privacy_re
     assert secret not in json.dumps(evidence)
     assert len(audits) == 1 and "reason" not in audits[0]["details"]
     reply = ModelReply(
-        text=json.dumps({"passed": True, "reason": "Corrected final candidate"}),
+        text=json.dumps(
+            {
+                "content_passed": True,
+                "group_reply_passed": True,
+                "reason": "Corrected final candidate",
+            }
+        ),
         usage=TokenUsage(input_tokens=10, output_tokens=5),
     )
     await setup.toolkit.validate(
@@ -1030,9 +1039,12 @@ async def test_canonical_original_request_is_bounded_redacted_and_shared_with_re
         run.workspace,
     )
     review = setup.model.requests[-1]
-    assert json.loads(review.messages[1].content)["original_request"] == context
+    authoritative = json.loads(review.messages[1].content)["human_requirements"]
+    assert {key: authoritative["requests"][0][key] for key in context} == context
+    assert authoritative["history_complete"] is not long_request
     assert secret not in review.model_dump_json()
-    assert "goal" in review.messages[0].content and "criteria" in review.messages[0].content
+    assert "human_requirements" in review.messages[0].content
+    assert "execution_plan" in review.messages[0].content
     assert "不添加用户未要求的标准" in review.messages[0].content
     assert "ASR" not in review.messages[0].content  # This case contains no audio evidence.
     assert "pre_delivery" in review.messages[0].content

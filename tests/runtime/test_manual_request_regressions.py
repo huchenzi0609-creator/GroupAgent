@@ -6,9 +6,8 @@ from groupagent.control import WorkSelector
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import Decision
 from groupagent.domain import DomainError, WorkState
-from groupagent.execution import ScriptedFakeModel
 
-from .foreground_model_fixture import candidate_reply, natural_reply
+from .foreground_model_fixture import ForegroundScriptedModel, candidate_reply, natural_reply
 from .test_app import app_for, event
 from .test_early_ack import intake, setup_chat
 
@@ -17,7 +16,7 @@ pytestmark = pytest.mark.postgres
 
 def image_request_model(app, request):
     """Explicit semantic fixture using the actual graph's named primitive."""
-    model = ScriptedFakeModel(
+    model = ForegroundScriptedModel(
         [
             candidate_reply(
                 Decision(

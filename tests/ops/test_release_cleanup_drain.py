@@ -35,8 +35,8 @@ def program(tmp_path, store, actor, member, root, pg_bin):
     dsn = tmp_path / "operator.dsn"
     dsn.write_text(store.dsn)
     script = (Path(__file__).resolve().parents[2] / "deploy/apply-pot-source-update.sh").read_text()
-    begin = script.index('maintenance "$next" -c \'\nimport asyncio,json') + len(
-        'maintenance "$next" -c \''
+    begin = script.index('maintenance "$previous" -c \'\nimport asyncio,json') + len(
+        'maintenance "$previous" -c \''
     )
     end = script.index('\n\' > "$release/cleanup-local-proof.json"', begin)
     code = script[begin:end]

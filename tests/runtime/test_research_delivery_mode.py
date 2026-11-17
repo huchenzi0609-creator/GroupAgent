@@ -219,11 +219,11 @@ async def test_router_md_goal_and_criteria_cannot_expand_message_research_into_a
 
     async def critic(request):
         payload = json.loads(request.messages[1].content)
-        assert payload["goal"] == QUESTION and not payload["artifacts"]
-        assert all("Markdown" not in value for value in payload["criteria"])
+        assert payload["execution_plan"]["goal"] == QUESTION and not payload["artifacts"]
+        assert all("Markdown" not in value for value in payload["execution_plan"]["criteria"])
         assert payload["research_source_content"]
         return ModelReply(
-            text='{"passed":true,"reason":"Canonical message requirements and actual sources verified"}',
+            text='{"content_passed":true,"group_reply_passed":true,"reason":"Canonical message requirements and actual sources verified"}',
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )
 

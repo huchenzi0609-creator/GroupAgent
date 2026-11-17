@@ -712,6 +712,14 @@ class AgentWechatAdapter:
             occurred_at=occurred_at,
             received_at=datetime.now(UTC),
             reply_to=reply_to,
+            mentioned_member_ids=[
+                _identifier(member_id)
+                for member_id in message.mentions.get("userIds", [])
+                if isinstance(member_id, str) and member_id
+            ]
+            if message.mentions.get("state") == "known"
+            and isinstance(message.mentions.get("userIds"), list)
+            else [],
             attachments=attachments,
             channel_account_id=self.config.account_id,
             source_epoch=None if platform_id else self.config.source_epoch,

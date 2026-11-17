@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from groupagent.config import AppConfig, GroupConfig
 from groupagent.coordinator import Decision
 from groupagent.domain import ActorContext, EventKind, GroupEvent, Role
 from groupagent.identity import BotIdentity
@@ -49,6 +50,16 @@ def sample(text, **changes):
 def test_priority_uses_shared_invocation_result_without_content_filters(monkeypatch, source, root):
     app = RuntimeApp.__new__(RuntimeApp)
     app.identity = BotIdentity()
+    app.config = AppConfig(
+        group=GroupConfig(
+            enabled=True,
+            internal_id="group",
+            external_group_id="synthetic@chatroom",
+            owner_ids=["synthetic-owner"],
+            bot_member_id="synthetic-bot",
+            shared_account=True,
+        )
+    )
     app.technical = ActorContext(
         group_id="group", member_id="service:runtime", role=Role.MAINTAINER
     )
@@ -59,9 +70,11 @@ def test_priority_uses_shared_invocation_result_without_content_filters(monkeypa
         assert actor == app.technical
         yield tx
 
-    def invocation(actual_tx, actual_event, identity):
+    def invocation(actual_tx, actual_event, identity, *, bot_member_id, shared_account):
         calls.append(actual_event.id)
         assert actual_tx is tx and identity == app.identity
+        assert bot_member_id == app.config.group.bot_member_id
+        assert shared_account is app.config.group.shared_account
         return root
 
     app.store = SimpleNamespace(transaction=transaction)

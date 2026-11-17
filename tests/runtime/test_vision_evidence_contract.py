@@ -150,7 +150,8 @@ async def test_original_view_mapping_survives_long_text_and_checks_current_candi
         return ModelReply(
             text=json.dumps(
                 {
-                    "passed": evidence[0]["matches_candidate"],
+                    "content_passed": evidence[0]["matches_candidate"],
+                    "group_reply_passed": True,
                     "reason": "Exact candidate binding"
                     if not changed_candidate
                     else "Different image is not candidate evidence",
@@ -240,7 +241,11 @@ async def test_source_only_observation_does_not_impose_a_global_candidate_vision
             assert image.format == "PNG" and image.getpixel((10, 10)) == (255, 165, 0)
         return ModelReply(
             text=json.dumps(
-                {"passed": True, "reason": "Independent actual candidate-byte fixture"}
+                {
+                    "content_passed": True,
+                    "group_reply_passed": True,
+                    "reason": "Independent actual candidate-byte fixture",
+                }
             ),
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )

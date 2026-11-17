@@ -611,7 +611,16 @@ class RuntimeApp:
         ):
             return True
         with self.store.transaction(self.technical) as tx:
-            return trusted_invocation_in_tx(tx, event, self.identity) is not None
+            return (
+                trusted_invocation_in_tx(
+                    tx,
+                    event,
+                    self.identity,
+                    bot_member_id=self.config.group.bot_member_id,
+                    shared_account=self.config.group.shared_account,
+                )
+                is not None
+            )
 
     async def process_pending(self, *, controls_only: bool = False, batched: bool = True) -> int:
         events = self._ready_events()
@@ -1206,6 +1215,8 @@ def build_app(
         quiet_hours=config.group.quiet_hours,
         participation_mode=config.group.participation_mode,
         identity=BotIdentity.from_runtime(config.runtime),
+        bot_member_id=config.group.bot_member_id,
+        shared_account=config.group.shared_account,
     )
     app = RuntimeApp(
         coordinator,
