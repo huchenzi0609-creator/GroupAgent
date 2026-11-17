@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from pydantic import (
-    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -15,6 +14,7 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from groupagent.scheduling.models import PreparedMessage
+from groupagent.scheduling.temporal import InstantProposal, ScheduleTimingProposal
 
 from .quiet import validate_windows
 
@@ -28,7 +28,7 @@ class ClaimTask(ActionData):
     title: str = Field(min_length=1, max_length=300)
     task_id: str | None = None
     expected_revision: int | None = Field(default=None, ge=1)
-    due_at: AwareDatetime | None = None
+    due_at: InstantProposal | None = None
     due_note: str | None = Field(default=None, max_length=200)
 
 
@@ -39,7 +39,7 @@ class AssignTask(ActionData):
     member_name: str = Field(min_length=1, max_length=200)
     task_id: str | None = None
     expected_revision: int | None = Field(default=None, ge=1)
-    due_at: AwareDatetime | None = None
+    due_at: InstantProposal | None = None
     due_note: str | None = Field(default=None, max_length=200)
 
 
@@ -50,7 +50,7 @@ class UpdateTask(ActionData):
     title: str | None = Field(default=None, max_length=300)
     status: Literal["open", "in_progress", "completed", "cancelled"] | None = None
     progress: str | None = Field(default=None, max_length=3000)
-    due_at: AwareDatetime | None = None
+    due_at: InstantProposal | None = None
     due_note: str | None = Field(default=None, max_length=200)
     clear_due: bool = False
     evidence_refs: list[str] | None = Field(default=None, max_length=20)
@@ -75,8 +75,8 @@ class CreateSchedule(ActionData):
         description="Enable only for a future goal when the requester explicitly allows no message "
         "if the completed check finds nothing to report.",
     )
-    timing: dict[str, JsonValue]
-    valid_until: AwareDatetime | None = None
+    timing: ScheduleTimingProposal
+    valid_until: InstantProposal | None = None
 
     @model_validator(mode="after")
     def single_payload(self) -> CreateSchedule:
@@ -91,7 +91,7 @@ class ChangeSchedule(ActionData):
     op: Literal["change_schedule"]
     schedule_id: str
     expected_revision: int = Field(ge=1)
-    timing: dict[str, JsonValue] | None = None
+    timing: ScheduleTimingProposal | None = None
     goal: str | None = Field(default=None, max_length=3000)
     prepared_message: PreparedMessage | None = None
     fact_source_ids: list[str] | None = Field(default=None, max_length=20)
@@ -101,7 +101,7 @@ class ChangeSchedule(ActionData):
         description="Omit to keep the existing setting. Set true only for an explicitly "
         "authorized future goal. Set false to require a delivered result.",
     )
-    valid_until: AwareDatetime | None = None
+    valid_until: InstantProposal | None = None
 
 
 class ControlSchedule(ActionData):
@@ -136,7 +136,7 @@ class Quiet(ActionData):
     op: Literal["quiet"]
     scope: Literal["self", "group"] = "self"
     enabled: bool
-    until: AwareDatetime | None = None
+    until: InstantProposal | None = None
     hours: list[str] | None = None
 
     @field_validator("hours")

@@ -106,8 +106,8 @@ async def test_fast_candidate_rejects_source_or_policy_change_after_context(
     request = await ingest(env, app, "请生成一份合成报告并交付Markdown。")
     original = app.coordinator._context
 
-    def changed(actor, value):
-        context = original(actor, value)
+    def changed(actor, value, **kwargs):
+        context = original(actor, value, **kwargs)
         if change == "source":
             app.coordinator.memory.forget(env.actor, event_ids=[request.id])
         else:

@@ -129,8 +129,8 @@ async def test_incomplete_quoted_and_compound_questions_fall_back(runtime_env, m
     remember(env, app, "项目简称", "合成青原")
     original_context = app.coordinator._context
 
-    def incomplete(actor, request):
-        context = original_context(actor, request)
+    def incomplete(actor, request, **kwargs):
+        context = original_context(actor, request, **kwargs)
         context["context_incomplete"] = True
         return context
 

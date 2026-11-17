@@ -84,7 +84,7 @@ def _task_ids(scope: Mapping[str, Any]) -> set[str]:
 
 @dataclass(frozen=True)
 class ContextQuery:
-    """A small explicit read plan; callers may supply it instead of lexical hints."""
+    """A bounded read plan for an event or an explicit tool request."""
 
     new_request: bool = False
     continuation: bool = False
@@ -94,6 +94,17 @@ class ContextQuery:
     fact_predicate: str | None = None
     roster: bool = False
     operations: bool = False
+    model_led: bool = False
+    preview: bool = False
+
+    @classmethod
+    def for_agent(cls, event: GroupEvent) -> ContextQuery:
+        # The model can request additional resources. Start with the delivery
+        # timeline and references that are structurally present in this event.
+        resources = {"works", "tasks", "schedules"}
+        if event.reply_to or event.attachments:
+            resources.add("files")
+        return cls(resources=frozenset(resources), model_led=True, preview=True)
 
     @classmethod
     def from_event(cls, event: GroupEvent, identity: BotIdentity) -> ContextQuery:
@@ -253,6 +264,10 @@ def select_focus(
         )
         sources = (quoted_reference["source_event_id"],) if identifiers else ()
         return ContextFocus("quote" if identifiers else "unavailable", identifiers, sources)
+    if query.model_led:
+        # Preserve the candidate references in recent messages and the work
+        # overview. A lexical guess about the current goal cannot discard them.
+        return ContextFocus("discussion")
     previous = [row for row in recent if row.get("id") != event.id]
     addressed = identity.directly_addressed(outside_quotes(event.text))
     quoted = next((row for row in previous if row.get("id") == event.reply_to), None)
@@ -543,6 +558,11 @@ class ContextBuilder:
         self, actor: ActorContext, event: GroupEvent, query: ContextQuery | None = None
     ) -> dict[str, Any]:
         query = query or ContextQuery.from_event(event, self.identity)
+        group_zone = ZoneInfo(self.config.group.time_zone)
+
+        def display_time(instant: datetime) -> str:
+            return (instant.astimezone(group_zone) if query.model_led else instant).isoformat()
+
         # An early public check is followed by the locked check below. A topic
         # restriction introduced between them must never leak quoted text.
         for identifier in (event.id, event.reply_to):
@@ -667,13 +687,14 @@ class ContextBuilder:
                         "actor_id": source.actor_id,
                         "kind": source.kind.value,
                         "speaker": speaker,
-                        "occurred_at": source.occurred_at.isoformat(),
+                        "occurred_at": display_time(source.occurred_at),
                         "text": source.text[:2000],
                         "reply_to": source.reply_to,
                         "attachments": source.attachments,
                         "work_reference": reference,
                         "focus_reset": bool(body.get("privacy_redacted")),
-                        "new_request": speaker == "human"
+                        "new_request": not query.model_led
+                        and speaker == "human"
                         and ContextQuery.from_event(source, self.identity).new_request,
                     }
                 )
@@ -703,7 +724,7 @@ class ContextBuilder:
                     row["id"]
                     for row in index
                     if row["state"] in _LIVE and (not query.states or row["state"] in query.states)
-                ][:8]
+                ][: 4 if query.preview else 8]
             works: list[dict] = []
             public_works: list[dict] = []
             for identifier in selected_work_ids:
@@ -770,10 +791,11 @@ class ContextBuilder:
             tasks: list[dict[str, Any]] = []
             task_queries = []
             if "tasks" in query.resources:
+                task_limit = 6 if query.preview else 20
                 task_candidates, witness = self.memory.task_query_in_tx(
                     tx,
                     topic_id=topic_id,
-                    limit=20,
+                    limit=task_limit,
                     public_only=True,
                     through_sequence=through_sequence,
                 )
@@ -786,11 +808,12 @@ class ContextBuilder:
                         retained=set(task.source_event_ids),
                     ):
                         tasks.append(task.model_dump(mode="json"))
-                    if len(tasks) >= 20:
+                    if len(tasks) >= task_limit:
                         evidence.incomplete = True
                         break
             rules: list[dict[str, Any]] = []
             if "schedules" in query.resources:
+                schedule_limit = 6 if query.preview else 12
                 for rule in self.scheduler.in_tx(tx).list(actor):
                     scope = rule.scope
                     if (
@@ -801,7 +824,7 @@ class ContextBuilder:
                         continue
                     if evidence.add("schedules:" + rule.id, scope_sources(scope), _task_ids(scope)):
                         rules.append(rule.model_dump(mode="json"))
-                    if len(rules) >= 12:
+                    if len(rules) >= schedule_limit:
                         evidence.incomplete = True
                         break
             memory_items, original_items = [], []
@@ -809,6 +832,19 @@ class ContextBuilder:
             memory_reads = (
                 [(query.fact_predicate, True)] if query.fact_predicate is not None else []
             ) + [(term, False) for term in query.memory_terms]
+            if query.preview:
+                # Match names of actual records, not instruction words. This
+                # brings a relevant durable scalar into chat in one model call.
+                predicates = tx.conn.execute(
+                    "SELECT DISTINCT f.predicate FROM ga_memory_facts f "
+                    "LEFT JOIN ga_memory_topics t ON (t.group_id,t.id)=(f.group_id,f.topic_id) "
+                    "WHERE f.group_id=%s AND f.state='active' "
+                    "AND (t.id IS NULL OR t.visibility='group') "
+                    "AND strpos(lower(%s),lower(f.predicate))>0 "
+                    "ORDER BY f.predicate LIMIT 4",
+                    (tx.group_id, event.text),
+                ).fetchall()
+                memory_reads.extend((row["predicate"], True) for row in predicates)
             for term, exact_predicate in memory_reads:
                 for hit in self.memory.in_tx(tx).retrieve(
                     actor,
@@ -887,7 +923,7 @@ class ContextBuilder:
                         if source.platform_message_id
                         and tx.is_bot_message(source.platform_message_id)
                         else "human",
-                        "occurred_at": source.occurred_at.isoformat(),
+                        "occurred_at": display_time(source.occurred_at),
                         "text": source.text[:2000],
                         "reply_to": source.reply_to,
                         "attachments": source.attachments,
@@ -1020,7 +1056,7 @@ class ContextBuilder:
             aliases = {f"member_{i + 1}": member_id for i, member_id in enumerate(all_ids)}
             inverse = {member_id: alias for alias, member_id in aliases.items()}
             payload = {
-                "now": self.clock().astimezone(ZoneInfo(self.config.group.time_zone)).isoformat(),
+                "now": self.clock().astimezone(group_zone).isoformat(),
                 "group_time_zone": self.config.group.time_zone,
                 "role": actor.role.value,
                 "read_only": actor.role in {Role.OBSERVER, Role.MAINTAINER},
@@ -1095,7 +1131,7 @@ class ContextBuilder:
                     "actor_id": event.actor_id,
                     "kind": event.kind.value,
                     "text": event.text,
-                    "occurred_at": event.occurred_at.isoformat(),
+                    "occurred_at": display_time(event.occurred_at),
                     "reply_to": event.reply_to,
                     "attachments": event.attachments,
                 },
@@ -1103,6 +1139,17 @@ class ContextBuilder:
             }
             if query.operations:
                 payload["runtime_limits"] = self.config.execution.model_dump(mode="json")
+            if query.model_led:
+                available = "preview" if query.preview else "loaded"
+                payload["context_coverage"] = {
+                    "recent_messages": "window",
+                    "works": available if "works" in query.resources else "on_request",
+                    "members": "loaded" if query.roster else "visible_participants",
+                    "tasks": available if "tasks" in query.resources else "on_request",
+                    "schedules": available if "schedules" in query.resources else "on_request",
+                    "files": "loaded" if "files" in query.resources else "on_request",
+                    "memory": available if memory_reads else "on_request",
+                }
             for key in (
                 "memory",
                 "recent_messages",

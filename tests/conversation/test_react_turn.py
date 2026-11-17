@@ -5,7 +5,7 @@ import json
 import pytest
 
 from groupagent.conversation.provider import ModelDecisionProvider
-from groupagent.domain import DomainError
+from groupagent.domain import DomainError, WorkState
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
 from .test_agent_dialogue import source
@@ -72,6 +72,7 @@ async def test_answer_or_observe_in_one_model_call_without_fast_semantics(conver
     result = await env.coordinator.process(value)
     assert result.decision.response == "“确实”用来强调事情真的发生了。"
     assert len(model.requests) == 1
+    assert model.requests[0].tool_choice == "required"
     assert {x["function"]["name"] for x in model.requests[0].tools} >= {
         "start_work",
         "read_work_facts",
@@ -162,3 +163,28 @@ async def test_receipt_reused_after_model_interruption_and_event_replay(conversa
     assert len(model.requests) == 1
     with env.store.transaction(env.actor) as tx:
         assert len(tx.list_work()) == len(tx.list_delivery()) == 1
+
+
+@pytest.mark.postgres
+async def test_exact_addressed_stop_uses_existing_work_without_model(conversation_env):
+    env = conversation_env
+    event = source(env, "Pot，请整理一份活动流程表。")
+    env.models[event.id] = ModelScript(
+        call(
+            "start_work",
+            "make-plan",
+            goal=event.text,
+            work_capabilities=["documents"],
+            outputs=[{"format": "docx"}],
+        ),
+        finish(),
+    )
+    work = await env.coordinator.process(event)
+    stop = source(env, "Pot停止")
+    model = ModelScript()
+    env.models[stop.id] = model
+    result = await env.coordinator.process(stop)
+    assert not model.requests
+    assert result.controlled_work_ids == [work.work_id]
+    with env.store.transaction(env.actor) as tx:
+        assert tx.get_work(work.work_id).state == WorkState.CANCELLED

@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from psycopg.errors import LockNotAvailable, QueryCanceled
 from psycopg.types.json import Jsonb
@@ -39,6 +40,12 @@ from groupagent.scheduling.models import (
 )
 from groupagent.scheduling.recurrence import latest_due, next_due, utc, zone
 from groupagent.scheduling.reminders import occurrence_reminder_contract
+from groupagent.scheduling.temporal import (
+    InstantProposal,
+    ScheduleTimingProposal,
+    resolve_instant,
+    resolve_schedule_timing,
+)
 from groupagent.security import redact_credentials
 
 Row = dict[str, Any]
@@ -95,7 +102,9 @@ def _prepared_payload(
         raise DomainError("invalid_input", "Prepared text contains unsupported content")
     kind = ScheduleKind(message.purpose)
     if kind == ScheduleKind.EXPLICIT_REMINDER and text not in event.text:
-        raise DomainError("source_unavailable", "An exact reminder must quote the author's wording")
+        raise DomainError(
+            "reminder_text_mismatch", "An exact reminder must quote the author's wording"
+        )
     scope["prepared_message_source_id"] = event.id
     return text, kind
 
@@ -242,8 +251,7 @@ class Scheduler:
         if count["n"] >= self.max_active:
             raise DomainError("quota_exceeded", "The group has reached its active schedule limit")
 
-    def _timing(self, timing: Timing | dict[str, JsonValue], now: datetime) -> Timing:
-        rule = parse_timing(timing)
+    def _timing(self, rule: Timing, now: datetime) -> Timing:
         if isinstance(rule, EveryTiming):
             if rule.interval_seconds < self.min_interval:
                 raise DomainError(
@@ -255,16 +263,30 @@ class Scheduler:
                 )
         return rule
 
+    @staticmethod
+    def _check_new_instant(
+        rule: Timing, now: datetime, time_zone: str, event: GroupEvent | None
+    ) -> None:
+        if isinstance(rule, AtTiming) and rule.at < now:
+            if event is None:
+                raise DomainError(
+                    "invalid_input", "A new one-shot schedule cannot start in the past"
+                )
+            target = rule.at.astimezone(zone(time_zone)).isoformat(timespec="seconds")
+            raise DomainError(
+                "schedule_time_missed", f"The requested instant {target} ({time_zone}) has passed"
+            )
+
     def create(
         self,
         actor: ActorContext,
         title: str,
         goal: str | None,
-        timing: Timing | dict[str, JsonValue],
+        timing: ScheduleTimingProposal | dict[str, JsonValue],
         *,
         now: datetime | None = None,
         time_zone: str = "Asia/Shanghai",
-        valid_until: datetime | None = None,
+        valid_until: InstantProposal | None = None,
         request_key: str | None = None,
         scope: dict[str, JsonValue] | None = None,
         budget: dict[str, JsonValue] | None = None,
@@ -283,8 +305,6 @@ class Scheduler:
             raise DomainError("permission_denied", "Silent results require a verified request")
         if request_key is not None:
             _text(request_key, "request_key")
-        zone(time_zone)
-        rule = self._timing(timing, now)
         scope = (
             dict(scope)
             if scope is not None
@@ -298,6 +318,7 @@ class Scheduler:
             raise DomainError("invalid_input", "Only a future goal may allow a silent result")
         scope.pop("allow_silent_result", None)
         scope.pop("allow_silent_result_source_id", None)
+        scope.pop("default_one_shot_validity", None)
         with self._mutation(actor) as tx:
             if request_key is not None:
                 old = tx.conn.execute(
@@ -308,6 +329,7 @@ class Scheduler:
                     tx._controller(old, "creator_id")
                     return Schedule.model_validate(old)
             execution_kind = ScheduleKind.GOAL
+            event = None
             if authorization_event_id is not None:
                 event = _verify_human_source(tx, authorization_event_id)
                 fingerprints = _source_fingerprints(scope)
@@ -330,19 +352,22 @@ class Scheduler:
                 )
             assert goal is not None
             _text(goal, "goal")
-            if isinstance(rule, AtTiming) and rule.at < now:
-                raise DomainError(
-                    "invalid_input", "A new one-shot schedule cannot start in the past"
-                )
-            end = (
-                utc(valid_until)
-                if valid_until
-                else (
+            occurred_at = event.occurred_at if event is not None else None
+            rule, time_zone = resolve_schedule_timing(
+                timing, occurred_at=occurred_at, time_zone=time_zone
+            )
+            rule = self._timing(rule, now)
+            self._check_new_instant(rule, now, time_zone, event)
+            if isinstance(rule, AtTiming):
+                scope["default_one_shot_validity"] = valid_until is None
+            if valid_until is not None:
+                end = resolve_instant(valid_until, occurred_at=occurred_at, time_zone=time_zone)
+            else:
+                end = (
                     rule.at + self.one_shot_grace
                     if isinstance(rule, AtTiming)
                     else now + self.default_validity
                 )
-            )
             following = next_due(rule, time_zone, now, inclusive=True)
             if end < now or following is None or following > end:
                 raise DomainError(
@@ -424,8 +449,11 @@ class Scheduler:
             return []
         with self._transaction(actor) as tx:
             rows = tx.conn.execute(
-                "SELECT s.* FROM ga_schedules s LEFT JOIN ga_memory_topics t "
+                "SELECT s.*,e.occurred_at AS timing_source_at "
+                "FROM ga_schedules s LEFT JOIN ga_memory_topics t "
                 "ON t.group_id=s.group_id AND t.id=s.scope->>'topic_id' "
+                "LEFT JOIN ga_events e ON e.group_id=s.group_id "
+                "AND e.id=s.scope->>'schedule_timing_source_id' AND e.memory_state='active' "
                 "WHERE s.group_id=%s AND (%s OR s.creator_id=%s) "
                 "AND (%s::text IS NULL OR s.id=%s) "
                 "AND (s.scope->>'topic_id' IS NULL OR t.visibility='group') "
@@ -441,7 +469,9 @@ class Scheduler:
             ).fetchall()
             result = []
             for row in rows:
+                timing_source_at = row.pop("timing_source_at")
                 rule = Schedule.model_validate(row)
+                time_zone = zone(rule.time_zone)
                 history = tx.conn.execute(
                     "SELECT o.id,o.scheduled_at,o.state,o.reason,o.work_id,o.delivery_id "
                     "FROM ga_schedule_occurrences o WHERE o.group_id=%s AND o.schedule_id=%s "
@@ -450,7 +480,7 @@ class Scheduler:
                 ).fetchall()
                 occurrences = []
                 for occurrence in history:
-                    projection = self._occurrence_facts(tx, occurrence)
+                    projection = self._occurrence_facts(tx, occurrence, time_zone)
                     occurrences.append(projection)
                 result.append(
                     ScheduleFacts(
@@ -464,6 +494,16 @@ class Scheduler:
                         time_zone=rule.time_zone,
                         valid_until=rule.valid_until,
                         next_due_at=rule.next_due_at,
+                        next_due_local=(
+                            rule.next_due_at.astimezone(time_zone).isoformat()
+                            if rule.next_due_at is not None
+                            else None
+                        ),
+                        timing_source_local=(
+                            timing_source_at.astimezone(time_zone).isoformat()
+                            if timing_source_at is not None
+                            else None
+                        ),
                         pause_reason=rule.pause_reason,
                         owned_by_requester=rule.creator_id == actor.member_id,
                         allow_silent_result=rule.scope.get("allow_silent_result") is True,
@@ -473,7 +513,9 @@ class Scheduler:
             return result
 
     @staticmethod
-    def _occurrence_facts(tx: UnitOfWork, occurrence: Row) -> ScheduleOccurrenceFacts:
+    def _occurrence_facts(
+        tx: UnitOfWork, occurrence: Row, time_zone: ZoneInfo
+    ) -> ScheduleOccurrenceFacts:
         work_id, delivery_id = occurrence["work_id"], occurrence["delivery_id"]
         state = OccurrenceState(occurrence["state"])
         deliveries = []
@@ -496,6 +538,7 @@ class Scheduler:
         return ScheduleOccurrenceFacts(
             id=occurrence["id"],
             scheduled_at=occurrence["scheduled_at"],
+            scheduled_local=occurrence["scheduled_at"].astimezone(time_zone).isoformat(),
             state=state,
             reason=occurrence["reason"],
             work_id=work_id,
@@ -523,9 +566,9 @@ class Scheduler:
         expected_revision: int,
         title: str | None = None,
         goal: str | None = None,
-        timing: Timing | dict[str, JsonValue] | None = None,
+        timing: ScheduleTimingProposal | dict[str, JsonValue] | None = None,
         time_zone: str | None = None,
-        valid_until: datetime | None = None,
+        valid_until: InstantProposal | None = None,
         now: datetime | None = None,
         prepared_message: PreparedMessage | None = None,
         authorization_event_id: str | None = None,
@@ -593,6 +636,7 @@ class Scheduler:
             elif allow_silent_result is False or prepared_message is not None:
                 scope.pop("allow_silent_result", None)
                 scope.pop("allow_silent_result_source_id", None)
+            event = None
             if authorization_event_id is not None:
                 event = _verify_human_source(tx, authorization_event_id)
                 fingerprints = _source_fingerprints(scope)
@@ -634,18 +678,52 @@ class Scheduler:
                     }
                 scope.update(source_event_ids=list(fingerprints), source_fingerprints=fingerprints)
                 _schedule_evidence(tx, scope)
-            rule = self._timing(timing if timing is not None else row["timing"], now)
-            time_zone = time_zone if time_zone is not None else row["time_zone"]
-            zone(time_zone)
-            end = utc(valid_until) if valid_until is not None else row["valid_until"]
+            reference = parse_timing(row["timing"])
+            occurred_at = event.occurred_at if event is not None else None
+            rule, time_zone = resolve_schedule_timing(
+                timing if timing is not None else reference,
+                occurred_at=occurred_at,
+                time_zone=time_zone if time_zone is not None else row["time_zone"],
+                reference_timing=reference,
+            )
+            rule = self._timing(rule, now)
+            if timing is not None and event is not None:
+                self._check_new_instant(rule, now, time_zone, event)
+            end = row["valid_until"]
+            if valid_until is not None:
+                end = resolve_instant(valid_until, occurred_at=occurred_at, time_zone=time_zone)
+                scope["default_one_shot_validity"] = False
+            elif (
+                isinstance(rule, AtTiming)
+                and isinstance(reference, AtTiming)
+                and timing is not None
+                and scope.get(
+                    "default_one_shot_validity", end == reference.at + self.one_shot_grace
+                )
+            ):
+                end = rule.at + self.one_shot_grace
+                scope["default_one_shot_validity"] = True
+            if not isinstance(rule, AtTiming):
+                scope.pop("default_one_shot_validity", None)
             if end < now:
                 raise DomainError("invalid_input", "The new validity must not already have expired")
             changed_timing = timing is not None or time_zone != row["time_zone"]
-            following = next_due(rule, time_zone, now) if changed_timing else row["next_due_at"]
+            following = (
+                next_due(rule, time_zone, now, inclusive=isinstance(rule, AtTiming))
+                if changed_timing
+                else row["next_due_at"]
+            )
             if following is not None and following > end:
+                if timing is not None and event is not None:
+                    raise DomainError(
+                        "invalid_input", "No occurrence fits within the authorized validity"
+                    )
                 following = None
             if changed_timing:
                 self._skip_pending(tx, schedule_id, "rule_updated")
+                if rule != reference or time_zone != row["time_zone"]:
+                    self._retire_prepared(tx, schedule_id, "rule_updated")
+                    self._sync(tx, schedule_id)
             target = row["state"]
             if (
                 target == ScheduleState.ACTIVE

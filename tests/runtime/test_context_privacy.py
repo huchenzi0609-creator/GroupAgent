@@ -121,13 +121,13 @@ async def test_source_forgotten_between_initial_read_and_context_never_reaches_m
     original = h.coordinator._context
     changed = False
 
-    def at_boundary(actor, canonical):
+    def at_boundary(actor, canonical, **kwargs):
         nonlocal changed
         if not changed:
             assert canonical.text == request.text and secret in json.dumps(canonical.attachments)
             h.memory.forget(env.actor, event_ids=[source.id])
             changed = True
-        return original(actor, canonical)
+        return original(actor, canonical, **kwargs)
 
     monkeypatch.setattr(h.coordinator, "_context", at_boundary)
     with pytest.raises(DomainError) as caught:

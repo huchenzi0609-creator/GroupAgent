@@ -117,8 +117,8 @@ async def admitted(setup, text, *, outputs=None, input_versions=()):
     if input_versions:
         context_builder = coordinator._context
 
-        def known_inputs(actor, event):
-            context = context_builder(actor, event)
+        def known_inputs(actor, event, **kwargs):
+            context = context_builder(actor, event, **kwargs)
             for version_id in input_versions:
                 version = env.registry.get(actor, version_id)
                 context["files"].append(

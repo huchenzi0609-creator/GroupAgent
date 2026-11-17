@@ -1,0 +1,390 @@
+{
+  "format_version": 1,
+  "catalog_sha256": "fd793d311077cb5411f9013ea8690b52831100f6d2f80b83107c5c71f951cd44",
+  "cases": [
+    {
+      "id": "CHAT-01",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "useful_single_replies",
+        "single_badge",
+        "no_work_or_filler",
+        "latency"
+      ],
+      "replay": [
+        "tests/runtime/test_pot_acceptance_replay.py::test_name_and_simple_followup_are_one_useful_delivery_per_turn",
+        "tests/runtime/test_bot_identity.py::test_real_context_and_wire_identity_keep_shared_account_echo_receipt_based"
+      ]
+    },
+    {
+      "id": "CHAT-02",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "human_conversation_silent_with_context",
+        "natural_and_quoted_continuations",
+        "no_unrelated_effect"
+      ],
+      "replay": [
+        "tests/runtime/test_group_conversation_contract_replay.py::test_complete_redacted_group_dialogue_preserves_silence_style_and_real_commitments",
+        "tests/conversation/test_turn_contract.py::test_open_question_to_agent_establishes_continuation_for_same_member"
+      ]
+    },
+    {
+      "id": "CHAT-03",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "human_text_reaches_model",
+        "verified_echo_skips_model",
+        "uncertain_send_reconciled_once",
+        "exact_delivery_receipt"
+      ],
+      "replay": [
+        "tests/runtime/test_echo_fast_path.py::test_echo_uses_control_lane_without_idle_batch_or_history",
+        "tests/runtime/test_bot_identity.py::test_real_context_and_wire_identity_keep_shared_account_echo_receipt_based",
+        "tests/runtime/test_dispatch.py::test_long_reply_crash_reconciles_each_part_without_duplicate"
+      ]
+    },
+    {
+      "id": "CHAT-04",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "brief_plain_text",
+        "long_complete_cited_artifact",
+        "accepted_bytes"
+      ],
+      "replay": [
+        "tests/runtime/test_wechat_text.py::test_markdown_structure_becomes_readable_plain_text",
+        "tests/runtime/test_bot_identity.py::test_long_text_delivery_prefixes_each_chunk_once_and_keeps_the_full_body",
+        "tests/runtime/test_research_group_delivery.py::test_artifact_delivery_preserves_reviewed_requested_explanation_and_empty_fallback"
+      ]
+    },
+    {
+      "id": "CHAT-05",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "immediate_silence",
+        "pending_notice_retired",
+        "authorized_work_retained"
+      ],
+      "replay": [
+        "tests/runtime/test_group_conversation_contract_replay.py::test_complete_redacted_group_dialogue_preserves_silence_style_and_real_commitments",
+        "tests/runtime/test_quiet_policy.py::test_quiet_barrier_retires_old_replies_and_preserves_accepted_work",
+        "tests/runtime/test_quiet_policy.py::test_accepted_work_result_survives_quiet_but_autonomous_notice_is_held",
+        "tests/runtime/test_quiet_work_notices.py::test_pending_legacy_recovery_notice_cannot_be_sent"
+      ]
+    },
+    {
+      "id": "GROUP-01",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "initial_room_roster",
+        "stable_missing_and_duplicate_names",
+        "single_manual_update",
+        "on_demand_refresh_only"
+      ],
+      "replay": [
+        "tests/memory/test_members.py::test_startup_sync_is_once_across_service_restart",
+        "tests/memory/test_members.py::test_room_name_wins_and_missing_room_uses_owner_exception",
+        "tests/memory/test_members.py::test_same_names_and_rename_never_transfer_task_ownership",
+        "tests/runtime/test_roster_queries.py::test_natural_query_refreshes_name_through_the_roster_tool",
+        "tests/runtime/test_roster_queries.py::test_group_change_reads_cache_once_without_remote_refresh"
+      ]
+    },
+    {
+      "id": "GROUP-02",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "claim_and_progress_one_owner_record",
+        "tentative_comment_no_write",
+        "lists_separate_types"
+      ],
+      "replay": [
+        "tests/runtime/test_app.py::test_self_claim_commits_once_without_second_confirmation",
+        "tests/runtime/test_team_tools.py::test_claim_then_update_tracks_field_sources_without_fabricating_title_author",
+        "tests/runtime/test_group_conversation_contract_replay.py::test_complete_redacted_group_dialogue_preserves_silence_style_and_real_commitments"
+      ]
+    },
+    {
+      "id": "GROUP-03",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "long_history_and_restart_recall",
+        "structured_facts_provenance",
+        "withdrawn_and_foreign_absent"
+      ],
+      "replay": [
+        "tests/memory/test_compaction.py::test_summary_and_cursor_survive_process_restart",
+        "tests/memory/test_compaction.py::test_provider_result_cannot_commit_after_revocation",
+        "tests/runtime/test_work_awareness_dialogue.py::test_public_work_facts_hide_foreign_group_and_participants_only_topic",
+        "tests/runtime/test_context_privacy.py::test_forgotten_task_source_is_not_reintroduced_through_memory_hit",
+        "tests/runtime/test_context_selection.py::test_fact_recall_keeps_authorship_and_source_limits_with_aliases"
+      ]
+    },
+    {
+      "id": "WORK-01",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "example_without_execution",
+        "actual_python_stdout",
+        "work_and_delivery_receipts"
+      ],
+      "replay": [
+        "tests/runtime/test_group_conversation_contract_replay.py::test_complete_redacted_group_dialogue_preserves_silence_style_and_real_commitments",
+        "tests/sandbox/test_worker.py::test_real_compute_input_output_stdin_and_no_host_mount",
+        "tests/runtime/test_app.py::test_end_to_end_local_spool_actual_database_and_restart"
+      ]
+    },
+    {
+      "id": "WORK-02",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "same_version_for_progress_and_quote",
+        "empty_state_honest",
+        "fresh_topic_without_old_work",
+        "no_write_from_lookup"
+      ],
+      "replay": [
+        "tests/runtime/test_work_awareness_dialogue.py::test_full_synthetic_dialogue_retains_two_real_works_after_topic_change_and_delivery",
+        "tests/runtime/test_work_facts.py::test_reads_and_rejected_reads_never_claim_work_or_create_audit_rows",
+        "tests/runtime/test_work_query_outcomes.py::test_empty_overview_never_substitutes_for_a_complete_historical_lookup"
+      ]
+    },
+    {
+      "id": "WORK-03",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "exact_authorized_cancel_set",
+        "revision_race_reread",
+        "only_essential_clarification"
+      ],
+      "replay": [
+        "tests/runtime/test_app.py::test_fast_control_quote_never_cancels_other_own_work",
+        "tests/runtime/test_work_awareness_dialogue.py::test_read_query_refreshes_a_running_to_delivering_race_without_write_cas",
+        "tests/runtime/test_host_effect_reconciler.py::test_cancellation_after_host_proof_wins_before_supervisor_compare_and_swap",
+        "tests/runtime/test_work_facts.py::test_actor_group_requester_and_turn_boundary_are_respected"
+      ]
+    },
+    {
+      "id": "WORK-04",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "healthy_chat_latency_during_work",
+        "one_useful_admission",
+        "fault_recovery_preserves_version",
+        "valid_result_accepted"
+      ],
+      "replay": [
+        "tests/runtime/test_durable_worker_pipeline.py::test_missing_output_recovers_across_restart_and_delivers_valid_illustrated_pdf",
+        "tests/runtime/test_quiet_work_notices.py::test_automatic_recovery_has_no_notice_and_is_presented_as_background_work",
+        "tests/runtime/test_resource_profile.py::test_heavy_tool_admission_leaves_conversation_and_control_lane_free",
+        "tests/execution/test_durable_recovery_acceptance.py::test_slow_external_receipt_inspection_does_not_starve_other_authorized_work"
+      ]
+    },
+    {
+      "id": "WORK-05",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "failure_visible_and_fallback_advances",
+        "restart_and_duplicate_at_most_once",
+        "only_actual_missing_input",
+        "no_false_completion_or_spin"
+      ],
+      "replay": [
+        "tests/execution/test_durable_recovery_acceptance.py::test_safe_activation_yield_is_queued_durably_and_restart_never_repeats_completed_tool",
+        "tests/execution/test_durable_recovery_acceptance.py::test_real_unknown_effect_keeps_durable_inspection_and_is_never_replayed",
+        "tests/execution/test_durable_recovery_acceptance.py::test_essential_question_uses_visible_scope_text_and_keeps_original_checkpoint",
+        "tests/research/test_read_recovery.py::test_failed_read_allows_another_source_and_partial_candidate",
+        "tests/runtime/test_pot_acceptance_replay.py::test_natural_literal_reminder_reconciles_lost_ack_after_restart"
+      ]
+    },
+    {
+      "id": "TIME-01",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "one_due_from_event_anchor_and_shanghai_display",
+        "status_before_and_after",
+        "one_accepted_reminder"
+      ],
+      "replay": [
+        "tests/runtime/test_pot_acceptance_replay.py::test_natural_literal_reminder_reconciles_lost_ack_after_restart",
+        "tests/runtime/test_literal_schedules.py::test_explicit_message_and_timing_updates_never_create_work"
+      ]
+    },
+    {
+      "id": "TIME-02",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "natural_offsets_and_cross_midnight",
+        "late_event_not_reanchored",
+        "ambiguity_and_discussion_no_rule"
+      ],
+      "replay": [
+        "tests/runtime/test_pot_acceptance_replay.py::test_natural_schedule_time_is_anchored_even_when_late",
+        "tests/runtime/test_literal_schedules.py::test_explicit_message_and_timing_updates_never_create_work",
+        "tests/scheduling/test_postgres_scheduler.py::test_one_shot_catchup_has_exact_bounded_grace",
+        "tests/scheduling/test_recurrence.py::test_ambiguous_or_invalid_timing_is_rejected"
+      ]
+    },
+    {
+      "id": "TIME-03",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "recurring_rule_updated_in_place",
+        "cross_zone_dst_policy",
+        "cancel_stops_future_receipts",
+        "concurrent_restart_one_occurrence"
+      ],
+      "replay": [
+        "tests/scheduling/test_recurrence.py::test_nonexistent_dst_wall_time_is_skipped",
+        "tests/scheduling/test_recurrence.py::test_repeated_dst_wall_time_runs_once_at_first_fold",
+        "tests/scheduling/test_postgres_scheduler.py::test_restart_concurrent_scanners_and_clock_rollback_do_not_duplicate",
+        "tests/scheduling/test_postgres_scheduler.py::test_revision_update_preserves_occurrence_history",
+        "tests/scheduling/test_postgres_scheduler.py::test_pause_resume_and_cancel_revoke_work_leases",
+        "tests/runtime/test_literal_schedules.py::test_latest_periodic_slot_and_crash_reconcile_use_one_native_key"
+      ]
+    },
+    {
+      "id": "TIME-04",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "prepared_due_while_worker_busy_without_model",
+        "conditional_work_uses_due_facts_and_silent_completion",
+        "rules_occurrences_receipts_distinct",
+        "quiet_respects_explicit_reminder"
+      ],
+      "replay": [
+        "tests/runtime/test_literal_schedules.py::test_personal_quiet_only_allows_exact_reminder_and_group_quiet_holds",
+        "tests/runtime/test_react_observations.py::test_clock_enqueues_prepared_send_while_maintenance_is_marked_active",
+        "tests/runtime/test_scheduled_silence.py::test_scheduled_look_can_finish_without_a_wechat_message",
+        "tests/runtime/test_pot_acceptance_replay.py::test_natural_literal_reminder_reconciles_lost_ack_after_restart"
+      ]
+    },
+    {
+      "id": "SEARCH-01",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "real_search_and_verified_official_source",
+        "fallback_after_injected_failure",
+        "useful_ack_latency",
+        "correct_final_steps"
+      ],
+      "replay": [
+        "tests/research/test_read_recovery.py::test_failed_read_allows_another_source_and_partial_candidate",
+        "tests/runtime/test_toolkit_contract.py::test_research_claim_without_actual_receipt_cannot_pass",
+        "tests/runtime/test_research_group_delivery.py::test_default_lookup_keeps_actual_provenance_internal_without_a_visible_bibliography"
+      ]
+    },
+    {
+      "id": "SEARCH-02",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "followup_same_work",
+        "real_download_conversion_dedup",
+        "source_manifest_and_delivered_file",
+        "accurate_partial_status"
+      ],
+      "replay": [
+        "tests/runtime/test_public_image_conversion.py::test_toolkit_accepts_jpeg_to_trusted_png_results_and_real_delivery_drafts",
+        "tests/runtime/test_public_image_conversion.py::test_requested_source_page_survives_reviewed_reused_image_delivery",
+        "tests/runtime/test_public_image_conversion.py::test_toolkit_two_encodings_of_one_source_cannot_satisfy_two_images",
+        "tests/research/test_public_images.py::test_real_worker_decode_precedes_mime_and_pixel_validation",
+        "tests/runtime/test_manual_request_regressions.py::test_existing_meme_request_starts_retrieval_without_image_generation"
+      ]
+    },
+    {
+      "id": "MEDIA-01",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "actual_image_text_and_description",
+        "identity_inference_bounded",
+        "actual_asr_code_and_downstream_provenance"
+      ],
+      "replay": [
+        "tests/media/test_sandbox_media.py::test_real_isolated_image_and_english_chinese_ocr",
+        "tests/media/test_sandbox_media.py::test_real_audio_normalization_and_chunking",
+        "tests/memory/test_audio_provenance.py::test_authenticated_asr_can_reply_only_for_original_audio_sender",
+        "tests/runtime/test_vision_evidence_contract.py::test_original_view_mapping_survives_long_text_and_checks_current_candidate",
+        "tests/runtime/test_manual_request_regressions.py::test_person_identity_question_returns_an_explicit_boundary_without_starting_work"
+      ]
+    },
+    {
+      "id": "FILE-01",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "quoted_current_version",
+        "original_and_new_version_survive",
+        "parsed_word_pdf_ppt_content",
+        "three_accepted_file_receipts"
+      ],
+      "replay": [
+        "tests/artifacts/test_isolated_matrix.py::test_real_isolated_ten_case_matrix",
+        "tests/artifacts/test_isolated_matrix.py::test_real_native_docx_read_search_edit_uses_returned_locator",
+        "tests/runtime/test_dispatch.py::test_file_bundle_preserves_partial_success_and_actual_bytes",
+        "tests/runtime/test_work_awareness_dialogue.py::test_full_synthetic_dialogue_retains_two_real_works_after_topic_change_and_delivery"
+      ]
+    },
+    {
+      "id": "PROACTIVE-01",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "model_shadow_proposal_or_silence",
+        "enabled_valid_notice_once",
+        "completed_withdrawn_expired_and_quiet_suppressed"
+      ],
+      "replay": [
+        "tests/runtime/test_react_observations.py::test_shadow_replays_only_fresh_facts_after_interrupted_react",
+        "tests/runtime/test_react_observations.py::test_observer_rechecks_state_after_model_and_again_at_the_sender",
+        "tests/runtime/test_react_observations.py::test_transient_observer_failure_retries_original_observation"
+      ]
+    },
+    {
+      "id": "EVOLVE-01",
+      "blind_level": "isolated_infrastructure",
+      "blind_checks": [
+        "independent_improvement_and_rollback",
+        "authorization_scope",
+        "tamper_rejected",
+        "real_sandbox_and_release_gate"
+      ],
+      "replay": [
+        "tests/evolution/test_development.py::test_independent_isolated_development_evaluation",
+        "tests/evolution/test_registry.py::test_strategy_approval_restart_rollback_and_withdrawal",
+        "tests/evolution/test_registry.py::test_code_gateway_to_evaluated_development_version"
+      ]
+    },
+    {
+      "id": "OPS-01",
+      "blind_level": "isolated_infrastructure",
+      "blind_checks": [
+        "two_gib_host_limits_and_dynamic_headroom",
+        "concurrent_chat_and_reminder_latency",
+        "migration_and_receipt_equivalence",
+        "channel_and_minigame_continuity"
+      ],
+      "replay": [
+        "tests/runtime/test_resource_profile.py::test_heavy_tool_admission_leaves_conversation_and_control_lane_free",
+        "tests/runtime/test_controller_resource_admission.py::test_queued_research_reaches_candidate_and_validation_below_worker_threshold",
+        "tests/sandbox/test_lowmem_profile.py::test_generate_and_render_one_office_document_at_512mb",
+        "tests/sandbox/test_lowmem_profile.py::test_offline_chromium_at_512mb",
+        "tests/ops/test_release_schema16.py::test_executable_release_orders_old_backup_before_candidate_migration",
+        "tests/ops/test_backup.py::test_real_consistent_dump_restore_checks_hashes_and_quarantines"
+      ]
+    },
+    {
+      "id": "OPS-02",
+      "blind_level": "deepseek_local",
+      "blind_checks": [
+        "migration_and_long_task_past_old_limits",
+        "genuine_provider_rate_limit_and_resume",
+        "same_work_and_attempt_charge_records"
+      ],
+      "replay": [
+        "tests/persistence/test_unlimited_budget_migration.py::test_unlimited_upgrade_retains_old_checksums_ledger_and_administrative_freeze",
+        "tests/billing/test_unlimited_budget.py::test_unlimited_preserves_all_charge_states_and_admits_beyond_exhausted_old_limits",
+        "tests/execution/test_optional_token_limit.py::test_owner_can_remove_old_cap_and_resume_without_resetting_usage",
+        "tests/execution/test_durable_recovery_acceptance.py::test_repeated_validation_faults_have_no_total_attempt_cutoff_and_eventually_deliver_once",
+        "tests/execution/test_model_recovery.py::test_live_recovery_keeps_unknown_reservation_and_does_not_replay_tools"
+      ]
+    }
+  ]
+}

@@ -72,8 +72,8 @@ async def test_enumerated_ppt_rechecks_source_after_context_snapshot(runtime_env
     request = await ingest(env, app, SPEC)
     original = app.coordinator._context
 
-    def withdrawn(actor, value):
-        context = original(actor, value)
+    def withdrawn(actor, value, **kwargs):
+        context = original(actor, value, **kwargs)
         app.coordinator.memory.forget(env.actor, event_ids=[request.id])
         return context
 

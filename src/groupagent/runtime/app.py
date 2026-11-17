@@ -63,6 +63,7 @@ from .contracts import ProcessLease
 from .dispatch import Dispatcher
 from .effect_reconciler import UnpublishedDraftReconciler
 from .executor import WorkSupervisor
+from .foreground_research import ForegroundResearch
 from .inputs import InputProcessor
 from .notices import NoticeService
 from .observers import ProactiveObserver
@@ -1155,6 +1156,9 @@ def build_app(
         members=members,
         scheduler=scheduler,
         artifacts=registry,
+        foreground_tools=ForegroundResearch(research, ledger)
+        if config.features.web_research
+        else None,
     )
 
     def resolve(member_id):

@@ -1,10 +1,8 @@
 """Opt-in public research tools. Registering does not add them to any work grant."""
 
 import asyncio
-import hashlib
 import math
 from collections.abc import Awaitable, Callable
-from decimal import Decimal
 from typing import Any
 
 from groupagent.domain import DomainError
@@ -14,6 +12,7 @@ from groupagent.tools import IdempotencyMode, ToolContext, ToolDefinition, ToolG
 from .browser import BrowserObservation, ControlledBrowser
 from .deepseek import DeepSeekResearchClient
 from .evidence import EvidenceStore
+from .metering import meter_public_read
 from .models import (
     FetchInput,
     FetchOutput,
@@ -81,42 +80,20 @@ def register_research_tools(
         key = context.idempotency_key + ":web." + operation
         if number:
             key += ":retry:" + str(number)
-        reservation = await asyncio.to_thread(
-            budget.reserve,
+
+        async def request():
+            check_attempt(context)
+            return await call(arguments)
+
+        return await meter_public_read(
+            budget,
             context.actor,
-            key,
-            "web." + operation,
-            price_ids[operation],
-            {"calls": Decimal(1)},
+            key=key,
+            operation="web." + operation,
+            price_id=price_ids[operation],
+            request=request,
             work_id=context.work_id,
         )
-        if not reservation.is_new or not await asyncio.to_thread(
-            budget.begin, context.actor, reservation.id
-        ):
-            raise DomainError(
-                "provider_reconciliation_required",
-                "Research attempt already has a durable budget reservation",
-            )
-        try:
-            check_attempt(context)
-            result = await call(arguments)
-            evidence = (
-                "web."
-                + operation
-                + ":"
-                + hashlib.sha256(result.model_dump_json().encode()).hexdigest()
-            )
-            settled = await asyncio.to_thread(
-                budget.settle, context.actor, reservation.id, {"calls": Decimal(1)}, evidence
-            )
-            if settled.overrun and settled.limits_enabled:
-                raise DomainError("budget_overrun", "Research exceeded its monetary reservation")
-            return result.model_copy(update={"budget_receipt": reservation.id})
-        except BaseException:
-            await asyncio.to_thread(
-                budget.unknown, context.actor, reservation.id, "research_call_incomplete"
-            )
-            raise
 
     async def paid(operation: str, arguments, context: ToolContext):
         for number in range(additional_retry_limit + 1):

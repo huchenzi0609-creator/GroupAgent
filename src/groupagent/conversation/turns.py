@@ -50,7 +50,11 @@ class FinishTurn(TurnData):
             "acknowledgements, scheduling times and work phases."
         ),
     )
-    reports: list[TurnReport] = Field(default_factory=list, max_length=20)
+    reports: list[TurnReport] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Optional evidence references. The host acknowledges committed effects automatically.",
+    )
     needs_input: StrictBool = False
     requested_silence: StrictBool = Field(
         default=False,

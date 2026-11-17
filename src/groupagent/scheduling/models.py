@@ -153,6 +153,7 @@ class ScheduleDeliveryFacts(DomainModel):
 class ScheduleOccurrenceFacts(DomainModel):
     id: str
     scheduled_at: AwareDatetime
+    scheduled_local: str | None = None
     state: OccurrenceState
     reason: str | None = None
     work_id: str | None = None
@@ -170,6 +171,8 @@ class ScheduleFacts(DomainModel):
     timing: Timing
     valid_until: AwareDatetime
     next_due_at: AwareDatetime | None
+    next_due_local: str | None = None
+    timing_source_local: str | None = None
     pause_reason: str | None
     owned_by_requester: bool
     allow_silent_result: bool = False

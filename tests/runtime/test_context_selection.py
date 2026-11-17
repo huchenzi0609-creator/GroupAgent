@@ -56,6 +56,24 @@ def test_native_quoted_followup_consumes_only_relevant_work(runtime_env):
     assert other.goal not in json.dumps(public_context(context), ensure_ascii=False)
 
 
+def test_agent_context_keeps_recent_evidence_across_apparent_topic_changes(runtime_env):
+    env = runtime_env
+    h = harness(env)
+    now = datetime.now(UTC).replace(microsecond=0)
+    earlier = emit(env, "合成小组件的作者刚提供了代号雨桥。", at=now - timedelta(seconds=15))
+    request = emit(env, "Pot，搜索这个作者的官网。", at=now)
+    later = emit(env, "尚未到达当前上下文的后续消息。", at=now + timedelta(seconds=1))
+
+    context = h.coordinator._context(env.actor, request, model_led=True)
+
+    assert context["recent_messages"][0]["id"] == earlier.id
+    assert context["conversation_focus"] == "discussion"
+    assert context["context_coverage"]["schedules"] == "preview"
+    assert later.id not in context["_snapshot"]["source_fingerprints"]
+    assert datetime.fromisoformat(context["model_event"]["occurred_at"]) == now
+    assert context["model_event"]["occurred_at"].endswith("+08:00")
+
+
 def test_unrelated_task_revision_is_not_a_chat_dependency(runtime_env):
     env = runtime_env
     h = harness(env)

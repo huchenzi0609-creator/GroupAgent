@@ -54,7 +54,7 @@ async def test_recall_of_known_bot_message_still_runs_privacy_handler(runtime_en
             app.coordinator.memory, "recall", lambda *args, **kwargs: calls.append(args)
         )
 
-        def after_recall(*args):
+        def after_recall(*args, **kwargs):
             raise AssertionError("context_after_recall")
 
         monkeypatch.setattr(app.coordinator, "_context", after_recall)

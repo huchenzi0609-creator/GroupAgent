@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "dataset_sha256": "7be45936cf4da43192bafc0498af81cb685d74385af7e47f675d79364d7f4d74",
+  "case_ids": [
+    "CHAT-01",
+    "CHAT-02",
+    "CHAT-03",
+    "CHAT-04",
+    "CHAT-05",
+    "GROUP-01",
+    "GROUP-02",
+    "GROUP-03",
+    "WORK-01",
+    "WORK-02",
+    "WORK-03",
+    "WORK-04",
+    "WORK-05",
+    "TIME-01",
+    "TIME-02",
+    "TIME-03",
+    "TIME-04",
+    "SEARCH-01",
+    "SEARCH-02",
+    "MEDIA-01",
+    "FILE-01",
+    "PROACTIVE-01",
+    "EVOLVE-01",
+    "OPS-01",
+    "OPS-02"
+  ],
+  "visibility": "Independent synthetic cases kept outside the implementation/test fixture tree; prompts frozen before calling the real model"
+}

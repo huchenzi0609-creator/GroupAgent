@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -36,6 +36,7 @@ from groupagent.domain import (
     WorkOrder,
     WorkState,
 )
+from groupagent.execution.kernel import KernelTool
 from groupagent.identity import BotIdentity, control_request
 from groupagent.memory import MemberService, MemoryService
 from groupagent.persistence import PostgresStore, UnitOfWork
@@ -44,6 +45,7 @@ from groupagent.runtime.input_selection import canonicalize_input_selection
 from groupagent.runtime.tool_selection import message_only_research_request
 from groupagent.runtime.work_facts import WorkFacts
 from groupagent.scheduling import Scheduler
+from groupagent.scheduling.temporal import clock_snapshot, resolve_instant
 from groupagent.security import redact_credentials
 from groupagent.vision_policy import FACE_ID_RESPONSE, requests_face_identification
 
@@ -102,6 +104,11 @@ _ERRORS = {
     "quota_exceeded": "这项操作超出了当前额度，我先保留现有安排。",
     "source_unavailable": "相关内容已不可用，我不会继续引用或处理它。",
     "unsupported_schedule": "目前支持一次性、按小时、每日或每周的安排。",
+    "invalid_schedule_time": "这项安排的时间无法确定，请补充日期、时区或要调整的安排。",
+    "nonexistent_local_time": "当地换时后跳过了这个时刻，请指定另一个时间。",
+    "ambiguous_dst_fold": "当地换时让这个时刻出现两次，请指定第一次或第二次。",
+    "schedule_time_missed": "这条消息对应的提醒时间已经过去了，未创建新提醒。",
+    "reminder_text_mismatch": "逐字提醒须使用本条消息中的原话。普通提醒可用改写后的通知内容。",
     "invalid_input": "这项操作还缺少清楚的时间或对象，请补充一下。",
     "selection_incomplete": "对象范围尚未完整确定，这次没有执行修改。",
 }
@@ -169,6 +176,8 @@ class ConversationCoordinator(Coordinator):
         scheduler: Scheduler,
         artifacts: ArtifactRegistry | None = None,
         clock: Callable[[], datetime] | None = None,
+        foreground_tools: Callable[[ActorContext, GroupEvent, dict[str, Any]], Iterable[KernelTool]]
+        | None = None,
     ) -> None:
         super().__init__(config, store, ObserveOnlyProvider())
         self.provider_factory, self.memory, self.members, self.scheduler = (
@@ -178,6 +187,7 @@ class ConversationCoordinator(Coordinator):
             scheduler,
         )
         self.artifacts, self.clock = artifacts, clock or (lambda: datetime.now(UTC))
+        self.foreground_tools = foreground_tools
         self.identity = BotIdentity.from_runtime(config.runtime)
         self.execution_guard: Callable[..., None] = lambda *args: None
         self.refresh_roster: (
@@ -263,10 +273,28 @@ class ConversationCoordinator(Coordinator):
         return bool(intent and intent.subject == "group" and intent.operation == "participation")
 
     def _context(
-        self, actor: ActorContext, event: GroupEvent, query: ContextQuery | None = None
+        self,
+        actor: ActorContext,
+        event: GroupEvent,
+        query: ContextQuery | None = None,
+        *,
+        model_led: bool = False,
     ) -> dict[str, Any]:
-        query = query or ContextQuery.from_event(event, self.identity)
-        if control_request(event.text, identity=self.identity) is not None:
+        if query is None:
+            if (
+                model_led
+                and event.kind in {EventKind.TEXT, EventKind.QUOTE}
+                and control_request(event.text, identity=self.identity) is not None
+            ):
+                # Complete immediate stop commands retain the trusted focus needed by the fence.
+                query = ContextQuery(resources=frozenset({"works"}), continuation=True)
+            else:
+                query = (
+                    ContextQuery.for_agent(event)
+                    if model_led
+                    else ContextQuery.from_event(event, self.identity)
+                )
+        if not model_led and control_request(event.text, identity=self.identity) is not None:
             query = replace(
                 query, new_request=False, continuation=True, resources=query.resources | {"works"}
             )
@@ -899,6 +927,15 @@ class ConversationCoordinator(Coordinator):
                 results.append(part_result)
                 replies.append(reply)
             return {"actions": results}, "\n".join(replies)
+        due_at = (
+            resolve_instant(
+                action.due_at,
+                occurred_at=event.occurred_at,
+                time_zone=self.config.group.time_zone,
+            )
+            if isinstance(action, (ClaimTask, AssignTask, UpdateTask)) and action.due_at is not None
+            else None
+        )
         if isinstance(action, ClaimTask):
             if action.task_id:
                 task = tx.claim_team_task(
@@ -927,7 +964,7 @@ class ConversationCoordinator(Coordinator):
                         )
                 else:
                     task = tx.create_team_task(
-                        action.title, due_at=action.due_at, source_event_id=event.id
+                        action.title, due_at=due_at, source_event_id=event.id
                     )
             if action.due_note:
                 task = tx.update_team_task(
@@ -961,7 +998,7 @@ class ConversationCoordinator(Coordinator):
                 )
             else:
                 task = tx.create_team_task(
-                    action.title, owner_id=member_id, due_at=action.due_at, source_event_id=event.id
+                    action.title, owner_id=member_id, due_at=due_at, source_event_id=event.id
                 )
             if action.due_note:
                 task = tx.update_team_task(
@@ -980,11 +1017,11 @@ class ConversationCoordinator(Coordinator):
         if isinstance(action, UpdateTask):
             options = {
                 key: getattr(action, key)
-                for key in ("title", "progress", "evidence_refs", "due_at")
+                for key in ("title", "progress", "evidence_refs")
                 if key in action.model_fields_set and getattr(action, key) is not None
             }
-            if action.clear_due:
-                options["due_at"] = None
+            if action.clear_due or due_at is not None:
+                options["due_at"] = due_at
             if action.status is not None:
                 options["status"] = TeamTaskState(action.status)
             if action.due_note:
@@ -993,7 +1030,7 @@ class ConversationCoordinator(Coordinator):
                 options["progress"] = (
                     (progress + "\n" if progress else "") + "截止安排：" + action.due_note
                 )
-                if action.due_at is None:
+                if due_at is None:
                     options["due_at"] = None
             task = tx.update_team_task(
                 action.task_id,
@@ -1061,7 +1098,7 @@ class ConversationCoordinator(Coordinator):
             if next_due is None:
                 response = "这项安排已更新。当前没有下一次执行时间。"
             else:
-                response = f"已安排。下一次是 {next_due}（{rule.time_zone}）。"
+                response = f"已安排「{rule.title}」。下一次是 {next_due}（{rule.time_zone}）。"
                 if rule.timing.kind != "at":
                     response += f"这项周期安排有效至 {until}。"
             return {
@@ -1072,6 +1109,7 @@ class ConversationCoordinator(Coordinator):
                 "next_due_at": rule.next_due_at.isoformat() if rule.next_due_at else None,
                 "valid_until": rule.valid_until.isoformat(),
                 "time_zone": rule.time_zone,
+                "timing": rule.timing.model_dump(mode="json"),
             }, response
         if isinstance(action, ControlSchedule):
             method = getattr(self.scheduler.in_tx(tx), action.command)
@@ -1137,12 +1175,15 @@ class ConversationCoordinator(Coordinator):
                 raise DomainError(
                     "permission_denied", "Only the owner changes group-wide participation"
                 )
-            if (
-                isinstance(action, Quiet)
-                and action.until is not None
-                and action.until <= self.clock()
-            ):
-                raise DomainError("invalid_input", "Quiet period must end in the future")
+            quiet_until = None
+            if isinstance(action, Quiet) and action.until is not None:
+                quiet_until = resolve_instant(
+                    action.until,
+                    occurred_at=event.occurred_at,
+                    time_zone=self.config.group.time_zone,
+                )
+                if quiet_until <= self.clock():
+                    raise DomainError("invalid_input", "Quiet period must end in the future")
             tx.conn.execute(
                 "INSERT INTO ga_conversation_policy(group_id,subject_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
                 (tx.group_id, subject),
@@ -1150,7 +1191,7 @@ class ConversationCoordinator(Coordinator):
             if isinstance(action, Quiet):
                 tx.conn.execute(
                     "UPDATE ga_conversation_policy SET quiet=%s,quiet_until=%s,quiet_hours=%s,revision=revision+1 WHERE group_id=%s AND subject_id=%s",
-                    (action.enabled, action.until, action.hours or [], tx.group_id, subject),
+                    (action.enabled, quiet_until, action.hours or [], tx.group_id, subject),
                 )
                 if action.enabled:
                     apply_quiet_barrier_in_tx(tx, event, subject)
@@ -1364,23 +1405,34 @@ class ConversationCoordinator(Coordinator):
     def _bind_agent_tools(
         self, actor: ActorContext, event: GroupEvent, context: dict[str, Any]
     ) -> None:
+        def read_clock() -> dict[str, str]:
+            return clock_snapshot(
+                occurred_at=event.occurred_at,
+                now=self.clock(),
+                time_zone=self.config.group.time_zone,
+            )
+
         async def assert_source() -> None:
             with self.store.transaction(actor, trace_id=event.id) as tx:
                 self.execution_guard(tx)
                 self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
 
         async def read_group_context(resource: str, term: str | None) -> Any:
+            if resource == "clock":
+                await assert_source()
+                return read_clock()
             status = None
             if resource == "members" and self.refresh_roster is not None:
                 status = await self.refresh_roster(actor, event, context)
             query = ContextQuery(
                 resources=frozenset({resource}),
+                model_led=True,
                 roster=resource == "members",
                 operations=resource == "runtime",
                 memory_terms=(term,) if resource == "memory" and term else (),
                 fact_predicate=term if resource == "memory" and term else None,
             )
-            loaded = self._context(actor, event, query)
+            loaded = self._context(actor, event, query, model_led=True)
             schedule_facts: list[dict[str, Any]] = []
             with self.store.transaction(actor, trace_id=event.id) as tx:
                 self.memory.prepare_in_tx(tx)
@@ -1565,6 +1617,9 @@ class ConversationCoordinator(Coordinator):
         context["_read_group_context"] = read_group_context
         context["_assert_session_source"] = assert_source
         context["_apply_business_action"] = apply_action
+        context["clock"] = read_clock()
+        if self.foreground_tools is not None:
+            context["_foreground_tools"] = tuple(self.foreground_tools(actor, event, context))
 
         async def authorize_work_repair(
             work_id: str, expected_goal_revision: int
@@ -1974,7 +2029,7 @@ class ConversationCoordinator(Coordinator):
                         return legacy_policy
         if event.kind == EventKind.RECALL:
             self.memory.recall(self.service_actor, event.id, now=self.clock())
-        context = self._context(actor, event)
+        context = self._context(actor, event, model_led=react_session)
         context["_react_session"] = react_session
         if previous and previous.get("agent_needs_execution"):
             if previous.get("turn_contract") and not react_session:
@@ -2143,7 +2198,8 @@ class ConversationCoordinator(Coordinator):
             candidate_digest = hashlib.sha256(decision.model_dump_json().encode()).hexdigest()
             if previous:
                 if tool_call_id and previous.get("agent_pending_response"):
-                    for receipt in previous.get("action_receipts", []):
+                    receipts = previous.get("action_receipts", [])
+                    for receipt in receipts:
                         if receipt.get("tool_call_id") == tool_call_id:
                             if receipt.get("candidate_sha256") != candidate_digest:
                                 raise DomainError(
@@ -2152,6 +2208,7 @@ class ConversationCoordinator(Coordinator):
                             return CoordinationResult.model_validate(receipt["result"]).model_copy(
                                 update={"duplicate": True}
                             )
+                    for receipt in receipts:
                         if receipt.get("candidate_sha256") == candidate_digest:
                             # Bind a second call ID to the same receipt as well;
                             # it must never be reusable for a different action.
@@ -2844,13 +2901,18 @@ class ConversationCoordinator(Coordinator):
                         decision = decision.model_copy(update={"response": text})
             except (DomainError, ValidationError) as error:
                 context["_snapshot"] = original_snapshot
+                if tool_call_id is not None and isinstance(error, DomainError) and error.retryable:
+                    raise
                 code = error.code if isinstance(error, DomainError) else "invalid_input"
+                response = _ERRORS.get(code, "这项操作暂时无法完成，现有记录已保留。")
+                if code == "schedule_time_missed" and isinstance(error, DomainError):
+                    response = str(error)
                 decision = Decision(
                     kind="clarify"
                     if code in {"ambiguous_reference", "not_found", "invalid_input"}
                     else "reply",
                     reason_code=code,
-                    response=_ERRORS.get(code, "这项操作暂时无法完成，现有记录已保留。"),
+                    response=response,
                     directness="direct",
                     confidence=1,
                 )

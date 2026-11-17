@@ -6,7 +6,7 @@ when clocks repeat. Aware one-shot timestamps already identify a unique instant.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from groupagent.domain import DomainError
@@ -26,12 +26,16 @@ def zone(name: str) -> ZoneInfo:
         raise DomainError("invalid_timezone", "Time zone must be a known IANA name") from error
 
 
-def _wall(day: date, timing: DailyTiming | WeeklyTiming, tz: ZoneInfo) -> datetime | None:
-    naive = datetime.combine(day, timing.local_time)
-    candidate = naive.replace(tzinfo=tz, fold=0).astimezone(UTC)
+def wall_instant(day: date, local_time: time, tz: ZoneInfo, *, fold: int = 0) -> datetime | None:
+    naive = datetime.combine(day, local_time)
+    candidate = naive.replace(tzinfo=tz, fold=fold).astimezone(UTC)
     if candidate.astimezone(tz).replace(tzinfo=None) != naive:
         return None
     return candidate
+
+
+def _wall(day: date, timing: DailyTiming | WeeklyTiming, tz: ZoneInfo) -> datetime | None:
+    return wall_instant(day, timing.local_time, tz)
 
 
 def next_due(
