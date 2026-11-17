@@ -212,7 +212,7 @@ async def test_requested_source_page_survives_reviewed_reused_image_delivery(
     assert len(accepted.deliveries) == 3
     assert not setup.http_calls
     review = json.loads(setup.model.requests[-1].messages[1].content)
-    assert review["original_request"]["text"] == request
+    assert review["human_requirements"]["requests"][0]["text"] == request
     assert all(
         "page_retrieved_at" in artifact["public_image_source"] for artifact in review["artifacts"]
     )
