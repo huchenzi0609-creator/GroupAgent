@@ -48,6 +48,7 @@ async def test_expired_relative_schedule_cannot_be_reanchored_in_same_turn(conve
         return call(
             "apply_business_action",
             "bad-new-time",
+            request_evidence=event.text,
             action={
                 "op": "create_schedule",
                 "title": "改头换面的旧提醒",
@@ -61,11 +62,83 @@ async def test_expired_relative_schedule_cannot_be_reanchored_in_same_turn(conve
         assert receipt["code"] == "schedule_time_missed" and not receipt["committed"]
         return finish("原先约的时刻已过。")
 
-    model = ModelScript(call("apply_business_action", "missed", action=first), retry, acknowledge)
+    model = ModelScript(
+        call("apply_business_action", "missed", action=first, request_evidence=event.text),
+        retry,
+        acknowledge,
+    )
     env.models[event.id] = model
     result = await env.coordinator.process(event)
     assert "时刻已过" in result.decision.response
     assert env.coordinator.scheduler.list(env.actor) == []
+
+
+@pytest.mark.postgres
+async def test_status_query_cannot_recreate_reminder_or_downgrade_literal(conversation_env):
+    env = conversation_env
+    now = datetime(2031, 5, 17, 9, 11, tzinfo=UTC)
+    env.coordinator.clock = lambda: now
+    original = ingest(env, "Pot，六分钟后逐字提醒我检查标签。", now, now)
+    literal = {
+        "op": "create_schedule",
+        "title": "检查标签",
+        "timing": {"kind": "after", "amount": 6, "unit": "minutes"},
+        "prepared_message": {"text": "检查标签", "purpose": "explicit_reminder"},
+    }
+    env.models[original.id] = ModelScript(
+        call(
+            "apply_business_action",
+            "original",
+            action=literal,
+            request_evidence=original.text,
+            finish_on_commit=True,
+        )
+    )
+    created = await env.coordinator.process(original)
+    assert created.action_result
+    intended_id = created.action_result["schedule_id"]
+    now += timedelta(seconds=1)
+    question = ingest(env, "Pot，那项提醒已经登记了吗？", now, now)
+
+    def missing_evidence(request):
+        rejected = tool_receipt(request)
+        assert not rejected["committed"]
+        assert rejected["issues"][0]["code"] == "schedule_request_evidence_required"
+        return call(
+            "apply_business_action",
+            "unjustified-literal",
+            action=literal,
+            request_evidence=question.text,
+        )
+
+    def after_literal_refusal(request):
+        assert tool_receipt(request)["code"] == "reminder_text_mismatch"
+        return call(
+            "apply_business_action",
+            "unjustified-paraphrase",
+            action={**literal, "prepared_message": {"text": "检查标签", "purpose": "notification"}},
+            request_evidence=question.text,
+        )
+
+    def inspect_existing(request):
+        rejected = tool_receipt(request)
+        assert rejected["code"] == "reminder_text_mismatch" and not rejected["committed"]
+        return call("read_group_context", "existing-rules", resource="schedules")
+
+    def report_existing(request):
+        assert [rule["id"] for rule in tool_receipt(request)["facts"]["facts"]] == [intended_id]
+        return finish("原来那条提醒已登记，正在等待到点。")
+
+    env.models[question.id] = ModelScript(
+        call("apply_business_action", "write-without-proof", action=literal),
+        missing_evidence,
+        after_literal_refusal,
+        inspect_existing,
+        report_existing,
+    )
+    answer = await env.coordinator.process(question)
+    assert answer.delivery_id and answer.action_result is None
+    assert [rule.id for rule in env.coordinator.scheduler.list(env.actor)] == [intended_id]
 
 
 @pytest.mark.postgres
@@ -94,6 +167,7 @@ async def test_relative_reminder_uses_verified_event_anchor_and_canonical_receip
         return call(
             "apply_business_action",
             "reminder",
+            request_evidence="5分钟以后提醒我取快递可以吗",
             action={
                 "op": "create_schedule",
                 "title": "取快递",
@@ -182,6 +256,7 @@ async def test_iana_weekly_creation_and_clock_only_edit_keep_zone_and_all_weekda
         call(
             "apply_business_action",
             "new-weekly",
+            request_evidence=original.text,
             action={
                 "op": "create_schedule",
                 "title": "核对清单",
@@ -208,6 +283,7 @@ async def test_iana_weekly_creation_and_clock_only_edit_keep_zone_and_all_weekda
         return call(
             "apply_business_action",
             "clock-only-edit",
+            request_evidence=edit.text,
             action={
                 "op": "change_schedule",
                 "schedule_id": fact["id"],
@@ -283,6 +359,7 @@ async def test_strict_wall_proposal_dst_requires_real_instant(
     action = call(
         "apply_business_action",
         "wall-time",
+        request_evidence=request.text,
         action={
             "op": "create_schedule",
             "title": "提交清单",

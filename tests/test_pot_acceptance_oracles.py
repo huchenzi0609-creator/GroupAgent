@@ -331,13 +331,49 @@ async def test_driver_reports_pending_timeout_with_retry_reason(oracles):
     assert observed == {"state": "observation_timeout", "retry": retry, "observed_retries": [retry]}
 
 
-def test_unfinished_foreground_blocks_blind_pass_even_for_turn_without_latency_tag(oracles):
+@pytest.mark.parametrize("state", ["blocked", "pending", "observation_timeout"])
+def test_unfinished_foreground_blocks_blind_pass_even_for_turn_without_latency_tag(oracles, state):
     case = {
         "level": "deepseek_local",
         "checks": {"witness": {"status": "passed", "evidence": [{"persisted": True}]}},
         "model_rounds": [{"status": "returned"}],
-        "turns": [{"foreground": {"state": "observation_timeout"}, "latency_required": False}],
+        "turns": [{"foreground": {"state": state}, "latency_required": False}],
     }
     assert oracles.blind_status(case, {"witness"}) == "blocked"
     case["turns"] = [{"foreground": {"state": "decided"}, "latency_required": False}]
     assert oracles.blind_status(case, {"witness"}) == "passed"
+
+
+def test_native_quote_accepts_exact_preloaded_work_version_without_an_extra_read(oracles):
+    target = "synthetic-claimed-work"
+    source = "current-quote-event"
+    exact = {"id": target, "goal_revision": 3}
+    stale = {"id": target, "goal_revision": 2}
+
+    def observation(*, event_id=source, kind="bot_reply", quote_id=target, facts=None):
+        return {
+            "source_event_id": event_id,
+            "input_context": {
+                "context": {
+                    "trusted_routing": {"source": kind, "recipient": "agent"},
+                    "quoted_work_id": quote_id,
+                    "work_facts_overview": {"facts": facts or [exact]},
+                }
+            },
+        }
+
+    assert oracles.work_fact_has(
+        oracles.quoted_work_context([observation()], source, target), target, [exact]
+    )
+    assert not oracles.work_fact_has(
+        oracles.quoted_work_context([observation(facts=[stale])], source, target), target, [exact]
+    )
+    assert not oracles.quoted_work_context(
+        [
+            observation(event_id="earlier-event"),
+            observation(kind="human_reply"),
+            observation(quote_id="different-work"),
+        ],
+        source,
+        target,
+    )

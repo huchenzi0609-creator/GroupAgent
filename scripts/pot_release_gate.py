@@ -258,6 +258,9 @@ def blind_status(row: dict[str, Any] | None, expected: set[str]) -> str:
         if not any(item.get("status") == "returned" for item in row.get("model_rounds", [])):
             return "blocked"
         for turn in row.get("turns", []):
+            outcome = (turn.get("foreground") or {}).get("state")
+            if outcome in {"blocked", "pending", "observation_timeout"}:
+                return "blocked"
             if turn.get("latency_required"):
                 seconds = turn.get("first_receipt_seconds")
                 if (

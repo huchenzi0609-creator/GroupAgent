@@ -47,10 +47,11 @@ async def test_name_and_simple_followup_are_one_useful_delivery_per_turn(runtime
         assert {item.state for item in tx.list_delivery()} == {DeliveryState.ACCEPTED}
 
 
-def create_reminder(seconds, body):
+def create_reminder(seconds, body, request_evidence):
     return tool(
         "apply_business_action",
         {
+            "request_evidence": request_evidence,
             "action": {
                 "op": "create_schedule",
                 "title": "取件提醒",
@@ -99,7 +100,7 @@ async def test_natural_literal_reminder_reconciles_lost_ack_after_restart(runtim
         assert datetime.fromisoformat(shown["result"]["action_result"]["next_due_at"]) == due
         return tool("finish_turn", {"disposition": "reply"})
 
-    model = DialogueModel(create_reminder(300, "取快递"), saved)
+    model = DialogueModel(create_reminder(300, "取快递", request.text), saved)
     replay.models[request.id] = model
     result = await replay.coordinator.process(request)
     assert not model.steps and not result.work_id
@@ -182,7 +183,7 @@ async def test_natural_schedule_time_is_anchored_even_when_late(runtime_env):
         assert decision["status"] == "rejected" and decision["committed"] is False
         return reply("原定北京时间次日00:03，消息到达时已经过了，未创建提醒。")
 
-    model = DialogueModel(create_reminder(300, "锁窗"), missed)
+    model = DialogueModel(create_reminder(300, "锁窗", request.text), missed)
     replay.models[request.id] = model
     result = await replay.coordinator.process(request)
     await replay.drain()

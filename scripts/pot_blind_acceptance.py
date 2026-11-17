@@ -848,7 +848,9 @@ async def time01(s):
     if not exact:
         return
     rule = rules[0]
+    original_rule_ids = {item.id for item in rules}
     before = await s.event("status_before", event_time=s.clock)
+    rule_ids_after_pre_due_query = {item.id for item in s.rules()}
     before_fact = s.occurrence_proof(rule)
     model_count = len(s.model_calls)
     first_wake = await s.wake(due + timedelta(seconds=1))
@@ -856,12 +858,27 @@ async def time01(s):
     delivered_without_model = len(s.model_calls) == model_count
     facts = s.occurrence_proof(rule)
     reminder = schedule_native_receipts(facts, s.spool())
+    rule_ids_before_post_due_query = {item.id for item in s.rules()}
     after = await s.event("status_after", event_time=s.clock)
+    rule_ids_after_post_due_query = {item.id for item in s.rules()}
+    unchanged_rules = (
+        original_rule_ids
+        == rule_ids_after_pre_due_query
+        == rule_ids_before_post_due_query
+        == rule_ids_after_post_due_query
+    )
+    rule_id_evidence = {
+        "original": sorted(original_rule_ids),
+        "after_pre_due_query": sorted(rule_ids_after_pre_due_query),
+        "before_post_due_query": sorted(rule_ids_before_post_due_query),
+        "after_post_due_query": sorted(rule_ids_after_post_due_query),
+    }
     before_reads = foreground_observations(s, before)
     after_reads = foreground_observations(s, after)
     s.check(
         "status_before_and_after",
-        bool(before_fact and not before_fact[0]["occurrences"])
+        unchanged_rules
+        and bool(before_fact and not before_fact[0]["occurrences"])
         and useful_text(before, ["尚未|还没|未发送|没发|未投递|未到"])
         and clock_display(
             response(before),
@@ -887,6 +904,7 @@ async def time01(s):
             "after_facts": facts,
             "before_reads": before_reads,
             "after_reads": after_reads,
+            "rule_ids": rule_id_evidence,
         },
     )
     body = spool_text(reminder[0]).removeprefix("【Pot】") if len(reminder) == 1 else ""
@@ -898,7 +916,8 @@ async def time01(s):
     occurrences = facts[0]["occurrences"] if facts else []
     s.check(
         "one_accepted_reminder",
-        delivered_without_model
+        unchanged_rules
+        and delivered_without_model
         and len(first_wake) == len(occurrences) == len(reminder) == 1
         and first_wake[0].work_id is None
         and dt(occurrences[0]["scheduled_at"]) == due
@@ -908,6 +927,7 @@ async def time01(s):
             "schedule_facts": facts,
             "local_receipts": reminder,
             "model_calls_at_due": not delivered_without_model,
+            "rule_ids": rule_id_evidence,
         },
     )
 
@@ -1345,9 +1365,30 @@ def work_fact_has(facts, work_id, work_rows):
         if (item := (work if isinstance(work, dict) else work.model_dump(mode="json")))
     }
     return work_id in expected and any(
-        observed["id"] == work_id and observed.get("goal_revision") == expected[work_id]
+        isinstance(observed, dict)
+        and observed.get("id") == work_id
+        and observed.get("goal_revision") == expected[work_id]
         for observed in facts
     )
+
+
+def quoted_work_context(observations, source_event_id, work_id):
+    """Use host-projected facts only when the current native quote binds the work."""
+    facts = []
+    for observation in observations:
+        if observation["source_event_id"] != source_event_id:
+            continue
+        context = observation.get("input_context", {}).get("context", {})
+        routing = context.get("trusted_routing") or {}
+        if (
+            routing.get("source") != "bot_reply"
+            or routing.get("recipient") != "agent"
+            or context.get("quoted_work_id") != work_id
+        ):
+            continue
+        facts.extend((context.get("work_facts_overview") or {}).get("facts", []))
+        facts.extend(context.get("works") or [])
+    return facts
 
 
 async def work02(s):
@@ -1391,6 +1432,10 @@ async def work02(s):
     old = None
     if output and output["spool"]:
         old = await s.event("old", quote=output["spool"][-1]["receipt"]["platform_message_id"])
+    old_observed_facts = work_facts_observed(s, old) if old else []
+    old_quote_facts = (
+        quoted_work_context(s.model_calls, old["event_id"], first["work_id"]) if old else []
+    )
     fresh = await s.event("new", latency=True)
     same_work = bool(
         first["work_id"] and second["work_id"] and first["work_id"] != second["work_id"]
@@ -1402,13 +1447,17 @@ async def work02(s):
         and old is not None
         and useful_text(old, s.spec["old_patterns"])
         and output is not None
+        and output["work"]["state"] == "completed"
         and work_fact_has(progress_facts, second["work_id"], initial)
-        and work_fact_has(work_facts_observed(s, old), first["work_id"], [output["work"]]),
+        and work_fact_has(
+            [*old_observed_facts, *old_quote_facts], first["work_id"], [output["work"]]
+        ),
         first,
         second,
         progress,
         old or {"quote": "no original receipt"},
         output or {"execution": "missing"},
+        {"quoted_host_facts": old_quote_facts, "read_work_facts": old_observed_facts},
     )
     s.check(
         "no_write_from_lookup",
@@ -1516,7 +1565,7 @@ async def work03(s):
     s.check(
         "only_essential_clarification",
         work_map(s) == prior
-        and useful_text(ambiguous, ["说的是|哪一个|哪项|哪件|哪个|(?:是|选).{1,80}还是"])
+        and useful_text(ambiguous, ["说的是|哪(?:一)?(?:个|项|件)|(?:是|选).{1,80}还是"])
         and not any(
             item.get("kind") == "control_work" and item.get("committed")
             for item in foreground_observations(s, ambiguous)
@@ -1888,16 +1937,28 @@ async def work05(s):
         {"before": before, "after": after, "same_receipt": bool(original)},
     )
     missing = await s.event("missing")
-    missing_output = await s.settle(missing["work_id"])
+    missing_orders = [
+        work for work in s.work_state() if work.request_event_id == missing["event_id"]
+    ]
+    missing_output = await s.settle(missing_orders[0].id) if len(missing_orders) == 1 else None
     clarification = response(missing) + "\n".join(
         spool_text(row) for row in (missing_output or {}).get("spool", [])
     )
     s.check(
         "only_actual_missing_input",
         essential_artifact_input_reply(clarification, s.spec["missing_pattern"])
-        and not (missing_output and missing_output["work"]["state"] == "completed"),
+        and len(missing_orders) <= 1
+        and (
+            not missing_orders
+            or bool(
+                missing_output
+                and missing_output["work"]["request_event_id"] == missing["event_id"]
+                and missing_output["work"]["state"] != "completed"
+            )
+        ),
         missing,
         missing_output or {"asked_from_foreground": True},
+        {"work_ids_created_by_the_missing_input_turn": [work.id for work in missing_orders]},
     )
     final_receipts = result["spool"] if result else before
     final_text = "\n".join(spool_text(item) for item in final_receipts)

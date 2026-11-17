@@ -24,6 +24,7 @@ from groupagent.execution.models import ModelMessage, ModelReply, ModelToolCall,
 from groupagent.execution.ports import ModelPort
 from groupagent.identity import BotIdentity
 from groupagent.scheduling.models import parse_timing
+from groupagent.scheduling.temporal import WallTimeInput, preview_wall_time
 from groupagent.security import redact_credentials
 
 from .actions import ACTION_ADAPTER, OutputRequirement
@@ -53,7 +54,7 @@ SYSTEM = """你是群内协作伙伴，结合当前事件和观察自主选择�
 
 ACTION_GUIDANCE = """单个简短公开事实可先用获准的web_search、web_fetch快速查证，再直接回答。搜索摘要不能当成已阅读网页。需要交付产物、多步核查，或快速查证未取得足够证据时，用start_work委托完整目标。委托与前台公开查询分开调用；已经决定委托的调研无需在提交前重复查找。读取附件、运行计算、制作或修改产物直接用start_work；修订既有目标用update_work并定位同一个工作，控制用control_work。人类分工tasks、机器人works、提醒schedules不能混用。即时人类任务、记忆、提醒、偏好写入用apply_business_action；清楚的本人承诺或获授权分工应实际登记为人类任务，尚在讨论的草案只观察。本人认领claim_task，本人进展update_task，owner分工assign_task，群级策略仅owner。查到当前群昵称可直接回答。只有owner明确要求为缺少群昵称的在群成员登记姓名例外时才用confirm_name。成员事实中的request_reference对应真人在本条消息给出的编号，使用其成员别名和当前版本。只需此轮保持安静用observe。要求接下来保持静默时提交quiet以保存实际范围和状态，同时结束可见回复。静默与暂停工作分开。
 同一条真人请求的运行工作使用一个完整目标，可另行登记同时交办的提醒和分工。到点只需发送提醒或通知时，现在写好prepared_message，一次和周期提醒都用这条路径。要求逐字时用explicit_reminder。到点还需查资料、运算、判断或执行步骤时用goal。只改时间不填新goal或prepared_message。只用fact_source_ids引用定时内容确实所需的当前授权材料。
-时间以context.clock和真实规则为准。相对本条消息用after及原句的amount和unit，保留原数值与单位，明确的日历时刻用wall，指定地区采用其IANA time_zone。周期只改钟点用clock，整体移动用shift，改周期用daily/weekly/every且周一为0。多个时刻仍待选择或遇到缺失时刻，就问具体选项。夏令时重复而真人已选择时，fold_evidence引用本条明确选择的原话。主机计算生效时刻。查送达看latest_occurrence_status中的平台接受数量和时刻，规则结束不代表发送失败。
+时间以context.clock和真实规则为准。相对本条消息用after及原句的amount和unit，保留原数值与单位，明确的日历时刻用wall，指定地区采用其IANA time_zone。周期只改钟点用clock，整体移动用shift，改周期用daily/weekly/every且周一为0。多个时刻仍待选择或遇到缺失时刻，就问具体选项。夏令时重复而真人已选择时，fold_evidence引用本条明确选择的原话。主机计算生效时刻。核对本地时刻用read_group_context的clock和wall_time。若返回requires_author_choice，说明真实候选并请真人选择。此选择不交给搜索或后台工作猜。查询已设提醒只读schedules的规则和送达事实，平台接受数和时刻在latest_occurrence_status。新建、修改、取消需在request_evidence引用当前真人要求这项操作的原话。
 输出格式、页数、图片数量和逐字内容只取真人要求。真人明确要求用特定程序或手段取得结果时，在required_work_tools填实际工具（如明确用Python计算填python_compute，明确实际运行Shell填process_run，明确实际搜索填web_search）；代码示例不要求运行。exact_units精确、min_units下限、max_units上限；expected_text只含逐字内容或独立单元格，关系/禁止事项放acceptance_criteria。public_image_count须有真人来源。input_event_ids只填目标实际需要的已授权附件消息，input_versions只填需要处理的确切文件版本。纯文本、普通引用和公开查询线索写进goal，附件字段没有输入时留空。只填本次动作有关字段，null可能清空。
 被拒动作没有执行，结合具体host_message修正或说明阻碍；不要重提已成功提交的同一动作。不要求原已授权低风险操作再次批准。"""
 
@@ -893,7 +894,16 @@ def _parameters_for_branch(kind: str, catalog: dict[str, Any] | None = None) -> 
 
 def business_action_schema(catalog: dict[str, Any] | None = None) -> dict[str, Any]:
     """Immediate human-task, memory, scheduling and preference writes only."""
-    return _parameters_for_branch("command", catalog)
+    parameters = _parameters_for_branch("command", catalog)
+    parameters["properties"]["request_evidence"] = {
+        "type": "string",
+        "maxLength": 240,
+        "description": (
+            "For a schedule write, quote the exact current human instruction authorizing creation, "
+            "change or cancellation. Questions about an existing rule use the read tool."
+        ),
+    }
+    return parameters
 
 
 def work_action_schema(kind: str, catalog: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1219,9 +1229,10 @@ class ModelDecisionProvider:
         async def read_group_context(call: ModelToolCall) -> str:
             resource, term = call.arguments.get("resource"), call.arguments.get("term")
             refresh = call.arguments.get("refresh", False)
+            preview_requested = "wall_time" in call.arguments
             receipt: dict[str, Any]
             if (
-                set(call.arguments) - {"resource", "term", "refresh"}
+                set(call.arguments) - {"resource", "term", "refresh", "wall_time"}
                 or not isinstance(resource, str)
                 or resource not in GROUP_RESOURCES
                 or term is not None
@@ -1229,6 +1240,8 @@ class ModelDecisionProvider:
                 or type(refresh) is not bool
                 or refresh
                 and resource != "members"
+                or preview_requested
+                and resource != "clock"
             ):
                 receipt = {"status": "rejected", "code": "invalid_read_arguments"}
             elif resource in _ARCHIVE_RESOURCES and (
@@ -1245,6 +1258,13 @@ class ModelDecisionProvider:
                 if is_archive:
                     archive_reads.add(resource)
                 try:
+                    wall = (
+                        WallTimeInput.model_validate_json(
+                            json.dumps(call.arguments["wall_time"]), strict=True
+                        )
+                        if preview_requested
+                        else None
+                    )
                     reader = context["_read_group_context"]
                     facts = (
                         await reader(resource, term, refresh=True)
@@ -1252,6 +1272,28 @@ class ModelDecisionProvider:
                         else await reader(resource, term)
                     )
                     receipt = {"status": "observed", "resource": resource, "facts": facts}
+                    if wall is not None:
+                        group_zone = facts.get("time_zone") if isinstance(facts, dict) else None
+                        if not isinstance(group_zone, str):
+                            raise DomainError(
+                                "clock_unavailable", "The group clock was unavailable"
+                            )
+                        preview = preview_wall_time(wall, time_zone=group_zone)
+                        receipt["facts"] = {
+                            **facts,
+                            "wall_time": preview.model_dump(mode="json"),
+                        }
+                        if preview.requires_author_choice:
+                            receipt.update(
+                                code="ambiguous_dst_fold"
+                                if preview.status == "ambiguous"
+                                else "nonexistent_local_time",
+                                instruction=(
+                                    "直接用候选时刻请真人选择。不自行选定、联网查询或委托后台代选。"
+                                    if preview.status == "ambiguous"
+                                    else "当地时钟跳过了该时刻。请真人指定另一个本地时刻。"
+                                ),
+                            )
                     if is_archive and isinstance(facts, list):
                         known = archive_facts[resource]
                         selected = archive_rows(resource, facts)
@@ -1263,6 +1305,12 @@ class ModelDecisionProvider:
                     if error.retryable:
                         raise
                     receipt = {"status": "rejected", "code": error.code}
+                except ValidationError as error:
+                    receipt = {
+                        "status": "rejected",
+                        "code": "invalid_wall_time_preview",
+                        "issues": _candidate_issues(error, WallTimeInput.model_fields),
+                    }
                 if is_archive and close_expired_archive():
                     receipt.update(archive_yield("foreground_archive_deferred"))
                 elif is_archive and repeated and receipt.get("new_evidence") is False:
@@ -1307,11 +1355,50 @@ class ModelDecisionProvider:
                         },
                         kind=action_kind,
                     )
+                prepared = action.get("prepared_message") if isinstance(action, dict) else None
+                literal = (
+                    isinstance(prepared, dict) and prepared.get("purpose") == "explicit_reminder"
+                )
+                if (
+                    operation == "create_schedule"
+                    and not literal
+                    and any(
+                        row.get("operation") == operation
+                        and row.get("code") == "reminder_text_mismatch"
+                        for row in receipts.values()
+                    )
+                ):
+                    return observation(
+                        call,
+                        {
+                            "status": "rejected",
+                            "code": "reminder_text_mismatch",
+                            "operation": operation,
+                            "instruction": "原文提醒未找到本条可用原话。保留原文要求，勿改成另一类新提醒。",
+                            "committed": False,
+                        },
+                        kind=action_kind,
+                    )
                 try:
                     schema = (
                         business_action_schema() if kind == "command" else work_action_schema(kind)
                     )
                     arguments = dict(call.arguments)
+                    if kind == "command":
+                        evidence = arguments.pop("request_evidence", None)
+                        if operation in {
+                            "create_schedule",
+                            "change_schedule",
+                            "control_schedule",
+                        } and (
+                            not isinstance(evidence, str)
+                            or not evidence.strip()
+                            or len(evidence) > 240
+                            or evidence.strip() not in outside_quotes(event.text)
+                        ):
+                            raise _InvalidCandidate(
+                                "request_evidence", "schedule_request_evidence_required"
+                            )
                     if kind == "control_work":
                         scope_evidence = arguments.pop("scope_evidence", None)
                         selector = arguments.get("work_selector")
@@ -1475,6 +1562,11 @@ class ModelDecisionProvider:
                         receipt["instruction"] = (
                             "批量修改须引用本条真人明确选择整组对象的原话，查询列表只是候选。"
                             "真人只指一项而候选不唯一时，询问哪一项。"
+                        )
+                    if any(issue["path"] == "request_evidence" for issue in issues):
+                        receipt["instruction"] = (
+                            "只有本条真人明确要求新建、修改或取消时才写入。"
+                            "问已有提醒是否登记、几点触发或是否送达时，读取schedules事实。"
                         )
                 timing = action.get("timing") if isinstance(action, dict) else None
                 if receipt.get("code") == "room_nickname_verified":
@@ -1840,7 +1932,7 @@ class ModelDecisionProvider:
             tools.append(
                 KernelTool(
                     name="read_group_context",
-                    description="Use current facts when they answer the request. Otherwise load authorized group references. Clock gives group-local time and the immutable event anchor. Members returns nicknames, aliases and revisions. Set refresh=true for fresh channel member data. Optional term narrows memory. Foreground archive discovery yields after its short window or repeated results without new evidence.",
+                    description="Use current facts when they answer the request. Otherwise load authorized group references. Clock gives group-local time and the immutable event anchor. With wall_time, clock also returns the precise UTC candidates and local offsets for a named calendar time, including DST gaps and repeats. This is a read with no scheduling effect. Members returns nicknames, aliases and revisions. Set refresh=true for fresh channel member data. Optional term narrows memory. Foreground archive discovery yields after its short window or repeated results without new evidence.",
                     parameters={
                         "type": "object",
                         "additionalProperties": False,
@@ -1848,6 +1940,10 @@ class ModelDecisionProvider:
                         "properties": {
                             "resource": {"type": "string", "enum": list(GROUP_RESOURCES)},
                             "term": {"type": "string", "minLength": 1, "maxLength": 100},
+                            "wall_time": {
+                                **WallTimeInput.model_json_schema(),
+                                "description": "Only for resource=clock. Preview a calendar date and local clock time in the supplied IANA zone or the configured group zone.",
+                            },
                             "refresh": {
                                 "type": "boolean",
                                 "description": "Request a fresh channel roster rather than the cache.",

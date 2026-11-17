@@ -61,7 +61,14 @@ async def conversion_setup(toolkit_setup, monkeypatch):
     return toolkit_setup
 
 
-async def imported_jpegs(setup, *, count=2, request_text=None, output_format="png"):
+async def imported_jpegs(
+    setup,
+    *,
+    count=2,
+    request_text=None,
+    output_format="png",
+    colors=("navy", "red", "green", "gold", "purple"),
+):
     text = request_text or f"请交付{count}张已验证的公开来源图片，全部使用PNG格式。"
     run = await prepare(
         setup,
@@ -72,7 +79,7 @@ async def imported_jpegs(setup, *, count=2, request_text=None, output_format="pn
     _, media, context = setup.toolkit._services[run.lease.attempt_id]
     original_source = await setup.toolkit._source(run.work, setup.env.actor, "image")
     originals = []
-    for index, color in enumerate(("navy", "red", "green", "gold", "purple")[:count]):
+    for index, color in enumerate(colors[:count]):
         output = io.BytesIO()
         Image.new("RGB", (64 + index, 48 + index), color).save(output, "JPEG")
         source = original_source.model_copy(
@@ -128,10 +135,8 @@ async def convert_and_select(run, versions):
     return (*converted, selected)
 
 
-async def test_docx_keeps_exact_source_with_each_verified_image_and_rejects_a_swap(
-    conversion_setup, monkeypatch, tmp_path
-):
-    setup = conversion_setup
+@pytest.fixture
+def docx_conversion_setup(conversion_setup, monkeypatch, tmp_path):
     fallback = SyntheticFixtureWorker.run
 
     async def document_worker(self, context, operation, inputs, *, parameters, outputs=()):
@@ -162,6 +167,13 @@ async def test_docx_keeps_exact_source_with_each_verified_image_and_rejects_a_sw
         return result, tuple((tmp_path / name).read_bytes() for name in outputs)
 
     monkeypatch.setattr(SyntheticFixtureWorker, "run", document_worker)
+    return conversion_setup
+
+
+async def test_docx_keeps_exact_source_with_each_verified_image_and_rejects_a_swap(
+    docx_conversion_setup,
+):
+    setup = docx_conversion_setup
     run, originals = await imported_jpegs(
         setup, request_text="请把两张现成的图片整理到一份Word文件。", output_format="docx"
     )
@@ -227,10 +239,110 @@ async def test_docx_keeps_exact_source_with_each_verified_image_and_rejects_a_sw
         run, "artifact_deliver", {"version_ids": [replaced.version_id]}, key="deliver-swapped"
     )
     assert selected.success, selected
-    with pytest.raises(DomainError, match="actual source pages"):
+    with pytest.raises(DomainError, match="verified source page"):
         await setup.toolkit.validate(
             run.work, run.lease, setup.env.actor, candidate(run, "已整理图片。"), run.workspace
         )
+
+
+async def test_workspace_docx_binds_only_scoped_embeds_and_rejects_fabricated_or_detached_urls(
+    docx_conversion_setup,
+):
+    setup = docx_conversion_setup
+    run, originals = await imported_jpegs(
+        setup, request_text="请把两张现成的图片整理到一份Word文件。", output_format="docx"
+    )
+    other_work, (other_picture,) = await imported_jpegs(
+        setup,
+        count=1,
+        request_text="另一个独立的合成项目。",
+        output_format="docx",
+        colors=("green",),
+    )
+    images = []
+    for version in originals:
+        conversion = await call(
+            run,
+            "image_convert",
+            {"file_id": version.file_id, "version_id": version.version_id, "format": "png"},
+            key="convert-workspace:" + version.version_id,
+        )
+        assert conversion.success, conversion
+        converted, raw = setup.env.registry.read(setup.env.actor, conversion.output["version_id"])
+        images.append((converted, raw, version.provenance["public_image"]["page_final_url"]))
+    foreign_scope = ArtifactScope(
+        setup.env.actor.group_id, other_work.work.id, setup.env.actor.member_id
+    )
+    outside_image = setup.env.artifacts.read(
+        foreign_scope, other_picture.file_id, other_picture.version_id
+    )
+    # These exact bytes have a verified lineage in another work only.
+    assert outside_image not in [raw for _, raw, _ in images]
+
+    async def adopt(captions, name, *, detached=False):
+        authored = Document()
+        authored.add_heading("Workspace draft", 0)
+        authored.add_paragraph(
+            "Caption placement tests use two imported pictures and unrelated art."
+        )
+        for index, ((_, raw, _), url) in enumerate(zip(images, captions, strict=True)):
+            paragraph = authored.add_paragraph()
+            paragraph.add_run().add_picture(io.BytesIO(raw))
+            if not detached and index == 0:
+                paragraph.add_run(" Source " + url)
+            else:
+                authored.add_paragraph("Original page " + url)
+                if detached:
+                    # Move evidence out of the local figure region while
+                    # retaining both genuine URLs elsewhere in the document.
+                    cap = authored.paragraphs[-1]._p
+                    blocker = authored.add_paragraph(
+                        "An unrelated paragraph separates this citation."
+                    )._p
+                    cap.addprevious(blocker)
+        authored.add_picture(io.BytesIO(outside_image))
+        authored.add_paragraph("Unrelated illustration without a stored source obligation.")
+        path = run.workspace / (name + ".docx")
+        authored.save(path)
+        receipt = await call(
+            run,
+            "artifact_from_workspace",
+            {"path": path.name, "name": path.name},
+            key="adopt:" + name,
+        )
+        assert receipt.success, receipt
+        version, adopted = setup.env.registry.read(setup.env.actor, receipt.output["version_id"])
+        assert adopted == path.read_bytes() and "source_image_refs" not in version.provenance
+        chosen = await call(
+            run, "artifact_deliver", {"version_ids": [version.version_id]}, key="deliver:" + name
+        )
+        assert chosen.success
+        return version
+
+    exact_urls = [url for _, _, url in images]
+    for name, captions, detached in (
+        ("guessed", ["https://example.com/photos/guess", exact_urls[1]], False),
+        ("swapped", list(reversed(exact_urls)), False),
+        ("detached", exact_urls, True),
+    ):
+        bad = await adopt(captions, name, detached=detached)
+        with pytest.raises(DomainError, match="exact verified source page") as error:
+            await setup.toolkit.validate(
+                run.work, run.lease, setup.env.actor, candidate(run), run.workspace
+            )
+        assert error.value.details["document_version_id"] == bad.version_id
+        repairs = {
+            image["embedded_sha256"]: image["verified_pages"][0]["url"]
+            for image in error.value.details["repair_images"]
+        }
+        assert repairs[images[0][0].sha256] == exact_urls[0]
+        assert len(repairs) == (1 if name == "guessed" else 2)
+
+    good = await adopt(exact_urls, "verified")
+    validated = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, candidate(run), run.workspace
+    )
+    assert any(draft.payload_hash == good.sha256 for draft in validated.deliveries)
 
 
 @pytest.mark.parametrize("scenario", _DELIVERY_CASES, ids=lambda case: case["id"])

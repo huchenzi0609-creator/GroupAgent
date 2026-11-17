@@ -6,6 +6,7 @@ from datetime import date as Date
 from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Literal, TypeAlias, cast
+from zoneinfo import ZoneInfo
 
 from pydantic import (
     AwareDatetime,
@@ -89,20 +90,9 @@ class AfterTiming(DurationTiming):
     amount: DurationAmount = Field(gt=0)
 
 
-class WallTiming(WallClockTiming):
-    kind: Literal["wall"]
+class WallTimeInput(WallClockTiming):
     date: Date
     time_zone: str | None = Field(default=None, description="IANA time zone for this local time.")
-    fold: Annotated[int, Field(strict=True, ge=0, le=1)] | None = Field(
-        default=None,
-        description="For a repeated local time, 0 selects the first instant and 1 the second.",
-    )
-    fold_evidence: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=160,
-        description="Exact words from the current requester selecting the earlier or later instant.",
-    )
 
     @field_validator("date", mode="before")
     @classmethod
@@ -114,6 +104,35 @@ class WallTiming(WallClockTiming):
             if parsed.isoformat() == value:
                 return parsed
         raise ValueError("Use a calendar date in YYYY-MM-DD form")
+
+
+class WallTiming(WallTimeInput):
+    kind: Literal["wall"]
+    fold: Annotated[int, Field(strict=True, ge=0, le=1)] | None = Field(
+        default=None,
+        description="For a repeated local time, 0 selects the first instant and 1 the second.",
+    )
+    fold_evidence: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        description="Exact words from the current requester selecting the earlier or later instant.",
+    )
+
+
+class WallTimeCandidate(DomainModel):
+    fold: Literal[0, 1]
+    local: str
+    utc: str
+
+
+class WallTimePreview(DomainModel):
+    date: Date
+    local_time: time
+    time_zone: str
+    status: Literal["unique", "ambiguous", "nonexistent"]
+    requires_author_choice: bool
+    candidates: tuple[WallTimeCandidate, ...]
 
 
 class ClockTiming(WallClockTiming):
@@ -166,6 +185,40 @@ def clock_snapshot(*, occurred_at: datetime, now: datetime, time_zone: str) -> d
     }
 
 
+def _wall_candidates(wall: WallTimeInput, time_zone: str) -> tuple[ZoneInfo, tuple[datetime, ...]]:
+    tz = zone(wall.time_zone if wall.time_zone is not None else time_zone)
+    try:
+        first = wall_instant(wall.date, wall.local_time, tz)
+        second = wall_instant(wall.date, wall.local_time, tz, fold=1)
+    except OverflowError as error:
+        raise DomainError(
+            "invalid_schedule_time", "The proposed instant is out of range"
+        ) from error
+    if first is None or second is None:
+        return tz, ()
+    return tz, (first,) if first == second else (first, second)
+
+
+def preview_wall_time(wall: WallTimeInput, *, time_zone: str) -> WallTimePreview:
+    """Observe possible instants for a local clock time without choosing one."""
+    tz, instants = _wall_candidates(wall, time_zone)
+    return WallTimePreview(
+        date=wall.date,
+        local_time=wall.local_time,
+        time_zone=tz.key,
+        status=("nonexistent", "unique", "ambiguous")[len(instants)],
+        requires_author_choice=len(instants) != 1,
+        candidates=tuple(
+            WallTimeCandidate(
+                fold=1 if index else 0,
+                local=instant.astimezone(tz).isoformat(),
+                utc=instant.isoformat(),
+            )
+            for index, instant in enumerate(instants)
+        ),
+    )
+
+
 def _plus(instant: datetime, seconds: int) -> datetime:
     try:
         return utc(instant) + timedelta(seconds=seconds)
@@ -191,21 +244,13 @@ def _instant(
                 "invalid_schedule_time", "A relative time requires a trusted source timestamp"
             )
         return _plus(occurred_at, proposal.seconds), time_zone
-    time_zone = proposal.time_zone if proposal.time_zone is not None else time_zone
-    tz = zone(time_zone)
-    try:
-        first = wall_instant(proposal.date, proposal.local_time, tz)
-        second = wall_instant(proposal.date, proposal.local_time, tz, fold=1)
-    except OverflowError as error:
-        raise DomainError(
-            "invalid_schedule_time", "The proposed instant is out of range"
-        ) from error
-    if first is None or second is None:
+    tz, candidates = _wall_candidates(proposal, time_zone)
+    if not candidates:
         raise DomainError(
             "nonexistent_local_time", "The local time was skipped when the clocks changed"
         )
     selection = (proposal.fold_evidence or "").strip()
-    if first != second and (
+    if len(candidates) == 2 and (
         proposal.fold is None
         or source_text is not None
         and (not selection or selection not in source_text)
@@ -213,7 +258,7 @@ def _instant(
         raise DomainError(
             "ambiguous_dst_fold", "The local time occurs twice. Choose the first or second instant"
         )
-    return (second if proposal.fold == 1 else first), time_zone
+    return candidates[-1 if proposal.fold == 1 else 0], tz.key
 
 
 def resolve_instant(

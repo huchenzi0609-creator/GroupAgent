@@ -216,6 +216,7 @@ class IsolatedDocumentService:
         *,
         start_unit: int = 0,
         max_units: int = 200,
+        docx_image_pages: dict[str, list[str]] | None = None,
     ) -> DocumentRead:
         scope = await self._scope(context)
         version = self._get(scope, file_id, version_id)
@@ -223,7 +224,12 @@ class IsolatedDocumentService:
             context,
             "document_read",
             (self._read(scope, file_id, version.version_id),),
-            parameters={"format": version.format, "start_unit": start_unit, "max_units": max_units},
+            parameters={
+                "format": version.format,
+                "start_unit": start_unit,
+                "max_units": max_units,
+                **({"docx_image_pages": docx_image_pages} if docx_image_pages else {}),
+            },
         )
         await self._scope(context)
         metadata = result.get("metadata", {})
@@ -241,6 +247,8 @@ class IsolatedDocumentService:
                 "distinct_embedded_image_count",
                 "embedded_image_sha256",
                 "embedded_image_page_bindings",
+                "unverified_public_image_occurrences",
+                "unverified_public_image_hashes",
             }
             if version.format == "docx"
             else set()
@@ -252,11 +260,16 @@ class IsolatedDocumentService:
                     "native_table_count",
                     "embedded_image_count",
                     "distinct_embedded_image_count",
+                    "unverified_public_image_occurrences",
                 )
             )
         ):
             raise DomainError("invalid_document", "Document worker returned invalid metadata")
-        for key in ("embedded_image_sha256", "embedded_image_page_bindings"):
+        for key in (
+            "embedded_image_sha256",
+            "embedded_image_page_bindings",
+            "unverified_public_image_hashes",
+        ):
             if key not in metadata:
                 continue
             try:
@@ -274,6 +287,18 @@ class IsolatedDocumentService:
                 raise DomainError(
                     "invalid_document", "Document worker returned invalid image hashes"
                 ) from None
+        if docx_image_pages:
+            unverified = metadata.get("unverified_public_image_occurrences")
+            hashes = json.loads(metadata.get("unverified_public_image_hashes", "[]"))
+            if (
+                unverified is None
+                or bool(int(unverified)) != bool(hashes)
+                or len(hashes) > int(unverified)
+                or not set(hashes).issubset(docx_image_pages)
+            ):
+                raise DomainError(
+                    "invalid_document", "Document worker omitted the scoped image-page check"
+                )
         return DocumentRead(
             file_id,
             version.version_id,

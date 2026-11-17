@@ -146,6 +146,61 @@ def _docx_page_bindings(
     return bindings
 
 
+def _scoped_public_docx_pages(
+    artifacts: ArtifactStore, scope: ArtifactScope, produced: list[dict[str, Any]]
+) -> dict[str, dict[str, ArtifactVersion]]:
+    """Index original and normalized bytes of verified images in this goal revision."""
+    by_digest: dict[str, dict[str, ArtifactVersion]] = {}
+    for row in produced:
+        version = ArtifactVersion(**row["artifact"])
+        if "public_image" not in version.provenance:
+            continue
+        lineage = _public_image_lineage(artifacts, scope, version)
+        if lineage is None:
+            continue
+        preview = ImageInfo.model_validate(version.provenance["media_metadata"]).preview_sha256
+        page = lineage.public_image["page_final_url"]
+        for digest in {version.sha256, preview}:
+            by_digest.setdefault(digest, {})[page] = version
+    return by_digest
+
+
+class _DocxImageSourceError(DomainError):
+    def __init__(
+        self,
+        version_id: str,
+        count: int,
+        hashes: list[str],
+        pages: dict[str, dict[str, ArtifactVersion]],
+    ) -> None:
+        super().__init__(
+            "validation_failed",
+            "The Word file needs the exact verified source page beside each matched image. "
+            "Place the visible page URL in the picture paragraph or the immediately following "
+            "caption in the same block. Use one picture per paragraph. The managed "
+            "document_generate tool adds these locators for the provided scoped image versions.",
+        )
+        self.details = {
+            "constraint": "docx_public_image_pages",
+            "document_version_id": version_id,
+            "unverified_occurrences": count,
+            "repair_images": [
+                {
+                    "embedded_sha256": image_hash,
+                    "verified_pages": [
+                        {
+                            **({"url": url} if len(url.encode()) <= 1500 else {}),
+                            "file_id": item.file_id,
+                            "version_id": item.version_id,
+                        }
+                        for url, item in sorted(pages[image_hash].items())[:2]
+                    ],
+                }
+                for image_hash in hashes[:3]
+            ],
+        }
+
+
 def _original_request_context(event: GroupEvent) -> dict[str, JsonValue]:
     text = redact_credentials(event.text)
     return {
@@ -1656,6 +1711,16 @@ class WorkToolkit:
         drafts = []
         excerpts = []
         retained_public_images = []
+        scope = ArtifactScope(actor.group_id, work.id, actor.member_id)
+        public_docx_pages = (
+            _scoped_public_docx_pages(self.artifacts, scope, produced)
+            if "docx" in actual_formats
+            else {}
+        )
+        docx_image_pages = {
+            digest: [image_page_binding(digest, url) for url in sorted(known)]
+            for digest, known in public_docx_pages.items()
+        }
         for row in outputs:
             version = ArtifactVersion(**row["artifact"])
             matching = next(
@@ -1667,10 +1732,28 @@ class WorkToolkit:
                 {},
             )
             if version.format in {"md", "docx", "pdf", "pptx"}:
-                read = await documents.read(context, version.file_id, version.version_id)
+                read = (
+                    await documents.read(
+                        context,
+                        version.file_id,
+                        version.version_id,
+                        docx_image_pages=docx_image_pages,
+                    )
+                    if version.format == "docx" and docx_image_pages
+                    else await documents.read(context, version.file_id, version.version_id)
+                )
                 text = read.text
                 if version.format == "docx":
-                    scope = ArtifactScope(actor.group_id, work.id, actor.member_id)
+                    missing_pages = int(
+                        read.metadata.get("unverified_public_image_occurrences", "0")
+                    )
+                    if missing_pages:
+                        raise _DocxImageSourceError(
+                            version.version_id,
+                            missing_pages,
+                            json.loads(read.metadata["unverified_public_image_hashes"]),
+                            public_docx_pages,
+                        )
                     expected_pages = _docx_page_bindings(self.artifacts, scope, version)
                     actual_pages = Counter(
                         json.loads(read.metadata.get("embedded_image_page_bindings", "[]"))

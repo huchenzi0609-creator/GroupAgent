@@ -1,6 +1,6 @@
 {
   "format_version": 1,
-  "dataset_sha256": "51c21f1a845308bd717d217e735ebe4a47de731379aeefb78ef614037999cfc3",
+  "dataset_sha256": "5d8d09fc089625f60f9d03d57de3825772ab204924f04c7108d4b25c2e1c6c25",
   "case_ids": [
     "CHAT-01",
     "CHAT-02",
@@ -29,15 +29,8 @@
     "OPS-02"
   ],
   "changed_case_ids": [
-    "CHAT-02",
-    "CHAT-04",
-    "CHAT-05",
-    "GROUP-03",
-    "WORK-03",
     "TIME-01",
-    "TIME-02",
-    "SEARCH-01",
-    "SEARCH-02"
+    "TIME-03"
   ],
   "visibility": "Private synthetic inputs. Commit the digest and case IDs only."
 }
