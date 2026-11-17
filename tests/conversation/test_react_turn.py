@@ -273,6 +273,7 @@ async def test_real_queued_ack_precedes_same_work_refinement_and_is_not_repeated
     initial = call(
         "start_work",
         "initial",
+        admission_ack="immediate",
         goal=event.text,
         work_capabilities=["documents"],
         outputs=[{"format": "docx"}, {"format": "pdf"}],
@@ -290,7 +291,9 @@ async def test_real_queued_ack_precedes_same_work_refinement_and_is_not_repeated
             assert queued.request_event_id == event.id
             assert queued.idempotency_key == "early_ack:" + event.id + ":1"
             assert queued.payload_ref.startswith("text:这项工作已排队。")
-            assert tx.get_work(work["id"]).state == WorkState.QUEUED
+            original = tx.get_work(work["id"])
+            assert original.state == WorkState.QUEUED
+            assert original.goal in queued.payload_ref
             assert delivery_admission_in_tx(tx, queued).allowed
             claimed = tx.claim_delivery("fixture-sender", intent_id=queued.id)
             assert claimed is not None
@@ -345,7 +348,7 @@ async def test_untyped_model_ack_uses_the_already_queued_canonical_receipt(conve
     env = conversation_env
     event = source(env, "Pot，请计算一个合成数值。")
     env.models[event.id] = ModelScript(
-        queued_compute(event),
+        queued_compute(event, admission_ack="immediate"),
         ModelReply(text="好的，我已经把这个任务放进队列了。", usage=USAGE),
     )
     result = await env.coordinator.process(event)
@@ -378,7 +381,7 @@ async def test_existing_legacy_ack_slot_preserves_work_and_falls_back_to_final_r
         assert receipt["committed"] is True and receipt["work_admission"] is None
         return finish()
 
-    env.models[event.id] = ModelScript(queued_compute(event), close)
+    env.models[event.id] = ModelScript(queued_compute(event, admission_ack="immediate"), close)
     result = await env.coordinator.process(event)
     assert result.work_id and result.delivery_id != legacy.id
     with env.store.transaction(env.actor) as tx:
@@ -424,7 +427,9 @@ async def test_quiet_barrier_retires_unsent_admission_without_cancelling_work(co
             assert pending.state == DeliveryState.REJECTED and not pending.platform_message_id
         return finish()
 
-    env.models[event.id] = ModelScript(queued_compute(event), quiet_before_send)
+    env.models[event.id] = ModelScript(
+        queued_compute(event, admission_ack="immediate"), quiet_before_send
+    )
     result = await env.coordinator.process(event)
     assert result.work_id and result.decision.kind == "observe"
     with env.store.transaction(env.actor) as tx:
@@ -440,6 +445,7 @@ async def test_receipt_reused_after_model_interruption_and_event_replay(conversa
     start = call(
         "start_work",
         "python-start",
+        admission_ack="immediate",
         goal=event.text,
         work_capabilities=["compute"],
         required_work_tools=["python_compute"],

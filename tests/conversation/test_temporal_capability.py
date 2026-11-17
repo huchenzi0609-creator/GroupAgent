@@ -40,7 +40,7 @@ async def test_expired_relative_schedule_cannot_be_reanchored_in_same_turn(conve
         "op": "create_schedule",
         "title": "去查展品",
         "prepared_message": {"text": "去查展品"},
-        "timing": {"kind": "after", "seconds": 420},
+        "timing": {"kind": "after", "amount": 7, "unit": "minutes"},
     }
 
     def retry(request):
@@ -97,7 +97,7 @@ async def test_relative_reminder_uses_verified_event_anchor_and_canonical_receip
             action={
                 "op": "create_schedule",
                 "title": "取快递",
-                "timing": {"kind": "after", "seconds": 300},
+                "timing": {"kind": "after", "amount": 5, "unit": "minutes"},
                 "prepared_message": {"purpose": "explicit_reminder", "text": "取快递"},
             },
         )

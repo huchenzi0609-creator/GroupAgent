@@ -20,11 +20,42 @@ from groupagent.scheduling import (
     Scheduler,
     WeeklyTiming,
 )
-from groupagent.scheduling.temporal import clock_snapshot, resolve_instant, resolve_schedule_timing
+from groupagent.scheduling.temporal import (
+    SCHEDULE_TIMING_ADAPTER,
+    clock_snapshot,
+    resolve_instant,
+    resolve_schedule_timing,
+)
 
 SHANGHAI = "Asia/Shanghai"
 SOURCE_TIME = datetime(2026, 11, 17, 20, 35, 22, tzinfo=UTC)
 DUE = datetime(2026, 11, 17, 20, 40, 22, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("amount", "unit", "elapsed"),
+    [(7, "minutes", 420), (0.5, "minutes", 30), (1.5, "minutes", 90), (0.5, "hours", 1800)],
+)
+def test_stated_duration_uses_exact_host_units_for_instant_and_shift(amount, unit, elapsed):
+    proposal = {"kind": "after", "amount": amount, "unit": unit}
+    assert resolve_instant(
+        proposal, occurred_at=SOURCE_TIME, time_zone=SHANGHAI
+    ) == SOURCE_TIME + timedelta(seconds=elapsed)
+    shifted, _ = resolve_schedule_timing(
+        {"kind": "shift", "amount": -amount, "unit": unit},
+        occurred_at=SOURCE_TIME,
+        time_zone=SHANGHAI,
+        reference_timing=AtTiming(at=DUE),
+    )
+    assert shifted == AtTiming(at=DUE - timedelta(seconds=elapsed))
+
+
+def test_advertised_duration_schema_uses_amount_and_unit_while_old_seconds_load():
+    definitions = SCHEDULE_TIMING_ADAPTER.json_schema()["$defs"]
+    for name in ("AfterTiming", "ShiftTiming"):
+        assert set(definitions[name]["properties"]) == {"kind", "amount", "unit"}
+    legacy = SCHEDULE_TIMING_ADAPTER.validate_json('{"kind":"after","seconds":300}', strict=True)
+    assert legacy.kind == "after" and legacy.seconds == 300
 
 
 def test_snapshot_and_one_shot_consume_the_same_event_clock() -> None:

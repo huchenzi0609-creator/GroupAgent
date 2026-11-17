@@ -61,6 +61,12 @@ def test_honest_work_state_and_essential_information_are_not_boilerplate(oracles
     assert not oracles.essential_artifact_input_reply(
         "库存卡编号已经做成文档发给大家。", "库存卡|编号"
     )
+    assert oracles.essential_artifact_input_reply(
+        "你把库存卡拍张照发上来，或者直接念一遍编号。", "库存卡|编号"
+    )
+    assert not oracles.essential_artifact_input_reply(
+        "你还没有发上来库存卡照片，编号也没有提供。", "库存卡|编号"
+    )
 
 
 def test_matched_work_fact_requires_exact_identity_and_version(oracles):
@@ -272,3 +278,66 @@ def test_inspector_extracts_live_relationship_of_link_inside_docx_table(oracles,
         subprocess.check_output([sys.executable, "-c", _INSPECT, str(path), "docx"], text=True)
     )
     assert decoded["links"] == [address]
+
+
+@pytest.mark.asyncio
+async def test_driver_follows_its_event_through_older_work_and_retry(oracles):
+    from types import SimpleNamespace
+
+    queue = ["older-event", "target-event", "target-event", "later-event"]
+    seen = []
+    retries = {
+        "attempts": 1,
+        "code": "turn_execution_pending",
+        "next_attempt_at": None,
+    }
+
+    def status(current):
+        assert current == "target-event"
+        attempts = seen.count(current)
+        if attempts == 2:
+            return {"state": "decided"}
+        return {"state": "pending", "retry": retries if attempts else None}
+
+    async def one_tick(*, batched):
+        assert not batched
+        seen.append(queue.pop(0))
+
+    driver = oracles.Scenario.__new__(oracles.Scenario)
+    driver.app = SimpleNamespace(process_pending=one_tick)
+    driver.args = SimpleNamespace(timeout=2)
+    driver.foreground_status = status
+    observed = await driver.process_event_until_observed("target-event", dispatch=False)
+    assert seen == ["older-event", "target-event", "target-event"]
+    assert observed == {"state": "decided", "observed_retries": [retries]}
+    assert queue == ["later-event"]
+
+
+@pytest.mark.asyncio
+async def test_driver_reports_pending_timeout_with_retry_reason(oracles):
+    from types import SimpleNamespace
+
+    retry = {"attempts": 1, "code": "turn_execution_pending", "next_attempt_at": None}
+
+    async def no_ready_work(*, batched):
+        assert not batched
+        return 0
+
+    driver = oracles.Scenario.__new__(oracles.Scenario)
+    driver.app = SimpleNamespace(process_pending=no_ready_work)
+    driver.args = SimpleNamespace(timeout=0.02)
+    driver.foreground_status = lambda _: {"state": "pending", "retry": retry}
+    observed = await driver.process_event_until_observed("target-event", dispatch=False)
+    assert observed == {"state": "observation_timeout", "retry": retry, "observed_retries": [retry]}
+
+
+def test_unfinished_foreground_blocks_blind_pass_even_for_turn_without_latency_tag(oracles):
+    case = {
+        "level": "deepseek_local",
+        "checks": {"witness": {"status": "passed", "evidence": [{"persisted": True}]}},
+        "model_rounds": [{"status": "returned"}],
+        "turns": [{"foreground": {"state": "observation_timeout"}, "latency_required": False}],
+    }
+    assert oracles.blind_status(case, {"witness"}) == "blocked"
+    case["turns"] = [{"foreground": {"state": "decided"}, "latency_required": False}]
+    assert oracles.blind_status(case, {"witness"}) == "passed"

@@ -4,9 +4,18 @@ from __future__ import annotations
 
 from datetime import date as Date
 from datetime import datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Annotated, Literal, TypeAlias, cast
 
-from pydantic import AwareDatetime, Field, JsonValue, TypeAdapter, ValidationError, field_validator
+from pydantic import (
+    AwareDatetime,
+    Field,
+    JsonValue,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from groupagent.domain import DomainError, DomainModel
 from groupagent.scheduling.models import (
@@ -20,12 +29,64 @@ from groupagent.scheduling.models import (
 )
 from groupagent.scheduling.recurrence import utc, wall_instant, zone
 
+_UNIT_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400, "weeks": 604800}
+DurationAmount = Annotated[
+    Decimal,
+    Field(allow_inf_nan=False, description="Copy the numeric amount in the request's stated unit."),
+]
 
-class AfterTiming(DomainModel):
-    kind: Literal["after"]
-    seconds: int = Field(
-        strict=True, gt=0, description="Positive elapsed seconds from the source message timestamp."
+
+class DurationTiming(DomainModel):
+    amount: DurationAmount
+    unit: Literal["seconds", "minutes", "hours", "days", "weeks"] = Field(
+        description="The unit stated by the requester. The host converts this amount."
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_amount(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        duration = dict(value)
+        if "seconds" in duration:
+            seconds = duration.pop("seconds")
+            if type(seconds) is not int or "amount" in duration or "unit" in duration:
+                raise ValueError(
+                    "Specify either a duration amount and unit or legacy integer seconds"
+                )
+            return {**duration, "amount": Decimal(seconds), "unit": "seconds"}
+        amount = duration.get("amount")
+        if type(amount) in (int, float, str):
+            try:
+                duration["amount"] = Decimal(str(amount))
+            except InvalidOperation as error:
+                raise ValueError("The stated duration requires a decimal number") from error
+        return duration
+
+    @property
+    def seconds(self) -> int:
+        # Integer-ratio arithmetic preserves the stated decimal exactly.
+        magnitude = self.amount.copy_abs()
+        if magnitude and magnitude < Decimal("0.000001"):
+            raise ValueError("The stated duration must resolve to whole seconds")
+        if magnitude > Decimal(timedelta.max.days * 86400 + 86399):
+            raise ValueError("The stated duration is outside the supported calendar range")
+        numerator, denominator = self.amount.as_integer_ratio()
+        seconds, remainder = divmod(numerator * _UNIT_SECONDS[self.unit], denominator)
+        if remainder:
+            raise ValueError("The stated duration must resolve to whole seconds")
+        return seconds
+
+    @model_validator(mode="after")
+    def whole_nonzero_duration(self) -> DurationTiming:
+        if not self.seconds:
+            raise ValueError("The duration must move the scheduled time")
+        return self
+
+
+class AfterTiming(DurationTiming):
+    kind: Literal["after"]
+    amount: DurationAmount = Field(gt=0)
 
 
 class WallTiming(WallClockTiming):
@@ -61,19 +122,11 @@ class ClockTiming(WallClockTiming):
     kind: Literal["clock"]
 
 
-class ShiftTiming(DomainModel):
+class ShiftTiming(DurationTiming):
     kind: Literal["shift"]
-    seconds: int = Field(
-        strict=True,
-        description="Signed seconds to move the selected schedule. Negative moves it earlier.",
+    amount: DurationAmount = Field(
+        description="Copy the stated amount. Use a negative sign to move the rule earlier."
     )
-
-    @field_validator("seconds")
-    @classmethod
-    def nonzero_shift(cls, value: int) -> int:
-        if value == 0:
-            raise ValueError("A shift must move the schedule")
-        return value
 
 
 CreateTimingProposal: TypeAlias = Annotated[

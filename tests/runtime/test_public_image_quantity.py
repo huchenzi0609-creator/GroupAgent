@@ -54,6 +54,27 @@ async def test_wakeup_only_inherits_an_explicit_referenced_human_quantity(runtim
         await app.close()
 
 
+async def test_explicit_image_count_does_not_depend_on_a_request_verb(runtime_env):
+    env = runtime_env
+    quote = "挑两张海豹表情包放在文件里"
+    request = event(env, "Pot，" + quote + "。")
+    decision = plan(
+        public_image_count=2,
+        public_image_count_evidence=RequirementEvidence(event_id=request.id, quote=quote),
+    )
+    app, _ = app_for(env, {request.id: decision})
+    try:
+        await intake(app, env, request)
+        result = await app.coordinator.process(request)
+        assert result.work_id, result.decision
+        with env.store.transaction(env.actor) as tx:
+            actual = tx.get_work(result.work_id)
+        assert actual.scope["public_image_count"] == 2
+        assert actual.scope["public_image_count_evidence"]["event_id"] == request.id
+    finally:
+        await app.close()
+
+
 async def test_unrelated_revision_preserves_grounded_two_and_correction_replaces_it(runtime_env):
     env = runtime_env
     original = event(env, "Pot，找两张海豹表情包。")

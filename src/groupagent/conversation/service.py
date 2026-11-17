@@ -42,6 +42,7 @@ from groupagent.memory import MemberService, MemoryService
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
 from groupagent.runtime.input_selection import canonicalize_input_selection
+from groupagent.runtime.text import visible_text
 from groupagent.runtime.tool_selection import message_only_research_request
 from groupagent.runtime.work_facts import WorkFacts
 from groupagent.scheduling import Scheduler
@@ -155,6 +156,12 @@ def _work_admission_text(
     if files:
         return f"我会整理成 {files}，检查内容后发回来。"
     return "这项工作已排队；有结果或需要补充资料时我会回复。"
+
+
+def _early_admission_text(goal: str, plan: str) -> str:
+    subject = " ".join(visible_text(redact_credentials(goal)).split())
+    label = subject[:72].rstrip() + ("…" if len(subject) > 72 else "")
+    return f"这项工作已排队。目标是「{label}」。" + plan.removeprefix("这项工作已排队；")
 
 
 def _admission_for_receipt(body: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any] | None:
@@ -659,7 +666,9 @@ class ConversationCoordinator(Coordinator):
         ):
             targets = {ref.id for ref in resolved.refs}
             compared = context.get("_work_target_reads", {}).values()
-            if any(targets & choices and len(choices) > 1 for choices in compared):
+            if (selector.basis == "ids" and len(targets) > 1) or any(
+                targets & choices and len(choices) > 1 for choices in compared
+            ):
                 authored = outside_quotes(event.text).casefold()
                 named = (
                     len(targets) == 1
@@ -3089,7 +3098,7 @@ class ConversationCoordinator(Coordinator):
                 if acknowledgement[1] == "silent":
                     work_admission = {"work_id": work_id, "silent": True}
                 elif decision.response:
-                    text = "这项工作已排队。" + decision.response.removeprefix("这项工作已排队；")
+                    text = _early_admission_text(work.goal, decision.response)
                     ack_delivery = tx.enqueue_work_admission(work_id, text)
                     if ack_delivery is not None:
                         delivery_id = ack_delivery.id

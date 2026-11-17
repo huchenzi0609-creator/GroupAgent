@@ -344,6 +344,63 @@ class Scenario:
                 await asyncio.gather(foreground, return_exceptions=True)
         await self.app.dispatcher.tick()
 
+    def foreground_status(self, source_event_id):
+        """Observe this source, independently of which event the last tick chose."""
+        with self.store.transaction(self.app.owner) as tx:
+            row = tx.conn.execute(
+                "SELECT d.event_id IS NOT NULL AND d.body->>'agent_pending_response' "
+                "IS DISTINCT FROM 'true' AS decided, r.blocked, r.attempts, r.code, r.next_attempt_at "
+                "FROM ga_events e LEFT JOIN ga_decisions d ON d.group_id=e.group_id AND d.event_id=e.id "
+                "LEFT JOIN ga_event_retry r ON r.group_id=e.group_id AND r.event_id=e.id "
+                "WHERE e.group_id=%s AND e.id=%s",
+                (self.group, source_event_id),
+            ).fetchone()
+        if row is None:
+            return {"state": "source_not_persisted"}
+        if row["decided"]:
+            return {"state": "decided"}
+        retry = (
+            {
+                "attempts": row["attempts"],
+                "code": row["code"],
+                "next_attempt_at": row["next_attempt_at"],
+            }
+            if row["code"]
+            else None
+        )
+        return {"state": "blocked" if row["blocked"] else "pending", "retry": retry}
+
+    async def process_event_until_observed(self, source_event_id, *, dispatch):
+        """Drain normal foreground ticks until the requested source settles."""
+        retries = {}
+        observation = self.foreground_status(source_event_id)
+        window = asyncio.timeout(self.args.timeout)
+        try:
+            async with window:
+                while observation["state"] == "pending":
+                    if dispatch:
+                        await self.process_with_admission_receipts(source_event_id)
+                    else:
+                        await self.app.process_pending(batched=False)
+                    observation = self.foreground_status(source_event_id)
+                    retry = observation.get("retry")
+                    if retry:
+                        retries[retry["code"]] = retry
+                    if observation["state"] == "pending":
+                        await asyncio.sleep(0.05)
+        except TimeoutError:
+            if not window.expired():
+                raise
+            observation = self.foreground_status(source_event_id)
+            retry = observation.get("retry")
+            if retry:
+                retries[retry["code"]] = retry
+            if observation["state"] == "pending":
+                observation["state"] = "observation_timeout"
+        if dispatch:
+            await self.app.dispatcher.tick()
+        return {**observation, "observed_retries": list(retries.values())}
+
     async def event(
         self,
         key,
@@ -394,18 +451,16 @@ class Scenario:
         )
         self.app.channel.append_incoming(record)
         await self.app.poll_intake()
-        if process and dispatch:
-            await self.process_with_admission_receipts(record.id)
-        else:
-            if process:
-                await self.app.process_pending(batched=False)
-            if dispatch:
-                await self.app.dispatcher.tick()
+        foreground = {"state": "fixture_ingest_only"}
+        if process:
+            foreground = await self.process_event_until_observed(record.id, dispatch=dispatch)
+        elif dispatch:
+            await self.app.dispatcher.tick()
         with self.store.transaction(self.app.owner) as tx:
             event = tx.conn.execute(
                 "SELECT 1 FROM ga_events WHERE group_id=%s AND id=%s", (self.group, record.id)
             ).fetchone()
-            decision = tx.get_decision(record.id)
+            decision = tx.get_decision(record.id) if event else None
             parts = tx.conn.execute(
                 "SELECT p.platform_message_id,p.state,p.intent_id,d.idempotency_key,d.accepted_at "
                 "FROM ga_delivery_parts p JOIN ga_deliveries d ON d.id=p.intent_id "
@@ -435,6 +490,7 @@ class Scenario:
             "event_id": record.id,
             "occurred_at": record.occurred_at.isoformat(),
             "persisted": bool(event),
+            "foreground": foreground,
             "decision": decision,
             "work_id": (decision or {}).get("result", {}).get("work_id"),
             "parts": parts,
@@ -953,14 +1009,17 @@ async def work04(s):
 
 
 async def chat04(s):
-    await s.event("topic", actor=GUEST)
+    topic = await s.event("topic", actor=GUEST)
     short = await s.event("short", latency=True)
     s.check(
         "brief_plain_text",
-        useful_text(short, s.spec["short_patterns"])
+        not topic["receipts"]
+        and not topic["work_id"]
+        and useful_text(short, s.spec["short_patterns"])
         and len(response(short)) <= 100
         and MARKUP.search(response(short)) is None
         and "？" not in response(short),
+        topic,
         short,
     )
     long = await s.event("long", latency=True)
@@ -1216,7 +1275,7 @@ async def group03(s):
     # inference calls just to fill a compaction window.
     await s.close()
     await s.open()
-    recalled = await s.event("recall")
+    recalled = await s.event("recall", latency=True)
     tasks = s.tasks()
     owner_name = s.app.coordinator.members.get(s.app.owner, OWNER).display_name
     recall_patterns = [
@@ -1294,16 +1353,32 @@ def work_fact_has(facts, work_id, work_rows):
 async def work02(s):
     empty = await s.event("empty", latency=True)
     empty_read = foreground_observations(s, empty)
+    empty_overviews = [
+        overview
+        for observation in s.model_calls
+        if observation["source_event_id"] == empty["event_id"]
+        and isinstance(
+            overview := observation.get("input_context", {})
+            .get("context", {})
+            .get("work_facts_overview"),
+            dict,
+        )
+        and overview.get("complete") is True
+        and overview.get("facts") == []
+    ]
     s.check(
         "empty_state_honest",
         useful_text(empty, ["没有|暂无|空|没有在|无|当前没"])
         and not s.work_state()
-        and any(
-            item.get("kind") == "read_work_facts" and item.get("status") == "empty"
-            for item in empty_read
+        and (
+            bool(empty_overviews)
+            or any(
+                item.get("kind") == "read_work_facts" and item.get("status") == "empty"
+                for item in empty_read
+            )
         ),
         empty,
-        {"work_fact_observations": empty_read},
+        {"work_fact_observations": empty_read, "complete_empty_host_overviews": empty_overviews},
     )
     first = await s.event("one", latency=True)
     second = await s.event("two", latency=True)
@@ -1630,12 +1705,17 @@ async def time04(s):
 
 
 def essential_artifact_input_reply(text, subject):
-    return bool(
-        re.search(subject, text)
-        and re.search(
-            r"拍(?:照|一下)|上传|发(?:来|给我|到这里|一下)|传(?:来|给我)|提供|告诉我|贴(?:来|上|出)|补充",
-            text,
-        )
+    if not re.search(subject, text):
+        return False
+    action = re.compile(
+        r"拍(?:照|一下|张照|一张照)|上传|发(?:来|上来|给我|到这里|一下)|传(?:来|给我)"
+        r"|提供|告诉我|贴(?:来|上|出)|补充|直接(?:念|报|说)(?:出|一遍|一下)"
+    )
+    negated = re.compile(r"(?:没有|没|尚未|未曾|未|不能|无法)\s*$")
+    return any(
+        not negated.search(clause[: request.start()])
+        for clause in re.split(r"[，,。；;！？!?\n]", text)
+        for request in action.finditer(clause)
     )
 
 

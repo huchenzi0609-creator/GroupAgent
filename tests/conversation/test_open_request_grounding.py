@@ -24,7 +24,11 @@ async def test_ambient_reply_requires_an_invitation(conversation_env, open_reque
             json.loads(call.messages[1].content)["context"]["trusted_routing"]["recipient"]
             == "ambient"
         )
-        return finish("正方形有四条边。", open_request=open_request)
+        return finish(
+            "正方形有四条边。",
+            open_request=True,
+            open_request_evidence="大家谁方便说一下，正方形有几条边？" if open_request else None,
+        )
 
     model = ModelScript(decide)
     env.models[request.id] = model

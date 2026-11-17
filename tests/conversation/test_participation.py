@@ -101,12 +101,12 @@ def context(role="member"):
     ],
 )
 async def test_verified_other_member_address_reaches_router_then_non_declaration_stays_silent(text):
-    model = ModelScript(finish("Synthetic unsolicited reply"), finish(disposition="observe"))
+    model = ModelScript(finish("Synthetic unsolicited reply"))
     assert fast_observe(event(text), context()) is None
     assert verified_human_addressee(text, context()) == "other"
     result = await ModelDecisionProvider(model).decide(event(text), context())
     assert result.kind == "observe" and result.action is None
-    assert len(model.requests) == 2
+    assert len(model.requests) == 1
 
 
 @pytest.mark.parametrize("role", ["member", "owner"])

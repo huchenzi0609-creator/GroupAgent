@@ -3,6 +3,7 @@
 import json
 from uuid import uuid4
 
+from groupagent.conversation.text import outside_quotes
 from groupagent.conversation.turns import receipt_phase
 from groupagent.execution.models import ModelReply, ModelToolCall
 
@@ -15,6 +16,12 @@ def finish_fixture_reply(request, reply):
     observe = bool(reply.tool_calls)
     reports = []
     payload = json.loads(request.messages[1].content)
+    invitation = (
+        outside_quotes(payload.get("event", {}).get("text", ""))[:160]
+        if not observe
+        and payload.get("context", {}).get("trusted_routing", {}).get("recipient") == "ambient"
+        else ""
+    )
     observations = list(payload.get("prior_receipts", []))
     observations.extend(
         json.loads(message.content)
@@ -32,9 +39,8 @@ def finish_fixture_reply(request, reply):
                 name="finish_turn",
                 arguments={
                     "disposition": "observe" if observe else "reply",
-                    "open_request": not observe
-                    and payload.get("context", {}).get("trusted_routing", {}).get("recipient")
-                    == "ambient",
+                    "open_request": bool(invitation),
+                    "open_request_evidence": invitation or None,
                     "response": None if observe else reply.text,
                     "reports": [] if observe else reports,
                 },

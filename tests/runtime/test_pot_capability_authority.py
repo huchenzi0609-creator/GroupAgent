@@ -183,3 +183,65 @@ async def test_scoped_status_reply_survives_an_interleaved_human_message(runtime
     )
     assert followup.delivery_id and followup.decision.kind == "reply"
     assert len(replay.works()) == 1
+
+
+async def test_verified_human_addressee_closes_wrong_reply_without_model_retry(runtime_env):
+    env = runtime_env
+    replay = Replay(env)
+    mistaken = DialogueModel(
+        tool("finish_turn", {"disposition": "reply", "response": "我来替这位同学答。"})
+    )
+    _, ignored, _ = await replay.say(
+        "主持同学，刚才那本书是你的？",
+        mistaken,
+        actor="synthetic-peer",
+        mentions=[env.actor.member_id],
+    )
+    assert len(mistaken.normal_requests) == 1
+    assert ignored.decision.reason_code == "not_addressed_to_agent" and not ignored.delivery_id
+    _, next_turn, _ = await replay.say(
+        "Pot，帮我算一下三加五。",
+        DialogueModel(reply("八。")),
+        actor="synthetic-peer",
+    )
+    assert next_turn.delivery_id and len(replay.works()) == 0
+
+
+@pytest.mark.parametrize("authorizes_bulk", [False, True])
+async def test_bulk_write_needs_the_actual_author_scope(runtime_env, authorizes_bulk):
+    env = runtime_env
+    replay = Replay(env)
+    for label in ("审阅说明", "整理笔记"):
+        event = replay.source(label)
+        with env.store.transaction(env.actor) as tx:
+            work = tx.create_work(label, event.id)
+            tx.transition_work(
+                work.id, WorkState.PAUSED, expected_revision=work.revision, reason="user_pause"
+            )
+    phrase = "把这两项暂停的工作都取消" if authorizes_bulk else "取消之前那项暂停的工作"
+    arguments = {
+        "work_selector": {"basis": "query", "quantifier": "all", "states": ["paused"]},
+        "control": "cancel",
+    }
+    if authorizes_bulk:
+        arguments["scope_evidence"] = phrase
+
+    def check(request):
+        seen = observation(request)
+        if authorizes_bulk:
+            assert seen["status"] == "committed"
+            return reply("已取消两项暂停工作。")
+        assert seen["issues"] == [
+            {"path": "scope_evidence", "code": "bulk_scope_needs_author_evidence"}
+        ]
+        return tool(
+            "finish_turn",
+            {"disposition": "reply", "response": "你想取消哪一项？", "needs_input": True},
+        )
+
+    _, _, _ = await replay.say(
+        "Pot，" + phrase + "。", DialogueModel(tool("control_work", arguments), check)
+    )
+    assert {work.state for work in replay.works()} == {
+        WorkState.CANCELLED if authorizes_bulk else WorkState.PAUSED
+    }

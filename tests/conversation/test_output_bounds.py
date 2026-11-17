@@ -68,5 +68,7 @@ def test_named_work_schemas_expose_bounds_without_an_exact_page_default():
         }
         if kind == "update_work":
             value.update(target_work_id="synthetic-work", expected_revision=1)
+        else:
+            value["admission_ack"] = "deferred"
         Draft202012Validator(schema).validate(value)
         assert "exact_units" not in json.dumps(value)

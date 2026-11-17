@@ -238,6 +238,7 @@ async def test_real_admission_is_deliverable_while_foreground_still_waits(runtim
                     name="start_work",
                     arguments={
                         "goal": "Calculate the requested synthetic value",
+                        "admission_ack": "immediate",
                         "work_capabilities": ["compute"],
                         "required_work_tools": ["python_compute"],
                         "outputs": [{"format": "text"}],
@@ -282,7 +283,9 @@ async def test_real_admission_is_deliverable_while_foreground_still_waits(runtim
             current = tx.get_delivery(marker["delivery_id"])
             assert current.state == DeliveryState.PENDING and decision["agent_pending_response"]
             assert tx.get_delivery(old.id).state == DeliveryState.REJECTED
-            assert tx.get_work(marker["work_id"]).state == WorkState.QUEUED
+            work = tx.get_work(marker["work_id"])
+            assert work.state == WorkState.QUEUED
+            assert work.goal in marker["text"]
         assert await app.dispatcher.tick() == 1
         assert not foreground.done()
         assert sent(env) == ["【Pot】" + marker["text"]]

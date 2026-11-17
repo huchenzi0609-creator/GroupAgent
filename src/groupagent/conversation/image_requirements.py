@@ -49,7 +49,7 @@ IMAGE_QUANTITY_INSTRUCTION = (
 )
 
 
-def _quantity(text: str) -> int | None:
+def _quantity(text: str, *, require_request: bool = True) -> int | None:
     outside = outside_quotes(text)
     if _INEXACT.search(outside) or _UNFIXED.search(outside):
         return None
@@ -58,8 +58,8 @@ def _quantity(text: str) -> int | None:
         statement = main_request(clause.strip())
         # A requested count, correction or stand-alone quantity answer is not
         # the same as a count mentioned in a historical/ownership statement.
-        if _NEGATED.match(statement) or not (
-            _REQUEST.match(statement) or _COUNT.fullmatch(statement)
+        if _NEGATED.match(statement) or (
+            require_request and not (_REQUEST.match(statement) or _COUNT.fullmatch(statement))
         ):
             continue
         matches.extend(_COUNT.finditer(statement))
@@ -72,14 +72,27 @@ def _quantity(text: str) -> int | None:
 def _quoted_quantity(source: str, quote: str, count: int) -> bool:
     """Keep a quote's enclosing clause, so cutting off a negation cannot grant it."""
     positions = [match.start() for match in re.finditer(re.escape(quote), source)]
+    cited = main_request(outside_quotes(quote).strip())
+    span = _COUNT.search(cited)
     for position in positions:
         before = list(_CLAUSE.finditer(source[:position]))
         start = before[-1].end() if before else 0
         after = _CLAUSE.search(source, position + len(quote))
         stop = after.start() if after else len(source)
-        if _quantity(source[start:stop]) != count:
+        clause = source[start:stop]
+        if _quantity(clause) == _quantity(quote) == count:
+            continue
+        # A source clause can express the directive with an unfamiliar verb.
+        # An extracted numeral alone cannot ground a new requirement.
+        if (
+            span is None
+            or not cited[: span.start()].strip()
+            or _CLAUSE.search(cited)
+            or _quantity(clause, require_request=False) != count
+            or _quantity(quote, require_request=False) != count
+        ):
             return False
-    return bool(positions) and _quantity(quote) == count
+    return bool(positions)
 
 
 def _current_quantity(text: str, identity: BotIdentity) -> int | None:

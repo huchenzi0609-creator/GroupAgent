@@ -56,6 +56,11 @@ class FinishTurn(TurnData):
         default=False,
         description="The human genuinely asked the group for an answer or help without addressing a particular person.",
     )
+    open_request_evidence: str | None = Field(
+        default=None,
+        max_length=160,
+        description="Quote the current human's actual question or invitation to the group when open_request is true.",
+    )
     response: str | None = Field(
         default=None,
         max_length=12000,

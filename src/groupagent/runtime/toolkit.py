@@ -1798,7 +1798,8 @@ class WorkToolkit:
                         "page_count": record.page_count,
                         "metadata": read.metadata,
                         "verified_selected_artifact": {
-                            "validation_id": record.validation_id,
+                            # Validation runs have new receipt IDs even when
+                            # the independently checked bytes and assertions match.
                             "content_passed": record.content_passed,
                             "rendered": record.rendered,
                             "checked_literals": (

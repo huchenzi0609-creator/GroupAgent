@@ -244,3 +244,45 @@ def test_admission_pump_selects_only_exact_durable_work_binding(runtime_env, mon
     assert not scenario.pending_admission(wrong_work.id)
     assert not scenario.pending_admission(wrong_delivery.id)
     assert scenario.pending_admission(verified.id)
+
+
+def test_foreground_driver_distinguishes_pending_retry_from_final_observe(runtime_env, monkeypatch):
+    import importlib
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    env = runtime_env
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+    evaluator = importlib.import_module("pot_blind_acceptance")
+    driver = evaluator.Scenario.__new__(evaluator.Scenario)
+    driver.store = env.store
+    driver.app = SimpleNamespace(owner=env.actor)
+    driver.group = env.actor.group_id
+    replay = Replay(env)
+    event = replay.source("合成排队评估请求")
+    assert driver.foreground_status("unregistered-fixture-event") == {
+        "state": "source_not_persisted"
+    }
+    assert driver.foreground_status(event.id) == {"state": "pending", "retry": None}
+    with env.store.transaction(env.actor) as tx:
+        tx.record_decision(event.id, {"kind": "observe", "agent_pending_response": True})
+        tx.conn.execute(
+            "INSERT INTO ga_event_retry(group_id,event_id,attempts,next_attempt_at,blocked,code) "
+            "VALUES(%s,%s,1,clock_timestamp(),false,'turn_execution_pending')",
+            (env.actor.group_id, event.id),
+        )
+    pending = driver.foreground_status(event.id)
+    assert pending["state"] == "pending"
+    assert pending["retry"]["code"] == "turn_execution_pending"
+    with env.store.transaction(env.actor) as tx:
+        tx.conn.execute(
+            "UPDATE ga_event_retry SET blocked=true WHERE group_id=%s AND event_id=%s",
+            (env.actor.group_id, event.id),
+        )
+    assert driver.foreground_status(event.id)["state"] == "blocked"
+    with env.store.transaction(env.actor) as tx:
+        tx.conn.execute(
+            "UPDATE ga_decisions SET body=body - 'agent_pending_response' WHERE group_id=%s AND event_id=%s",
+            (env.actor.group_id, event.id),
+        )
+    assert driver.foreground_status(event.id) == {"state": "decided"}

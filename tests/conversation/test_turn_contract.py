@@ -123,10 +123,10 @@ async def test_native_human_reply_keeps_data_and_fences_unsolicited_delivery(con
     env = conversation_env
     peer_message = source(env, "合成同学间的技术讨论。", actor="synthetic-peer")
     event = source(env, "我用框架重做了Pot的内核，刚才在验证。", reply_to=peer_message.id)
-    model = ModelScript(finish("插话不应送出。"), finish(disposition="observe"))
+    model = ModelScript(finish("插话不应送出。"))
     env.models[event.id] = model
     result = await env.coordinator.process(event)
-    assert len(model.requests) == 2 and result.decision.kind == "observe"
+    assert len(model.requests) == 1 and result.decision.kind == "observe"
     with env.store.transaction(env.actor) as tx:
         assert recipient_evidence_in_tx(tx, event).source == "human_reply"
         assert not tx.list_work() and not tx.list_delivery()
@@ -141,7 +141,13 @@ async def test_native_human_reply_keeps_data_and_fences_unsolicited_delivery(con
 async def test_open_question_to_agent_establishes_continuation_for_same_member(conversation_env):
     env = conversation_env
     event = source(env, "请解释一下列表和元组的区别。")
-    env.models[event.id] = ModelScript(finish("列表可修改，元组固定。", open_request=True))
+    env.models[event.id] = ModelScript(
+        finish(
+            "列表可修改，元组固定。",
+            open_request=True,
+            open_request_evidence="请解释一下列表和元组的区别。",
+        )
+    )
     result = await env.coordinator.process(event)
     assert result.delivery_id and result.decision.directness == "open"
     followup = source(env, "哪一种适合固定记录呢？")

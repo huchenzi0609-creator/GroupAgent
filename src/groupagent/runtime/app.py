@@ -327,9 +327,16 @@ class RuntimeApp:
         """Give the initial reply a head start without making speech a work dependency."""
         with self.store.transaction(self.technical) as tx:
             row = tx.conn.execute(
-                "SELECT state,created_at FROM ga_deliveries WHERE group_id=%s AND request_event_id=%s "
-                "AND idempotency_key=%s",
-                (tx.group_id, work.request_event_id, "reply:" + work.request_event_id + ":1"),
+                "SELECT d.state,d.created_at FROM ga_deliveries d "
+                "WHERE d.group_id=%s AND d.request_event_id=%s AND d.created_by=%s "
+                "AND (d.idempotency_key='reply:'||d.request_event_id||':1' OR ("
+                "d.idempotency_key='early_ack:'||d.request_event_id||':1' AND EXISTS ("
+                "SELECT 1 FROM ga_decisions a WHERE a.group_id=d.group_id "
+                "AND a.event_id=d.request_event_id AND a.body#>>'{work_admission,work_id}'=%s "
+                "AND a.body#>>'{work_admission,delivery_id}'=d.id"
+                "))) ORDER BY (d.idempotency_key='early_ack:'||d.request_event_id||':1') DESC "
+                "LIMIT 1",
+                (tx.group_id, work.request_event_id, work.requester_id, work.id),
             ).fetchone()
         return (
             row is None
