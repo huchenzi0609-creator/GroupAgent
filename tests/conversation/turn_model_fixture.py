@@ -14,6 +14,7 @@ def semantic_fixture_reply(
     outcome=None,
     required_actions=None,
     work_context_required=False,
+    information_basis="stable_knowledge",
 ):
     system = request.messages[0].content or ""
     if system.startswith("TURN_CONTRACT_V1"):
@@ -45,6 +46,7 @@ def semantic_fixture_reply(
             "intent": mode,
             "required_actions": requirements,
             "work_context_required": work_context_required,
+            "information_basis": information_basis,
         }
     elif system.startswith("TURN_OUTCOME_V1"):
         payload = json.loads(request.messages[1].content)

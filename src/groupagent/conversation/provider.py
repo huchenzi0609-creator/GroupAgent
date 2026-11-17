@@ -16,7 +16,7 @@ from pydantic import ValidationError
 from groupagent.coordinator import DECISION_CONTRACT_ERRORS, Decision
 from groupagent.delivery import group_reply_instruction
 from groupagent.domain import DomainError, GroupEvent
-from groupagent.execution.kernel import AgentKernel, KernelHooks, KernelTool
+from groupagent.execution.kernel import AgentKernel, KernelDirective, KernelHooks, KernelTool
 from groupagent.execution.models import ModelMessage, ModelReply, ModelToolCall
 from groupagent.execution.ports import ModelPort
 from groupagent.identity import BotIdentity
@@ -37,6 +37,8 @@ from .turns import (
     TurnContract,
     assess_outcome,
     assess_turn,
+    durable_effect_identity,
+    durable_progress,
     missing_actions,
     recipient_from_context,
 )
@@ -975,6 +977,20 @@ class ModelDecisionProvider:
                 directness=contract.directness,
                 confidence=1,
             )
+        if contract.information_blocker:
+            blocked_text = (
+                "你当前的角色不允许委派联网核实，暂时无法提供已核验的结果。"
+                if contract.information_blocker == "read_only_scope"
+                else "当前联网核实功能不可用，暂时无法确认这项公开信息。"
+            )
+            context["_turn_outcome"] = {"outcome": "blocked", "explanation": blocked_text}
+            return Decision(
+                kind="reply",
+                reason_code=contract.information_blocker,
+                response=blocked_text,
+                directness=contract.directness,
+                confidence=1,
+            )
         public = {
             key: value
             for key, value in context.items()
@@ -1001,12 +1017,104 @@ class ModelDecisionProvider:
             raise DomainError("context_too_large", "Conversation context exceeds its bounded input")
         silent: Decision | None = None
         receipts: list[dict[str, Any]] = list(context.get("_prior_action_receipts", []))
+        matched_effects = set(context.get("_matched_action_effects", []))
+        repair_targets = context.setdefault("_admission_repair_targets", {})
         context["_turn_execution_pending"] = contract.intent == "action"
-        stalled_evidence: str | None = None
+        stalled_evidence: tuple[str, ...] | None = None
         rejected_proposals: set[str] = set()
+
+        def matched_receipts() -> list[dict[str, Any]]:
+            return [
+                receipt
+                for receipt in receipts
+                if durable_effect_identity(receipt) in matched_effects
+            ]
+
+        def quiet_committed() -> bool:
+            return any(
+                receipt.get("committed") is True
+                and receipt.get("result", {}).get("decision", {}).get("reason_code")
+                == "quiet_enabled"
+                for receipt in receipts
+            )
 
         def proposal_key(call: ModelToolCall) -> str:
             return json.dumps({"tool": call.name, "arguments": call.arguments}, sort_keys=True)
+
+        def call_action(call: ModelToolCall) -> tuple[str, str | None]:
+            action = call.arguments.get("action")
+            operation = action.get("op") if isinstance(action, dict) else None
+            return (
+                "business" if call.name == "apply_business_action" else call.name,
+                operation if isinstance(operation, str) else None,
+            )
+
+        def fulfilled(call: ModelToolCall) -> bool:
+            kind, operation = call_action(call)
+            if kind not in {"start_work", "update_work", "control_work", "business"}:
+                return False
+
+            def matches(required):
+                return required.kind == kind and (
+                    required.operation is None or required.operation == operation
+                )
+
+            return any(matches(required) for required in contract.required_actions) and not any(
+                matches(required) for required in missing_actions(contract, matched_receipts())
+            )
+
+        def visible_tools() -> frozenset[str]:
+            names = {
+                "read_work_facts",
+                "start_work",
+                "update_work",
+                "control_work",
+                "apply_business_action",
+                "observe",
+            }
+            pending = missing_actions(contract, matched_receipts())
+            for kind in ("start_work", "update_work", "control_work", "business"):
+                if contract.intent == "action" and not any(item.kind == kind for item in pending):
+                    names.discard("apply_business_action" if kind == "business" else kind)
+            if repair_targets:
+                names.discard("start_work")
+                names.add("update_work")
+            if contract.visible and contract.intent == "action" and not quiet_committed():
+                names.discard("observe")
+            return frozenset(names)
+
+        def repair_feedback(explanation: str) -> str:
+            nonlocal stalled_evidence
+            state = durable_progress(receipts)
+            if stalled_evidence == state:
+                raise DomainError(
+                    "turn_execution_pending",
+                    "Foreground execution has not made host progress",
+                    retryable=True,
+                )
+            stalled_evidence = state
+            missing = missing_actions(contract, matched_receipts())
+            raw_missing = missing_actions(contract, receipts)
+            return json.dumps(
+                {
+                    "type": "turn_completion_repair",
+                    "phase": "foreground_admission",
+                    "code": "matching_host_action_required"
+                    if missing
+                    else "truthful_phase_reply_required",
+                    "missing_actions": [item.model_dump(mode="json") for item in missing],
+                    "admission_repair_targets": context.get("_admission_repair_details", []),
+                    "feedback": explanation,
+                    "instruction": (
+                        "只提交missing_actions中尚缺主机回执的动作，不重复已接受的动作；真实权限/能力阻碍或用户专属缺参才聚焦说明。"
+                        if raw_missing
+                        else "已有主机回执，需要说明其与本轮目标及实际阶段的对应；不要把排队当失败或另起工作。目标确实不符时由主机对齐同一工作；已对齐后只如实说明已排队。"
+                        if missing
+                        else "所需前台动作已被接受，只修正回复措辞。排队是成功委派，不必等待后台检索、产物或交付完成；简短如实说明已排队及后续交付。不得另起、重提或恢复同一工作，也不能静默逃避本轮回复。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
         async def after_model(candidate: ModelReply, messages: tuple[ModelMessage, ...]):
             if any(proposal_key(call) in rejected_proposals for call in candidate.tool_calls):
@@ -1015,6 +1123,23 @@ class ModelDecisionProvider:
                     "Foreground repeated a rejected tool proposal",
                     retryable=True,
                 )
+            if any(
+                fulfilled(call)
+                or (call.name == "start_work" and repair_targets)
+                or (
+                    call.name == "observe"
+                    and contract.visible
+                    and contract.intent == "action"
+                    and not quiet_committed()
+                )
+                for call in candidate.tool_calls
+            ):
+                feedback = repair_feedback(
+                    "本批工具未执行；已接受的动作不用重做，可见执行请求应给出真实阶段回复。"
+                )
+                # Drop the unexecuted proposal so its tool-call IDs never become
+                # dangling exchanges when standard middleware returns to model.
+                return KernelDirective(messages=messages[:-1], feedback=feedback, jump_to="model")
             return None
 
         def observation(receipt: dict[str, Any], *, kind: str, operation: str | None = None) -> str:
@@ -1065,13 +1190,26 @@ class ModelDecisionProvider:
             action = call.arguments.get("action")
             raw_operation = action.get("op") if isinstance(action, dict) else None
             operation = raw_operation if isinstance(raw_operation, str) else None
+            target_id = call.arguments.get("target_work_id")
+            repairing = (
+                kind == "update_work" and isinstance(target_id, str) and target_id in repair_targets
+            )
             try:
-                if contract.intent != "action" or not any(
-                    required.kind == action_kind
-                    and (required.operation is None or required.operation == operation)
-                    for required in contract.required_actions
+                if fulfilled(call):
+                    raise _InvalidCandidate("kind", "action_already_committed")
+                if contract.intent != "action" or not (
+                    repairing
+                    or any(
+                        required.kind == action_kind
+                        and (required.operation is None or required.operation == operation)
+                        for required in contract.required_actions
+                    )
                 ):
                     raise _InvalidCandidate("kind", "action_not_requested_this_turn")
+                if repairing and (
+                    not call.arguments.get("work_capabilities") or not call.arguments.get("outputs")
+                ):
+                    raise _InvalidCandidate("kind", "admission_repair_requires_complete_plan")
                 schema = (
                     business_action_schema(catalog)
                     if kind == "command"
@@ -1084,8 +1222,11 @@ class ModelDecisionProvider:
                     json.dumps(
                         {
                             **call.arguments,
+                            **({"goal": event.text} if repairing else {}),
                             "kind": kind,
-                            "reason_code": "agent_tool_" + kind,
+                            "reason_code": "repair_current_turn_admission"
+                            if repairing
+                            else "agent_tool_" + kind,
                             "directness": directness,
                             "confidence": 1,
                         },
@@ -1124,10 +1265,26 @@ class ModelDecisionProvider:
             receipt = await callback(candidate, call.id)
             if receipt.get("committed") is not True:
                 rejected_proposals.add(proposal_key(call))
-            return observation(receipt, kind=action_kind, operation=operation)
+            previous_progress = durable_progress(receipts)
+            result = observation(
+                receipt,
+                kind="start_work" if receipt.get("satisfies_kind") == "start_work" else action_kind,
+                operation=operation,
+            )
+            if receipt.get("committed") is True and repairing:
+                repair_targets.pop(target_id, None)
+            if receipt.get("committed") is True and durable_progress(receipts) == previous_progress:
+                # A differently worded proposal for the same accepted effect
+                # is not new work. The ordinary retry path persists receipts.
+                repair_feedback(
+                    "同一持久动作已经接受，这次没有新的执行效果；请说明真实阶段或具体目标不匹配。"
+                )
+            return result
 
         async def observe(call: ModelToolCall) -> str:
             nonlocal silent
+            if contract.visible and contract.intent == "action" and not quiet_committed():
+                return json.dumps({"status": "rejected", "code": "visible_action_requires_reply"})
             reason = call.arguments.get("reason_code", "agent_observed")
             directness = call.arguments.get("directness", "none")
             if (
@@ -1150,62 +1307,59 @@ class ModelDecisionProvider:
         async def after_agent(
             candidate: ModelReply, messages: tuple[ModelMessage, ...]
         ) -> str | None:
-            nonlocal stalled_evidence, silent
+            nonlocal silent
             if contract.intent != "action":
                 return None
             if context.get("_agent_context_revoked"):
                 context["_turn_execution_pending"] = False
                 return None
-            missing = missing_actions(contract, receipts)
+            if quiet_committed() and not missing_actions(contract, receipts):
+                context["_turn_execution_pending"] = False
+                silent = Decision(kind="observe", reason_code="quiet_enabled", confidence=1)
+                return None
             outcome = await assess_outcome(self.model, contract, candidate, context, receipts)
-            if outcome.outcome in {"blocked", "needs_input"}:
+            if outcome.outcome in {"committed", "repair_reply"}:
+                matched_effects.update(durable_progress(receipts))
+                context["_matched_action_effects"] = sorted(matched_effects)
+            missing = missing_actions(contract, matched_receipts())
+            if outcome.outcome == "missing_evidence" and outcome.mismatched_work_ids:
+                repair = context.get("_authorize_work_repair")
+                owned = {
+                    effect["id"]: effect["goal_revision"]
+                    for receipt in receipts
+                    if receipt.get("committed") is True
+                    for effect in receipt.get("work_effects", [])
+                    if isinstance(effect, dict)
+                    and effect.get("current_event_owned") is True
+                    and isinstance(effect.get("id"), str)
+                    and type(effect.get("goal_revision")) is int
+                }
+                if repair is not None and any(
+                    item.kind == "start_work" for item in contract.required_actions
+                ):
+                    for work_id in dict.fromkeys(outcome.mismatched_work_ids):
+                        if work_id not in owned:
+                            continue
+                        available = await repair(work_id, owned[work_id])
+                        context.setdefault("_admission_repair_details", []).append(available)
+            has_reply = isinstance(candidate.text, str) and bool(candidate.text.strip())
+            if outcome.outcome in {"blocked", "needs_input"} and missing and has_reply:
                 context["_turn_outcome"] = outcome.model_dump(mode="json")
                 context["_turn_execution_pending"] = False
                 silent = None
                 return None
-            if outcome.outcome == "committed" and not missing:
+            if (
+                outcome.outcome == "committed"
+                and not missing
+                and (has_reply or not contract.visible)
+            ):
                 context["_turn_outcome"] = outcome.model_dump(mode="json")
                 context["_turn_execution_pending"] = False
                 return None
-            evidence_state = json.dumps(
-                sorted(
-                    {
-                        json.dumps(
-                            {
-                                key: value
-                                for key, value in receipt.items()
-                                if key not in {"replayed", "tool_call_id", "status", "host_message"}
-                            },
-                            sort_keys=True,
-                            default=str,
-                        )
-                        for receipt in receipts
-                        if receipt.get("committed") is True
-                    }
-                )
-            )
-            if stalled_evidence == evidence_state:
-                # No host progress after repair: yield this activation to the
-                # durable event retry/backoff mechanism, never promise success.
-                raise DomainError(
-                    "turn_execution_pending",
-                    "Foreground execution has not made host progress",
-                    retryable=True,
-                )
-            stalled_evidence = evidence_state
             self.diagnostics.append({"code": "turn_action_evidence_missing"})
-            return json.dumps(
-                {
-                    "type": "turn_completion_repair",
-                    "code": "matching_host_action_required",
-                    "missing_actions": [item.model_dump(mode="json") for item in missing],
-                    "feedback": outcome.explanation,
-                    "instruction": "本轮执行请求尚未有匹配主机凭据。现在调用对应工具提交工作/操作；"
-                    "只有存在具体权限、能力阻碍或真正缺少必要输入时才说明阻碍或聚焦澄清。"
-                    "不能用即将开始的承诺完成本轮，不要重复提交已经有回执的同一动作。",
-                },
-                ensure_ascii=False,
-            )
+            if contract.visible:
+                silent = None
+            return repair_feedback(outcome.explanation)
 
         tools = (
             KernelTool(
@@ -1272,7 +1426,9 @@ class ModelDecisionProvider:
                 ),
                 tools=tools,
                 max_output_tokens=4000,
-                hooks=KernelHooks(after_model=after_model, after_agent=after_agent),
+                hooks=KernelHooks(
+                    after_model=after_model, after_agent=after_agent, visible_tools=visible_tools
+                ),
             )
         except TimeoutError:
             raise DomainError(

@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 
+from groupagent.coordinator import Decision
 from groupagent.domain import EventKind, GroupEvent, WorkState
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
@@ -78,7 +79,8 @@ class ScriptedModel:
         if assessed is not None:
             return assessed
         self.requests.append(request)
-        assert {tool["function"]["name"] for tool in request.tools} == {
+        available = {tool["function"]["name"] for tool in request.tools}
+        assert available <= {
             "read_work_facts",
             "start_work",
             "update_work",
@@ -86,6 +88,7 @@ class ScriptedModel:
             "apply_business_action",
             "observe",
         }
+        assert "read_work_facts" in available
         assert "Decision schema:" not in request.messages[0].content
         step = self.steps.pop(0)
         if isinstance(step, BaseException):
@@ -406,44 +409,43 @@ async def test_quiet_between_action_commit_and_final_text_suppresses_pending_ack
 
 async def test_tool_call_and_same_action_replays_never_create_duplicate_work(conversation_env):
     env = conversation_env
-    candidate = action(
-        "start_work",
+    candidate = Decision(
+        kind="start_work",
+        reason_code="host_idempotency_fixture",
+        directness="direct",
+        confidence=1,
         goal="制作节水Word",
         work_capabilities=["documents"],
         outputs=[{"format": "docx"}],
     )
-    first = call("apply_business_action", candidate, "initial")
-    repeated = call("apply_business_action", candidate, "initial")
-    alias = call("apply_business_action", candidate, "alias")
-    conflicting = call(
-        "apply_business_action",
-        action("command", action={"op": "claim_task", "title": "未经此次调用授权的分工"}),
-        "alias",
+    event = source(env, "Pot，帮我做节水Word。")
+    actor = env.coordinator.actor(event)
+    context = env.coordinator._context(actor, event)
+    env.coordinator._bind_agent_tools(actor, event, context)
+    apply = context["_apply_business_action"]
+    assert (await apply(candidate, "initial"))["status"] == "committed"
+    assert (await apply(candidate, "initial"))["replayed"]
+    assert (await apply(candidate, "alias"))["replayed"]
+    conflicting = Decision(
+        kind="command",
+        reason_code="host_idempotency_fixture",
+        directness="direct",
+        confidence=1,
+        action={"op": "claim_task", "title": "未经此次调用授权的分工"},
     )
-
-    def repeat(request):
-        assert last_observation(request)["status"] == "committed"
-        return repeated
-
-    def replay_alias(request):
-        assert last_observation(request)["replayed"]
-        return alias
-
-    def conflict(request):
-        assert last_observation(request)["replayed"]
-        return conflicting
-
-    def finish(request):
-        observed = last_observation(request)
-        assert observed["status"] == "rejected"
-        assert (
-            observed.get("code") == "invalid_input"
-            or observed["issues"][0]["code"] == "action_not_requested_this_turn"
-        )
-        return reply("节水文档已排队；重复调用没有新增任务。")
-
-    event, result = await turn(
-        env, "Pot，帮我做节水Word。", ScriptedModel(first, repeat, replay_alias, conflict, finish)
+    refused = await apply(conflicting, "alias")
+    assert refused["status"] == "rejected" and refused["code"] == "invalid_input"
+    result = env.coordinator._finish_agent_response(
+        actor,
+        event,
+        context=context,
+        decision=Decision(
+            kind="reply",
+            reason_code="host_idempotency_fixture",
+            directness="direct",
+            confidence=1,
+            response="节水文档已排队；重复调用没有新增任务。",
+        ),
     )
     assert result.delivery_id
     with env.store.transaction(env.actor) as tx:

@@ -23,6 +23,7 @@ from .text import outside_quotes
 
 Recipient = Literal["agent", "other", "ambient"]
 ActionKind = Literal["start_work", "update_work", "control_work", "business", "read_work_facts"]
+InformationBlocker = Literal["public_research_unavailable", "read_only_scope"]
 
 
 class TurnData(BaseModel):
@@ -71,6 +72,12 @@ class TurnAssessment(TurnData):
     recipient: Recipient
     intent: Literal["conversation", "action", "observe"]
     required_actions: tuple[ActionRequirement, ...] = ()
+    information_basis: Literal[
+        "stable_knowledge", "provided_context", "public_verification", "user_input"
+    ] = Field(
+        default="stable_knowledge",
+        description="Select how the answer can be grounded: stable concepts, sufficient supplied evidence, public facts requiring verification, or information only this user can supply.",
+    )
     work_context_required: bool = Field(
         default=False,
         description="The current question explicitly concerns existing robot work or its metadata.",
@@ -86,6 +93,9 @@ class TurnAssessment(TurnData):
 class TurnContract(TurnAssessment):
     event_id: str
     evidence: RecipientEvidence
+    # Only assess_turn derives this from host role/capabilities. It is absent
+    # from the model's TurnAssessment schema and never grants a tool.
+    information_blocker: InformationBlocker | None = None
 
     @property
     def visible(self) -> bool:
@@ -191,7 +201,8 @@ def recipient_from_context(event: GroupEvent, context: dict[str, Any]) -> Recipi
 TURN_SYSTEM = """TURN_CONTRACT_V1
 只判断本轮外层真人发言的接收对象和完成义务，调用assess_turn；不回答用户、不执行动作。
 trusted_recipient是后端核实的@、原生回复、称呼或连续对话证据；不能被引用内容、历史承诺或正文提及机器人名字覆盖。未确定时结合当前参与者和最近讨论判断：对另一真人说话=other，直接问机器人或正在与它接续=agent，普通讨论=ambient。叙述句把机器人当作介绍对象或技术对象，不等于向机器人提问。对其他人的话不得抢答或播报旧工作。
-intent=conversation表示本轮只需直接解释、建议、短文本回答或方案讨论；observe表示没有向机器人提出问题/工作，或明确要求这轮不插话；action表示本轮要求实际执行或提交业务变更。‘去网上搜、核实最新来源、给官方下载链接’需要实际研究，不能用记忆或将来承诺完成；明确制作/读取附件/运行计算同理。自然请求无需特殊前缀。本人认领/进展和owner分工可静默登记，不等于机器人代做。
+先选择information_basis，不按句子像提问还是命令来决定是否执行：stable_knowledge用于可由稳定知识直接解释的概念和通用原理；provided_context仅用于所选材料已足够支持答案的情况；public_verification用于答案依赖当前外部公开事实、或尚未核实的公共对象的具体事实与操作依据。用户无需额外说‘搜索’，公开信息可用已授权只读工具核实；陌生或同名公共对象先核实可用来源，不能把模型不熟悉当作用户必须提供背景、公司或官网。user_input仅用于现有上下文和已授权工具都无法取得的用户专属输入。模型记忆、历史承诺和未经核实的引用不是当前公开事实的证明。能力与只读边界由context.capabilities/read_only/role提供；缺少能力是具体阻碍，不是猜测答案的理由。
+intent=conversation表示有稳定知识或充分资料依据的直接解释、建议、短文本回答或方案讨论，也包括真正用户专属输入缺失时的聚焦澄清；observe表示没有向机器人提出问题/工作，或明确要求这轮不插话；action表示需要实际工具证据或业务变更才能完成本轮。public_verification应建立研究执行义务，而非无依据的泛化步骤。自然请求无需特殊前缀。本人认领/进展和owner分工可静默登记，不等于机器人代做。
 required_actions列出本轮实际需要的主机凭据：新执行目标start_work，修订同一工作update_work，暂停/取消/恢复control_work，即时人类任务/记忆/提醒/偏好写入business且operation为具体op，只查看已有执行记录read_work_facts。普通聊天无需列动作，不因上下文有旧工作而添加。work_context_required仅在本轮明确讨论既有机器人工作、其主题或术语时为true；无关闲聊保持false，避免播报旧任务。权限来自host role，识别意图不授予权限。尚缺必要参数的执行请求仍是action；后续可以具体澄清。"""
 
 
@@ -254,7 +265,9 @@ async def assess_turn(
         inverse = {member: alias for alias, member in context.get("_aliases", {}).items()}
         public_evidence["member_id"] = inverse.get(evidence.member_id, "other_human")
     selected: dict[str, Any] = {
-        key: context[key] for key in ("role", "requester_member_id") if key in context
+        key: context[key]
+        for key in ("role", "requester_member_id", "read_only", "capabilities", "now")
+        if key in context
     }
     for name, fields, limit in (
         ("members", ("member_id", "name", "membership_state", "name_source"), 40),
@@ -275,13 +288,15 @@ async def assess_turn(
                 for row in rows[-limit:]
                 if isinstance(row, dict)
             ]
+    schema = TurnAssessment.model_json_schema()
+    schema["required"] = [*schema.get("required", []), "information_basis"]
     assessment = _validated(
         TurnAssessment,
         await semantic_assessment(
             model,
             system=TURN_SYSTEM,
             name="assess_turn",
-            schema=TurnAssessment.model_json_schema(),
+            schema=schema,
             payload={
                 "event": projection,
                 "trusted_recipient": public_evidence,
@@ -290,9 +305,24 @@ async def assess_turn(
         ),
     )
     recipient = evidence.recipient if evidence.directed else assessment.recipient
-    return TurnContract(
-        **{**assessment.model_dump(), "recipient": recipient}, event_id=event.id, evidence=evidence
-    )
+    values = {**assessment.model_dump(), "recipient": recipient}
+    blocker: InformationBlocker | None = None
+    if (
+        recipient == "agent"
+        and assessment.intent == "conversation"
+        and assessment.information_basis == "public_verification"
+    ):
+        # Public uncertainty is semantically different from a missing private
+        # input. Normalize only a new conversational lookup; existing selected
+        # work/update/control/read obligations remain exactly as assessed.
+        capabilities = context.get("capabilities", {})
+        if context.get("read_only") is True or context.get("role") not in {"owner", "member"}:
+            blocker = "read_only_scope"
+        elif not isinstance(capabilities, dict) or capabilities.get("web_research") is not True:
+            blocker = "public_research_unavailable"
+        else:
+            values.update(intent="action", required_actions=[{"kind": "start_work"}])
+    return TurnContract(**values, event_id=event.id, evidence=evidence, information_blocker=blocker)
 
 
 def public_contract(contract: TurnContract, context: dict[str, Any]) -> dict[str, Any]:
@@ -305,13 +335,15 @@ def public_contract(contract: TurnContract, context: dict[str, Any]) -> dict[str
 
 
 class TurnOutcome(TurnData):
-    outcome: Literal["committed", "blocked", "needs_input", "missing_evidence"]
+    outcome: Literal["committed", "repair_reply", "blocked", "needs_input", "missing_evidence"]
     explanation: str = Field(min_length=1, max_length=700)
+    mismatched_work_ids: tuple[str, ...] = ()
 
 
 OUTCOME_SYSTEM = """TURN_OUTCOME_V1
-核验本轮执行义务的完成证据或真实阻碍/必要澄清。只调用assess_turn_outcome，不执行动作。
-committed只在每项当前请求都有相匹配的本轮成功主机回执时使用；无关工作、另一种动作或只有部分执行不能满足当前请求。核对实际目标、对象和结果，不仅看调用了同名工具。
+你核验的是foreground_admission前台接单与本轮回复，不是后台工作成品验收。只调用assess_turn_outcome，不执行动作。
+start_work回执committed且有work_id表示研究/制作已被接受；queued就是成功委派，不要求此刻已搜到结果、生成产物或完成交付。update_work验证修订已被接受，control_work验证控制已应用，business验证即时写入，read_work_facts验证实际记录已读取。核对当前请求与真实回执是否匹配，不把后台尚未完成当作前台缺少动作，不要求另起工作或重复提交。
+committed表示每项前台义务已有匹配主机凭据，且候选正文诚实说明当前阶段。只有排队回执时可以简短说明已排队、结果稍后交付，不能声称已实际检索、执行或发出结果。凭据已齐而正文夸大阶段、空白或试图静默时输出repair_reply，仅修正文；reply_required=false时，已接受的真人声明可以静默committed。真正缺少匹配主机动作时才输出missing_evidence。无关工作或仅部分动作不能满足本轮请求；若实际work_effects.goal指向错误对象，在mismatched_work_ids列出其真实ID，不能只因queued或缺少成品而说目标错误。
 blocked必须说明当前权限/能力/实际拒绝回执造成的具体阻碍，不能把可自动执行的原任务说成需重复批准。needs_input必须指出无法从现有上下文获得、且执行必需的具体输入；陌生公开产品名可以直接搜索核实，不能要求用户提供官网或产品背景再开始。泛泛的‘需要帮忙吗/确认要做吗’不是必要输入。不存在具体阻碍或缺参，或候选只是‘正在搜/将制作/已开始’而无匹配回执，输出missing_evidence。工具提案、模型正文和旧工作不算本轮已执行。explanation用简短真人语言说明依据；不能虚构执行失败。"""
 
 
@@ -334,6 +366,12 @@ async def assess_outcome(
                 "event": context.get("_turn_event", context.get("model_event")),
                 "role": context.get("role"),
                 "capabilities": context.get("capabilities"),
+                "completion_phase": "foreground_admission",
+                "background_completion_required": False,
+                "reply_required": contract.visible,
+                "missing_host_actions": [
+                    item.model_dump(mode="json") for item in missing_actions(contract, receipts)
+                ],
                 "candidate": candidate.text,
                 "host_receipts": receipts,
             },
@@ -341,17 +379,108 @@ async def assess_outcome(
     )
 
 
+def durable_effect_identity(receipt: dict[str, Any]) -> str | None:
+    """Ignore proposals, acknowledgement text and observation times as progress."""
+    if receipt.get("committed") is not True:
+        return None
+    kind, operation = receipt.get("kind"), receipt.get("operation")
+    result = receipt.get("result")
+    result = result if isinstance(result, dict) else receipt
+    resources: list[dict[str, Any]] = []
+    effects = receipt.get("work_effects", [])
+    if isinstance(effects, list):
+        for effect in effects:
+            if isinstance(effect, dict) and effect.get("id"):
+                resources.append(
+                    {
+                        key: effect[key]
+                        for key in (
+                            "id",
+                            "goal_revision",
+                            *(("state",) if kind == "control_work" else ()),
+                        )
+                        if key in effect
+                    }
+                )
+    if not resources and result.get("work_id"):
+        resources.append({"id": result["work_id"]})
+
+    def business(value):
+        if not isinstance(value, dict):
+            return
+        identifiers = {
+            key: value[key]
+            for key in (
+                "task_id",
+                "schedule_id",
+                "fact_id",
+                "member_id",
+                "policy_subject",
+                "revision",
+            )
+            if key in value
+        }
+        if identifiers:
+            resources.append(identifiers)
+        actions = value.get("actions", [])
+        for action in actions if isinstance(actions, list) else ():
+            business(action)
+
+    if kind == "business":
+        business(result.get("action_result", result))
+    if kind == "read_work_facts":
+        facts = receipt.get("facts", [])
+        resources += (
+            [
+                {key: fact[key] for key in ("id", "goal_revision", "state") if key in fact}
+                for fact in facts
+                if isinstance(fact, dict)
+            ]
+            if isinstance(facts, list)
+            else []
+        )
+    return json.dumps(
+        {
+            "kind": kind,
+            "operation": operation,
+            "resources": sorted({json.dumps(row, sort_keys=True) for row in resources}),
+        },
+        sort_keys=True,
+    )
+
+
+def durable_progress(receipts: list[dict[str, Any]]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                identity
+                for receipt in receipts
+                if (identity := durable_effect_identity(receipt)) is not None
+            }
+        )
+    )
+
+
 def missing_actions(
     contract: TurnContract, receipts: list[dict[str, Any]]
 ) -> tuple[ActionRequirement, ...]:
     """Only callbacks returning real committed evidence can discharge an action."""
-    return tuple(
-        required
-        for required in contract.required_actions
-        if not any(
-            receipt.get("committed") is True
-            and receipt.get("kind") == required.kind
-            and (required.operation is None or receipt.get("operation") == required.operation)
-            for receipt in receipts
+    used: set[str] = set()
+    missing = []
+    for required in contract.required_actions:
+        match = next(
+            (
+                identity
+                for receipt in receipts
+                if (identity := durable_effect_identity(receipt)) is not None
+                and identity not in used
+                and receipt.get("kind") == required.kind
+                and (required.operation is None or receipt.get("operation") == required.operation)
+            ),
+            None,
         )
-    )
+        if match is None:
+            missing.append(required)
+        else:
+            used.add(match)
+    return tuple(missing)

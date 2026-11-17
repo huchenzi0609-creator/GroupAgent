@@ -125,6 +125,22 @@ async def run(args):
         return event, entry
 
     try:
+        if args.case == "stable_concept":
+            _, concept = await turn("stable_concept", "Pot，RAG是什么？")
+            assert concept["reply"] and concept["work_count"] == 0
+            report["passed"] = True
+            return
+        if args.case == "implicit_install":
+            _, installed = await turn(
+                "implicit_install_lookup",
+                "Pot，告诉我如何下载并安装WorkBuddy。",
+            )
+            assert installed["work_id"] and installed["work_count"] == 1
+            assert installed["reply"] and installed["wire_text"], (
+                "A directly addressed action must acknowledge real admission, not escape silently"
+            )
+            report["passed"] = True
+            return
         peer, ambient = await turn("peer_source", "我先试一下群里的功能。", peer=True)
         assert ambient["kind"] in {"observe", "ignore"} and not ambient["wire_text"]
         _, quiet = await turn(
@@ -155,4 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--dsn-file", type=Path, required=True)
     parser.add_argument("--secrets", type=Path, default=ROOT / ".env.local")
+    parser.add_argument(
+        "--case", choices=("dialogue", "implicit_install", "stable_concept"), default="dialogue"
+    )
     asyncio.run(run(parser.parse_args()))

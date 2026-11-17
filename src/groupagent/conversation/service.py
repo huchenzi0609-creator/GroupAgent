@@ -1397,12 +1397,21 @@ class ConversationCoordinator(Coordinator):
                 return {"status": "rejected", "code": error.code, "committed": False}
             context["_agent_applied"] = True
             accepted = bool(result.work_id or result.action_result is not None)
+            with self.store.transaction(actor, trace_id=event.id) as tx:
+                prior: dict[str, Any] = tx.get_decision(event.id) or {}
+            digest = hashlib.sha256(candidate.model_dump_json().encode()).hexdigest()
+            recorded: dict[str, Any] = next(
+                (
+                    receipt
+                    for receipt in prior.get("action_receipts", [])
+                    if receipt.get("tool_call_id") == tool_call_id
+                    and receipt.get("candidate_sha256") == digest
+                ),
+                {},
+            )
             # Successful reads never enter this function. A prior closed turn is
             # not evidence that a different candidate was committed.
             if result.duplicate:
-                with self.store.transaction(actor, trace_id=event.id) as tx:
-                    prior: dict[str, Any] = tx.get_decision(event.id) or {}
-                digest = hashlib.sha256(candidate.model_dump_json().encode()).hexdigest()
                 accepted = (
                     any(
                         receipt.get("candidate_sha256") == digest
@@ -1415,12 +1424,59 @@ class ConversationCoordinator(Coordinator):
                 "committed": accepted,
                 "replayed": result.duplicate,
                 "tool_call_id": tool_call_id,
+                "work_effects": recorded.get("work_effects", []),
+                "satisfies_kind": recorded.get("satisfies_kind"),
                 "host_message": result.decision.response,
                 "result": self._model_aliases(result.model_dump(mode="json"), context),
             }
 
         context["_read_work_facts"] = read_facts
         context["_apply_business_action"] = apply_action
+
+        async def authorize_work_repair(
+            work_id: str, expected_goal_revision: int
+        ) -> dict[str, Any]:
+            # Bind a full normal update to this admitted generation. A later
+            # human revision cannot refresh this authority.
+            with self.store.transaction(actor, trace_id=event.id) as tx:
+                work = tx.get_work(work_id)
+                if work.request_event_id != event.id or work.requester_id != actor.member_id:
+                    return {"committed": False, "status": "rejected", "code": "scope_violation"}
+                if work.state not in {
+                    WorkState.QUEUED,
+                    WorkState.RUNNING,
+                    WorkState.VALIDATING,
+                    WorkState.WAITING_INPUT,
+                }:
+                    return {
+                        "committed": False,
+                        "status": "rejected",
+                        "code": "work_control_preserved",
+                    }
+                if (
+                    type(expected_goal_revision) is not int
+                    or work.goal_revision != expected_goal_revision
+                ):
+                    return {
+                        "committed": False,
+                        "status": "rejected",
+                        "code": "goal_revision_changed",
+                    }
+            facts = await read_facts(
+                WorkSelector(basis="ids", ids=(work_id,), states=(), quantifier="one"), False
+            )
+            context.setdefault("_admission_repair_targets", {})[work_id] = expected_goal_revision
+            return {
+                "status": "repair_available",
+                "target_work_id": work_id,
+                "expected_revision": work.revision,
+                "expected_goal_revision": expected_goal_revision,
+                "original_goal": event.text,
+                "facts": facts,
+                "instruction": "用update_work提交同一工作的完整修正计划，包含work_capabilities、outputs与明确输入；不要另起工作。",
+            }
+
+        context["_authorize_work_repair"] = authorize_work_repair
 
     def _finish_agent_response_in_tx(
         self,
@@ -1691,12 +1747,16 @@ class ConversationCoordinator(Coordinator):
         if previous and previous.get("agent_needs_execution"):
             if previous.get("turn_contract"):
                 context["_turn_contract"] = TurnContract.model_validate(previous["turn_contract"])
+            context["_matched_action_effects"] = previous.get("agent_matched_effects", [])
+            context["_admission_repair_targets"] = previous.get("agent_repair_targets", {})
             context["_prior_action_receipts"] = [
                 self._model_aliases(
                     {
-                        "kind": receipt.get("kind")
+                        "kind": receipt.get("satisfies_kind")
+                        or receipt.get("kind")
                         or receipt.get("result", {}).get("decision", {}).get("kind"),
                         "operation": receipt.get("operation"),
+                        "work_effects": receipt.get("work_effects", []),
                         "committed": bool(
                             receipt.get("result", {}).get("work_id")
                             or receipt.get("result", {}).get("action_result") is not None
@@ -1788,6 +1848,12 @@ class ConversationCoordinator(Coordinator):
                                 pending = tx.get_decision(event.id)
                                 if pending is not None:
                                     pending["agent_needs_execution"] = True
+                                    pending["agent_matched_effects"] = context.get(
+                                        "_matched_action_effects", []
+                                    )
+                                    pending["agent_repair_targets"] = context.get(
+                                        "_admission_repair_targets", {}
+                                    )
                                     tx.conn.execute(
                                         "UPDATE ga_decisions SET body=%s WHERE group_id=%s AND event_id=%s",
                                         (Jsonb(pending), actor.group_id, event.id),
@@ -1852,6 +1918,93 @@ class ConversationCoordinator(Coordinator):
                         update={"duplicate": True}
                     )
             self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
+            repair_admission = decision.reason_code == "repair_current_turn_admission"
+            if repair_admission:
+                repair_target = tx.get_work(decision.target_work_id or "")
+                expected_goal_revision = context.get("_admission_repair_targets", {}).get(
+                    repair_target.id
+                )
+                if (
+                    repair_target.request_event_id != event.id
+                    or repair_target.requester_id != actor.member_id
+                    or repair_target.goal_revision != expected_goal_revision
+                    or repair_target.state
+                    not in {
+                        WorkState.QUEUED,
+                        WorkState.RUNNING,
+                        WorkState.VALIDATING,
+                        WorkState.WAITING_INPUT,
+                    }
+                ):
+                    raise DomainError(
+                        "version_conflict",
+                        "Admission repair cannot override another goal or manual control",
+                    )
+                if (
+                    decision.goal != event.text
+                    or not decision.work_capabilities
+                    or not decision.outputs
+                ):
+                    raise DomainError(
+                        "invalid_input",
+                        "Admission repair requires the original goal and complete plan",
+                    )
+                capabilities = set(decision.work_capabilities)
+                formats = {str(item.get("format")) for item in decision.outputs}
+                if (
+                    (
+                        capabilities & {"public_research", "public_images"}
+                        and not self.config.features.web_research
+                    )
+                    or (
+                        "public_images" in capabilities
+                        and not self.config.features.public_image_retrieval
+                    )
+                    or (
+                        formats & {"md", "docx", "pdf", "pptx"}
+                        and not self.config.features.document_editing
+                    )
+                    or (
+                        formats & {"wav", "ogg"}
+                        and not self.config.features.speech_reply_on_request
+                    )
+                ):
+                    raise DomainError(
+                        "feature_disabled", "Corrected plan requests a disabled capability"
+                    )
+                if (
+                    "image_analysis" in capabilities
+                    and not self.config.features.image_understanding
+                ) or (
+                    "audio_transcription" in capabilities
+                    and not self.config.features.audio_transcription
+                ):
+                    raise DomainError("feature_disabled", "Corrected media capability is disabled")
+                contract = context.get("_turn_contract")
+                if (
+                    isinstance(contract, TurnContract)
+                    and contract.information_basis == "public_verification"
+                    and not capabilities & {"public_research", "public_images"}
+                ):
+                    raise DomainError(
+                        "invalid_input", "Public verification still requires actual research"
+                    )
+                normalized = [
+                    OutputRequirement.model_validate(item).model_dump(
+                        mode="json", exclude_none=True
+                    )
+                    for item in decision.outputs
+                ]
+                if (
+                    repair_target.goal == event.text
+                    and normalized == repair_target.scope.get("outputs")
+                    and capabilities
+                    == set(_strings(repair_target.scope.get("work_capabilities", [])))
+                    and decision.input_versions == repair_target.input_versions
+                    and decision.input_event_ids
+                    == repair_target.scope.get("attachment_event_ids", [])
+                ):
+                    raise DomainError("invalid_input", "Corrected admission is unchanged")
             if (
                 context.get("_exact_fact_reply")
                 and self._fast_fact_reply(event, context, actor, tx=tx) != decision
@@ -2187,8 +2340,12 @@ class ConversationCoordinator(Coordinator):
                             decision.target_work_id or "",
                             decision.goal or "",
                             expected_revision=decision.expected_revision or 0,
-                            acceptance_criteria=decision.acceptance_criteria or None,
-                            input_versions=decision.input_versions or None,
+                            acceptance_criteria=decision.acceptance_criteria
+                            if repair_admission
+                            else decision.acceptance_criteria or None,
+                            input_versions=decision.input_versions
+                            if repair_admission
+                            else decision.input_versions or None,
                             source_fingerprints=quantity_sources,
                             source_task_revisions=context["_snapshot"].get(
                                 "source_task_revisions", {}
@@ -2213,6 +2370,36 @@ class ConversationCoordinator(Coordinator):
                             else None,
                         )
                         work_id = work.id
+                        if repair_admission:
+                            corrected_scope = dict(work.scope)
+                            research = bool(
+                                set(decision.work_capabilities)
+                                & {"public_research", "public_images"}
+                            )
+                            corrected_scope.update(
+                                work_capabilities=list(decision.work_capabilities),
+                                research_required=research,
+                                research_message_only=research
+                                and message_only_research_request(
+                                    event.text, identity=self.identity
+                                ),
+                                attachment_event_ids=list(attachment_ids),
+                                required_tools=[
+                                    name
+                                    for name in _strings(corrected_scope.get("required_tools", []))
+                                    if name not in {"web_image_import", "web_search", "web_fetch"}
+                                    or research
+                                    and (
+                                        name != "web_image_import"
+                                        or "public_images" in decision.work_capabilities
+                                    )
+                                ],
+                            )
+                            tx.conn.execute(
+                                "UPDATE ga_work_orders SET scope=%s WHERE group_id=%s AND id=%s",
+                                (Jsonb(corrected_scope), actor.group_id, work.id),
+                            )
+                            work = work.model_copy(update={"scope": corrected_scope})
                         if (
                             decision.work_capabilities
                             or is_public_image_work(previous_work)
@@ -2507,6 +2694,27 @@ class ConversationCoordinator(Coordinator):
                         "kind": receipt_kind,
                         "operation": receipt_operation,
                         "candidate_sha256": candidate_digest,
+                        "satisfies_kind": "start_work"
+                        if decision.reason_code == "repair_current_turn_admission"
+                        else None,
+                        "work_effects": [
+                            {
+                                "id": work.id,
+                                "goal_revision": work.goal_revision,
+                                "state": work.state.value,
+                                "goal": work.goal,
+                                "revision": work.revision,
+                                "current_event_owned": work.request_event_id == event.id
+                                and work.requester_id == actor.member_id,
+                                "work_capabilities": work.scope.get("work_capabilities", []),
+                                "outputs": work.scope.get("outputs", []),
+                                "required_checks": list(work.required_checks),
+                            }
+                            for identifier in dict.fromkeys(
+                                [*([work_id] if work_id else []), *controlled_work_ids]
+                            )
+                            for work in [tx.get_work(identifier)]
+                        ],
                         "result": result.model_dump(mode="json"),
                     },
                 ]

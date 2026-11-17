@@ -17,7 +17,7 @@ from groupagent.conversation.policy import (
     recipient_evidence_in_tx,
 )
 from groupagent.conversation.provider import ModelDecisionProvider
-from groupagent.conversation.turns import RecipientEvidence, TurnContract
+from groupagent.conversation.turns import RecipientEvidence, TurnContract, assess_turn
 from groupagent.domain import DomainError, EventKind, GroupEvent
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 from groupagent.identity import BotIdentity
@@ -245,6 +245,160 @@ async def test_action_promise_repairs_inside_same_graph_and_commits_before_reply
     )
     assert result.response == "研究工作已经排队，核实后给你下载入口。"
     assert len(committed) == 1 and len(model.requests) == 3 and not model.steps
+
+
+def public_information_assessment():
+    # Reproduce the coarse conversational classification while making the
+    # semantic evidence requirement explicit. No product/verb parser is used.
+    return {
+        "recipient": "agent",
+        "intent": "conversation",
+        "required_actions": [],
+        "information_basis": "public_verification",
+    }
+
+
+async def test_public_information_basis_establishes_research_without_explicit_search_wording():
+    goal = "Pot，请说明如何获取和配置Aurora Desk。"
+    committed = []
+
+    async def apply(candidate, identifier):
+        committed.append(candidate)
+        assert candidate.kind == "start_work" and candidate.work_capabilities == ["public_research"]
+        return {
+            "status": "committed",
+            "committed": True,
+            "result": {
+                "work_id": "synthetic-research",
+                "decision": candidate.model_dump(mode="json"),
+            },
+        }
+
+    model = ContractModel(
+        reply("请先告诉我产品公司或官网，我再给一般步骤。"),
+        start(goal),
+        reply("已安排核实官方资料，再给出准确步骤。"),
+        assessment=public_information_assessment(),
+        expected_goal=goal,
+    )
+    current = context(
+        capabilities={"web_research": True}, read_only=False, _apply_business_action=apply
+    )
+    result = await ModelDecisionProvider(model).decide(event(goal), current)
+    assessment_request = model.assessments[0]
+    assessment_context = json.loads(assessment_request.messages[1].content)["context"]
+    assert assessment_context["capabilities"] == {"web_research": True}
+    assert assessment_context["read_only"] is False
+    assert "information_basis" in assessment_request.tools[0]["function"]["parameters"]["required"]
+    assert current["_turn_contract"].intent == "action"
+    assert current["_turn_contract"].information_basis == "public_verification"
+    assert len(committed) == 1 and len(model.requests) == 3
+    assert result.response == "已安排核实官方资料，再给出准确步骤。"
+
+
+@pytest.mark.parametrize("question", ["Pot，什么是RAG？", "Pot，用一句话解释什么是人。"])
+async def test_stable_concepts_remain_conversation_with_research_available(question):
+    model = ContractModel(
+        reply("这是稳定概念的简短解释。"),
+        assessment={
+            "recipient": "agent",
+            "intent": "conversation",
+            "required_actions": [],
+            "information_basis": "stable_knowledge",
+        },
+    )
+    current = context(capabilities={"web_research": True}, read_only=False)
+    result = await ModelDecisionProvider(model).decide(event(question), current)
+    assert result.response == "这是稳定概念的简短解释。"
+    assert current["_turn_contract"].intent == "conversation"
+    assert len(model.requests) == len(model.assessments) == 1
+
+
+@pytest.mark.parametrize("basis", ["provided_context", "user_input"])
+async def test_supplied_evidence_or_true_user_only_input_does_not_force_research(basis):
+    model = ContractModel(
+        reply("基于已有材料回答，或只补充真正缺少的个人输入。"),
+        assessment={
+            "recipient": "agent",
+            "intent": "conversation",
+            "required_actions": [],
+            "information_basis": basis,
+        },
+    )
+    current = context(capabilities={"web_research": True}, read_only=False)
+    result = await ModelDecisionProvider(model).decide(
+        event("Pot，请按本轮具体材料说明。"), current
+    )
+    assert result.response and current["_turn_contract"].intent == "conversation"
+    assert not current["_turn_contract"].required_actions
+    assert len(model.requests) == len(model.assessments) == 1
+
+
+@pytest.mark.parametrize("kind", ["update_work", "control_work", "read_work_facts"])
+async def test_public_basis_preserves_selected_existing_work_obligations(kind):
+    model = ContractModel(
+        assessment={
+            "recipient": "agent",
+            "intent": "action",
+            "required_actions": [{"kind": kind}],
+            "information_basis": "public_verification",
+        }
+    )
+    value = event("Pot，核对已有工作的资料。")
+    contract = await assess_turn(
+        model,
+        value,
+        context(capabilities={"web_research": True}),
+        {
+            "id": value.id,
+            "text": value.text,
+        },
+    )
+    assert contract.intent == "action" and [item.kind for item in contract.required_actions] == [
+        kind
+    ]
+
+
+@pytest.mark.parametrize(
+    "role,read_only,enabled,reason",
+    [
+        ("owner", False, False, "public_research_unavailable"),
+        ("observer", True, True, "read_only_scope"),
+    ],
+)
+async def test_public_verification_uses_actual_host_boundaries_without_granting_research(
+    role, read_only, enabled, reason
+):
+    model = ContractModel(assessment=public_information_assessment())
+    current = context(role=role, read_only=read_only, capabilities={"web_research": enabled})
+    result = await ModelDecisionProvider(model).decide(
+        event("Pot，说明这个公开产品的当前用法。"), current
+    )
+    assert result.reason_code == reason and result.response
+    assert current["_turn_outcome"]["outcome"] == "blocked"
+    assert not model.requests
+
+
+@pytest.mark.postgres
+async def test_implicit_public_information_commits_research_in_its_first_turn(conversation_env):
+    env = conversation_env
+    value = source(env, "Pot，请说明如何获取和配置Aurora Desk。")
+    model = ContractModel(
+        reply("请先给我官网地址。"),
+        start(value.text),
+        reply("已安排核实官方资料，再给出准确步骤。"),
+        assessment=public_information_assessment(),
+        expected_goal=value.text,
+    )
+    env.models[value.id] = model
+    result = await env.coordinator.process(value)
+    assert result.work_id
+    with env.store.transaction(env.actor) as tx:
+        assert len(tx.list_work()) == 1 and len(tx.list_delivery()) == 1
+        assert tx.get_work(result.work_id).scope["research_required"] is True
+        saved = tx.get_decision(value.id)["turn_contract"]
+        assert saved["intent"] == "action" and saved["information_basis"] == "public_verification"
+    assert result.decision.response == "已安排核实官方资料，再给出准确步骤。"
 
 
 @pytest.mark.parametrize("outcomes", [(), ("committed", "committed")])
