@@ -77,6 +77,7 @@ from .intent import (
 )
 from .participation import fast_observe, outside_quotes, policy_intent, verified_human_addressee
 from .policy import (
+    PolicyAdmission,
     apply_quiet_barrier_in_tx,
     ingress_admission,
     interpret_policy,
@@ -1733,6 +1734,40 @@ class ConversationCoordinator(Coordinator):
 
         context["_authorize_work_repair"] = authorize_work_repair
 
+    def _record_invoked_attachment(
+        self,
+        tx: UnitOfWork,
+        event: GroupEvent,
+        decision: Decision,
+        admission: PolicyAdmission | None = None,
+    ) -> None:
+        # An attachment can continue an already authorized same-actor session
+        # without requiring a visible reply or creating a new invocation.
+        if (
+            event.kind not in {EventKind.IMAGE, EventKind.AUDIO, EventKind.FILE}
+            or decision.kind != "observe"
+            or decision.directness == "other"
+        ):
+            return
+        if admission is None:
+            admission = ingress_admission(
+                tx,
+                event,
+                self.identity,
+                time_zone=self.config.group.time_zone,
+                quiet_hours=self.config.group.quiet_hours,
+                now=self.clock(),
+                default_mode=self.config.group.participation_mode,
+                bot_member_id=self.config.group.bot_member_id,
+                shared_account=self.config.group.shared_account,
+            )
+        if admission.allowed and admission.invocation_root_event_id:
+            tx.conn.execute(
+                "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason,created_at,invocation_root_event_id) "
+                "VALUES(%s,%s,false,'invocation_attachment',%s,%s) ON CONFLICT DO NOTHING",
+                (tx.group_id, event.id, self.clock(), admission.invocation_root_event_id),
+            )
+
     def _finish_agent_response_in_tx(
         self,
         tx: UnitOfWork,
@@ -1753,11 +1788,13 @@ class ConversationCoordinator(Coordinator):
         self.memory.prepare_in_tx(tx)
         self.execution_guard(tx)
         snapshot = context["_snapshot"] if context is not None else body.get("agent_snapshot", {})
+        sources_valid = not body.get("agent_context_revoked")
         try:
             self.memory.assert_snapshot_in_tx(tx, snapshot)
             if tx.get_event(event.id).content_state != "active":
                 raise DomainError("source_unavailable", "The request was withdrawn")
         except DomainError as error:
+            sources_valid = False
             # Committed actions remain facts. Revoked context cannot authorize a
             # delayed reply, even if inference had already produced its text.
             final = Decision(kind="observe", reason_code=error.code, confidence=1)
@@ -1809,6 +1846,8 @@ class ConversationCoordinator(Coordinator):
         )
         if not admission.allowed:
             final = Decision(kind="observe", reason_code=admission.reason_code, confidence=1)
+        if sources_valid:
+            self._record_invoked_attachment(tx, event, final, admission)
         delivery_id = previous.delivery_id
         if final.response and final.kind not in {"ignore", "observe"}:
             delivery = tx.enqueue_reply(
@@ -2901,36 +2940,7 @@ class ConversationCoordinator(Coordinator):
                         ),
                     ),
                 )
-            if (
-                event.kind in {EventKind.IMAGE, EventKind.AUDIO, EventKind.FILE}
-                and decision.kind == "observe"
-                and decision.directness != "other"
-            ):
-                # A silent attachment inside an existing invoked conversation
-                # carries that same session; it neither wakes a new one nor
-                # changes the user's quiet policy or starts execution.
-                media_admission = ingress_admission(
-                    tx,
-                    event,
-                    self.identity,
-                    time_zone=self.config.group.time_zone,
-                    quiet_hours=self.config.group.quiet_hours,
-                    now=self.clock(),
-                    default_mode=self.config.group.participation_mode,
-                    bot_member_id=self.config.group.bot_member_id,
-                    shared_account=self.config.group.shared_account,
-                )
-                if media_admission.allowed and media_admission.invocation_root_event_id:
-                    tx.conn.execute(
-                        "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason,created_at,invocation_root_event_id) "
-                        "VALUES(%s,%s,false,'invocation_attachment',%s,%s) ON CONFLICT DO NOTHING",
-                        (
-                            actor.group_id,
-                            event.id,
-                            self.clock(),
-                            media_admission.invocation_root_event_id,
-                        ),
-                    )
+            self._record_invoked_attachment(tx, event, decision)
             result = CoordinationResult(
                 event_id=event.id,
                 decision=decision,

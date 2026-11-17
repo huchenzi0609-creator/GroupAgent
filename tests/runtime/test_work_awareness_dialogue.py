@@ -86,10 +86,26 @@ def foreground_model(harness):
     class ForegroundModel:
         name = "synthetic-work-awareness-router"
 
+        def __init__(self):
+            self.current_intent = None
+            self.current_requirements = []
+
         async def complete(self, request):
             marker = request.messages[0].content or ""
             if marker.startswith("TURN_OUTCOME_V1"):
-                return semantic_fixture_reply(request)
+                assessed = semantic_fixture_reply(
+                    request, required_actions=self.current_requirements
+                )
+                verdict = json.loads(assessed.text)
+                # The fixture's scenario specifies whether this turn asks the
+                # agent for a reply. Initial intent is not a production gate.
+                verdict["reply_required"] = self.current_intent in {
+                    "start_profile",
+                    "start_memes",
+                    "query_memes",
+                    "ordinary_reply",
+                }
+                return assessed.model_copy(update={"text": json.dumps(verdict)})
             if marker.startswith("TURN_CONTRACT_V1"):
                 payload = json.loads(request.messages[1].content)
                 current_intent = harness.scenarios[payload["event"]["id"]]["intent"]
@@ -98,6 +114,8 @@ def foreground_model(harness):
                     if current_intent in {"start_profile", "start_memes"}
                     else ([{"kind": "read_work_facts"}] if current_intent == "query_memes" else [])
                 )
+                self.current_intent = current_intent
+                self.current_requirements = required
                 return semantic_fixture_reply(
                     request,
                     required_actions=required,
