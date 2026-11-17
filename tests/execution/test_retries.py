@@ -50,6 +50,40 @@ async def test_confirmed_rejections_retry_and_each_attempt_remains_budgeted(
     assert budget.settled[-1][1].total == 15
 
 
+async def test_provider_rejection_is_journaled_separately_from_lost_reply(
+    execution_request, gateway
+):
+    class RejectionAwareBudget(BudgetFixture):
+        def __init__(self):
+            super().__init__()
+            self.rejections = []
+
+        async def confirm_rejection(self, reservation_id):
+            self.rejections.append(reservation_id)
+
+    budget = RejectionAwareBudget()
+    model = RejectingFakeModel([ModelRejected(0)])
+    checkpoints = []
+
+    async def checkpoint(saved):
+        checkpoints.append(saved)
+
+    async def event(_):
+        pass
+
+    engine = ScopedToolEngine(model, gateway, model_budget=budget)
+    engine.bind_persistence(event, checkpoint)
+    result = await engine.wait(await engine.start(execution_request))
+    assert model.calls == 2 and result.state == RunState.CANDIDATE
+    assert budget.rejections == ["1"] and budget.settled[0][0] == "2"
+    prepared = [
+        saved.backend_state["pending_model_settlement"]["reservation_id"]
+        for saved in checkpoints
+        if saved.backend_state.get("rejected_model_reservation")
+    ]
+    assert prepared == ["1"]
+
+
 async def test_retry_limit_and_remaining_round_budget_are_not_reset(execution_request, gateway):
     model = RejectingFakeModel([ModelRejected(0)] * 10)
     engine = ScopedToolEngine(model, gateway)

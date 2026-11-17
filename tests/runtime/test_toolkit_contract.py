@@ -537,6 +537,91 @@ async def test_wrong_artifact_reference_returns_model_to_existing_copy_and_deliv
         assert tx.get_work(run.work.id).input_versions == [source_version]
 
 
+async def test_worker_reuses_read_attachment_instead_of_waiting_for_another_upload(toolkit_setup):
+    setup = toolkit_setup
+    source_run = await prepare(setup)
+    source_version = (await create_document(source_run)).output["version_id"]
+    run = await prepare(
+        setup,
+        goal="Revise the supplied report into a new Markdown file",
+        scope={
+            "outputs": [{"format": "md", "expected_text": ["87"]}],
+            "required_tools": ["workspace_read_text"],
+        },
+    )
+    round_number = 0
+    usage = TokenUsage(input_tokens=2, output_tokens=1)
+
+    def propose(tool_name, **arguments):
+        return ModelReply(
+            tool_calls=(ModelToolCall(id=str(round_number), name=tool_name, arguments=arguments),),
+            finish_reason="tool_calls",
+            usage=usage,
+        )
+
+    class WorkerFixture:
+        name = "offline-prepared-attachment"
+
+        async def complete(self, request):
+            nonlocal round_number
+            round_number += 1
+            if round_number == 1:
+                return propose("artifact_import", version_id=source_version)
+            latest = request.messages[-1]
+            data = json.loads(latest.content)
+            if round_number == 2:
+                imported = data["output"]["files"][0]
+                assert imported["from_version"] == source_version
+                return propose(
+                    "artifact_export",
+                    file_id=imported["file_id"],
+                    version_id=imported["version_id"],
+                    path="source.md",
+                )
+            if round_number == 3:
+                assert data["output"]["path"] == "source.md"
+                return propose("workspace_read_text", path="source.md")
+            if round_number == 4:
+                assert "87" in data["output"]["text"]
+                return ModelReply(text="Please upload the original.", needs_input=True, usage=usage)
+            if round_number == 5:
+                assert data["code"] == "input_request_requires_evidence"
+                return propose(
+                    "request_input",
+                    question="Please upload the original again.",
+                    missing=[{"kind": "attachment", "reference": "source.md"}],
+                )
+            if round_number == 6:
+                assert data["error_code"] == "input_already_available"
+                return propose(
+                    "document_generate",
+                    name="revised.md",
+                    kind="report",
+                    title="Revised report",
+                    sections=[{"title": "Findings", "paragraphs": ["The original value was 87."]}],
+                )
+            if round_number == 7:
+                return propose("artifact_deliver", version_ids=[data["output"]["version_id"]])
+            assert data["success"]
+            return ModelReply(text="The revised report preserves the value 87.", usage=usage)
+
+    engine = LangGraphEngine(WorkerFixture(), run.gateway)
+    result = await engine.wait(await engine.start(run.prepared.request))
+    assert result.state == RunState.CANDIDATE and result.checkpoint.input_request is None, (
+        result.error_code,
+        [(row.tool_name, row.error_code) for row in result.receipts],
+    )
+    assert round_number == 8
+    rejected = next(receipt for receipt in result.receipts if receipt.tool_name == "request_input")
+    assert (
+        rejected.control is None and failure_disposition(rejected) == ToolFailureDisposition.REPAIR
+    )
+    validated = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, result, run.workspace
+    )
+    assert "artifact:md" in validated.checks
+
+
 @pytest.mark.parametrize("phase", ["lookup_timeout", "after_scope_commit"])
 async def test_artifact_import_keeps_ambiguous_failures_for_reconciliation(
     toolkit_setup, monkeypatch, phase

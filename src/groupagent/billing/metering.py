@@ -8,6 +8,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from groupagent.domain import ActorContext, DomainError
+from groupagent.execution.errors import ModelRejected
 from groupagent.execution.models import ExecutionRequest, ModelReply, ModelRequest, TokenUsage
 from groupagent.execution.ports import ModelPort, estimate_input_tokens
 
@@ -62,6 +63,9 @@ class MeteredModel:
                 # start. This boundary never dispatches model-proposed tools.
                 reply = await self.model.complete(request)
             except (Exception, asyncio.CancelledError) as error:
+                if isinstance(error, ModelRejected):
+                    self.ledger.confirm_provider_rejection(self.actor, reservation.id)
+                    raise
                 self.ledger.unknown(self.actor, reservation.id)
                 if isinstance(error, DomainError) and error.code in {
                     "provider_unavailable",
@@ -155,8 +159,24 @@ class LedgerModelBudget:
         if result.overrun and result.limits_enabled:
             raise DomainError("budget_exhausted", "Provider usage exceeded its admission")
 
+    async def confirm_rejection(self, reservation_id: str) -> None:
+        actor = self._actors.get(reservation_id)
+        if actor is None:
+            raise DomainError(
+                "reconciliation_required", "Provider rejection needs persisted authority"
+            )
+        self.ledger.confirm_provider_rejection(actor, reservation_id)
+
+    async def recover_rejection(self, request: ExecutionRequest, reservation_id: str) -> None:
+        await self.recover(request, reservation_id, None, provider_rejected=True)
+
     async def recover(
-        self, request: ExecutionRequest, reservation_id: str, usage: TokenUsage | None
+        self,
+        request: ExecutionRequest,
+        reservation_id: str,
+        usage: TokenUsage | None,
+        *,
+        provider_rejected: bool = False,
     ) -> None:
         """Settle a persisted engine call after a process restart, without inference.
 
@@ -174,7 +194,7 @@ class LedgerModelBudget:
                 + ("WHERE group_id=%s AND key=%s" if keyed else "WHERE group_id=%s AND id=%s"),
                 (request.actor.group_id, reservation_id),
             ).fetchone()
-            if row is None and keyed and usage is None:
+            if row is None and keyed and usage is None and not provider_rejected:
                 # The persisted admission intent preceded reserve(). Its exact
                 # deterministic key has no ledger entry, so no call began.
                 return
@@ -191,6 +211,13 @@ class LedgerModelBudget:
                     "reconciliation_required", "Persisted accounting call does not match its work"
                 )
             identifier, state = row["id"], row["state"]
+        if provider_rejected:
+            if usage is not None:
+                raise DomainError(
+                    "reconciliation_required", "Rejected call cannot carry inference usage"
+                )
+            self.ledger.confirm_provider_rejection(request.actor, identifier)
+            return
         if state in {"reserved", "released"}:
             if usage is not None:
                 raise DomainError(

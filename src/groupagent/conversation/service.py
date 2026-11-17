@@ -90,7 +90,7 @@ from .policy import (
     interpret_policy,
     recipient_evidence_in_tx,
 )
-from .references import resolve_work_selection
+from .references import authored_identifier, resolve_work_selection
 from .turns import TurnContract
 from .work_queries import query_work_in_tx, render_work_query
 
@@ -636,18 +636,26 @@ class ConversationCoordinator(Coordinator):
             and resolved.refs[0].revision != decision.expected_revision
         ):
             raise DomainError("version_conflict", "The exact work reference is stale")
-        if not readonly and context.get("_react_session") and selector.quantifier == "one":
-            target_id = resolved.refs[0].id
+        if (
+            not readonly
+            and context.get("_react_session")
+            and (selector.basis == "ids" or selector.quantifier == "one")
+        ):
+            targets = {ref.id for ref in resolved.refs}
             compared = context.get("_work_target_reads", {}).values()
-            if any(target_id in choices and len(choices) > 1 for choices in compared):
+            if any(targets & choices and len(choices) > 1 for choices in compared):
                 authored = outside_quotes(event.text).casefold()
-                named = selector.title_query and selector.title_query.casefold() in authored
-                if (
-                    target_id != context.get("_quoted_work_id")
-                    and target_id.casefold() not in authored
-                    and not named
-                    and selector.basis != "focus"
-                ):
+                named = (
+                    len(targets) == 1
+                    and selector.title_query
+                    and selector.title_query.casefold() in authored
+                )
+                bound = all(
+                    target_id == context.get("_quoted_work_id")
+                    or authored_identifier(authored, target_id.casefold())
+                    for target_id in targets
+                )
+                if not bound and not named and selector.basis != "focus":
                     raise DomainError(
                         "ambiguous_reference",
                         "Several works match. Select an author-named or quoted target, "

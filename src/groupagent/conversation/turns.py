@@ -52,6 +52,10 @@ class ActionCompletion(TurnData):
 
 class FinishTurn(TurnData):
     disposition: Literal["reply", "observe", "proactive"]
+    open_request: StrictBool = Field(
+        default=False,
+        description="The human genuinely asked the group for an answer or help without addressing a particular person.",
+    )
     response: str | None = Field(
         default=None,
         max_length=12000,

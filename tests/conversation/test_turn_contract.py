@@ -141,7 +141,7 @@ async def test_native_human_reply_keeps_data_and_fences_unsolicited_delivery(con
 async def test_open_question_to_agent_establishes_continuation_for_same_member(conversation_env):
     env = conversation_env
     event = source(env, "请解释一下列表和元组的区别。")
-    env.models[event.id] = ModelScript(finish("列表可修改，元组固定。"))
+    env.models[event.id] = ModelScript(finish("列表可修改，元组固定。", open_request=True))
     result = await env.coordinator.process(event)
     assert result.delivery_id and result.decision.directness == "open"
     followup = source(env, "哪一种适合固定记录呢？")

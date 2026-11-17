@@ -32,6 +32,9 @@ def finish_fixture_reply(request, reply):
                 name="finish_turn",
                 arguments={
                     "disposition": "observe" if observe else "reply",
+                    "open_request": not observe
+                    and payload.get("context", {}).get("trusted_routing", {}).get("recipient")
+                    == "ambient",
                     "response": None if observe else reply.text,
                     "reports": [] if observe else reports,
                 },

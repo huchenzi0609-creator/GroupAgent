@@ -37,7 +37,14 @@ from reportlab.platypus import Image as PDFImage
 from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, TableStyle
 from reportlab.platypus import Table as PDFTable
 
-from .models import ArtifactError, Deck, DocumentUnit, Report, TableData
+from .models import (
+    PUBLIC_IMAGE_PAGE_CAPTION,
+    ArtifactError,
+    Deck,
+    DocumentUnit,
+    Report,
+    TableData,
+)
 from .store import VIDEO_SUFFIXES
 from .visuals import add_slide_visuals, chart_png, chart_summary, check_chart, validated_image
 
@@ -252,7 +259,10 @@ def build_docx(report: Report, *, font_family: str = "Arial") -> bytes:
                 io.BytesIO(content), width=WordInches(image.width_inches)
             )
             picture._inline.docPr.set("descr", image.alt_text)
-            document.add_paragraph(image.alt_text, style="Caption")
+            caption = document.add_paragraph(image.alt_text, style="Caption")
+            if image.source_page_url:
+                caption.add_run().add_break()
+                caption.add_run(PUBLIC_IMAGE_PAGE_CAPTION + image.source_page_url)
         for chart in section.charts:
             paragraph = document.add_paragraph()
             paragraph.paragraph_format.keep_with_next = True

@@ -1,5 +1,7 @@
 """Real PostgreSQL checks on authority distinct from readable model observations."""
 
+import json
+
 import pytest
 
 from groupagent.domain import WorkState
@@ -23,6 +25,7 @@ async def test_human_supplied_stable_member_reference_resolves_from_current_rost
         roster = observation(request)["facts"]
         missing = next(row for row in roster if row["name"] == "群昵称待补充")
         assert missing["member_id"] != opaque
+        assert missing["request_reference"] == opaque
         return tool(
             "apply_business_action",
             {
@@ -52,8 +55,9 @@ async def test_human_supplied_stable_member_reference_resolves_from_current_rost
 
 
 @pytest.mark.parametrize("explicit_reference", [False, True])
+@pytest.mark.parametrize("quantifier", ["one", "all"])
 async def test_reading_multiple_work_targets_does_not_authorize_a_guess(
-    runtime_env, explicit_reference
+    runtime_env, explicit_reference, quantifier
 ):
     env = runtime_env
     replay = Replay(env)
@@ -76,7 +80,7 @@ async def test_reading_multiple_work_targets_does_not_authorize_a_guess(
                     "basis": "ids",
                     "ids": [ids[0]],
                     "states": ["paused"],
-                    "quantifier": "one",
+                    "quantifier": quantifier,
                 },
                 "control": "cancel",
             },
@@ -108,3 +112,34 @@ async def test_reading_multiple_work_targets_does_not_authorize_a_guess(
     expected = WorkState.CANCELLED if explicit_reference else WorkState.PAUSED
     assert actual == {ids[0]: expected, ids[1]: WorkState.PAUSED}
     assert (result.decision.kind == "clarify") is (not explicit_reference)
+
+
+async def test_direct_native_acceptance_quote_targets_known_work(runtime_env):
+    env = runtime_env
+    replay = Replay(env)
+    _, admission, _ = await replay.say(
+        "Pot，请整理一份合成背景说明。",
+        DialogueModel(
+            tool(
+                "start_work",
+                {"goal": "整理一份合成背景说明", "finish_on_commit": True},
+            )
+        ),
+    )
+    with env.store.transaction(env.actor) as tx:
+        native = tx.get_delivery(admission.delivery_id).platform_message_id
+        work = tx.get_work(admission.work_id)
+    assert native and work
+
+    def quoted(request):
+        context = json.loads(request.messages[1].content)["context"]
+        assert context["quoted_work_id"] == work.id
+        assert context["works"][0]["goal_revision"] == work.goal_revision
+        return reply("这条确认对应原来的背景说明工作，目前在队列里。")
+
+    await replay.say(
+        "这项工作的实际状态是什么？",
+        DialogueModel(quoted),
+        reply_to=native,
+    )
+    assert len(replay.works()) == 1

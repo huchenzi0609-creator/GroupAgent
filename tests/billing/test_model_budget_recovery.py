@@ -70,6 +70,29 @@ async def test_restart_cannot_attach_another_work_reservation(setup, tmp_path):
         )
 
 
+async def test_restart_records_confirmed_rejection_for_exact_attempt_only(setup, tmp_path):
+    store, ledger, actor, _ = setup
+    request = work_request(store, actor, tmp_path)
+    other = work_request(store, actor, tmp_path)
+    budget = LedgerModelBudget(ledger, price_id="fixture")
+    identifier = await budget.reserve(request, round_number=1, input_tokens=20, output_tokens=10)
+    restarted = LedgerModelBudget(ledger, price_id="fixture")
+    with pytest.raises(DomainError, match="does not match"):
+        await restarted.recover_rejection(other, identifier)
+    await restarted.recover_rejection(request, identifier)
+    await restarted.recover_rejection(request, identifier)
+    with store.transaction(actor) as tx:
+        row = tx.conn.execute(
+            "SELECT state,reason,actual_amount FROM ga_budget_reservations WHERE id=%s",
+            (identifier,),
+        ).fetchone()
+    assert row == {
+        "state": "released",
+        "reason": "provider_rejected_rate_limit",
+        "actual_amount": None,
+    }
+
+
 async def test_persisted_key_before_reserve_does_not_create_a_charge_on_recovery(setup, tmp_path):
     store, ledger, actor, _ = setup
     request = work_request(store, actor, tmp_path)

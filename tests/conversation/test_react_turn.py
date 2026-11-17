@@ -127,6 +127,141 @@ async def test_failed_probe_then_real_action_and_truthful_mixed_reply(conversati
     assert len(model.requests) == 4
 
 
+def queued_compute(event, identifier="compute", **fields):
+    return call(
+        "start_work",
+        identifier,
+        goal=event.text,
+        work_capabilities=["compute"],
+        required_work_tools=["python_compute"],
+        outputs=[{"format": "text"}],
+        **fields,
+    )
+
+
+def pair(write, closing):
+    return write.model_copy(update={"tool_calls": (*write.tool_calls, *closing.tool_calls)})
+
+
+def offered_properties(request, name):
+    return next(
+        row["function"]["parameters"]["properties"]
+        for row in request.tools
+        if row["function"]["name"] == name
+    )
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("supplement", [None, "平方是数与自身相乘。"])
+async def test_paired_finish_uses_verified_commit_and_one_canonical_delivery(
+    conversation_env, supplement
+):
+    env = conversation_env
+    event = source(env, "Pot，请运行 Python 计算 13 的平方。")
+
+    def plan(request):
+        fields = offered_properties(request, "start_work")
+        assert "topic_id" not in fields
+        assert fields["input_versions"]["maxItems"] == fields["input_event_ids"]["maxItems"] == 0
+        return pair(queued_compute(event), finish(supplement, reports=[("compute", "queued")]))
+
+    model = ModelScript(plan)
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.work_id and result.delivery_id and len(model.requests) == 1
+    assert "实际运行 Python" in result.decision.response
+    if supplement is not None:
+        assert result.decision.response.count(supplement) == 1
+    replay = await env.coordinator.process(event)
+    assert replay.duplicate and replay.delivery_id == result.delivery_id
+    with env.store.transaction(env.actor) as tx:
+        assert len(tx.list_work()) == len(tx.list_delivery()) == 1
+        trace = tx.get_decision(event.id)["turn_outcome"]
+        assert trace["actions"] == [{"tool": "start_work", "status": "committed"}]
+        assert trace["receipt_ids"] == ["compute"]
+
+
+@pytest.mark.postgres
+async def test_rejected_write_does_not_publish_paired_finish_and_topic_lookup_refreshes_schema(
+    conversation_env, monkeypatch
+):
+    env = conversation_env
+    event = source(env, "Pot，用 Python 实际计算 17 的平方。")
+    topic = env.coordinator.memory.create_topic(env.actor, "Known synthetic topic")
+    unlinked = env.coordinator.memory.create_topic(env.actor, "Unlinked synthetic topic")
+    env.coordinator.memory.link_event(env.actor, event.id, topic.id, evidence_event_ids=[event.id])
+    read_context = env.coordinator._context
+
+    def bounded_preview(actor, event, query=None, **options):
+        projected = read_context(actor, event, query, **options)
+        # Exercise a preview that omitted the optional reference. The actual
+        # topic read still uses the production snapshot and PostgreSQL query.
+        return {**projected, "topics": []} if query is None else projected
+
+    monkeypatch.setattr(env.coordinator, "_context", bounded_preview)
+    bad = pair(
+        queued_compute(event, "bad-reference", topic_id="invented"),
+        finish("This response has no committed operation."),
+    )
+
+    def load(request):
+        receipt = tool_receipt(request)
+        assert receipt["status"] == "rejected"
+        assert receipt["available_topic_ids"] == []
+        assert "topic_id" not in offered_properties(request, "start_work")
+        with env.store.transaction(env.actor) as tx:
+            assert not tx.list_work() and not tx.list_delivery()
+        return call("read_group_context", "topics", resource="topics")
+
+    def corrected(request):
+        assert tool_receipt(request)["facts"] == [
+            {"id": topic.id, "title": topic.title, "visibility": "group"}
+        ]
+        fields = offered_properties(request, "start_work")
+        assert fields["topic_id"]["enum"] == [topic.id]
+        assert unlinked.id not in fields["topic_id"]["enum"]
+        return pair(
+            queued_compute(event, "authorized-topic", topic_id=topic.id),
+            finish(reports=[("authorized-topic", "queued")]),
+        )
+
+    model = ModelScript(bad, load, corrected)
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.work_id and result.delivery_id and len(model.requests) == 3
+    assert "no committed operation" not in result.decision.response
+    with env.store.transaction(env.actor) as tx:
+        assert tx.get_work(result.work_id).scope["topic_id"] == topic.id
+        assert len(tx.list_work()) == len(tx.list_delivery()) == 1
+
+
+@pytest.mark.postgres
+async def test_invalid_paired_report_recovers_without_reexecuting_committed_write(
+    conversation_env,
+):
+    env = conversation_env
+    event = source(env, "Pot，用 Python 实际计算 11 的平方。")
+
+    def use_actual_receipt(request):
+        feedback = json.loads(request.messages[-1].content)
+        assert feedback["code"] == "report_requires_current_matching_receipt"
+        assert feedback["available_reports"] == [{"tool_call_id": "compute", "phase": "queued"}]
+        with env.store.transaction(env.actor) as tx:
+            assert len(tx.list_work()) == 1 and not tx.list_delivery()
+        return finish(reports=[("compute", "queued")])
+
+    model = ModelScript(
+        pair(queued_compute(event), finish("这已经完成了。", reports=[("compute", "committed")])),
+        use_actual_receipt,
+    )
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.work_id and result.delivery_id and len(model.requests) == 2
+    assert "这已经完成了" not in result.decision.response
+    with env.store.transaction(env.actor) as tx:
+        assert len(tx.list_work()) == len(tx.list_delivery()) == 1
+
+
 @pytest.mark.postgres
 async def test_receipt_reused_after_model_interruption_and_event_replay(conversation_env):
     env = conversation_env

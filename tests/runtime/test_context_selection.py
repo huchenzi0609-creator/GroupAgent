@@ -74,6 +74,29 @@ def test_agent_context_keeps_recent_evidence_across_apparent_topic_changes(runti
     assert context["model_event"]["occurred_at"].endswith("+08:00")
 
 
+def test_agent_context_distinguishes_existing_transcript_from_attachment(runtime_env):
+    env = runtime_env
+    h = harness(env)
+    now = datetime.now(UTC)
+    audio = emit(env, "", kind=EventKind.AUDIO, at=now - timedelta(seconds=10))
+    transcript = emit(
+        env,
+        "合成语音代号是星湖四。",
+        kind=EventKind.QUOTE,
+        reply_to=audio.id,
+        at=audio.occurred_at,
+        trusted_actor_origin="authenticated_audio_transcription",
+        attachments=[{"kind": "audio_transcription", "source_event_id": audio.id}],
+    )
+    request = emit(env, "Pot，刚才说的是哪个代号？", at=now)
+
+    context = h.coordinator._context(env.actor, request, model_led=True)
+    observed = next(row for row in context["recent_messages"] if row["id"] == transcript.id)
+    assert observed["content_origin"] == "authenticated_audio_transcription"
+    assert observed["text"] == transcript.text and observed["reply_to"] == audio.id
+    assert transcript.id in context["_snapshot"]["source_fingerprints"]
+
+
 def test_unrelated_task_revision_is_not_a_chat_dependency(runtime_env):
     env = runtime_env
     h = harness(env)

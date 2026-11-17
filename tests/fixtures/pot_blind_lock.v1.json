@@ -1,6 +1,6 @@
 {
   "format_version": 1,
-  "dataset_sha256": "ee42bd84a07a85afaa8b0a32776c341092899b0e04125be6449224ce28c171a2",
+  "dataset_sha256": "11f18eb0cb37200ad197156b48687743915dc69703a8a500f18cb8b4c3dc4585",
   "case_ids": [
     "CHAT-01",
     "CHAT-02",
@@ -29,23 +29,18 @@
     "OPS-02"
   ],
   "changed_case_ids": [
+    "CHAT-01",
     "CHAT-02",
     "CHAT-04",
     "CHAT-05",
     "GROUP-01",
-    "GROUP-02",
-    "GROUP-03",
     "WORK-02",
     "WORK-03",
-    "TIME-01",
+    "WORK-05",
     "TIME-02",
     "TIME-03",
-    "TIME-04",
-    "WORK-05",
     "SEARCH-01",
-    "SEARCH-02",
-    "FILE-01",
     "OPS-02"
   ],
-  "visibility": "Independent private inputs. Only case IDs and the frozen byte digest are committed."
+  "visibility": "Private synthetic inputs. Commit the digest and case IDs only."
 }

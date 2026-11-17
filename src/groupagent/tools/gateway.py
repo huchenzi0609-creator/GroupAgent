@@ -201,6 +201,15 @@ class ToolGateway:
         return frozenset(self._tools)
 
     @property
+    def requires_typed_input_request(self) -> bool:
+        definition = self._tools.get("request_input")
+        return bool(
+            definition
+            and definition.control_kind == "request_input"
+            and definition.input_model is not InputRequest
+        )
+
+    @property
     def control_names(self) -> frozenset[str]:
         return frozenset(
             name for name, definition in self._tools.items() if definition.control_kind

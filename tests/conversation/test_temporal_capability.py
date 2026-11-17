@@ -29,6 +29,46 @@ def ingest(env, text, occurred_at, received_at):
 
 
 @pytest.mark.postgres
+async def test_expired_relative_schedule_cannot_be_reanchored_in_same_turn(conversation_env):
+    env = conversation_env
+    occurred = datetime(2031, 7, 9, 8, 20, tzinfo=UTC)
+    received = occurred + timedelta(minutes=8)
+    env.coordinator.clock = lambda: received
+    event = ingest(env, "Pot，过七分钟告诉我去查展品。", occurred, received)
+
+    first = {
+        "op": "create_schedule",
+        "title": "去查展品",
+        "prepared_message": {"text": "去查展品"},
+        "timing": {"kind": "after", "seconds": 420},
+    }
+
+    def retry(request):
+        assert tool_receipt(request)["code"] == "schedule_time_missed"
+        return call(
+            "apply_business_action",
+            "bad-new-time",
+            action={
+                "op": "create_schedule",
+                "title": "改头换面的旧提醒",
+                "goal": "去查展品的提醒",
+                "timing": {"kind": "at", "at": (received + timedelta(minutes=7)).isoformat()},
+            },
+        )
+
+    def acknowledge(request):
+        receipt = tool_receipt(request)
+        assert receipt["code"] == "schedule_time_missed" and not receipt["committed"]
+        return finish("原先约的时刻已过。")
+
+    model = ModelScript(call("apply_business_action", "missed", action=first), retry, acknowledge)
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert "时刻已过" in result.decision.response
+    assert env.coordinator.scheduler.list(env.actor) == []
+
+
+@pytest.mark.postgres
 @pytest.mark.parametrize(("delay", "mixed"), [(10, False), (10, True), (360, False)])
 async def test_relative_reminder_uses_verified_event_anchor_and_canonical_receipt(
     conversation_env, delay, mixed

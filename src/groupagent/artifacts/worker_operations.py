@@ -33,6 +33,7 @@ from .formats import (
     extract,
 )
 from .models import (
+    PUBLIC_IMAGE_PAGE_CAPTION,
     ArtifactError,
     ArtifactScope,
     ChartData,
@@ -43,6 +44,7 @@ from .models import (
     Section,
     Slide,
     TableData,
+    image_page_binding,
 )
 from .store import ArtifactStore
 
@@ -63,7 +65,10 @@ def _chart(value: dict[str, Any]) -> ChartData:
 def unpack_document(value: dict[str, Any], read_image) -> Report | Deck:
     def image(data: dict[str, Any]) -> ImageData:
         return ImageData(
-            read_image(data["input_index"]), data["alt_text"], data.get("width_inches", 5.5)
+            read_image(data["input_index"]),
+            data["alt_text"],
+            data.get("width_inches", 5.5),
+            data.get("source_page_url"),
         )
 
     if value["kind"] == "report":
@@ -104,7 +109,12 @@ def pack_document(document: Report | Deck) -> tuple[dict[str, Any], tuple[bytes,
     def image(data: ImageData) -> dict[str, Any]:
         index = len(inputs)
         inputs.append(data.content)
-        return {"input_index": index, "alt_text": data.alt_text, "width_inches": data.width_inches}
+        return {
+            "input_index": index,
+            "alt_text": data.alt_text,
+            "width_inches": data.width_inches,
+            **({"source_page_url": data.source_page_url} if data.source_page_url else {}),
+        }
 
     if isinstance(document, Report):
         value = {
@@ -240,27 +250,36 @@ def document_operation(
                 if blip.embed
             }
             if image_ids:
-                embedded_hashes = sorted(
-                    {
-                        hashlib.sha256(
-                            word_document.part.related_parts[identifier].blob
-                        ).hexdigest()
-                        for identifier in image_ids
-                    }
-                )
+                image_hashes = {
+                    identifier: hashlib.sha256(
+                        word_document.part.related_parts[identifier].blob
+                    ).hexdigest()
+                    for identifier in image_ids
+                }
+                embedded_hashes = sorted(set(image_hashes.values()))
                 metadata["embedded_image_count"] = str(len(word_document.inline_shapes))
-                metadata["distinct_embedded_image_count"] = str(
-                    len(
-                        {
-                            hashlib.sha256(
-                                word_document.part.related_parts[identifier].blob
-                            ).hexdigest()
-                            for identifier in image_ids
-                        }
-                    )
-                )
+                metadata["distinct_embedded_image_count"] = str(len(embedded_hashes))
                 if len(embedded_hashes) <= 10:
                     metadata["embedded_image_sha256"] = json.dumps(embedded_hashes)
+                bindings = []
+                paragraphs = word_document.paragraphs
+                for picture, caption in zip(paragraphs, paragraphs[1:], strict=False):
+                    # One actual inline picture followed by one visible source
+                    # line. An unlinked provenance paragraph cannot count.
+                    if picture._p.getnext() != caption._p:
+                        continue
+                    sources = [
+                        line.removeprefix(PUBLIC_IMAGE_PAGE_CAPTION)
+                        for line in caption.text.splitlines()
+                        if line.startswith(PUBLIC_IMAGE_PAGE_CAPTION)
+                    ]
+                    if len(sources) != 1 or not sources[0]:
+                        continue
+                    ids = picture._p.xpath(".//wp:inline//a:blip/@r:embed")
+                    if len(ids) == 1 and ids[0] in image_hashes:
+                        bindings.append(image_page_binding(image_hashes[ids[0]], sources[0]))
+                if 0 < len(bindings) <= 10:
+                    metadata["embedded_image_page_bindings"] = json.dumps(sorted(bindings))
         return {
             "units": [asdict(unit) for unit in units[start : start + count]],
             "total_units": len(units),

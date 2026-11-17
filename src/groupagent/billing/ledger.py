@@ -805,6 +805,23 @@ class BudgetLedger:
                 (identifier,),
             )
 
+    def confirm_provider_rejection(self, actor: ActorContext, identifier: str) -> None:
+        """Release only an attempt with authoritative provider rejection evidence."""
+        with self.store.transaction(actor) as tx:
+            row = self._owned(tx, identifier)
+            if row["state"] == "released" and row["reason"] == "provider_rejected_rate_limit":
+                return
+            if row["state"] not in {"inflight", "unknown"}:
+                raise DomainError(
+                    "reconciliation_required", "Provider rejection does not match an attempted call"
+                )
+            tx.conn.execute(
+                "UPDATE ga_budget_reservations SET state='released',"
+                "reason='provider_rejected_rate_limit',updated_at=clock_timestamp() WHERE id=%s",
+                (identifier,),
+            )
+            tx._audit("budget_provider_rejected", identifier, reason="rate_limited")
+
     def settle(
         self,
         actor: ActorContext,

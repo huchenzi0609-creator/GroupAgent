@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -153,11 +154,19 @@ class TableData:
     rows: tuple[tuple[str, ...], ...]
 
 
+PUBLIC_IMAGE_PAGE_CAPTION = "图片来源："
+
+
+def image_page_binding(image_sha256: str, page_url: str) -> str:
+    return hashlib.sha256(f"{image_sha256}\0{page_url}".encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class ImageData:
     content: bytes
     alt_text: str
     width_inches: float = 5.5
+    source_page_url: str | None = None
 
 
 @dataclass(frozen=True)

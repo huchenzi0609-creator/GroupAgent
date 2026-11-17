@@ -22,7 +22,7 @@ from pydantic import ValidationError
 from groupagent.channels.models import AgentWechatConfig, stable_key
 from groupagent.config import AppConfig
 from groupagent.coordinator import CoordinationResult
-from groupagent.domain import ActorContext, DomainError, GroupEvent, Role
+from groupagent.domain import ActorContext, DomainError, EventKind, GroupEvent, Role
 from groupagent.identity import DEFAULT_IDENTITY, BotIdentity
 from groupagent.memory import MemberService, MemoryService
 from groupagent.memory.causality import after_boundary_sql, causal_sources
@@ -36,6 +36,7 @@ from groupagent.scheduling import Scheduler
 
 from .intent import main_request, new_work_intent
 from .participation import outside_quotes
+from .references import authored_identifier
 from .work_queries import compact_work_overview
 
 _LIVE = frozenset(
@@ -455,6 +456,14 @@ class ContextBuilder:
                 raise
         if (
             message_id is None
+            and event.kind == EventKind.QUOTE
+            and tx.is_bot_message(event.reply_to)
+        ):
+            # A channel can supply the verified native receipt directly,
+            # before its inbound echo is normalized into an event row.
+            return event.reply_to
+        if (
+            message_id is None
             and event.trusted_actor_origin == "agentwechat_authenticated_message_metadata"
             and event.channel_account_id == self.config.runtime.channel_account_id
         ):
@@ -686,6 +695,7 @@ class ContextBuilder:
                         "id": source.id,
                         "actor_id": source.actor_id,
                         "kind": source.kind.value,
+                        "content_origin": source.trusted_actor_origin,
                         "speaker": speaker,
                         "occurred_at": display_time(source.occurred_at),
                         "text": source.text[:2000],
@@ -919,6 +929,7 @@ class ContextBuilder:
                         "id": source.id,
                         "actor_id": source.actor_id,
                         "kind": source.kind.value,
+                        "content_origin": source.trusted_actor_origin,
                         "speaker": "assistant"
                         if source.platform_message_id
                         and tx.is_bot_message(source.platform_message_id)
@@ -1040,11 +1051,18 @@ class ContextBuilder:
                 ]
             )
             text_for_names = event.text + "\n" + "\n".join(row["text"] for row in recent)
+            authored = outside_quotes(event.text)
+            authored_members = {
+                member.member_id
+                for member in member_rows
+                if query.model_led and authored_identifier(authored, member.member_id)
+            }
             visible_members = [
                 member
                 for member in member_rows
                 if query.roster
                 or member.member_id in selected_actor_ids
+                or member.member_id in authored_members
                 or member.display_name != "群昵称待补充"
                 and member.display_name in text_for_names
             ]
@@ -1073,6 +1091,11 @@ class ContextBuilder:
                         "name_source": member.name_source,
                         "membership_state": member.membership_state,
                         "revision": member.revision,
+                        **(
+                            {"request_reference": member.member_id}
+                            if member.member_id in authored_members
+                            else {}
+                        ),
                     }
                     for member in visible_members
                 ],
@@ -1130,6 +1153,7 @@ class ContextBuilder:
                     "id": event.id,
                     "actor_id": event.actor_id,
                     "kind": event.kind.value,
+                    "content_origin": event.trusted_actor_origin,
                     "text": event.text,
                     "occurred_at": display_time(event.occurred_at),
                     "reply_to": event.reply_to,

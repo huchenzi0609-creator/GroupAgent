@@ -240,6 +240,7 @@ class IsolatedDocumentService:
                 "embedded_image_count",
                 "distinct_embedded_image_count",
                 "embedded_image_sha256",
+                "embedded_image_page_bindings",
             }
             if version.format == "docx"
             else set()
@@ -255,9 +256,11 @@ class IsolatedDocumentService:
             )
         ):
             raise DomainError("invalid_document", "Document worker returned invalid metadata")
-        if "embedded_image_sha256" in metadata:
+        for key in ("embedded_image_sha256", "embedded_image_page_bindings"):
+            if key not in metadata:
+                continue
             try:
-                hashes = json.loads(metadata["embedded_image_sha256"])
+                hashes = json.loads(metadata[key])
                 if (
                     not isinstance(hashes, list)
                     or len(hashes) > 10

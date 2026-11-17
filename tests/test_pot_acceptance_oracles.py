@@ -90,3 +90,79 @@ def test_inspector_counts_actual_png_embeddings_instead_of_alt_text(oracles, tmp
     assert len(images) == 3
     assert {row["content_type"] for row in images} == {"image/png"}
     assert len({row["sha256"] for row in images}) == 2
+
+
+def test_chat_count_accepts_spacing_without_changing_value(oracles):
+    witnessed = {"receipts": [native_text("one", "它有 12 条边。")]}
+    wrong = {"receipts": [native_text("two", "它有 13 条边。")]}
+    assert oracles.useful_text(witnessed, [r"12条边"], compact_whitespace=True)
+    assert not oracles.useful_text(wrong, [r"12条边"], compact_whitespace=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrency", [1, 2])
+async def test_case_concurrency_keeps_the_report_and_evidence_separate(
+    oracles, monkeypatch, tmp_path, concurrency
+):
+    import asyncio
+    import hashlib
+    from types import SimpleNamespace
+
+    table = {
+        identity: {"blind_level": "isolated_infrastructure", "blind_checks": ["witness"]}
+        for identity in ("probe-first", "probe-second", "probe-third")
+    }
+    dataset = tmp_path / "sealed.json"
+    dataset.write_text(
+        json.dumps({"format_version": 1, "cases": {identity: {} for identity in table}})
+    )
+    dataset.chmod(0o600)
+    lock = tmp_path / "lock.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "dataset_sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
+                "case_ids": list(table),
+            }
+        )
+    )
+    dsn_file = tmp_path / "fixture.dsn"
+    dsn_file.write_text("offline test fixture")
+    monkeypatch.setattr(oracles, "coverage", lambda: table)
+    monkeypatch.setattr(oracles, "BLIND_LOCK", lock)
+    monkeypatch.setattr(oracles, "bindings", lambda: {"source": {"sha256": "fixture-ci"}})
+    monkeypatch.setattr(oracles, "PostgresStore", lambda _: object())
+    monkeypatch.setattr(oracles, "postgres_identity", lambda _: {"database": "pot_blind"})
+    active: set[str] = set()
+    peak = 0
+
+    async def probe(args, identity, destination, spec, row):
+        nonlocal peak
+        active.add(identity)
+        peak = max(peak, len(active))
+        assert destination.name == identity
+        await asyncio.sleep(0.01)
+        row["checks"]["witness"] = {"status": "passed", "evidence": [{"probe": identity}]}
+        active.remove(identity)
+
+    monkeypatch.setattr(oracles, "evaluate_infrastructure", probe)
+    args = SimpleNamespace(
+        dataset=dataset,
+        output=tmp_path / "report",
+        dsn_file=dsn_file,
+        worker_image="sha256:" + "a" * 64,
+        timeout=1,
+        cases=None,
+        model="offline-test",
+        vision_model="offline-test",
+        asr_model="offline-test",
+        concurrency=concurrency,
+    )
+    assert await oracles.run(args) == 0
+    assert peak == concurrency
+    report = json.loads((args.output / "report.json").read_text())
+    assert report["environment"]["case_concurrency"] == concurrency
+    assert [item["id"] for item in report["cases"]] == list(table)
+    for result in report["cases"]:
+        evidence = oracles.read_json(args.output / result["id"] / "evidence.json")
+        assert evidence["checks"]["witness"]["evidence"] == [{"probe": result["id"]}]

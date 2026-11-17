@@ -94,6 +94,50 @@ async def test_ungranted_request_input_cannot_pause_work(execution_request, gate
     assert "tool_not_available" in model.requests[1].messages[-1].content
 
 
+@pytest.mark.parametrize(
+    "missing",
+    [
+        {"kind": "information", "field": "reporting period"},
+        {"kind": "attachment", "reference": "accounting-totals.xlsx"},
+    ],
+)
+async def test_structured_request_can_wait_for_distinct_missing_input(
+    execution_request, gateway, missing
+):
+    register_request_input_tool(
+        gateway, prepared_files=lambda: [{"version_id": "prepared-version", "name": "source.md"}]
+    )
+    request = execution_request.model_copy(update={"allowed_tools": gateway.registered_names})
+    model = ScriptedFakeModel(
+        [
+            ModelReply(
+                tool_calls=(
+                    ModelToolCall(
+                        id="need-missing",
+                        name="request_input",
+                        arguments={
+                            "question": "Please supply the remaining material.",
+                            "missing": [missing],
+                        },
+                    ),
+                ),
+                finish_reason="tool_calls",
+                usage=TokenUsage(input_tokens=2, output_tokens=1),
+            ),
+            answer(),
+        ]
+    )
+    engine = ScopedToolEngine(model, gateway)
+    run_id = await engine.start(request)
+    waiting = await engine.wait(run_id)
+    assert waiting.state == RunState.WAITING_INPUT
+    assert waiting.checkpoint.input_request.required_inputs == (
+        missing.get("field") or missing["reference"],
+    )
+    await engine.append_input(run_id, request.actor, "Here is the missing material", 1)
+    assert (await engine.wait(run_id)).state == RunState.CANDIDATE
+
+
 class Empty(ToolData):
     pass
 

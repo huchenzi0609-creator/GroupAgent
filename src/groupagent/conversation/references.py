@@ -7,6 +7,7 @@ an old globally unique work is never a substitute for conversational focus.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -19,6 +20,12 @@ from groupagent.domain import ActorContext, DomainError, EventKind, GroupEvent, 
 
 def _title(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def authored_identifier(text: str, identifier: str) -> bool:
+    """Recognize an exact opaque identifier supplied in the current message."""
+    edge = r"[a-zA-Z0-9_@.:-]"
+    return bool(identifier and re.search(rf"(?<!{edge}){re.escape(identifier)}(?!{edge})", text))
 
 
 def resolve_work_selection(

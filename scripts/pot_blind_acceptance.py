@@ -72,7 +72,7 @@ def response(turn):
     return "\n".join(spool_text(receipt).removeprefix("【Pot】") for receipt in only_text(turn))
 
 
-def useful_text(turn, patterns=()):
+def useful_text(turn, patterns=(), *, compact_whitespace=False):
     sent = only_text(turn)
     text = response(turn)
     bare = text.strip("。！!，,、 ：:；;")
@@ -80,7 +80,7 @@ def useful_text(turn, patterns=()):
         len(sent) == 1
         and bool(re.search(r"\w", bare))
         and not FILLER.fullmatch(bare)
-        and pattern_all(text, patterns)
+        and pattern_all(re.sub(r"\s+", "", text) if compact_whitespace else text, patterns)
     )
 
 
@@ -375,7 +375,7 @@ class Scenario:
             self.when.append({"turn": key, "first_accepted_seconds": delay})
         return evidence
 
-    async def settle(self, work_id):
+    async def settle(self, work_id, *, allow_delivery_hold=False):
         if not work_id:
             return None
         end = time.monotonic() + self.args.timeout
@@ -385,7 +385,9 @@ class Scenario:
             await self.app.dispatcher.tick()
             with self.store.transaction(self.app.owner) as tx:
                 work = tx.get_work(work_id)
-            if work and work.state in TERMINAL:
+            if work and (
+                work.state in TERMINAL or allow_delivery_hold and work.state == WorkState.DELIVERING
+            ):
                 break
             await asyncio.sleep(0.15)
         return self.proof(work) if work else None
@@ -524,7 +526,7 @@ async def chat01(s):
     s.check(
         "useful_single_replies",
         useful_text(first, s.spec["name_patterns"])
-        and useful_text(second, s.spec["followup_patterns"]),
+        and useful_text(second, s.spec["followup_patterns"], compact_whitespace=True),
         first,
         second,
     )
@@ -816,11 +818,12 @@ async def time02(s):
         late,
         {"rules": s.snapshot()},
     )
+    before_ambiguity = {r.id: r for r in s.rules()}
     ambiguous = await s.event("ambiguous", event_time=s.clock)
     discussion = await s.event("discussion", actor=GUEST, event_time=s.clock)
     s.check(
         "ambiguity_and_discussion_no_rule",
-        {r.id: r for r in shifted} == {r.id: r for r in s.rules()}
+        before_ambiguity == {r.id: r for r in s.rules()}
         and useful_text(ambiguous, ["九点|9点|09:00|9:00", "三点|3点|15"])
         and not any(read.get("committed") for read in foreground_observations(s, ambiguous))
         and not discussion["receipts"],
@@ -908,23 +911,23 @@ async def chat04(s):
 
 
 async def chat05(s):
-    work = await s.event("work", latency=True)
-    # A pending legacy progress notice is a fixture. The quiet action, its
-    # retirement and the continued authorized work all use the real app.
+    request = await s.event("work", latency=True)
+    # Use a pending legacy progress notice to test suppression across policy changes.
+    started = None
     progress_id = None
-    if work["work_id"]:
+    if request["work_id"]:
         with s.store.transaction(s.app.owner) as tx:
-            existing = tx.get_work(work["work_id"])
+            started = tx.get_work(request["work_id"])
             body = "例行后台进度提示"
             progress_id = tx._insert_delivery(
                 None,
                 "text:" + body,
                 hashlib.sha256(body.encode()).hexdigest(),
-                "blind-progress:" + existing.id,
+                "blind-progress:" + started.id,
             ).id
             tx.conn.execute(
                 "INSERT INTO ga_progress_notices(group_id,work_id,notice_key,intent_id) VALUES(%s,%s,%s,%s)",
-                (s.group, existing.id, "recovery:blind", progress_id),
+                (s.group, started.id, "recovery:blind", progress_id),
             )
     before = s.spool()
     quiet = await s.event("quiet")
@@ -937,16 +940,54 @@ async def chat05(s):
         discussion,
         {"native_count": len(after)},
     )
+    quiet_phase = await s.settle(request["work_id"], allow_delivery_hold=True)
+    result = quiet_phase
+    lift = None
+    if quiet_phase and quiet_phase["work"]["state"] == "delivering":
+        lift = await s.event("lift_quiet")
+        result = await s.settle(request["work_id"])
     if progress_id:
         with s.store.transaction(s.app.owner) as tx:
             progress = tx.get_delivery(progress_id).model_dump(mode="json")
-        s.check("pending_notice_retired", progress["state"] == "rejected", progress)
-    result = await s.settle(work["work_id"])
+        s.check(
+            "pending_notice_retired",
+            progress["state"] == "rejected"
+            and not any(spool_text(item).removeprefix("【Pot】") == body for item in s.spool()),
+            progress,
+        )
+    artifact_rows = (
+        await s.artifacts(result) if result and result["work"]["state"] == "completed" else []
+    )
+    work_file_receipts = [
+        item for item in (result or {}).get("spool", []) if item["payload"]["kind"] == "file"
+    ]
     s.check(
         "authorized_work_retained",
-        bool(result and result["work"]["state"] == "completed" and result["spool"]),
-        work,
-        result or {"execution": "missing"},
+        bool(
+            started
+            and quiet_phase
+            and result
+            and quiet_phase["work"]["state"] in {"delivering", "completed"}
+            and any(item["passed"] for item in quiet_phase["validation"])
+            and result["work"]["state"] == "completed"
+            and result["work"]["id"] == quiet_phase["work"]["id"] == started.id
+            and result["work"]["goal_revision"]
+            == quiet_phase["work"]["goal_revision"]
+            == started.goal_revision
+            and len(work_file_receipts) == 1
+            and len(artifact_rows) == 1
+            and artifact_rows[0]["format"] == "pdf"
+            and artifact_rows[0]["accepted_sha256"] == artifact_rows[0]["sha256"]
+            and all(
+                marker in artifact_rows[0]["decoded"].get("text", "")
+                for marker in s.spec["expected_pdf_text"]
+            )
+        ),
+        request,
+        quiet_phase or {"quiet_phase": "no verified result or delivery hold"},
+        lift or {"lift": "no held delivery"},
+        result or {"completion": "missing"},
+        {"actual_artifacts": artifact_rows, "native_file_receipts": work_file_receipts},
     )
 
 
@@ -1157,9 +1198,9 @@ async def work02(s):
     s.check(
         "same_version_for_progress_and_quote",
         same_work
-        and useful_text(progress, ["潮汐"])
+        and useful_text(progress, s.spec["progress_patterns"])
         and old is not None
-        and useful_text(old, ["南窗|50653|37"])
+        and useful_text(old, s.spec["old_patterns"])
         and output is not None
         and work_fact_has(progress_facts, second["work_id"], initial)
         and work_fact_has(work_facts_observed(s, old), first["work_id"], [output["work"]]),
@@ -1354,6 +1395,8 @@ async def time03(s):
     s.check(
         "concurrent_restart_one_occurrence",
         len(native) == len(occurrences) == 1
+        and cross.execution_kind.value == "explicit_reminder"
+        and spool_text(native[0]).removeprefix("【Pot】") == s.spec["cross_zone_payload"]
         and occurrences[0].delivery_id is not None
         and occurrences[0].scheduled_at == stamp
         and len(facts[0]["occurrences"][0]["deliveries"]) == 1,
@@ -1476,9 +1519,10 @@ def foreground_observations(s, turn):
     ]
 
 
-def inject_first_public_read(s):
+def inject_first_public_read(s, calls=None):
     client = s.app.coordinator.foreground_tools.client
-    calls = []
+    if calls is None:
+        calls = []
 
     def wrap(method, operation):
         async def wrapped(arguments):
@@ -1497,6 +1541,8 @@ def inject_first_public_read(s):
 
     client.search = wrap(client.search, "web_search")
     client.fetch = wrap(client.fetch, "web_fetch")
+    client.search_received = wrap(client.search_received, "web_search")
+    client.fetch_received = wrap(client.fetch_received, "web_fetch")
     return calls
 
 
@@ -1551,11 +1597,26 @@ async def search01(s):
     search = any(call["operation"] == "web_search" and call.get("result") for call in calls) or any(
         item["tool_name"] == "web_search" for item in backend
     )
-    answer = response(request) + "\n".join(spool_text(row) for row in (work or {}).get("spool", []))
+    inspected = await s.artifacts(work) if work and work["work"]["state"] == "completed" else []
+    delivered_files = [
+        artifact for artifact in inspected if artifact["accepted_sha256"] == artifact["sha256"]
+    ]
+    output_segments = (
+        [response(request)]
+        + [spool_text(row) for row in (work or {}).get("spool", [])]
+        + [item["decoded"].get("text", "") for item in delivered_files]
+    )
+    output_links = [url for item in delivered_files for url in item["decoded"].get("links", [])]
+    output_links.extend(
+        link.rstrip(")）】。.,，；;")
+        for text in output_segments
+        for link in re.findall(r"https://[^\s]+", text)
+    )
     evidence = {
-        "foreground_calls": calls,
+        "public_provider_reads": calls,
         "foreground_observations": direct_receipts,
         "execution": work,
+        "delivered_inspected_outputs": delivered_files,
         "ledger": s.ledger([request["event_id"]]),
     }
     s.check(
@@ -1571,10 +1632,8 @@ async def search01(s):
         "correct_final_steps",
         bool(
             official
-            and s.spec["correct_text"] in answer
-            and any(
-                official_source(url, s.spec) for url in re.findall(r"https://[^\s）】。]+", answer)
-            )
+            and any(s.spec["correct_text"] in " ".join(part.split()) for part in output_segments)
+            and any(official_source(url, s.spec) for url in output_links)
         ),
         request,
         evidence,
@@ -1588,6 +1647,7 @@ async def work05(s):
     before = s.spool()
     await s.close()
     await s.open()
+    inject_first_public_read(s, calls)
     await s.app.dispatcher.tick()
     original = (
         await s.app.channel.lookup_delivery(s.group, before[0]["receipt"]["idempotency_key"])
@@ -1630,12 +1690,15 @@ async def work05(s):
         missing,
         missing_output or {"asked_from_foreground": True},
     )
+    final_receipts = result["spool"] if result else before
+    final_text = "\n".join(spool_text(item) for item in final_receipts)
     s.check(
         "no_false_completion_or_spin",
         bool(verified and original and original.state == "accepted" and before and after == before)
+        and (not result or result["work"]["state"] == "completed")
+        and len(final_receipts) == 1
         and any(
-            official_source(url, s.spec)
-            for url in re.findall(r"https://[^\s）】。]+", spool_text(before[0]))
+            official_source(url, s.spec) for url in re.findall(r"https://[^\s）】。]+", final_text)
         )
         and not any(
             left["operation"] == middle["operation"] == right["operation"]
@@ -2380,6 +2443,7 @@ async def run(args):
             "channel": "LocalChannel",
             "scope": "Real provider and local transport receipts; fault timing is explicitly injected, no WeChat",
             "admission_samples": "Synthetic headroom on local host; Docker worker uses real cgroup limits",
+            "case_concurrency": args.concurrency,
         },
         "selected": requested,
         "cases": [],
@@ -2387,8 +2451,10 @@ async def run(args):
         "consistent": False,
         "passed": False,
     }
-    samples = []
-    for identity, rules in table.items():
+    semaphore = asyncio.Semaphore(args.concurrency)
+
+    async def independent_case(identity, rules):
+        samples = []
         row = {
             "id": identity,
             "level": rules["blind_level"],
@@ -2453,10 +2519,33 @@ async def run(args):
             case_root.mkdir(exist_ok=True, mode=0o700)
             write_json(case_root / "evidence.json", row)
             row["evidence_sha256"] = sha256(case_root / "evidence.json")
-        report["cases"].append(row)
-        report["latency"] = latency_report(samples)
-        write_json(destination / "report.json", report)
-        print(json.dumps({"case": identity, "status": row["status"]}), flush=True)
+        return identity, row, samples
+
+    async def admitted_case(identity, rules):
+        async with semaphore:
+            return await independent_case(identity, rules)
+
+    case_tasks = [
+        asyncio.create_task(admitted_case(identity, rules)) for identity, rules in table.items()
+    ]
+    results = {}
+    samples = []
+    try:
+        for progress in asyncio.as_completed(case_tasks):
+            identity, row, case_samples = await progress
+            samples.extend(case_samples)
+            results[identity] = row
+            report["cases"] = [results[key] for key in table if key in results]
+            report["latency"] = latency_report(
+                sorted(samples, key=lambda sample: (sample["case"], sample["turn"]))
+            )
+            write_json(destination / "report.json", report)
+            print(json.dumps({"case": identity, "status": row["status"]}), flush=True)
+    finally:
+        for task in case_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*case_tasks, return_exceptions=True)
     report["consistent"] = (
         started == bindings()
         and runner_hash == sha256(Path(__file__))
@@ -2482,6 +2571,13 @@ def main():
     parser.add_argument("--vision-model", default="deepseek-flash")
     parser.add_argument("--asr-model", default="tools/asr")
     parser.add_argument("--timeout", type=float, default=140)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Maximum independently scoped synthetic cases in progress",
+    )
     parser.add_argument(
         "--replay-evidence", type=Path, help="Source-bound replay report for OPS-02 migration"
     )

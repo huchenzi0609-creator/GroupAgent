@@ -14,7 +14,18 @@ from groupagent.tools import IdempotencyMode, ToolContext, ToolData, ToolDefinit
 from groupagent.tools.models import ToolFailure
 
 from .isolated import IsolatedDocumentService
-from .models import ChartData, ChartSeries, Deck, ImageData, Report, Section, Slide, TableData
+from .models import (
+    ArtifactScope,
+    ArtifactVersion,
+    ChartData,
+    ChartSeries,
+    Deck,
+    ImageData,
+    Report,
+    Section,
+    Slide,
+    TableData,
+)
 from .store import document_format
 
 
@@ -65,7 +76,7 @@ class ImageInput(ArtifactReference):
     alt_text: str = Field(
         min_length=1,
         max_length=500,
-        description="Visible caption immediately BELOW this image in DOCX/PDF reports; include its associated source URL here when requested below the image. Markdown/PPTX use it as image description metadata. Pixels come from the exact file_id/version_id.",
+        description="Visible caption below this image in DOCX/PDF reports. For a verified public image in DOCX, the host adds the original page locator under this caption. Do not reconstruct or manually add public-image URLs. Markdown/PPTX use this as image description metadata. Pixels come from the exact file_id/version_id.",
     )
     width_inches: float = Field(
         default=5.5,
@@ -79,7 +90,7 @@ class SectionInput(ToolData):
     title: str = Field(min_length=1, max_length=180)
     paragraphs: tuple[str, ...] = Field(
         max_length=50,
-        description="Plain text rendered BEFORE this section's tables/images/charts. Captions and source URLs requested below an image belong in that image's alt_text. Empty strings reserve blank writing space. For .md, do not put fenced code, headings or pipe tables here; write complete Markdown with workspace_write_text then artifact_from_workspace instead.",
+        description="Plain text rendered BEFORE this section's tables/images/charts. Captions belong in the image's alt_text. Verified public images in DOCX receive a host-created source locator below their caption. Empty strings reserve blank writing space. For .md, do not put fenced code, headings or pipe tables here; write complete Markdown with workspace_write_text then artifact_from_workspace instead.",
     )
     tables: tuple[TableInput, ...] = Field(default=(), max_length=5)
     images: tuple[ImageInput, ...] = Field(
@@ -276,6 +287,7 @@ def register_document_tools(
     service: IsolatedDocumentService,
     *,
     provenance_factory: Callable[[ToolContext], Awaitable[dict[str, Any]]] | None = None,
+    public_image_page: Callable[[ArtifactScope, ArtifactVersion, str], str | None] | None = None,
 ) -> None:
     def chart(value: ChartInput) -> ChartData:
         return ChartData(
@@ -332,6 +344,9 @@ def register_document_tools(
                 pixels,
                 value.alt_text,
                 value.width_inches,
+                public_image_page(scope, version, value.alt_text)
+                if public_image_page and document_format(arguments.name) == "docx"
+                else None,
             )
 
         if arguments.kind == "report":

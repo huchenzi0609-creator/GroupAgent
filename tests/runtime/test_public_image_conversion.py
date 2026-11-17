@@ -3,13 +3,18 @@
 No network, paid provider or OS sandbox acceptance is claimed by these tests.
 """
 
+import hashlib
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from docx import Document
+from PIL import Image
 
-from groupagent.artifacts import ArtifactScope
+from groupagent.artifacts import ArtifactScope, ValidationRecord
+from groupagent.artifacts.worker_operations import document_operation
 from groupagent.domain import ActorContext, DomainError, Role
 from groupagent.memory import MemoryService
 from groupagent.research.image_transforms import (
@@ -56,17 +61,13 @@ async def conversion_setup(toolkit_setup, monkeypatch):
     return toolkit_setup
 
 
-async def imported_jpegs(setup, *, count=2, request_text=None):
-    import io
-
-    from PIL import Image
-
+async def imported_jpegs(setup, *, count=2, request_text=None, output_format="png"):
     text = request_text or f"请交付{count}张已验证的公开来源图片，全部使用PNG格式。"
     run = await prepare(
         setup,
         goal=text,
         request_text=text,
-        scope={"public_image_count": count, "outputs": [{"format": "png"}]},
+        scope={"public_image_count": count, "outputs": [{"format": output_format}]},
     )
     _, media, context = setup.toolkit._services[run.lease.attempt_id]
     original_source = await setup.toolkit._source(run.work, setup.env.actor, "image")
@@ -80,14 +81,19 @@ async def imported_jpegs(setup, *, count=2, request_text=None):
                 "source_url": f"https://images.example.com/image-{index}.jpg",
             }
         )
+        page = (
+            f"https://example.com/photos/actual-{index}?revision=2"
+            if output_format == "docx"
+            else "https://example.com/page"
+        )
         ref = await media.ingest_image(
             context,
             source,
             output.getvalue(),
             research_provenance={
                 "requested_url": source.source_url,
-                "page_url": "https://example.com/page",
-                "page_final_url": "https://example.com/page",
+                "page_url": page,
+                "page_final_url": page,
                 "page_sha256": "a" * 64,
                 "page_retrieved_at": "2026-11-16T00:00:00+00:00",
                 "retrieved_at": "2026-11-16T00:00:01+00:00",
@@ -120,6 +126,111 @@ async def convert_and_select(run, versions):
     )
     assert selected.success
     return (*converted, selected)
+
+
+async def test_docx_keeps_exact_source_with_each_verified_image_and_rejects_a_swap(
+    conversion_setup, monkeypatch, tmp_path
+):
+    setup = conversion_setup
+    fallback = SyntheticFixtureWorker.run
+
+    async def document_worker(self, context, operation, inputs, *, parameters, outputs=()):
+        if parameters.get("format") != "docx":
+            return await fallback(
+                self, context, operation, inputs, parameters=parameters, outputs=outputs
+            )
+        if operation == "document_validate":
+            # The test independently exercises actual DOCX generation and
+            # parsing. Rendering is outside this fixture.
+            return ValidationRecord(
+                "fixture",
+                "fixture",
+                hashlib.sha256(inputs[0]).hexdigest(),
+                "docx",
+                structural_passed=True,
+                content_passed=True,
+                rendered=True,
+                layout_passed=True,
+                page_count=1,
+            ).to_dict(), ()
+        result = document_operation(
+            operation,
+            {"parameters": parameters, "outputs": outputs},
+            lambda request, index=0: inputs[index],
+            lambda name: tmp_path / name,
+        )
+        return result, tuple((tmp_path / name).read_bytes() for name in outputs)
+
+    monkeypatch.setattr(SyntheticFixtureWorker, "run", document_worker)
+    run, originals = await imported_jpegs(
+        setup, request_text="请把两张现成的图片整理到一份Word文件。", output_format="docx"
+    )
+    source_pages = [value.provenance["public_image"]["page_final_url"] for value in originals]
+    images = []
+    for version in originals:
+        conversion = await call(
+            run,
+            "image_convert",
+            {"file_id": version.file_id, "version_id": version.version_id, "format": "png"},
+            key="convert:" + version.version_id,
+        )
+        assert conversion.success, conversion
+        images.append(
+            {key: conversion.output[key] for key in ("file_id", "version_id")}
+            | {"alt_text": "Picture " + str(len(images) + 1), "width_inches": 2.5}
+        )
+
+    args = {
+        "name": "photo-report.docx",
+        "kind": "report",
+        "title": "Photo report",
+        "sections": [{"title": "Two frames", "paragraphs": ["Selected images."], "images": images}],
+    }
+    wrong = {**images[0], "alt_text": "Photo source https://example.com/photos/guess"}
+    rejection = await call(
+        run,
+        "document_generate",
+        {**args, "sections": [{**args["sections"][0], "images": [wrong, images[1]]}]},
+        key="unverified-caption",
+    )
+    assert rejection.error_code == "image_source_unverified"
+    assert rejection.effect_state == EffectState.NOT_STARTED
+
+    generated = await call(run, "document_generate", args)
+    assert generated.success, generated
+    version, payload = setup.env.registry.read(setup.env.actor, generated.output["version_id"])
+    actual = Document(io.BytesIO(payload))
+    assert len(actual.inline_shapes) == 2
+    captions = [paragraph for paragraph in actual.paragraphs if paragraph.style.name == "Caption"]
+    assert [paragraph.text.splitlines()[-1] for paragraph in captions] == [
+        "图片来源：" + url for url in source_pages
+    ]
+    selected = await call(run, "artifact_deliver", {"version_ids": [version.version_id]})
+    assert selected.success, selected
+    accepted = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, candidate(run, "已整理两张图片。"), run.workspace
+    )
+    assert "artifact:docx" in accepted.checks
+
+    # Both source URLs still occur in the swapped file. A list of document
+    # URLs and image counts cannot detect this wrong placement.
+    for caption, wrong_url in zip(captions, reversed(source_pages), strict=True):
+        caption.runs[-1].text = "图片来源：" + wrong_url
+    swapped = io.BytesIO()
+    actual.save(swapped)
+    scope = ArtifactScope(setup.env.actor.group_id, run.work.id, setup.env.actor.member_id)
+    replaced = setup.env.artifacts.revise(
+        scope, version.file_id, swapped.getvalue(), expected_version_id=version.version_id
+    )
+    setup.env.registry.register(setup.env.actor, run.lease, replaced, purpose="candidate")
+    selected = await call(
+        run, "artifact_deliver", {"version_ids": [replaced.version_id]}, key="deliver-swapped"
+    )
+    assert selected.success, selected
+    with pytest.raises(DomainError, match="actual source pages"):
+        await setup.toolkit.validate(
+            run.work, run.lease, setup.env.actor, candidate(run, "已整理图片。"), run.workspace
+        )
 
 
 @pytest.mark.parametrize("scenario", _DELIVERY_CASES, ids=lambda case: case["id"])
