@@ -153,7 +153,8 @@ async def test_late_actual_source_reaches_critic_and_optional_is_not_required(
         return ModelReply(
             text=json.dumps(
                 {
-                    "passed": not extra_required,
+                    "content_passed": not extra_required,
+                    "group_reply_passed": True,
                     "reason": "Actual source says optional, not uniquely required",
                 }
             ),
