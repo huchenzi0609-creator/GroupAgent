@@ -48,6 +48,8 @@ class PromiseThenAction:
                         if any(row.get("committed") for row in evidence)
                         else "missing_evidence",
                         "explanation": "Synthetic verdict: this public search is executable and needs a real work receipt.",
+                        "required_actions": [{"kind": "start_work"}],
+                        "reply_required": True,
                     }
                 ),
                 usage=USAGE,

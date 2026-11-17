@@ -231,7 +231,9 @@ async def test_actual_router_request_knows_its_name_and_preserves_human_self_cla
                     text=json.dumps(
                         {
                             "outcome": "committed",
+                            "reply_required": True,
                             "explanation": "Explicit synthetic human-task receipt.",
+                            "required_actions": [{"kind": "business", "operation": "claim_task"}],
                         }
                     ),
                     usage=usage,

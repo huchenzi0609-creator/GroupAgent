@@ -66,6 +66,9 @@ def event(text=GOAL, **changes):
 
 
 def context(**changes):
+    async def persist_unit_contract(_):
+        return {"status": "persisted"}  # Protocol fixture; actual persistence is tested with PG.
+
     return {
         "role": "owner",
         "requester_member_id": "synthetic-owner",
@@ -74,6 +77,7 @@ def context(**changes):
         "works": [],
         "tasks": [],
         "schedules": [],
+        "_persist_turn_contract": persist_unit_contract,
         **changes,
     }
 
@@ -110,12 +114,18 @@ class ContractModel:
                     == self.expected_goal
                     for receipt in payload["host_receipts"]
                 )
-                outcome = "committed" if matching else "missing_evidence"
+                ordinary = self.assessment.get("intent") == "conversation"
+                outcome = "committed" if matching or ordinary else "missing_evidence"
+            required = self.assessment.get("required_actions", [])
+            if not required and self.assessment.get("information_basis") == "public_verification":
+                required = [{"kind": "start_work"}]
             return reply(
                 json.dumps(
                     {
                         "outcome": outcome,
                         "explanation": "当前公开资料请求需要匹配的实际研究工作回执。",
+                        "required_actions": required,
+                        "reply_required": payload["trusted_recipient"]["recipient"] == "agent",
                     }
                 )
             )
@@ -311,7 +321,7 @@ async def test_stable_concepts_remain_conversation_with_research_available(quest
     result = await ModelDecisionProvider(model).decide(event(question), current)
     assert result.response == "这是稳定概念的简短解释。"
     assert current["_turn_contract"].intent == "conversation"
-    assert len(model.requests) == len(model.assessments) == 1
+    assert len(model.requests) == 1 and len(model.assessments) == 2
 
 
 @pytest.mark.parametrize("basis", ["provided_context", "user_input"])
@@ -331,7 +341,7 @@ async def test_supplied_evidence_or_true_user_only_input_does_not_force_research
     )
     assert result.response and current["_turn_contract"].intent == "conversation"
     assert not current["_turn_contract"].required_actions
-    assert len(model.requests) == len(model.assessments) == 1
+    assert len(model.requests) == 1 and len(model.assessments) == 2
 
 
 @pytest.mark.parametrize("kind", ["update_work", "control_work", "read_work_facts"])

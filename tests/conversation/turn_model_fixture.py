@@ -51,9 +51,37 @@ def semantic_fixture_reply(
     elif system.startswith("TURN_OUTCOME_V1"):
         payload = json.loads(request.messages[1].content)
         accepted = any(receipt.get("committed") for receipt in payload["host_receipts"])
+        requirements = list(required_actions or [])
+        if required_actions is None:
+            for step in upcoming:
+                if not isinstance(step, ModelReply):
+                    continue
+                for call in step.tool_calls:
+                    if call.name in {
+                        "start_work",
+                        "update_work",
+                        "control_work",
+                        "read_work_facts",
+                    }:
+                        item = {"kind": call.name}
+                    elif call.name == "apply_business_action":
+                        item = {"kind": "business", "operation": call.arguments["action"]["op"]}
+                    else:
+                        continue
+                    if item not in requirements:
+                        requirements.append(item)
+            for receipt in payload["host_receipts"]:
+                item = {"kind": receipt["kind"]}
+                if receipt.get("operation") is not None:
+                    item["operation"] = receipt["operation"]
+                if item not in requirements:
+                    requirements.append(item)
         value = {
-            "outcome": outcome or ("committed" if accepted else "blocked"),
+            "outcome": outcome
+            or ("committed" if accepted or not payload["host_receipts"] else "blocked"),
             "explanation": "Explicit synthetic host-receipt assessment.",
+            "required_actions": requirements,
+            "reply_required": payload["trusted_recipient"]["recipient"] == "agent",
         }
     else:
         return None

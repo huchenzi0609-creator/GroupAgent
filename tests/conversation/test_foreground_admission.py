@@ -26,7 +26,16 @@ class PhaseModel(ContractModel):
             self.assessments.append(request)
             review = self.reviews.pop(0)
             value = review(payload) if callable(review) else {"outcome": review}
-            return reply(json.dumps({"explanation": "Synthetic phase and target review.", **value}))
+            return reply(
+                json.dumps(
+                    {
+                        "explanation": "Synthetic phase and target review.",
+                        "required_actions": self.assessment.get("required_actions", []),
+                        "reply_required": payload["trusted_recipient"]["recipient"] == "agent",
+                        **value,
+                    }
+                )
+            )
         return await super().complete(request)
 
 
@@ -65,23 +74,14 @@ async def test_queued_admission_repairs_wording_without_reexecuting(conversation
     env = conversation_env
     value = source(env, GOAL)
 
-    def final(request):
-        names = {item["function"]["name"] for item in request.tools}
-        assert "start_work" not in names and "observe" not in names
-        feedback = json.loads(request.messages[-1].content)
-        assert feedback["code"] == "truthful_phase_reply_required"
-        return reply("研究已排队，核实后给你下载入口。")
-
-    model = PhaseModel(
-        start(), reply("我已经在网上搜了。"), final, reviews=["repair_reply", "committed"]
-    )
+    model = PhaseModel(start(), reply("我已经在网上搜了。"), reviews=["repair_reply"])
     env.models[value.id] = model
     result = await env.coordinator.process(value)
     with env.store.transaction(env.actor) as tx:
         assert len(tx.list_work()) == len(tx.list_delivery()) == 1
         assert len(tx.get_decision(value.id)["action_receipts"]) == 1
-    assert result.decision.response == "研究已排队，核实后给你下载入口。"
-    assert len(model.requests) == 3 and not model.reviews
+    assert result.decision.response == "我会查找资料并核对来源，再把结论发回来。"
+    assert len(model.requests) == 2 and not model.reviews
 
 
 @pytest.mark.postgres
@@ -102,11 +102,11 @@ async def test_visible_action_cannot_escape_with_observe_after_queued_commit(con
     result = await env.coordinator.process(value)
     assert result.delivery_id and result.decision.kind != "observe"
     assert len(model.requests) == 3
-    assert not any(
-        call.name == "observe"
-        for message in model.requests[-1].messages
-        for call in message.tool_calls
-    )
+    calls = {call.id for message in model.requests[-1].messages for call in message.tool_calls}
+    observed = {
+        message.tool_call_id for message in model.requests[-1].messages if message.role == "tool"
+    }
+    assert calls <= observed  # Provisional observe is audited, never a dangling or final escape.
 
 
 @pytest.mark.postgres
@@ -117,7 +117,7 @@ async def test_same_work_effect_with_changed_proposals_defers_and_stays_pending(
         start(),
         start("另一个文字描述，实际仍是同一项工作。", "second"),
         reply("检索已经完成。"),
-        reviews=["repair_reply"],
+        reviews=["missing_evidence"],
     )
     env.models[value.id] = model
     with pytest.raises(DomainError, match="host progress"):
@@ -136,7 +136,10 @@ async def test_same_work_effect_with_changed_proposals_defers_and_stays_pending(
         await env.coordinator.process(value)
     with env.store.transaction(env.actor) as tx:
         assert len(tx.list_work()) == 1 and not tx.list_delivery()
-        assert len(tx.get_decision(value.id)["action_receipts"]) == 2
+        assert (
+            len({row["result"]["work_id"] for row in tx.get_decision(value.id)["action_receipts"]})
+            == 1
+        )
 
 
 @pytest.mark.postgres

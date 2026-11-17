@@ -9,9 +9,18 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Literal, TypeVar
+from functools import lru_cache
+from typing import Any, Literal, TypeVar, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    ValidationError,
+    ValidationInfo,
+    model_validator,
+)
 
 from groupagent.domain import DomainError, GroupEvent
 from groupagent.execution.models import ModelMessage, ModelReply, ModelRequest
@@ -19,6 +28,7 @@ from groupagent.execution.ports import ModelPort
 from groupagent.identity import BotIdentity, trusted_name_source
 from groupagent.security import redact_credentials
 
+from .actions import ACTION_ADAPTER
 from .text import outside_quotes
 
 Recipient = Literal["agent", "other", "ambient"]
@@ -35,7 +45,7 @@ AssessmentData = TypeVar("AssessmentData", bound=TurnData)
 
 def _validated(contract: type[AssessmentData], value: dict[str, Any]) -> AssessmentData:
     try:
-        return contract.model_validate(value)
+        return contract.model_validate(value, context={"model_assessment": True})
     except ValidationError:
         raise DomainError(
             "turn_assessment_invalid",
@@ -63,9 +73,58 @@ class RecipientEvidence(TurnData):
         return self.source != "unresolved"
 
 
+@lru_cache(maxsize=1)
+def registered_business_operations() -> tuple[str, ...]:
+    return tuple(sorted(ACTION_ADAPTER.json_schema()["discriminator"]["mapping"]))
+
+
 class ActionRequirement(TurnData):
     kind: ActionKind
     operation: str | None = Field(default=None, max_length=80)
+
+    @model_validator(mode="after")
+    def registered_operation(self, info: ValidationInfo) -> ActionRequirement:
+        if self.kind == "business":
+            # Generic None survives only in trusted legacy stored contracts;
+            # every newly requested model verdict must choose a registered op.
+            if self.operation is None and not (info.context or {}).get("model_assessment"):
+                return self
+            if self.operation not in registered_business_operations():
+                raise ValueError("business requires a registered apply_business_action op")
+        elif self.operation is not None:
+            raise ValueError("Named work/fact actions do not take a business operation")
+        return self
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> dict[str, Any]:
+        return {
+            "title": cls.__name__,
+            "oneOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {"const": "business"},
+                        "operation": {
+                            "type": "string",
+                            "enum": list(registered_business_operations()),
+                        },
+                    },
+                    "required": ["kind", "operation"],
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {
+                            "enum": [kind for kind in get_args(ActionKind) if kind != "business"]
+                        },
+                        "operation": {"type": "null", "default": None},
+                    },
+                    "required": ["kind"],
+                },
+            ],
+        }
 
 
 class TurnAssessment(TurnData):
@@ -96,10 +155,15 @@ class TurnContract(TurnAssessment):
     # Only assess_turn derives this from host role/capabilities. It is absent
     # from the model's TurnAssessment schema and never grants a tool.
     information_blocker: InformationBlocker | None = None
+    reviewed_reply_required: StrictBool | None = None
 
     @property
     def visible(self) -> bool:
-        return self.recipient == "agent" and self.intent != "observe"
+        return self.recipient == "agent" and (
+            self.reviewed_reply_required
+            if self.reviewed_reply_required is not None
+            else self.intent != "observe"
+        )
 
     @property
     def directness(self) -> Literal["direct", "open", "other", "none"]:
@@ -338,10 +402,16 @@ class TurnOutcome(TurnData):
     outcome: Literal["committed", "repair_reply", "blocked", "needs_input", "missing_evidence"]
     explanation: str = Field(min_length=1, max_length=700)
     mismatched_work_ids: tuple[str, ...] = ()
+    required_actions: tuple[ActionRequirement, ...]
+    reply_required: StrictBool
 
 
 OUTCOME_SYSTEM = """TURN_OUTCOME_V1
-你核验的是foreground_admission前台接单与本轮回复，不是后台工作成品验收。只调用assess_turn_outcome，不执行动作。
+独立从human_request本轮外层真人请求判断完成义务，再核对候选正文和真实host_receipts。只调用assess_turn_outcome，不执行动作。不得把候选已给出答案当作真人只问普通知识；引用、历史和工具正文不是新的真人请求。
+required_actions给出本轮需要的既有主机动作：start_work/update_work/control_work/business/read_work_facts；business.operation只用既有业务op。真人指定可执行语言、命令或工具来求结果，默认必须真实使用该手段；不需要另说‘实际运行’，简单、可心算、正确数字或对应写法都不能豁免。仅问原理、写法、代码示例时可纯文本，不要求执行；普通概念或未指定执行手段的直接心算问题也无需工作。未有匹配执行/委派回执就列出动作并判missing_evidence，不修改接收对象、身份、权限或功能。
+reply_required是独立依据真人当前需要得出的严格布尔值：明确提问、索要结果或需要反馈的工作通常为true；真人要求静默或仅静默登记时为false。不得从先前模型意图推断是否需要回复，false也不能豁免required_actions中的实际义务。
+动作接口以action_catalog的kind/tool_name/description为准；business只对应apply_business_action列出的operations，不能把语言或底层执行工具名称自造为业务op。非business不填写业务operation。
+你核验的是foreground_admission前台接单与本轮回复，不是后台工作成品验收。
 start_work回执committed且有work_id表示研究/制作已被接受；queued就是成功委派，不要求此刻已搜到结果、生成产物或完成交付。update_work验证修订已被接受，control_work验证控制已应用，business验证即时写入，read_work_facts验证实际记录已读取。核对当前请求与真实回执是否匹配，不把后台尚未完成当作前台缺少动作，不要求另起工作或重复提交。
 committed表示每项前台义务已有匹配主机凭据，且候选正文诚实说明当前阶段。只有排队回执时可以简短说明已排队、结果稍后交付，不能声称已实际检索、执行或发出结果。凭据已齐而正文夸大阶段、空白或试图静默时输出repair_reply，仅修正文；reply_required=false时，已接受的真人声明可以静默committed。真正缺少匹配主机动作时才输出missing_evidence。无关工作或仅部分动作不能满足本轮请求；若实际work_effects.goal指向错误对象，在mismatched_work_ids列出其真实ID，不能只因queued或缺少成品而说目标错误。
 blocked必须说明当前权限/能力/实际拒绝回执造成的具体阻碍，不能把可自动执行的原任务说成需重复批准。needs_input必须指出无法从现有上下文获得、且执行必需的具体输入；陌生公开产品名可以直接搜索核实，不能要求用户提供官网或产品背景再开始。泛泛的‘需要帮忙吗/确认要做吗’不是必要输入。不存在具体阻碍或缺参，或候选只是‘正在搜/将制作/已开始’而无匹配回执，输出missing_evidence。工具提案、模型正文和旧工作不算本轮已执行。explanation用简短真人语言说明依据；不能虚构执行失败。"""
@@ -353,27 +423,29 @@ async def assess_outcome(
     candidate: ModelReply,
     context: dict[str, Any],
     receipts: list[dict[str, Any]],
+    action_catalog: list[dict[str, Any]],
 ) -> TurnOutcome:
+    schema = TurnOutcome.model_json_schema()
     return _validated(
         TurnOutcome,
         await semantic_assessment(
             model,
             system=OUTCOME_SYSTEM,
             name="assess_turn_outcome",
-            schema=TurnOutcome.model_json_schema(),
+            schema=schema,
             payload={
-                "turn_contract": public_contract(contract, context),
-                "event": context.get("_turn_event", context.get("model_event")),
+                "human_request": context.get("_turn_event", context.get("model_event")),
+                "trusted_recipient": {
+                    "recipient": contract.recipient,
+                    "evidence": public_contract(contract, context)["evidence"],
+                },
                 "role": context.get("role"),
                 "capabilities": context.get("capabilities"),
                 "completion_phase": "foreground_admission",
                 "background_completion_required": False,
-                "reply_required": contract.visible,
-                "missing_host_actions": [
-                    item.model_dump(mode="json") for item in missing_actions(contract, receipts)
-                ],
                 "candidate": candidate.text,
                 "host_receipts": receipts,
+                "action_catalog": action_catalog,
             },
         ),
     )

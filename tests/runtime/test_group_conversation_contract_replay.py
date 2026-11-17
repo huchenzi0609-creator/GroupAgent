@@ -63,11 +63,14 @@ class DialogueModel:
         if marker.startswith("TURN_OUTCOME_V1"):
             payload = json.loads(request.messages[1].content)
             committed = any(row.get("committed") is True for row in payload["host_receipts"])
+            ordinary = self.assessment["intent"] == "conversation"
             return reply(
                 json.dumps(
                     {
-                        "outcome": "committed" if committed else "missing_evidence",
+                        "outcome": "committed" if committed or ordinary else "missing_evidence",
                         "explanation": "Synthetic assessment: a public lookup can proceed using the available tools.",
+                        "required_actions": self.assessment["required_actions"],
+                        "reply_required": self.assessment["recipient"] == "agent",
                     }
                 )
             )

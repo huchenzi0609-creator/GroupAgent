@@ -65,11 +65,39 @@ async def run(args):
         "run_id": args.run_id,
         "provider": "actual DeepSeek",
         "passed": False,
-        "scope": "real foreground/model/PG/local spool; research admission only, no worker or WeChat",
+        "scope": "real foreground/model/PG/local spool; work admission only, no worker or WeChat",
         "cases": [],
     }
     output = destination / "report.json"
     save(output, report)
+    if args.capture_semantic:
+        original_factory = app.coordinator.provider_factory
+        semantic_sequence = 0
+
+        def captured_factory(actor, event):
+            provider = original_factory(actor, event)
+            original_complete = provider.model.complete
+
+            async def capture(request):
+                nonlocal semantic_sequence
+                response = await original_complete(request)
+                marker = request.messages[0].content or ""
+                if marker.startswith(("TURN_CONTRACT_V1", "TURN_OUTCOME_V1")):
+                    semantic_sequence += 1
+                    save(
+                        destination / f"semantic-{semantic_sequence:04}.json",
+                        {
+                            "scope": "authorized synthetic local group only; no credentials or HTTP headers",
+                            "request": request.model_dump(mode="json"),
+                            "response": response.model_dump(mode="json"),
+                        },
+                    )
+                return response
+
+            provider.model.complete = capture
+            return provider
+
+        app.coordinator.provider_factory = captured_factory
 
     async def turn(name, text, *, peer=False, quote=None):
         stamp = datetime.now(UTC)
@@ -125,6 +153,27 @@ async def run(args):
         return event, entry
 
     try:
+        if args.case == "code_example":
+            _, example = await turn(
+                "code_example_only", "Pot，给我一段计算1到10平方和的Python代码示例。"
+            )
+            assert example["reply"] and example["wire_text"] and example["work_count"] == 0
+            report["passed"] = True
+            return
+        if args.case == "explicit_compute":
+            event, computed = await turn(
+                "explicit_compute_method",
+                "Pot，用 Python 算出 1 到 10 的平方和，告诉我结果。",
+            )
+            assert computed["work_id"] and computed["work_count"] == 1
+            assert computed["reply"] and computed["wire_text"]
+            with store.transaction(app.owner) as tx:
+                work = tx.get_work(computed["work_id"])
+                body = tx.get_decision(event.id)
+                assert "python_compute" in work.scope["required_tools"]
+                assert body["action_receipts"] and not body["agent_pending_response"]
+            report["passed"] = True
+            return
         if args.case == "stable_concept":
             _, concept = await turn("stable_concept", "Pot，RAG是什么？")
             assert concept["reply"] and concept["work_count"] == 0
@@ -171,7 +220,16 @@ if __name__ == "__main__":
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--dsn-file", type=Path, required=True)
     parser.add_argument("--secrets", type=Path, default=ROOT / ".env.local")
+    parser.add_argument("--capture-semantic", action="store_true")
     parser.add_argument(
-        "--case", choices=("dialogue", "implicit_install", "stable_concept"), default="dialogue"
+        "--case",
+        choices=(
+            "dialogue",
+            "implicit_install",
+            "stable_concept",
+            "explicit_compute",
+            "code_example",
+        ),
+        default="dialogue",
     )
     asyncio.run(run(parser.parse_args()))

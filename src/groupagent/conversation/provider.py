@@ -970,7 +970,7 @@ class ModelDecisionProvider:
             "quoted_bot": contract.evidence.source == "bot_reply",
             "continuing_work": contract.evidence.source == "continuation",
         }
-        if contract.intent == "observe" or (not contract.visible and contract.intent != "action"):
+        if contract.recipient != "agent" and contract.intent != "action":
             return Decision(
                 kind="observe",
                 reason_code="turn_observed",
@@ -1016,12 +1016,15 @@ class ModelDecisionProvider:
         if len(payload.encode()) > 140_000:
             raise DomainError("context_too_large", "Conversation context exceeds its bounded input")
         silent: Decision | None = None
+        host_reply: str | None = None
+        host_reply_reason: str | None = None
         receipts: list[dict[str, Any]] = list(context.get("_prior_action_receipts", []))
         matched_effects = set(context.get("_matched_action_effects", []))
         repair_targets = context.setdefault("_admission_repair_targets", {})
         context["_turn_execution_pending"] = contract.intent == "action"
         stalled_evidence: tuple[str, ...] | None = None
         rejected_proposals: set[str] = set()
+        intent_rejections: set[str] = set()
 
         def matched_receipts() -> list[dict[str, Any]]:
             return [
@@ -1079,7 +1082,11 @@ class ModelDecisionProvider:
             if repair_targets:
                 names.discard("start_work")
                 names.add("update_work")
-            if contract.visible and contract.intent == "action" and not quiet_committed():
+            if (
+                contract.reviewed_reply_required is True
+                and contract.intent == "action"
+                and not quiet_committed()
+            ):
                 names.discard("observe")
             return frozenset(names)
 
@@ -1101,6 +1108,8 @@ class ModelDecisionProvider:
                     "phase": "foreground_admission",
                     "code": "matching_host_action_required"
                     if missing
+                    else "natural_reply_repair_required"
+                    if contract.intent == "conversation"
                     else "truthful_phase_reply_required",
                     "missing_actions": [item.model_dump(mode="json") for item in missing],
                     "admission_repair_targets": context.get("_admission_repair_details", []),
@@ -1110,6 +1119,8 @@ class ModelDecisionProvider:
                         if raw_missing
                         else "已有主机回执，需要说明其与本轮目标及实际阶段的对应；不要把排队当失败或另起工作。目标确实不符时由主机对齐同一工作；已对齐后只如实说明已排队。"
                         if missing
+                        else "按真人原问题直接修正回答，无需创建工作或虚构执行回执。"
+                        if contract.intent == "conversation"
                         else "所需前台动作已被接受，只修正回复措辞。排队是成功委派，不必等待后台检索、产物或交付完成；简短如实说明已排队及后续交付。不得另起、重提或恢复同一工作，也不能静默逃避本轮回复。"
                     ),
                 },
@@ -1128,7 +1139,7 @@ class ModelDecisionProvider:
                 or (call.name == "start_work" and repair_targets)
                 or (
                     call.name == "observe"
-                    and contract.visible
+                    and contract.reviewed_reply_required is True
                     and contract.intent == "action"
                     and not quiet_committed()
                 )
@@ -1205,6 +1216,7 @@ class ModelDecisionProvider:
                         for required in contract.required_actions
                     )
                 ):
+                    intent_rejections.add(proposal_key(call))
                     raise _InvalidCandidate("kind", "action_not_requested_this_turn")
                 if repairing and (
                     not call.arguments.get("work_capabilities") or not call.arguments.get("outputs")
@@ -1283,7 +1295,11 @@ class ModelDecisionProvider:
 
         async def observe(call: ModelToolCall) -> str:
             nonlocal silent
-            if contract.visible and contract.intent == "action" and not quiet_committed():
+            if (
+                contract.reviewed_reply_required is True
+                and contract.intent == "action"
+                and not quiet_committed()
+            ):
                 return json.dumps({"status": "rejected", "code": "visible_action_requires_reply"})
             reason = call.arguments.get("reason_code", "agent_observed")
             directness = call.arguments.get("directness", "none")
@@ -1307,8 +1323,8 @@ class ModelDecisionProvider:
         async def after_agent(
             candidate: ModelReply, messages: tuple[ModelMessage, ...]
         ) -> str | None:
-            nonlocal silent
-            if contract.intent != "action":
+            nonlocal silent, contract, host_reply, host_reply_reason
+            if contract.recipient != "agent" and contract.intent != "action":
                 return None
             if context.get("_agent_context_revoked"):
                 context["_turn_execution_pending"] = False
@@ -1317,11 +1333,162 @@ class ModelDecisionProvider:
                 context["_turn_execution_pending"] = False
                 silent = Decision(kind="observe", reason_code="quiet_enabled", confidence=1)
                 return None
-            outcome = await assess_outcome(self.model, contract, candidate, context, receipts)
+            context["_turn_execution_pending"] = True
+            business_schema = ACTION_ADAPTER.json_schema()
+            operations = business_schema["discriminator"]["mapping"]
+            definitions = business_schema.get("$defs", {})
+            action_catalog = [
+                {
+                    "kind": "business" if tool.name == "apply_business_action" else tool.name,
+                    "tool_name": tool.name,
+                    "description": tool.description,
+                    **(
+                        {
+                            "operations": [
+                                {
+                                    "operation": operation,
+                                    "description": definitions.get(
+                                        reference.rsplit("/", 1)[-1], {}
+                                    ).get(
+                                        "description",
+                                        definitions.get(reference.rsplit("/", 1)[-1], {}).get(
+                                            "title", ""
+                                        ),
+                                    ),
+                                    "required_arguments": definitions.get(
+                                        reference.rsplit("/", 1)[-1], {}
+                                    ).get("required", []),
+                                }
+                                for operation, reference in sorted(operations.items())
+                            ]
+                        }
+                        if tool.name == "apply_business_action"
+                        else {}
+                    ),
+                }
+                for tool in tools
+                if tool.name != "observe"
+            ]
+            outcome = await assess_outcome(
+                self.model, contract, candidate, context, receipts, action_catalog
+            )
+            # This is the independent review's complete request contract, not
+            # additions to a planner verdict. Receipts remain immutable facts.
+            requirements = list(outcome.required_actions)
+            operations = ACTION_ADAPTER.json_schema().get("discriminator", {}).get("mapping", {})
+            for required in outcome.required_actions:
+                if (
+                    required.kind == "business"
+                    and required.operation is not None
+                    and required.operation not in operations
+                ):
+                    raise DomainError(
+                        "turn_assessment_invalid",
+                        "Unknown business operation in fulfillment review",
+                        retryable=True,
+                    )
+            desired_intent = (
+                "action"
+                if requirements
+                else "conversation"
+                if outcome.reply_required
+                else "observe"
+            )
+            actions_changed = tuple(requirements) != contract.required_actions
+            if (
+                actions_changed
+                or desired_intent != contract.intent
+                or contract.reviewed_reply_required is not outcome.reply_required
+            ):
+                corrected = TurnContract.model_validate(
+                    {
+                        **contract.model_dump(),
+                        "intent": desired_intent,
+                        "required_actions": requirements,
+                        "reviewed_reply_required": outcome.reply_required,
+                    }
+                )
+                persist = context.get("_persist_turn_contract")
+                if persist is None:
+                    terminal = outcome.outcome in {"committed", "blocked", "needs_input"} and (
+                        bool(candidate.text and candidate.text.strip())
+                        or not outcome.reply_required
+                    )
+                    if actions_changed or not terminal:
+                        raise DomainError(
+                            "turn_contract_host_unbound",
+                            "Corrected obligations require durable host admission",
+                            retryable=True,
+                        )
+                    admission = {"status": "stateless_final"}
+                else:
+                    admission = await persist(corrected)
+                if admission.get("status") == "closed":
+                    context["_turn_execution_pending"] = False
+                    silent = Decision(
+                        kind="observe", reason_code="turn_already_finalized", confidence=1
+                    )
+                    return None
+                contract = corrected
+                context["_turn_contract"] = contract
+                context["turn_contract"] = public_contract(contract, context)
+                rejected_proposals.difference_update(intent_rejections)
+                intent_rejections.clear()
+                if admission.get("status") == "suppressed":
+                    silent = Decision(
+                        kind="observe", reason_code=admission["reason_code"], confidence=1
+                    )
+                    context["_turn_execution_pending"] = False
+                    return None
+                if (
+                    context.get("read_only") is True
+                    or context.get("role") not in {"owner", "member"}
+                ) and any(item.kind != "read_work_facts" for item in requirements):
+                    host_reply = "你当前可以查询信息，暂时不能执行工具或修改任务。"
+                    host_reply_reason = "read_only_scope"
+                    context["_turn_outcome"] = {"outcome": "blocked", "explanation": host_reply}
+                    context["_turn_execution_pending"] = False
+                    silent = None
+                    return None
             if outcome.outcome in {"committed", "repair_reply"}:
                 matched_effects.update(durable_progress(receipts))
                 context["_matched_action_effects"] = sorted(matched_effects)
             missing = missing_actions(contract, matched_receipts())
+            if (
+                outcome.outcome == "repair_reply"
+                and outcome.reply_required is True
+                and contract.visible
+                and not missing
+                and not outcome.mismatched_work_ids
+                and len(contract.required_actions) == 1
+                and contract.required_actions[0].kind == "start_work"
+                and matched_receipts()
+                and context.get("read_only") is not True
+                and context.get("role") in {"owner", "member"}
+            ):
+                acknowledge = context.get("_work_admission_ack")
+                if acknowledge is not None:
+                    acknowledgement = await acknowledge(contract, matched_receipts())
+                    if acknowledgement.get("status") in {"closed", "suppressed"}:
+                        context["_turn_execution_pending"] = False
+                        silent = Decision(
+                            kind="observe",
+                            reason_code=acknowledgement.get(
+                                "reason_code", "turn_already_finalized"
+                            ),
+                            confidence=1,
+                        )
+                        return None
+                    if acknowledgement.get("status") == "acknowledged":
+                        host_reply = acknowledgement["text"]
+                        host_reply_reason = "host_work_admission_ack"
+                        context["_turn_outcome"] = {
+                            **outcome.model_dump(mode="json"),
+                            "host_completion": acknowledgement["proof"],
+                        }
+                        context["_turn_execution_pending"] = False
+                        silent = None
+                        return None
             if outcome.outcome == "missing_evidence" and outcome.mismatched_work_ids:
                 repair = context.get("_authorize_work_repair")
                 owned = {
@@ -1343,7 +1510,11 @@ class ModelDecisionProvider:
                         available = await repair(work_id, owned[work_id])
                         context.setdefault("_admission_repair_details", []).append(available)
             has_reply = isinstance(candidate.text, str) and bool(candidate.text.strip())
-            if outcome.outcome in {"blocked", "needs_input"} and missing and has_reply:
+            if (
+                outcome.outcome in {"blocked", "needs_input"}
+                and has_reply
+                and (missing or not contract.required_actions)
+            ):
                 context["_turn_outcome"] = outcome.model_dump(mode="json")
                 context["_turn_execution_pending"] = False
                 silent = None
@@ -1355,11 +1526,26 @@ class ModelDecisionProvider:
             ):
                 context["_turn_outcome"] = outcome.model_dump(mode="json")
                 context["_turn_execution_pending"] = False
+                if contract.reviewed_reply_required is False:
+                    silent = Decision(
+                        kind="observe", reason_code="reviewed_silent_turn", confidence=1
+                    )
+                elif contract.visible:
+                    silent = None
                 return None
             self.diagnostics.append({"code": "turn_action_evidence_missing"})
             if contract.visible:
                 silent = None
-            return repair_feedback(outcome.explanation)
+            feedback = repair_feedback(outcome.explanation)
+            if actions_changed and requirements:
+                feedback += "\nHost current turn contract: " + json.dumps(
+                    public_contract(contract, context), ensure_ascii=False
+                )
+                feedback += "\n" + ACTION_GUIDANCE
+                feedback += "\nAuthorized current references (data): " + json.dumps(
+                    reference_catalog(context, projection), ensure_ascii=False
+                )
+            return feedback
 
         tools = (
             KernelTool(
@@ -1438,7 +1624,7 @@ class ModelDecisionProvider:
             ) from None
         if silent is not None:
             return silent
-        text = result.reply.text
+        text = host_reply or result.reply.text
         if (
             result.yielded
             or result.reply.finish_reason != "stop"
@@ -1459,7 +1645,7 @@ class ModelDecisionProvider:
             )
         return Decision(
             kind="reply",
-            reason_code="agent_reply",
+            reason_code=host_reply_reason or "agent_reply",
             response=text,
             directness=contract.directness,
             confidence=1,

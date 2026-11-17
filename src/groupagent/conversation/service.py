@@ -639,7 +639,11 @@ class ConversationCoordinator(Coordinator):
         contract = context.get("_turn_contract")
         if isinstance(contract, TurnContract):
             decision = decision.model_copy(update={"directness": contract.directness})
-            if not contract.visible and decision.action is None:
+            if (
+                not contract.visible
+                and decision.action is None
+                and decision.kind not in {"start_work", "update_work", "control_work"}
+            ):
                 return Decision(
                     kind="observe", reason_code="turn_observed", directness=contract.directness
                 )
@@ -1487,6 +1491,203 @@ class ConversationCoordinator(Coordinator):
         context["_read_work_facts"] = read_facts
         context["_apply_business_action"] = apply_action
 
+        async def work_admission_ack(
+            contract: TurnContract, receipts: list[dict[str, Any]]
+        ) -> dict[str, Any]:
+            if (
+                contract.event_id != event.id
+                or not contract.visible
+                or contract.reviewed_reply_required is not True
+                or len(contract.required_actions) != 1
+                or contract.required_actions[0].kind != "start_work"
+                or actor.role not in {Role.OWNER, Role.MEMBER}
+            ):
+                return {"status": "unavailable"}
+            with self.store.transaction(actor, trace_id=event.id) as tx:
+                self.memory.prepare_in_tx(tx)
+                self.execution_guard(tx)
+                self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
+                tx._reply_source(event.id)
+                body: dict[str, Any] = tx.get_decision(event.id) or {}
+                if not body.get("agent_pending_response"):
+                    return {"status": "closed"}
+                if body.get("turn_contract") != contract.model_dump(mode="json"):
+                    return {"status": "unavailable"}
+                admission = ingress_admission(
+                    tx,
+                    event,
+                    self.identity,
+                    time_zone=self.config.group.time_zone,
+                    quiet_hours=self.config.group.quiet_hours,
+                    default_mode=self.config.group.participation_mode,
+                    now=self.clock(),
+                    bot_member_id=self.config.group.bot_member_id,
+                    shared_account=self.config.group.shared_account,
+                )
+                if not admission.allowed:
+                    return {"status": "suppressed", "reason_code": admission.reason_code}
+                ids = {
+                    receipt.get("tool_call_id")
+                    for receipt in receipts
+                    if receipt.get("committed") is True
+                }
+                for recorded in reversed(body.get("action_receipts", [])):
+                    if (
+                        recorded.get("tool_call_id") not in ids
+                        or recorded.get("kind") != "start_work"
+                    ):
+                        continue
+                    result = recorded.get("result", {})
+                    work_id = result.get("work_id")
+                    effects = recorded.get("work_effects", [])
+                    if (
+                        not isinstance(work_id, str)
+                        or len(effects) != 1
+                        or result.get("decision", {}).get("kind") != "start_work"
+                    ):
+                        continue
+                    work = tx.get_work(work_id)
+                    effect = effects[0]
+                    if (
+                        effect.get("id") != work.id
+                        or effect.get("goal_revision") != work.goal_revision
+                        or effect.get("goal") != work.goal
+                        or work.request_event_id != event.id
+                        or work.requester_id != actor.member_id
+                        or work.state
+                        not in {WorkState.QUEUED, WorkState.RUNNING, WorkState.VALIDATING}
+                    ):
+                        continue
+                    outputs = work.scope.get("outputs", [])
+                    formats = (
+                        [
+                            format_name
+                            for row in outputs
+                            if isinstance(row, dict)
+                            and isinstance(format_name := row.get("format"), str)
+                        ]
+                        if isinstance(outputs, list)
+                        else []
+                    )
+                    text = _work_admission_text(
+                        _strings(work.scope.get("required_tools", [])),
+                        formats,
+                        research_required=work.scope.get("research_required") is True,
+                        image_inputs="image_analysis"
+                        in _strings(work.scope.get("work_capabilities", [])),
+                    )
+                    return {
+                        "status": "acknowledged",
+                        "text": text,
+                        "proof": {
+                            "origin": "host_work_metadata",
+                            "tool_call_id": recorded["tool_call_id"],
+                            "work_id": work.id,
+                            "goal_revision": work.goal_revision,
+                        },
+                    }
+            return {"status": "unavailable"}
+
+        context["_work_admission_ack"] = work_admission_ack
+
+        async def persist_turn_contract(contract: TurnContract) -> dict[str, Any]:
+            # An independent final review may discover a missed obligation
+            # before any action exists. Persist it before the graph continues.
+            if contract.event_id != event.id:
+                raise DomainError("scope_violation", "Turn contract belongs to another event")
+            with self.store.transaction(actor, trace_id=event.id) as tx:
+                self.memory.prepare_in_tx(tx)
+                self.execution_guard(tx)
+                prior: dict[str, Any] | None = tx.get_decision(event.id)
+                if prior is not None and not prior.get("agent_pending_response"):
+                    context["_agent_turn_persisted"] = True
+                    return {"status": "closed"}
+                try:
+                    self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
+                    tx._reply_source(event.id)
+                except DomainError as error:
+                    if prior is None:
+                        raise
+                    self._finish_agent_response_in_tx(
+                        tx,
+                        event,
+                        prior,
+                        decision=Decision(kind="observe", reason_code=error.code),
+                        context=context,
+                    )
+                    context["_agent_turn_persisted"] = True
+                    return {"status": "suppressed", "reason_code": error.code}
+                if prior is None:
+                    pending = CoordinationResult(
+                        event_id=event.id,
+                        decision=Decision(
+                            kind="reply",
+                            response="本轮回复尚待核验。",
+                            reason_code="agent_contract_pending",
+                            directness=contract.directness,
+                            confidence=1,
+                        ),
+                    )
+                    prior = {
+                        "kind": "reply",
+                        "result": pending.model_dump(mode="json"),
+                        "action_receipts": [],
+                    }
+                body = {
+                    **prior,
+                    "turn_contract": contract.model_dump(mode="json"),
+                    "agent_pending_response": True,
+                    "agent_needs_execution": True,
+                    "agent_snapshot": {
+                        key: value for key, value in context["_snapshot"].items() if key != "items"
+                    },
+                    "source_event_ids": sorted(
+                        set(prior.get("source_event_ids", []))
+                        | set(context["_snapshot"]["source_fingerprints"])
+                        | set(context.get("_work_fact_source_ids", []))
+                    ),
+                    "source_fingerprints": {
+                        **prior.get("source_fingerprints", {}),
+                        **context["_snapshot"]["source_fingerprints"],
+                    },
+                    "source_task_revisions": {
+                        **prior.get("source_task_revisions", {}),
+                        **context["_snapshot"].get("source_task_revisions", {}),
+                    },
+                }
+                if tx.get_decision(event.id) is None:
+                    tx.record_decision(event.id, body)
+                else:
+                    tx.conn.execute(
+                        "UPDATE ga_decisions SET body=%s WHERE group_id=%s AND event_id=%s",
+                        (Jsonb(body), actor.group_id, event.id),
+                    )
+                admission = ingress_admission(
+                    tx,
+                    event,
+                    self.identity,
+                    time_zone=self.config.group.time_zone,
+                    quiet_hours=self.config.group.quiet_hours,
+                    default_mode=self.config.group.participation_mode,
+                    now=self.clock(),
+                    bot_member_id=self.config.group.bot_member_id,
+                    shared_account=self.config.group.shared_account,
+                )
+                if not admission.allowed:
+                    self._finish_agent_response_in_tx(
+                        tx,
+                        event,
+                        body,
+                        decision=Decision(kind="observe", reason_code=admission.reason_code),
+                        context=context,
+                    )
+                    context["_agent_turn_persisted"] = True
+                    return {"status": "suppressed", "reason_code": admission.reason_code}
+            context["_agent_turn_persisted"] = True
+            return {"status": "persisted"}
+
+        context["_persist_turn_contract"] = persist_turn_contract
+
         async def authorize_work_repair(
             work_id: str, expected_goal_revision: int
         ) -> dict[str, Any]:
@@ -1571,9 +1772,17 @@ class ConversationCoordinator(Coordinator):
                         for receipt in body.get("action_receipts", [])
                     ]
                     text = "\n".join(dict.fromkeys(value for value in acknowledgements if value))
+                template = (
+                    decision
+                    if (
+                        previous.decision.reason_code == "agent_contract_pending"
+                        and decision is not None
+                    )
+                    else previous.decision
+                )
                 final = (
-                    previous.decision.model_copy(update={"response": text})
-                    if text and previous.decision.kind not in {"ignore", "observe"}
+                    template.model_copy(update={"response": text})
+                    if text and template.kind not in {"ignore", "observe"}
                     else Decision(kind="observe", reason_code="agent_turn_silent", confidence=1)
                 )
         saved_contract = (
@@ -1643,6 +1852,15 @@ class ConversationCoordinator(Coordinator):
         )
         associated = list(dict.fromkeys([*associated, *controlled]))
         action_result = previous.action_result
+        if not associated and context is not None and context.get("_last_work_fact_read"):
+            observed = context["_last_work_fact_read"]
+            associated = [row["id"] for row in observed["facts"]]
+            read_ids: list[JsonValue] = [identifier for identifier in associated]
+            action_result = {
+                "work_facts": observed,
+                "work_ids": read_ids,
+                "states": [row["state"] for row in observed["facts"]],
+            }
         if associated:
             associated_values: list[JsonValue] = [identifier for identifier in associated]
             action_result = {**(action_result or {}), "work_ids": associated_values}
@@ -1810,6 +2028,7 @@ class ConversationCoordinator(Coordinator):
                         or receipt.get("kind")
                         or receipt.get("result", {}).get("decision", {}).get("kind"),
                         "operation": receipt.get("operation"),
+                        "tool_call_id": receipt.get("tool_call_id"),
                         "work_effects": receipt.get("work_effects", []),
                         "committed": bool(
                             receipt.get("result", {}).get("work_id")
@@ -1897,11 +2116,19 @@ class ConversationCoordinator(Coordinator):
                     decision = immediate or await provider.decide(event, context)
                 except Exception:
                     if context.get("_turn_execution_pending"):
-                        if context.get("_agent_applied") or previous:
+                        if (
+                            context.get("_agent_applied")
+                            or context.get("_agent_turn_persisted")
+                            or previous
+                        ):
                             with self.store.transaction(actor, trace_id=event.id) as tx:
                                 pending = tx.get_decision(event.id)
                                 if pending is not None:
                                     pending["agent_needs_execution"] = True
+                                    if isinstance(context.get("_turn_contract"), TurnContract):
+                                        pending["turn_contract"] = context[
+                                            "_turn_contract"
+                                        ].model_dump(mode="json")
                                     pending["agent_matched_effects"] = context.get(
                                         "_matched_action_effects", []
                                     )
@@ -1913,10 +2140,15 @@ class ConversationCoordinator(Coordinator):
                                         (Jsonb(pending), actor.group_id, event.id),
                                     )
                         raise
-                    if context.get("_agent_applied"):
+                    if context.get("_agent_applied") or context.get("_agent_turn_persisted"):
                         return self._finish_agent_response(actor, event, context=context)
                     raise
-        if context.get("_agent_applied") or previous and previous.get("agent_pending_response"):
+        if (
+            context.get("_agent_applied")
+            or context.get("_agent_turn_persisted")
+            or previous
+            and previous.get("agent_pending_response")
+        ):
             return self._finish_agent_response(actor, event, decision=decision, context=context)
         return self._apply_decision(actor, event, decision, context, fast_admitted=fast_admitted)
 
