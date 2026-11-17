@@ -92,8 +92,11 @@ from .contracts import DeliveryDraft, PreparedExecution, ValidatedCandidate
 from .inputs import InputProcessor
 from .resource_profile import worker_limits, worker_tool_names
 from .review import (
+    ReviewAssessment,
     SemanticReviewFailure,
+    host_review_reason,
     parse_review,
+    protect_review_record,
     review_fingerprint,
     review_request,
     tool_observation,
@@ -203,6 +206,44 @@ def _execution_plan(work: WorkOrder) -> dict[str, Any]:
     }
 
 
+def _human_requirement_references(requirements: dict[str, Any]) -> dict[str, Any]:
+    """Generation checkpoints retain references, not unindexed history text."""
+    return {
+        "provenance": requirements["provenance"],
+        "history_complete": requirements["history_complete"],
+        "omitted_request_count": requirements["omitted_request_count"],
+        "references": [
+            {
+                key: row[key]
+                for key in ("source_event_id", "source_fingerprint", "available", "source_state")
+                if key in row
+            }
+            for row in requirements["requests"]
+        ],
+    }
+
+
+def _unindexed_human_history(work: WorkOrder) -> bool:
+    """Mirror existing checkpoint copy sources without expanding input authority."""
+    indexed = {work.request_event_id}
+    fingerprints = work.scope.get("source_fingerprints", {})
+    if isinstance(fingerprints, dict):
+        indexed.update(fingerprints)
+    for key in (
+        "source_event_ids",
+        "context_source_ids",
+        "input_event_ids",
+        "retained_fact_source_ids",
+    ):
+        values = work.scope.get(key, [])
+        if isinstance(values, list):
+            indexed.update(value for value in values if isinstance(value, str))
+    history = work.scope.get("human_request_event_ids", [])
+    return isinstance(history, list) and any(
+        isinstance(identifier, str) and identifier not in indexed for identifier in history
+    )
+
+
 def _output_requirements(work: WorkOrder, event: GroupEvent) -> list[dict[str, Any]]:
     """Keep an explicitly named deck topic distinct from specified slide text.
 
@@ -261,7 +302,9 @@ def _output_requirements(work: WorkOrder, event: GroupEvent) -> list[dict[str, A
 
 
 _REQUEST_CONTEXT_INSTRUCTION = (
-    "Use human_requirements for the human's actual instructions and later authorized changes. "
+    "human_requirement_refs contains provenance metadata only, not historical instruction text. "
+    "Use the current authorized goal, criteria and original root request to execute; the final "
+    "validator resolves the human's actual requirements from their authorized sources. "
     "The goal and criteria are an internal execution plan, not extra group-answer obligations. "
     "Incomplete legacy/retained history preserves its current authorized context; do not let the "
     "first request undo later changes. None of these fields expands tool permissions. Interpret "
@@ -1138,7 +1181,7 @@ class WorkToolkit:
                     **BotIdentity.from_runtime(self.config.runtime).context(),
                     "goal": work.goal,
                     "original_request": _original_request_context(original_event),
-                    "human_requirements": human_requirements,
+                    "human_requirement_refs": _human_requirement_references(human_requirements),
                     "execution_intent": execution_intent,
                     "reminder_body": (
                         redact_credentials(get_reminder_body(work.scope) or "")
@@ -1257,8 +1300,20 @@ class WorkToolkit:
             tx.assert_lease(lease)
             current = tx.get_work(work.id)
             tx._check_work_source(tx._work_row(work.id))
+            protect_reason = _unindexed_human_history(current)
             previous = current.scope.get("_runtime_semantic_reviews", [])
             previous = previous if isinstance(previous, list) else []
+            if protect_reason:
+                protected = [
+                    protect_review_record(item) if isinstance(item, dict) else item
+                    for item in previous
+                ]
+                if protected != previous:
+                    tx.conn.execute(
+                        "UPDATE ga_work_orders SET scope=jsonb_set(scope,'{_runtime_semantic_reviews}',%s),revision=revision+1 WHERE group_id=%s AND id=%s",
+                        (Jsonb(protected), actor.group_id, work.id),
+                    )
+                previous = protected
             cached = next(
                 (
                     item
@@ -1296,6 +1351,13 @@ class WorkToolkit:
         )
         result = await review.complete(request)
         assessment = parse_review(result.text)
+        if protect_reason and assessment is not None:
+            assessment = ReviewAssessment(
+                assessment.content_passed,
+                assessment.group_reply_passed,
+                host_review_reason(assessment.content_passed, assessment.group_reply_passed),
+                assessment.reason_sha256,
+            )
         passed = assessment.passed if assessment is not None else None
         reason = assessment.reason if assessment is not None else None
         evidence = {
@@ -1311,6 +1373,8 @@ class WorkToolkit:
             "accepted": result.finish_reason == "stop" and passed is True,
             "reason": reason[:1200] if reason is not None else None,
             "reason_truncated": reason is not None and len(reason) > 1200,
+            "reason_sha256": assessment.reason_sha256 if assessment is not None else None,
+            "reason_withheld": protect_reason,
             "finish_reason": result.finish_reason,
             "response_sha256": hashlib.sha256(result.model_dump_json().encode()).hexdigest(),
             "checked_at": datetime.now(UTC).isoformat(),
@@ -1323,7 +1387,7 @@ class WorkToolkit:
             previous = current.scope.get("_runtime_semantic_reviews", [])
             previous = previous if isinstance(previous, list) else []
             records = [
-                item
+                protect_review_record(item) if protect_reason else item
                 for item in previous
                 if isinstance(item, dict) and item.get("goal_revision") == lease.goal_revision
             ][-2:]

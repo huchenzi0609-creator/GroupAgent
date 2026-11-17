@@ -116,6 +116,7 @@ class ReviewAssessment:
     content_passed: bool
     group_reply_passed: bool
     reason: str | None
+    reason_sha256: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -136,7 +137,36 @@ def parse_review(text: str | None) -> ReviewAssessment | None:
         value["content_passed"],
         value["group_reply_passed"],
         redact_credentials(reason) if isinstance(reason, str) else None,
+        hashlib.sha256(reason.encode()).hexdigest() if isinstance(reason, str) else None,
     )
+
+
+def host_review_reason(content: object, reply: object) -> str:
+    def status(value: object) -> str:
+        return "passed" if value is True else "failed" if value is False else "unknown"
+
+    return (
+        f"Host review status: content={status(content)}; group_reply={status(reply)}. "
+        "Historical-source diagnostic text is not retained. Recheck the current authorized requirements."
+    )
+
+
+def protect_review_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Remove free diagnostic text without changing its verdict or receipt hashes."""
+    reason = record.get("reason")
+    return {
+        **record,
+        "reason": host_review_reason(
+            record.get("content_passed"), record.get("group_reply_passed")
+        ),
+        "reason_sha256": record.get("reason_sha256")
+        if record.get("reason_withheld") is True
+        else hashlib.sha256(reason.encode()).hexdigest()
+        if isinstance(reason, str)
+        else None,
+        "reason_truncated": False,
+        "reason_withheld": True,
+    }
 
 
 class SemanticReviewFailure(DomainError):
@@ -166,6 +196,8 @@ class SemanticReviewFailure(DomainError):
             "group_reply_passed": assessment.group_reply_passed,
         }
         self.details = dict(self.binding)
+        if assessment.reason_sha256:
+            self.details["reason_sha256"] = assessment.reason_sha256
 
 
 def tool_observation(receipt: ToolReceipt) -> dict[str, Any]:
