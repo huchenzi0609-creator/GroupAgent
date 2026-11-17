@@ -101,7 +101,7 @@ class ContextQuery:
     def for_agent(cls, event: GroupEvent) -> ContextQuery:
         # The model can request additional resources. Start with the delivery
         # timeline and references that are structurally present in this event.
-        resources = {"works", "tasks", "schedules"}
+        resources = {"tasks", "schedules"}
         if event.reply_to or event.attachments:
             resources.add("files")
         return cls(resources=frozenset(resources), model_led=True, preview=True)
@@ -1143,7 +1143,7 @@ class ContextBuilder:
                 available = "preview" if query.preview else "loaded"
                 payload["context_coverage"] = {
                     "recent_messages": "window",
-                    "works": available if "works" in query.resources else "on_request",
+                    "works": "preview" if query.preview else "loaded" if works else "on_request",
                     "members": "loaded" if query.roster else "visible_participants",
                     "tasks": available if "tasks" in query.resources else "on_request",
                     "schedules": available if "schedules" in query.resources else "on_request",

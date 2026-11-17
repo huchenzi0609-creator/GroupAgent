@@ -90,7 +90,12 @@ from groupagent.tools import (
     register_workspace_tools,
 )
 from groupagent.tools.compute import register_compute_tools
-from groupagent.tools.models import ToolFailure, successful_required_tools
+from groupagent.tools.models import (
+    ToolFailure,
+    ToolFailureDisposition,
+    ToolFailureOrigin,
+    successful_required_tools,
+)
 from groupagent.tools.paths import open_parent
 from groupagent.vision_policy import FACE_ID_RESPONSE, requests_face_identification
 
@@ -1029,12 +1034,38 @@ class WorkToolkit:
 
         async def file_import(args, context):
             if self.inputs is None:
-                raise DomainError("dependency_unavailable", "Attachment importer is unavailable")
+                raise ToolFailure(
+                    "dependency_unavailable",
+                    "Attachment importer is unavailable",
+                    not_started=True,
+                    origin=ToolFailureOrigin.CAPABILITY,
+                    disposition=ToolFailureDisposition.REPAIR,
+                )
             with self.store.transaction(actor) as tx:
                 memory_lock(tx)
                 tx.assert_lease(lease)
-                fingerprints, retained = self.registry.consume_in_tx(tx, args.version_id)
-                task_sources = self.registry.task_sources_in_tx(tx, args.version_id)
+                try:
+                    fingerprints, retained = self.registry.consume_in_tx(tx, args.version_id)
+                    task_sources = self.registry.task_sources_in_tx(tx, args.version_id)
+                except DomainError as error:
+                    # These registry reads have not changed work scope or
+                    # copied bytes. I/O errors and failures after qualification
+                    # retain the gateway's reconciliation semantics.
+                    if error.retryable or error.code not in {
+                        "not_found",
+                        "permission_denied",
+                        "source_unavailable",
+                    }:
+                        raise
+                    raise ToolFailure(
+                        error.code,
+                        "This version cannot be imported. Select an exact version_id from "
+                        "the authorized inputs or artifact_search. If the file is already "
+                        "in this work, use the existing import receipt to inspect it.",
+                        not_started=True,
+                        origin=ToolFailureOrigin.PRECONDITION,
+                        disposition=ToolFailureDisposition.REPAIR,
+                    ) from None
                 current = tx.get_work(work.id)
                 scope = dict(current.scope)
                 current_tasks = scope.get("source_task_revisions", {})
@@ -1055,7 +1086,13 @@ class WorkToolkit:
                 )
                 versions = list(dict.fromkeys([*current.input_versions, args.version_id]))
                 if len(versions) > self.config.limits.input_files_per_work:
-                    raise DomainError("quota_exceeded", "Work input limit reached")
+                    raise ToolFailure(
+                        "quota_exceeded",
+                        "Work input limit reached",
+                        not_started=True,
+                        origin=ToolFailureOrigin.PRECONDITION,
+                        disposition=ToolFailureDisposition.REPAIR,
+                    )
                 tx.conn.execute(
                     "UPDATE ga_work_orders SET scope=%s,input_versions=%s WHERE group_id=%s AND id=%s",
                     (Jsonb(scope), Jsonb(versions), actor.group_id, work.id),
@@ -1081,7 +1118,7 @@ class WorkToolkit:
         gateway.register(
             ToolDefinition(
                 name="artifact_import",
-                description="Import one authorized immutable file version into this work, preserving its source dependencies; then inspect it with the document/media tools.",
+                description="Import one authorized immutable version_id from artifact_search when that file is not already in this work. Existing input_files and successful import receipts already contain the work-scoped file_id and version_id to inspect. A filename, event ID, or file_id is not a version_id.",
                 input_model=FileImportInput,
                 output_model=FileResult,
                 handler=file_import,

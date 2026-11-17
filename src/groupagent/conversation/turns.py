@@ -39,6 +39,17 @@ class TurnReport(TurnData):
     phase: ReceiptPhase
 
 
+class ActionCompletion(TurnData):
+    finish_on_commit: StrictBool = Field(
+        default=False,
+        description=(
+            "Set true when this is the only tool call and the host's committed action receipt "
+            "fully answers the request. A rejection stays in the turn for correction. Omit if "
+            "you still need to answer a separate question or carry out another action."
+        ),
+    )
+
+
 class FinishTurn(TurnData):
     disposition: Literal["reply", "observe", "proactive"]
     response: str | None = Field(

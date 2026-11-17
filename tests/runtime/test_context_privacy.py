@@ -211,12 +211,18 @@ async def test_displayed_old_record_sources_enter_reply_provenance_and_later_for
     result = await h.coordinator.process(request)
     payload = model_payload(h.model)
     assert old.id not in {row["id"] for row in payload["context"]["recent_messages"]}
-    collection = {"work": "works", "rule": "schedules", "task": "tasks"}[record_kind]
-    assert record.id in {row["id"] for row in payload["context"][collection]}
+    if record_kind == "work":
+        records = payload["context"]["work_facts_overview"]["facts"]
+        assert not payload["context"]["works"]
+    else:
+        collection = "schedules" if record_kind == "rule" else "tasks"
+        records = payload["context"][collection]
+    assert record.id in {row["id"] for row in records}
     assert secret_title in json.dumps(payload, ensure_ascii=False)
     with env.store.transaction(env.actor) as tx:
         decision = tx.get_decision(request.id)
-        assert old.id in decision["source_fingerprints"] and old.id in decision["source_event_ids"]
+        assert old.id in decision["source_event_ids"]
+        assert (old.id in decision["source_fingerprints"]) == (record_kind != "work")
     h.memory.forget(env.actor, event_ids=[old.id])
     with env.store.transaction(env.actor) as tx:
         assert tx.get_decision(request.id)["privacy_redacted"] is True
@@ -354,7 +360,11 @@ async def test_work_and_topic_source_growth_omits_whole_items_with_visible_incom
     assert not {item.id for item in internal} & source_ids
     assert "eval-billing-internal" not in json.dumps(public, ensure_ascii=False)
     await h.coordinator.process(request)
-    assert model_payload(h.model)["context"]["context_incomplete"] is True
+    projected = model_payload(h.model)["context"]
+    assert projected["context_coverage"]["works"] == "preview" and not projected["works"]
+    assert {row["id"] for row in projected["work_facts_overview"]["facts"]} == {
+        row.id for row in originals
+    }
 
 
 async def test_deterministic_native_quote_stop_survives_omitted_huge_work_context(runtime_env):

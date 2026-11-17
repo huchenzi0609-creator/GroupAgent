@@ -325,6 +325,10 @@ def score(args: argparse.Namespace) -> int:
             ROOT / "scripts" / "pot_blind_acceptance.py"
         ):
             raise ValueError("Blind evaluator changed since the recorded run")
+        if blind_report.get("inspector_sha256") != sha256(
+            ROOT / "scripts" / "runtime_acceptance_checks.py"
+        ):
+            raise ValueError("Independent artifact inspector changed since the recorded run")
         environment = blind_report.get("environment", {})
         if (
             environment.get("channel") != "LocalChannel"

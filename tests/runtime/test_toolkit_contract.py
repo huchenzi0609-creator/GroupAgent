@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from PIL import Image
+from psycopg.errors import QueryCanceled
 
 from groupagent.artifacts import ArtifactScope, ArtifactStore, DocumentService, Report
 from groupagent.artifacts.formats import build_markdown, extract
@@ -27,9 +28,11 @@ from groupagent.artifacts.worker_operations import unpack_document
 from groupagent.billing import BudgetLedger, PriceSnapshot
 from groupagent.config import AppConfig, GroupConfig, RuntimeConfig, SpendConfig
 from groupagent.domain import DomainError, WorkState
+from groupagent.execution import LangGraphEngine
 from groupagent.execution.models import (
     EngineCheckpoint,
     ModelReply,
+    ModelToolCall,
     RunSnapshot,
     RunState,
     TokenUsage,
@@ -43,7 +46,8 @@ from groupagent.runtime.inputs import InputProcessor
 from groupagent.runtime.state import source_fingerprint
 from groupagent.runtime.toolkit import WorkToolkit
 from groupagent.scheduling import EveryTiming, Scheduler
-from groupagent.tools import ToolContext, ToolScope
+from groupagent.tools import EffectState, ToolContext, ToolScope
+from groupagent.tools.models import ToolFailureDisposition, failure_disposition
 
 from .conftest import source
 
@@ -454,6 +458,115 @@ async def test_search_import_same_work_and_other_work_create_scoped_immutable_co
     assert not selected.success and selected.error_code == "scope_violation"
 
 
+async def test_wrong_artifact_reference_returns_model_to_existing_copy_and_delivery(toolkit_setup):
+    setup = toolkit_setup
+    source_run = await prepare(setup)
+    source_version = (await create_document(source_run)).output["version_id"]
+    run = await prepare(setup, scope={"outputs": [{"format": "md", "expected_text": ["87"]}]})
+    copies = []
+
+    def propose(tool_name, key, **arguments):
+        return ModelReply(
+            tool_calls=(ModelToolCall(id=key, name=tool_name, arguments=arguments),),
+            finish_reason="tool_calls",
+            usage=TokenUsage(input_tokens=2, output_tokens=1),
+        )
+
+    class ArtifactRepairFixture:
+        name = "offline-artifact-repair"
+
+        async def complete(self, request):
+            observations = [
+                json.loads(row.content) for row in request.messages if row.role == "tool"
+            ]
+            if not observations:
+                return propose("artifact_import", "known-version", version_id=source_version)
+            seen = observations[-1]
+            if len(observations) == 1:
+                copies.append(seen["output"]["files"][0])
+                return propose("artifact_import", "wrong-reference", version_id="nonexistent")
+            if len(observations) == 2:
+                assert seen["error_code"] == "not_found" and seen["effect_state"] == "not_started"
+                assert seen["failure"]["disposition"] == "repair"
+                return propose(
+                    "document_read",
+                    "read-known-copy",
+                    file_id=copies[-1]["file_id"],
+                    version_id=copies[-1]["version_id"],
+                )
+            if len(observations) == 3:
+                assert "87" in json.dumps(seen["output"])
+                return propose(
+                    "document_generate",
+                    "write-result",
+                    name="result.md",
+                    kind="report",
+                    title="Result",
+                    sections=[{"title": "Findings", "paragraphs": ["Original value: 87."]}],
+                )
+            if len(observations) == 4:
+                return propose(
+                    "artifact_deliver", "select-result", version_ids=[seen["output"]["version_id"]]
+                )
+            return ModelReply(
+                text="The verified report contains the original value 87.",
+                usage=TokenUsage(input_tokens=2, output_tokens=1),
+            )
+
+    engine = LangGraphEngine(ArtifactRepairFixture(), run.gateway)
+    result = await engine.wait(await engine.start(run.prepared.request))
+    assert result.state == RunState.CANDIDATE, (
+        result.error_code,
+        [(row.tool_name, row.error_code, row.effect_state) for row in result.receipts],
+    )
+    assert [receipt.tool_name for receipt in result.receipts] == [
+        "artifact_import",
+        "artifact_import",
+        "document_read",
+        "document_generate",
+        "artifact_deliver",
+    ]
+    validated = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, result, run.workspace
+    )
+    assert "artifact:md" in validated.checks
+    assert "artifact:" + result.receipts[-2].output["version_id"] in {
+        delivery.payload_ref for delivery in validated.deliveries
+    }
+    with setup.env.store.transaction(setup.env.actor) as tx:
+        assert tx.get_work(run.work.id).input_versions == [source_version]
+
+
+@pytest.mark.parametrize("phase", ["lookup_timeout", "after_scope_commit"])
+async def test_artifact_import_keeps_ambiguous_failures_for_reconciliation(
+    toolkit_setup, monkeypatch, phase
+):
+    setup = toolkit_setup
+    source_run = await prepare(setup)
+    source_version = (await create_document(source_run)).output["version_id"]
+    run = await prepare(setup)
+
+    if phase == "lookup_timeout":
+
+        def interrupted_lookup(*_args):
+            raise QueryCanceled("Synthetic database statement timeout")
+
+        monkeypatch.setattr(setup.env.registry, "consume_in_tx", interrupted_lookup)
+    else:
+
+        async def failed_copy(*_args):
+            raise DomainError("not_found", "Synthetic failure after the scope UPDATE committed")
+
+        monkeypatch.setattr(setup.inputs, "import_for_work", failed_copy)
+
+    receipt = await call(run, "artifact_import", {"version_id": source_version})
+    assert receipt.effect_state == EffectState.UNKNOWN
+    assert failure_disposition(receipt) == ToolFailureDisposition.RECONCILE
+    with setup.env.store.transaction(setup.env.actor) as tx:
+        expected = [source_version] if phase == "after_scope_commit" else []
+        assert tx.get_work(run.work.id).input_versions == expected
+
+
 async def test_withdrawn_source_blocks_search_import_and_stale_work_tools(toolkit_setup):
     setup = toolkit_setup
     first = await prepare(setup)
@@ -464,6 +577,8 @@ async def test_withdrawn_source_blocks_search_import_and_stale_work_tools(toolki
     assert listed.success and listed.output["files"] == []
     denied = await call(second, "artifact_import", {"version_id": generated.output["version_id"]})
     assert not denied.success and denied.error_code == "source_unavailable"
+    assert denied.effect_state == EffectState.NOT_STARTED
+    assert failure_disposition(denied) == ToolFailureDisposition.FENCE
     stale = await call(
         first,
         "document_generate",

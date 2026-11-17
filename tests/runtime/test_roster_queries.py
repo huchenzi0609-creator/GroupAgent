@@ -73,7 +73,7 @@ async def test_natural_query_refreshes_name_through_the_roster_tool(runtime_env)
         )
 
     env.channel.refresh_members = refresh
-    request = event(env, "Pot，现在可以看到我的群昵称吗？")
+    request = event(env, "Pot，刚刚已经改妥当了，劳驾再核对一次。")
 
     def answer(request):
         receipt = tool_receipt(request)
@@ -83,7 +83,9 @@ async def test_natural_query_refreshes_name_through_the_roster_tool(runtime_env)
         chosen = next(row for row in facts["members"] if row["member_id"] == actor)
         return finish(f"能，群昵称是{chosen['name']}。", reports=[("roster", "observed")])
 
-    model = ModelScript(call("read_group_context", "roster", resource="members"), answer)
+    model = ModelScript(
+        call("read_group_context", "roster", resource="members", refresh=True), answer
+    )
     app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(model)
     try:
         await intake(app, env, request)
@@ -115,7 +117,9 @@ async def test_failed_refresh_does_not_claim_user_has_no_nickname(runtime_env):
         assert not status["fresh"] and status["error_code"] == "roster_refresh_timeout"
         return finish("这次刷新没有成功，暂时无法核对。", reports=[("roster", "observed")])
 
-    model = ModelScript(call("read_group_context", "roster", resource="members"), explain)
+    model = ModelScript(
+        call("read_group_context", "roster", resource="members", refresh=True), explain
+    )
     app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(model)
     try:
         await intake(app, env, request)
@@ -147,7 +151,7 @@ async def test_roster_refresh_does_not_mask_a_concurrent_forget(runtime_env):
         )
 
     env.channel.refresh_members = refresh
-    model = ModelScript(call("read_group_context", "roster", resource="members"))
+    model = ModelScript(call("read_group_context", "roster", resource="members", refresh=True))
     app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(model)
     request = event(env, "Pot，请刷新我的群昵称。")
     try:

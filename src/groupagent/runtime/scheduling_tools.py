@@ -19,7 +19,13 @@ from groupagent.domain import ActorContext, DomainError, ExecutionLease, Role, W
 from groupagent.memory.common import memory_lock, source_rows
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.scheduling import Scheduler
-from groupagent.scheduling.models import PreparedMessage, Schedule, Timing
+from groupagent.scheduling.models import PreparedMessage, Schedule
+from groupagent.scheduling.temporal import (
+    CreateTimingProposal,
+    InstantProposal,
+    ScheduleTimingProposal,
+    resolve_instant,
+)
 from groupagent.scheduling.triggers import EventTriggerService, TriggerRule, TriggerType
 from groupagent.tools import IdempotencyMode, ToolContext, ToolData, ToolDefinition, ToolGateway
 from groupagent.tools.models import ToolFailure
@@ -41,9 +47,9 @@ class CreateSchedule(ToolData):
         description="Enable only if the requester explicitly allows future work to finish silently "
         "when there is nothing to report.",
     )
-    timing: Timing
+    timing: CreateTimingProposal
     time_zone: str = Field(default="Asia/Shanghai", min_length=1, max_length=100)
-    valid_until: AwareDatetime | None = None
+    valid_until: InstantProposal | None = None
 
     @model_validator(mode="after")
     def single_payload(self) -> CreateSchedule:
@@ -66,9 +72,9 @@ class UpdateSchedule(ToolData):
         strict=True,
         description="Omit to keep the existing setting. Set false to require a delivered result.",
     )
-    timing: Timing | None = None
+    timing: ScheduleTimingProposal | None = None
     time_zone: str | None = Field(default=None, min_length=1, max_length=100)
-    valid_until: AwareDatetime | None = None
+    valid_until: InstantProposal | None = None
 
 
 class ControlRule(ToolData):
@@ -299,6 +305,15 @@ def register_scheduling_tools(
                 value.fact_source_ids
             ) <= set(raw):
                 raise DomainError("source_unavailable", "Schedule evidence was not in this work")
+            end = (
+                resolve_instant(
+                    value.valid_until,
+                    occurred_at=tx.get_event(current.request_event_id).occurred_at,
+                    time_zone=value.time_zone,
+                )
+                if value.valid_until is not None
+                else None
+            )
             result = scheduler.in_tx(tx).create(
                 actor,
                 value.title,
@@ -306,7 +321,7 @@ def register_scheduling_tools(
                 value.timing,
                 now=now,
                 time_zone=value.time_zone,
-                valid_until=_ttl(value.valid_until, now),
+                valid_until=_ttl(end, now),
                 request_key=key,
                 budget=current.budget,
                 prepared_message=value.prepared_message,
@@ -341,6 +356,15 @@ def register_scheduling_tools(
                 len(set(sources)) != len(sources) or not set(sources) <= set(raw)
             ):
                 raise DomainError("source_unavailable", "Schedule evidence was not in this work")
+            end = (
+                resolve_instant(
+                    value.valid_until,
+                    occurred_at=tx.get_event(current.request_event_id).occurred_at,
+                    time_zone=value.time_zone or original.time_zone,
+                )
+                if value.valid_until is not None
+                else original.valid_until
+            )
             result = service.update(
                 actor,
                 value.schedule_id,
@@ -353,7 +377,7 @@ def register_scheduling_tools(
                 allow_silent_result=value.allow_silent_result,
                 timing=value.timing,
                 time_zone=value.time_zone,
-                valid_until=_ttl(value.valid_until or original.valid_until, now),
+                valid_until=_ttl(end, now),
                 now=now,
             )
             return _receipt(result, now)
@@ -436,7 +460,8 @@ def register_scheduling_tools(
             "schedule_create",
             CreateSchedule,
             create_schedule,
-            "Create a finite at/every/daily/weekly rule. Supply prepared_message for text ready now, "
+            "Create a finite time rule. Relative after timing uses the verified human message time. "
+            "Supply prepared_message for text ready now, "
             "or goal for work that requires a future execution. Mark explicit_reminder only when the "
             "source directly grants the reminder and contains its exact wording.",
         ),
@@ -444,7 +469,8 @@ def register_scheduling_tools(
             "schedule_update",
             UpdateSchedule,
             update_schedule,
-            "Update an authorized finite time rule using its current revision.",
+            "Update an authorized finite time rule using its current revision. Use clock to change "
+            "only the local time of an existing daily or weekly rule.",
         ),
         (
             "schedule_control",

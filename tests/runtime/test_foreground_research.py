@@ -1,5 +1,6 @@
 """Real PostgreSQL ledger with an explicit offline public-provider fixture."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from groupagent.billing.prices import deepseek_20261114
 from groupagent.domain import DomainError, Role
 from groupagent.execution.models import ModelToolCall
 from groupagent.research.deepseek import DeepSeekResearchClient
+from groupagent.runtime import foreground_research
 from groupagent.runtime.foreground_research import ForegroundResearch
 
 from .conftest import source
@@ -69,3 +71,41 @@ async def test_inline_search_is_authorized_and_metered_by_inbound_source(runtime
             "state": "settled",
         }
     ]
+
+
+async def test_inline_bound_preserves_ambiguous_billing_and_delegation_option(
+    runtime_env, monkeypatch
+):
+    env = runtime_env
+    event = source(env, "Synthetic public research")
+    ledger = BudgetLedger(env.store)
+    ledger.configure(env.actor, currency="CNY", daily_limit=None, total_limit=None)
+    for price in deepseek_20261114():
+        ledger.register_price(env.actor, price)
+    calls = []
+
+    async def provider(request):
+        calls.append(request)
+        await asyncio.sleep(10)
+        raise AssertionError("Foreground deadline did not interrupt the mock")
+
+    monkeypatch.setattr(foreground_research, "_INLINE_READ_SECONDS", 0.25)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as http:
+        research = foreground_research.ForegroundResearch(
+            DeepSeekResearchClient("synthetic", client=http), ledger
+        )
+        search, _ = research(env.actor, event, {})
+        for identity in ("first", "alternate"):
+            with pytest.raises(DomainError) as rejected:
+                await search.handler(
+                    ModelToolCall(id=identity, name=search.name, arguments={"query": identity})
+                )
+            assert rejected.value.code == "foreground_research_deferred"
+
+    assert len(calls) == 1
+    with env.store.transaction(env.actor) as tx:
+        receipts = tx.conn.execute(
+            "SELECT state,source_event_id FROM ga_budget_reservations WHERE group_id=%s",
+            (env.actor.group_id,),
+        ).fetchall()
+    assert receipts == [{"state": "unknown", "source_event_id": event.id}]

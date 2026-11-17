@@ -48,12 +48,11 @@ class WallTiming(WallClockTiming):
                 return parsed
         raise ValueError("Use a calendar date in YYYY-MM-DD form")
 
-    @field_validator("local_time", mode="before")
-    @classmethod
-    def clock_time(cls, value: object) -> object:
-        if isinstance(value, (str, time)):
-            return value
-        raise ValueError("Use a local time in HH:MM or HH:MM:SS form")
+
+class ClockTiming(WallClockTiming):
+    """Change only the local clock time of an existing daily or weekly rule."""
+
+    kind: Literal["clock"]
 
 
 class ShiftTiming(DomainModel):
@@ -71,8 +70,19 @@ class ShiftTiming(DomainModel):
         return value
 
 
+CreateTimingProposal: TypeAlias = Annotated[
+    AtTiming | DailyTiming | EveryTiming | WeeklyTiming | AfterTiming | WallTiming,
+    Field(discriminator="kind"),
+]
 ScheduleTimingProposal: TypeAlias = Annotated[
-    AtTiming | DailyTiming | EveryTiming | WeeklyTiming | AfterTiming | WallTiming | ShiftTiming,
+    AtTiming
+    | DailyTiming
+    | EveryTiming
+    | WeeklyTiming
+    | AfterTiming
+    | WallTiming
+    | ClockTiming
+    | ShiftTiming,
     Field(discriminator="kind"),
 ]
 InstantTimingProposal: TypeAlias = Annotated[
@@ -186,7 +196,7 @@ def resolve_schedule_timing(
     reference_timing: Timing | None = None,
 ) -> tuple[Timing, str]:
     """Return existing stored timing and its display zone from a typed proposal."""
-    if isinstance(value, dict) and value.get("kind") not in ("after", "wall", "shift"):
+    if isinstance(value, dict) and value.get("kind") not in ("after", "wall", "clock", "shift"):
         zone(time_zone)
         return parse_timing(value), time_zone
     try:
@@ -198,6 +208,12 @@ def resolve_schedule_timing(
         zone(time_zone)
         return AtTiming(at=instant), time_zone
     zone(time_zone)
+    if isinstance(proposal, ClockTiming):
+        if not isinstance(reference_timing, (DailyTiming, WeeklyTiming)):
+            raise DomainError(
+                "invalid_schedule_time", "A clock-only change requires a daily or weekly schedule"
+            )
+        return reference_timing.model_copy(update={"local_time": proposal.local_time}), time_zone
     if isinstance(proposal, ShiftTiming):
         if reference_timing is None:
             raise DomainError("invalid_schedule_time", "A shift requires a selected schedule")

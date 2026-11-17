@@ -14,7 +14,9 @@ import subprocess
 import sys
 import time
 import traceback
+import unicodedata
 from datetime import UTC, datetime, timedelta
+from datetime import time as WallTime
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -34,7 +36,7 @@ from pot_release_gate import (
 from runtime_acceptance_checks import decode_artifact
 
 from groupagent.config import AppConfig
-from groupagent.domain import DomainError, EventKind, GroupEvent, WorkState
+from groupagent.domain import DomainError, EventKind, GroupEvent, TeamTaskState, WorkState
 from groupagent.persistence import PostgresStore
 from groupagent.resources import MemorySnapshot
 from groupagent.runtime.app import build_app
@@ -44,7 +46,9 @@ from groupagent.tools import ToolContext, ToolScope
 OWNER = "synthetic-owner"
 GUEST = "synthetic-guest"
 TERMINAL = {WorkState.COMPLETED, WorkState.CANCELLED, WorkState.FAILED, WorkState.WAITING_INPUT}
-FILLER = re.compile(r"稍等|正在处理|还在处理|我会尽快|请耐心")
+FILLER = re.compile(
+    r"(?:请)?(?:稍等(?:一下|片刻)?|正在处理(?:中)?|还在处理|我会尽快(?:处理|回复)?|请耐心等待)"
+)
 MARKUP = re.compile(r"(?m)^\s*(?:[>#]|\d+[.)、]|[-*]\s+)|\*\*|\x60\x60\x60")
 
 
@@ -70,12 +74,45 @@ def response(turn):
 
 def useful_text(turn, patterns=()):
     sent = only_text(turn)
+    text = response(turn)
+    bare = text.strip("。！!，,、 ：:；;")
     return (
         len(sent) == 1
-        and re.search(r"\w", response(turn)) is not None
-        and FILLER.search(response(turn)) is None
-        and pattern_all(response(turn), patterns)
+        and bool(re.search(r"\w", bare))
+        and not FILLER.fullmatch(bare)
+        and pattern_all(text, patterns)
     )
+
+
+def clock_display(text, expected, *, seconds_required):
+    """Check a requested local clock display in colon or Chinese forms."""
+    value = WallTime.fromisoformat(expected)
+    text = unicodedata.normalize("NFKC", text)
+    clocks = re.findall(r"(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?(?![\d:])", text)
+    clocks += re.findall(r"(?<!\d)(\d{1,2})[点时](\d{1,2})分(?:(\d{1,2})秒)?", text)
+    for hour, minute, seconds in clocks:
+        if (int(hour), int(minute)) == (value.hour, value.minute) and (
+            int(seconds) == value.second if seconds else not seconds_required
+        ):
+            return True
+    return False
+
+
+def schedule_native_receipts(facts, spool):
+    """Join accepted occurrence delivery records to independent channel receipts."""
+    native_ids = {
+        delivery["platform_message_id"]
+        for rule in facts
+        for occurrence in rule["occurrences"]
+        for delivery in occurrence["deliveries"]
+        if delivery["state"] == "accepted" and delivery["platform_message_id"]
+    }
+    return [
+        item
+        for item in spool
+        if item["receipt"]["state"] == "accepted"
+        and item["receipt"]["platform_message_id"] in native_ids
+    ]
 
 
 def one_badge(turn):
@@ -97,6 +134,13 @@ def actual_url(value, domains):
     except ValueError:
         return False
     return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
+def official_source(url, spec):
+    if not actual_url(url, spec["official_domains"]):
+        return False
+    patterns = spec.get("official_source_patterns", ())
+    return not patterns or any(re.search(pattern, url, re.I) for pattern in patterns)
 
 
 class Scenario:
@@ -593,7 +637,9 @@ async def group02(s):
         and pattern_all(updated[0].title, s.spec["title_patterns"])
         and pattern_all(updated[0].progress, s.spec["progress_patterns"])
         and claim["event_id"] in updated[0].source_event_ids
-        and progress["event_id"] in updated[0].source_event_ids,
+        and progress["event_id"] in updated[0].source_event_ids
+        and updated[0].revision == initial[0].revision + 1
+        and progress["event_id"] in updated[0].field_sources.get("progress", []),
         claim,
         progress,
         {"tasks": [task.model_dump(mode="json") for task in updated]},
@@ -660,8 +706,9 @@ async def time01(s):
     s.check(
         "one_due_from_event_anchor_and_shanghai_display",
         exact
-        and s.spec["due"][11:19] in response(request)
-        and "Asia/Shanghai" in response(request),
+        and rules[0].time_zone == "Asia/Shanghai"
+        and clock_display(response(request), s.spec["due"][11:19], seconds_required=True)
+        and pattern_all(response(request), [r"Asia/Shanghai|北京时间|上海时间|\+08:00"]),
         request,
         {"rules": s.snapshot(rules)},
     )
@@ -669,40 +716,66 @@ async def time01(s):
         return
     rule = rules[0]
     before = await s.event("status_before", event_time=s.clock)
-    initially_absent = not s.app.coordinator.scheduler.occurrences(s.app.owner, rule.id)
+    before_fact = s.occurrence_proof(rule)
     model_count = len(s.model_calls)
-    await s.wake(due + timedelta(seconds=1))
+    first_wake = await s.wake(due + timedelta(seconds=1))
     await s.wake(due + timedelta(seconds=2))
     delivered_without_model = len(s.model_calls) == model_count
-    after = await s.event("status_after", event_time=s.clock)
     facts = s.occurrence_proof(rule)
-    payload = s.spec["payload"]
-    reminder = [
-        item
-        for item in s.spool()
-        if payload in spool_text(item)
-        and "已安排" not in spool_text(item)
-        and item not in only_text(before) + only_text(after)
-    ]
+    reminder = schedule_native_receipts(facts, s.spool())
+    after = await s.event("status_after", event_time=s.clock)
+    before_reads = foreground_observations(s, before)
+    after_reads = foreground_observations(s, after)
     s.check(
         "status_before_and_after",
-        initially_absent
-        and useful_text(
-            before,
-            [s.spec["initial_current_time"], s.spec["due"][11:19], "尚未|还没|未发送|没发|未投递"],
+        bool(before_fact and not before_fact[0]["occurrences"])
+        and useful_text(before, ["尚未|还没|未发送|没发|未投递|未到"])
+        and clock_display(
+            response(before),
+            s.spec["initial_current_time"],
+            seconds_required=s.spec.get("seconds_required", False),
         )
-        and useful_text(after, ["已|成功", "发出|投递|送达|回执"]),
+        and clock_display(response(before), s.spec["due"][11:19], seconds_required=False)
+        and useful_text(after, ["(?:已|成功).{0,15}(?:发送|发出|投递|送达)|回执"])
+        and not pattern_all(response(after), ["尚未|还没|未发送|没发|未投递"])
+        and all(
+            any(
+                read.get("kind") == "read_group_context"
+                and read.get("resource") == "schedules"
+                and read.get("status") == "observed"
+                for read in reads
+            )
+            for reads in (before_reads, after_reads)
+        ),
         before,
         after,
-        {"schedule_facts": facts},
+        {
+            "before_facts": before_fact,
+            "after_facts": facts,
+            "before_reads": before_reads,
+            "after_reads": after_reads,
+        },
     )
+    body = spool_text(reminder[0]).removeprefix("【Pot】") if len(reminder) == 1 else ""
+    correct_body = (
+        body == s.spec["payload"] and rule.execution_kind.value == "explicit_reminder"
+        if s.spec.get("verbatim")
+        else pattern_all(body, s.spec["payload_patterns"])
+    )
+    occurrences = facts[0]["occurrences"] if facts else []
     s.check(
         "one_accepted_reminder",
         delivered_without_model
-        and len(reminder) == 1
-        and reminder[0]["receipt"]["state"] == "accepted"
-        and len(s.app.coordinator.scheduler.occurrences(s.app.owner, rule.id)) == 1,
-        {"schedule_facts": facts, "local_receipts": reminder},
+        and len(first_wake) == len(occurrences) == len(reminder) == 1
+        and first_wake[0].work_id is None
+        and dt(occurrences[0]["scheduled_at"]) == due
+        and len(occurrences[0]["deliveries"]) == 1
+        and correct_body,
+        {
+            "schedule_facts": facts,
+            "local_receipts": reminder,
+            "model_calls_at_due": not delivered_without_model,
+        },
     )
 
 
@@ -738,7 +811,7 @@ async def time02(s):
     late = await s.event("late", event_time=anchor - timedelta(seconds=15))
     s.check(
         "late_event_not_reanchored",
-        [r.id for r in shifted] == [r.id for r in s.rules()]
+        {r.id: r for r in shifted} == {r.id: r for r in s.rules()}
         and useful_text(late, ["已经|过了|错过|来不及|未安排|无法登记"]),
         late,
         {"rules": s.snapshot()},
@@ -747,8 +820,9 @@ async def time02(s):
     discussion = await s.event("discussion", actor=GUEST, event_time=s.clock)
     s.check(
         "ambiguity_and_discussion_no_rule",
-        [r.id for r in shifted] == [r.id for r in s.rules()]
-        and useful_text(ambiguous, ["九点|9点", "三点|3点|15"])
+        {r.id: r for r in shifted} == {r.id: r for r in s.rules()}
+        and useful_text(ambiguous, ["九点|9点|09:00|9:00", "三点|3点|15"])
+        and not any(read.get("committed") for read in foreground_observations(s, ambiguous))
         and not discussion["receipts"],
         ambiguous,
         discussion,
@@ -825,7 +899,7 @@ async def chat04(s):
         "long_complete_cited_artifact",
         all(marker in body for marker in s.spec["long_markers"])
         and len(re.findall(r"[\u3400-\u9fff]", body)) >= s.spec["long_min_han"]
-        and any(actual_url(url, s.spec["official_domains"]) for url in urls)
+        and any(official_source(url, s.spec) for url in urls)
         and bool(successful_tools(work, {"web_fetch", "browser_open", "web_search"})),
         work,
         markdown,
@@ -964,7 +1038,7 @@ async def group03(s):
     )
     with s.store.transaction(foreign_actor) as tx:
         tx.ingest_event(foreign_event, "blind-foreign", "1", 0)
-        tx.create_team_task("蓝杉陈列卡复核", source_event_id=foreign_id)
+        tx.create_team_task(s.spec["shared_title"], source_event_id=foreign_id)
     for index in range(s.spec["filler_count"]):
         filler = await s.event(
             "filler", actor=GUEST, text=s.spec["filler"].format(index), process=False
@@ -978,18 +1052,29 @@ async def group03(s):
     await s.open()
     recalled = await s.event("recall")
     tasks = s.tasks()
+    owner_name = s.app.coordinator.members.get(s.app.owner, OWNER).display_name
+    recall_patterns = [
+        s.spec["wanted"],
+        re.escape(owner_name) + "|你(?:是|来|负责|接手|认领|担任|已)|(?:是|由|给|负责人[：:是]?)你",
+    ]
     s.check(
         "long_history_and_restart_recall",
         summary is not None
         and checkpoint["through_sequence"] > 0
-        and useful_text(recalled, [s.spec["wanted"]]),
+        and useful_text(recalled, recall_patterns)
+        and any(
+            task.owner_id == OWNER and claim["event_id"] in task.source_event_ids for task in tasks
+        ),
         recalled,
         {"checkpoint": checkpoint, "compacted": summary is not None},
     )
     s.check(
         "structured_facts_provenance",
         any(
-            task.owner_id == OWNER and claim["event_id"] in task.source_event_ids for task in tasks
+            task.owner_id == OWNER
+            and claim["event_id"] in task.source_event_ids
+            and s.spec["shared_title"] in task.title
+            for task in tasks
         ),
         claim,
         {"tasks": [task.model_dump(mode="json") for task in tasks]},
@@ -1019,12 +1104,40 @@ def foreground_tools(s, event):
     ]
 
 
+def work_facts_observed(s, turn):
+    return [
+        item
+        for observation in foreground_observations(s, turn)
+        if observation.get("kind") == "read_work_facts" and observation.get("status") == "matched"
+        for item in observation.get("facts", [])
+    ]
+
+
+def work_fact_has(facts, work_id, work_rows):
+    expected = {
+        item["id"]: item.get("goal_revision")
+        for work in work_rows
+        if (item := (work if isinstance(work, dict) else work.model_dump(mode="json")))
+    }
+    return work_id in expected and any(
+        observed["id"] == work_id and observed.get("goal_revision") == expected[work_id]
+        for observed in facts
+    )
+
+
 async def work02(s):
     empty = await s.event("empty", latency=True)
+    empty_read = foreground_observations(s, empty)
     s.check(
         "empty_state_honest",
-        useful_text(empty, ["没有|暂无|空|没有在|无"]) and not s.work_state(),
+        useful_text(empty, ["没有|暂无|空|没有在|无|当前没"])
+        and not s.work_state()
+        and any(
+            item.get("kind") == "read_work_facts" and item.get("status") == "empty"
+            for item in empty_read
+        ),
         empty,
+        {"work_fact_observations": empty_read},
     )
     first = await s.event("one", latency=True)
     second = await s.event("two", latency=True)
@@ -1032,6 +1145,7 @@ async def work02(s):
     await s.event("chatter", actor=GUEST)
     progress = await s.event("progress", latency=True)
     after_progress = s.work_state()
+    progress_facts = work_facts_observed(s, progress)
     output = await s.settle(first["work_id"])
     old = None
     if output and output["spool"]:
@@ -1046,8 +1160,9 @@ async def work02(s):
         and useful_text(progress, ["潮汐"])
         and old is not None
         and useful_text(old, ["南窗|50653|37"])
-        and any(call["name"] == "read_work_facts" for call in foreground_tools(s, progress))
-        and any(call["name"] == "read_work_facts" for call in foreground_tools(s, old)),
+        and output is not None
+        and work_fact_has(progress_facts, second["work_id"], initial)
+        and work_fact_has(work_facts_observed(s, old), first["work_id"], [output["work"]]),
         first,
         second,
         progress,
@@ -1058,7 +1173,8 @@ async def work02(s):
         "no_write_from_lookup",
         [(work.id, work.revision) for work in initial]
         == [(work.id, work.revision) for work in after_progress]
-        and not any(turn["work_id"] for turn in (empty, progress, fresh)),
+        and not any(turn["work_id"] for turn in (empty, fresh))
+        and progress["work_id"] in (None, second["work_id"]),
         empty,
         progress,
         fresh,
@@ -1177,39 +1293,52 @@ async def time03(s):
         "recurring_rule_updated_in_place",
         same
         and first[0].goal == revised[0].goal
-        and first[0].timing.kind == "weekly"
-        and revised[0].timing.local_time.isoformat() == "10:00:00"
+        and first[0].time_zone == revised[0].time_zone == "Asia/Shanghai"
+        and first[0].execution_kind == revised[0].execution_kind
+        and first[0].timing.kind == revised[0].timing.kind == "weekly"
+        and list(first[0].timing.weekdays)
+        == list(revised[0].timing.weekdays)
+        == s.spec["retained_weekdays"]
+        and revised[0].timing.local_time.isoformat() == s.spec["updated_local_time"]
         and revised[0].revision == first[0].revision + 1,
         created,
         updated,
         {"before": s.snapshot(first), "after": s.snapshot(revised)},
     )
     cancelled = await s.event("cancel", event_time=s.clock + timedelta(seconds=2))
+    retired = next((rule for rule in s.rules() if revised and rule.id == revised[0].id), None)
     count = len(s.spool())
     if revised and revised[0].next_due_at:
         await s.wake(revised[0].next_due_at)
     s.check(
         "cancel_stops_future_receipts",
         len(s.spool()) == count
-        and bool(
-            revised and not s.app.coordinator.scheduler.occurrences(s.app.owner, revised[0].id)
-        ),
+        and bool(retired and retired.state.value == "cancelled")
+        and not s.app.coordinator.scheduler.occurrences(s.app.owner, retired.id),
         cancelled,
         {"rules": s.snapshot(), "spool_count": len(s.spool())},
     )
     extra = await s.event("cross_zone", event_time=s.clock)
-    cross = next((item for item in s.rules() if item.time_zone == s.spec["zone"]), None)
+    before_fold = {rule.id: rule for rule in s.rules()}
+    cross = next((rule for rule in before_fold.values() if rule.time_zone == s.spec["zone"]), None)
     ambiguous = await s.event("ambiguous", event_time=s.clock)
+    after_fold = {rule.id: rule for rule in s.rules()}
     s.check(
         "cross_zone_dst_policy",
         bool(
             cross
             and cross.timing.kind == "weekly"
-            and useful_text(ambiguous, ["两次|第一次|第二次|重叠|夏令时"])
+            and cross.next_due_at == dt(s.spec["expected_dst_next_due"])
+            and before_fold == after_fold
+            and useful_text(ambiguous, ["两次|第一次|第二次|重叠|夏令时|前一次|后一次"])
+            and not any(item.get("committed") for item in foreground_observations(s, ambiguous))
         ),
         extra,
         ambiguous,
-        {"rules": s.snapshot()},
+        {
+            "rules_before_fold": s.snapshot(list(before_fold.values())),
+            "rules_after_fold": s.snapshot(list(after_fold.values())),
+        },
     )
     if not cross or not cross.next_due_at:
         return
@@ -1220,13 +1349,15 @@ async def time03(s):
     await asyncio.gather(*(asyncio.to_thread(scheduler.wake, s.app.owner, stamp) for _ in range(3)))
     await s.app.dispatcher.tick()
     facts = s.occurrence_proof(cross)
+    native = schedule_native_receipts(facts, s.spool())
     occurrences = scheduler.occurrences(s.app.owner, cross.id)
     s.check(
         "concurrent_restart_one_occurrence",
-        len(occurrences) == 1
+        len(native) == len(occurrences) == 1
         and occurrences[0].delivery_id is not None
-        and "accepted" in json.dumps(facts, default=str),
-        {"schedule_facts": facts},
+        and occurrences[0].scheduled_at == stamp
+        and len(facts[0]["occurrences"][0]["deliveries"]) == 1,
+        {"schedule_facts": facts, "accepted_native_receipts": native},
     )
 
 
@@ -1239,41 +1370,77 @@ async def time04(s):
     condition = await s.event("conditional")
     rules = s.rules()
     reminders = [r for r in rules if r.execution_kind.value == "explicit_reminder"]
-    due_work = [r for r in rules if r.execution_kind.value != "explicit_reminder"]
+    due_work = [r for r in rules if r.execution_kind.value == "goal"]
     if len(reminders) != 1 or len(due_work) != 1:
+        for check in s.row["checks"]:
+            s.check(check, False, quiet, direct, condition, {"rules": s.snapshot(rules)})
         return
     plain, check = reminders[0], due_work[0]
     calls = len(s.model_calls)
-    await s.wake(plain.next_due_at)
-    just_literal = [
-        row
-        for row in s.spool()
-        if s.spec["direct_payload"] == spool_text(row).removeprefix("【Pot】")
-    ]
+    with s.store.transaction(s.app.owner) as tx:
+        quiet_row = tx.conn.execute(
+            "SELECT quiet FROM ga_conversation_policy WHERE group_id=%s AND subject_id=%s",
+            (s.group, OWNER),
+        ).fetchone()
+        work_before = tx.get_work(work["work_id"]) if work["work_id"] else None
+    direct_occurrences = await s.wake(plain.next_due_at)
     facts = s.occurrence_proof(plain)
-    holds = bool(just_literal and len(s.model_calls) == calls)
+    just_literal = schedule_native_receipts(facts, s.spool())
+    literal_body = (
+        spool_text(just_literal[0]).removeprefix("【Pot】") if len(just_literal) == 1 else None
+    )
+    holds = (
+        len(s.model_calls) == calls
+        and len(just_literal) == 1
+        and literal_body == s.spec["direct_payload"]
+        and len(direct_occurrences) == 1
+        and direct_occurrences[0].work_id is None
+        and direct_occurrences[0].delivery_id
+    )
     s.check(
         "prepared_due_while_worker_busy_without_model",
-        holds and bool(work["work_id"]),
+        holds
+        and work_before is not None
+        and work_before.state not in TERMINAL
+        and s.headroom == 150,
         work,
         direct,
-        {"schedule_facts": facts, "receipts": just_literal},
+        {
+            "schedule_facts": facts,
+            "receipts": just_literal,
+            "work_before_due": work_before.model_dump(mode="json") if work_before else None,
+            "simulated_headroom_mib": s.headroom,
+        },
     )
     s.check(
         "quiet_respects_explicit_reminder",
-        holds and len(just_literal) == 1,
+        holds and bool(quiet_row and quiet_row["quiet"]) and not quiet["receipts"],
         quiet,
-        {"receipt": just_literal[0] if just_literal else None},
+        {"policy": quiet_row, "accepted_receipts": just_literal},
     )
+    conditional_occurrences = await s.wake(check.next_due_at)
+    actual_occurrence = conditional_occurrences[0] if len(conditional_occurrences) == 1 else None
     s.check(
         "rules_occurrences_receipts_distinct",
         len(facts) == 1
-        and len(s.app.coordinator.scheduler.occurrences(s.app.owner, plain.id)) == 1,
-        {"literal": facts, "conditional_rule": check.model_dump(mode="json")},
+        and len(direct_occurrences) == 1
+        and len(conditional_occurrences) == 1
+        and bool(
+            actual_occurrence and actual_occurrence.work_id and not actual_occurrence.delivery_id
+        )
+        and actual_occurrence.schedule_id == check.id
+        and direct_occurrences[0].schedule_id == plain.id
+        and direct_occurrences[0].id != actual_occurrence.id,
+        {
+            "literal": facts,
+            "conditional_rule": check.model_dump(mode="json"),
+            "conditional_occurrence": actual_occurrence.model_dump(mode="json")
+            if actual_occurrence
+            else None,
+        },
     )
-    [occurrence] = await s.wake(check.next_due_at)
     s.headroom = 1300
-    output = await s.settle(occurrence.work_id)
+    output = await s.settle(actual_occurrence.work_id if actual_occurrence else None)
     s.check(
         "conditional_work_uses_due_facts_and_silent_completion",
         bool(
@@ -1287,6 +1454,16 @@ async def time04(s):
         ),
         condition,
         output or {"execution": "missing"},
+    )
+
+
+def essential_artifact_input_reply(text, subject):
+    return bool(
+        re.search(subject, text)
+        and re.search(
+            r"拍(?:照|一下)|上传|发(?:来|给我|到这里|一下)|传(?:来|给我)|提供|告诉我|贴(?:来|上|出)|补充",
+            text,
+        )
     )
 
 
@@ -1323,14 +1500,14 @@ def inject_first_public_read(s):
     return calls
 
 
-def successful_public_calls(calls, domains):
+def successful_public_calls(calls, spec):
     return [
         call
         for call in calls
         if call["operation"] == "web_fetch"
         and call.get("result")
         and any(
-            actual_url(url, domains)
+            official_source(url, spec)
             for url in re.findall(
                 r'https://[^"\s]+', json.dumps(call["result"], ensure_ascii=False)
             )
@@ -1358,14 +1535,14 @@ async def search01(s):
     backend = (
         [] if not work else successful_tools(work, {"web_fetch", "web_search", "browser_open"})
     )
-    official = successful_public_calls(calls, s.spec["official_domains"])
+    official = successful_public_calls(calls, s.spec)
     if not official and backend:
         official = [
             item
             for item in backend
             if item["tool_name"] in {"web_fetch", "browser_open"}
             and any(
-                actual_url(url, s.spec["official_domains"])
+                official_source(url, s.spec)
                 for url in re.findall(
                     r'https://[^"\s]+', json.dumps(item["output"], ensure_ascii=False)
                 )
@@ -1387,7 +1564,7 @@ async def search01(s):
     s.check("fallback_after_injected_failure", explicit_changed_fallback(calls), evidence)
     s.check(
         "useful_ack_latency",
-        accepted_by(request) and useful_text(request, ["micro|编辑器"]),
+        accepted_by(request) and useful_text(request, s.spec["useful_patterns"]),
         request,
     )
     s.check(
@@ -1396,8 +1573,7 @@ async def search01(s):
             official
             and s.spec["correct_text"] in answer
             and any(
-                actual_url(url, s.spec["official_domains"])
-                for url in re.findall(r"https://[^\s）】。]+", answer)
+                official_source(url, s.spec) for url in re.findall(r"https://[^\s）】。]+", answer)
             )
         ),
         request,
@@ -1429,7 +1605,7 @@ async def work05(s):
         await s.app.dispatcher.tick()
     after = s.spool()
     result = await s.settle(delegated["work_id"])
-    verified = successful_public_calls(calls, s.spec["official_domains"])
+    verified = successful_public_calls(calls, s.spec)
     s.check(
         "failure_visible_and_fallback_advances",
         explicit_changed_fallback(calls) and bool(verified),
@@ -1449,17 +1625,26 @@ async def work05(s):
     )
     s.check(
         "only_actual_missing_input",
-        bool(re.search(s.spec["missing_pattern"], clarification))
-        and ("？" in clarification or "请" in clarification)
+        essential_artifact_input_reply(clarification, s.spec["missing_pattern"])
         and not (missing_output and missing_output["work"]["state"] == "completed"),
         missing,
         missing_output or {"asked_from_foreground": True},
     )
     s.check(
         "no_false_completion_or_spin",
-        bool(verified) and len(calls) <= 8 and bool(original),
+        bool(verified and original and original.state == "accepted" and before and after == before)
+        and any(
+            official_source(url, s.spec)
+            for url in re.findall(r"https://[^\s）】。]+", spool_text(before[0]))
+        )
+        and not any(
+            left["operation"] == middle["operation"] == right["operation"]
+            and left["arguments"] == middle["arguments"] == right["arguments"]
+            and not any(item.get("result") for item in (left, middle, right))
+            for left, middle, right in zip(calls, calls[1:], calls[2:], strict=False)
+        ),
         delegated,
-        result or {"direct_verified_call_count": len(verified)},
+        result or {"direct_verified_call_count": len(verified), "public_calls": len(calls)},
     )
 
 
@@ -1473,8 +1658,8 @@ async def search02(s):
         bool(start["work_id"])
         and len(works) == 1
         and works[0].id == start["work_id"]
-        and not followup["work_id"]
-        and any(item["name"] == "read_work_facts" for item in foreground_tools(s, followup)),
+        and followup["work_id"] in (None, start["work_id"])
+        and work_fact_has(work_facts_observed(s, followup), start["work_id"], works),
         start,
         followup,
         {"work_ids": [work.id for work in works]},
@@ -1495,23 +1680,57 @@ async def search02(s):
         >= expected,
         result,
     )
+    matching_files = False
+    public_links = {
+        url.rstrip("/")
+        for item in imports
+        for url in re.findall(r"https://[^\s)>，。]+", item["output"].get("page_citation") or "")
+    }
+    embedded_hashes = set()
+    converted_hashes = {
+        item["output"].get("sha256")
+        for item in conversions
+        if item["output"].get("format") == "png"
+    }
+    if len(artifacts) == 1:
+        artifact = artifacts[0]
+        decoded = artifact["decoded"]
+        addresses = set(decoded.get("links", []))
+        addresses.update(re.findall(r"https://[^\s）】。]+", decoded.get("text", "")))
+        retained_links = {url.rstrip("/") for url in addresses} & public_links
+        images = decoded.get("embedded_images", [])
+        embedded_hashes = {
+            image["sha256"] for image in images if image.get("content_type") == "image/png"
+        }
+        matching_files = (
+            artifact["accepted_sha256"] == artifact["sha256"]
+            and len(retained_links) >= expected
+            and len(images) == len(embedded_hashes) == expected
+            and embedded_hashes <= converted_hashes
+        )
     s.check(
         "source_manifest_and_delivered_file",
-        len(artifacts) == 1
-        and artifacts[0]["accepted_sha256"] == artifacts[0]["sha256"]
-        and len(set(artifacts[0]["decoded"].get("links", []))) >= expected
-        and len(artifacts[0]["decoded"].get("embedded_images", [])) == expected,
-        {"files": artifacts, "execution": result},
+        matching_files,
+        {
+            "files": artifacts,
+            "execution": result,
+            "source_link_count": len(public_links),
+            "embedded_png_count": len(embedded_hashes),
+        },
     )
-    partial = len(imports) < expected
+    attempts = result["work"]["state"]
+    delivered = [spool_text(item) for item in result["spool"] if item["payload"]["kind"] == "text"]
+    if matching_files:
+        truthfully_reported = attempts == "completed"
+    elif attempts in {"failed", "waiting_input", "paused"}:
+        truthfully_reported = any(
+            re.search(r"未完成|暂未交付|只找到|只交付|缺少|目前无法", text) for text in delivered
+        )
+    else:
+        truthfully_reported = False
     s.check(
         "accurate_partial_status",
-        (
-            partial
-            and result["work"]["state"] != "completed"
-            or not partial
-            and result["work"]["state"] == "completed"
-        ),
+        truthfully_reported,
         {"import_receipts": len(imports), "execution": result},
     )
 
@@ -1652,15 +1871,13 @@ async def media01(s):
     descriptions = response(photo) + "\n".join(
         spool_text(row) for row in (photo_result or {}).get("spool", [])
     )
-    observed = bool(
-        got and successful_tools(got, {"image_understand", "image_ocr", "vision", "ocr_image"})
-    )
+    observed = bool(got and successful_tools(got, {"image_analyze", "media_ocr", "provider_ocr"}))
     s.check(
         "actual_image_text_and_description",
         observed
         and s.spec["image_name"] in merged
         and s.spec["image_code"] in merged
-        and pattern_all(descriptions, ["蓝", "红", "矩形|长方形|方块", "圆"]),
+        and pattern_all(descriptions, ["蓝", "红", "矩形|长方形|方块|方形", "圆"]),
         source,
         first,
         photo,
@@ -1686,20 +1903,26 @@ async def media01(s):
     with s.store.transaction(s.app.owner) as tx:
         transcripts = tx.conn.execute(
             "SELECT id,body FROM ga_events WHERE group_id=%s AND body->>'trusted_actor_origin'="
-            "'authenticated_audio_transcription' AND body->>'verified_source_event_id'=%s",
+            "'authenticated_audio_transcription' AND body->>'reply_to'=%s",
             (s.group, audio["event_id"]),
         ).fetchall()
+    bound_evidence = [
+        entry
+        for row in transcripts
+        for entry in row["body"].get("attachments", [])
+        if entry.get("kind") == "audio_transcription"
+        and entry.get("source_event_id") == audio["event_id"]
+        and entry.get("request_ids")
+        and entry.get("budget_receipts")
+        and pattern_all(row["body"].get("text", ""), s.spec["speech_patterns"])
+    ]
     s.check(
         "actual_asr_code_and_downstream_provenance",
-        bool(transcripts)
-        and pattern_all(response(question), s.spec["speech_patterns"])
-        and any(
-            pattern_all(row["body"].get("text", ""), s.spec["speech_patterns"])
-            for row in transcripts
-        ),
+        len(transcripts) == len(bound_evidence) == 1
+        and useful_text(question, s.spec["speech_patterns"]),
         audio,
         question,
-        {"transcripts": transcripts},
+        {"transcripts": transcripts, "bound_provider_evidence": bound_evidence},
     )
 
 
@@ -1722,7 +1945,7 @@ async def proactive01(s):
                 task.id,
                 expected_revision=task.revision,
                 progress=body,
-                status="completed" if finish else task.status,
+                status=TeamTaskState.COMPLETED if finish else task.status,
                 source_event_id=event["event_id"],
             )
 
@@ -2128,6 +2351,8 @@ async def run(args):
     destination.mkdir(parents=True, exist_ok=False, mode=0o700)
     started = bindings()
     runner_hash = sha256(Path(__file__))
+    inspector = Path(__file__).with_name("runtime_acceptance_checks.py")
+    inspector_hash = sha256(inspector)
     dsn = args.dsn_file.read_text().strip()
     postgres = postgres_identity(dsn)
     if postgres["database"] != "pot_blind":
@@ -2139,6 +2364,7 @@ async def run(args):
         **started,
         "dataset_sha256": dataset_sha,
         "runner_sha256": runner_hash,
+        "inspector_sha256": inspector_hash,
         "environment": {
             "model": {
                 "provider": "api.deepseek.com",
@@ -2231,7 +2457,11 @@ async def run(args):
         report["latency"] = latency_report(samples)
         write_json(destination / "report.json", report)
         print(json.dumps({"case": identity, "status": row["status"]}), flush=True)
-    report["consistent"] = started == bindings() and runner_hash == sha256(Path(__file__))
+    report["consistent"] = (
+        started == bindings()
+        and runner_hash == sha256(Path(__file__))
+        and inspector_hash == sha256(inspector)
+    )
     report["passed"] = report["consistent"] and all(
         row["status"] == "passed" for row in report["cases"]
     )

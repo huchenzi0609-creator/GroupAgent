@@ -14,7 +14,11 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from groupagent.scheduling.models import PreparedMessage
-from groupagent.scheduling.temporal import InstantProposal, ScheduleTimingProposal
+from groupagent.scheduling.temporal import (
+    CreateTimingProposal,
+    InstantProposal,
+    ScheduleTimingProposal,
+)
 
 from .quiet import validate_windows
 
@@ -75,7 +79,10 @@ class CreateSchedule(ActionData):
         description="Enable only for a future goal when the requester explicitly allows no message "
         "if the completed check finds nothing to report.",
     )
-    timing: ScheduleTimingProposal
+    timing: CreateTimingProposal
+    time_zone: str | None = Field(
+        default=None, description="Explicit IANA time zone. Omit to use the group time zone."
+    )
     valid_until: InstantProposal | None = None
 
     @model_validator(mode="after")
@@ -92,6 +99,9 @@ class ChangeSchedule(ActionData):
     schedule_id: str
     expected_revision: int = Field(ge=1)
     timing: ScheduleTimingProposal | None = None
+    time_zone: str | None = Field(
+        default=None, description="Explicit new IANA time zone. Omit to retain the schedule's zone."
+    )
     goal: str | None = Field(default=None, max_length=3000)
     prepared_message: PreparedMessage | None = None
     fact_source_ids: list[str] | None = Field(default=None, max_length=20)

@@ -127,3 +127,125 @@ async def test_model_can_refresh_clock_then_answer_in_one_completion(conversatio
     assert len(model.requests) == 2
     assert result.decision.response == "北京时间现在是凌晨04:35:37。"
     assert result.delivery_id
+
+
+@pytest.mark.postgres
+async def test_iana_weekly_creation_and_clock_only_edit_keep_zone_and_all_weekdays(
+    conversation_env,
+):
+    env = conversation_env
+    now = datetime(2026, 11, 17, 20, 35, 22, tzinfo=UTC)
+    env.coordinator.clock = lambda: now
+    zone = "America/Los_Angeles"
+    original = ingest(env, "Pot，洛杉矶时间每周四和周日17:30提醒我核对清单。", now, now)
+    env.models[original.id] = ModelScript(
+        call(
+            "apply_business_action",
+            "new-weekly",
+            action={
+                "op": "create_schedule",
+                "title": "核对清单",
+                "timing": {"kind": "weekly", "local_time": "17:30", "weekdays": [3, 6]},
+                "time_zone": zone,
+                "prepared_message": {"purpose": "explicit_reminder", "text": "核对清单"},
+            },
+            finish_on_commit=True,
+        ),
+    )
+    created = await env.coordinator.process(original)
+    assert created.action_result and created.action_result["time_zone"] == zone
+    schedule = env.coordinator.scheduler.get(env.actor, created.action_result["schedule_id"])
+    assert schedule.next_due_at == datetime(2026, 11, 20, 1, 30, tzinfo=UTC)
+    assert schedule.timing.kind == "weekly" and schedule.timing.weekdays == [3, 6]
+
+    now += timedelta(seconds=1)
+    edit = ingest(env, "Pot，只把刚才那个提醒的时间改成18:15，日期别动。", now, now)
+
+    def change_selected_rule(request):
+        observed = tool_receipt(request)
+        (fact,) = observed["facts"]["facts"]
+        assert fact["id"] == schedule.id and fact["time_zone"] == zone
+        return call(
+            "apply_business_action",
+            "clock-only-edit",
+            action={
+                "op": "change_schedule",
+                "schedule_id": fact["id"],
+                "expected_revision": fact["revision"],
+                "timing": {"kind": "clock", "local_time": "18:15"},
+            },
+            finish_on_commit=True,
+        )
+
+    env.models[edit.id] = ModelScript(
+        call("read_group_context", "weekly-facts", resource="schedules"),
+        change_selected_rule,
+    )
+    changed = await env.coordinator.process(edit)
+    assert changed.action_result and changed.action_result["schedule_id"] == schedule.id
+    assert changed.action_result["timing"] == {
+        "kind": "weekly",
+        "local_time": "18:15:00",
+        "weekdays": [3, 6],
+    }
+    revised = env.coordinator.scheduler.get(env.actor, schedule.id)
+    assert revised.time_zone == zone and revised.goal == schedule.goal
+    assert revised.revision == schedule.revision + 1
+    assert revised.next_due_at == datetime(2026, 11, 20, 2, 15, tzinfo=UTC)
+    assert env.coordinator.scheduler.wake(env.actor, schedule.next_due_at) == []
+    (occurrence,) = env.coordinator.scheduler.wake(env.actor, revised.next_due_at)
+    assert occurrence.delivery_id and occurrence.work_id is None
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    ("date", "local_time", "fold", "expected"),
+    [
+        ("2026-03-08", "02:30", None, "nonexistent_local_time"),
+        ("2026-11-01", "01:30", None, "ambiguous_dst_fold"),
+        ("2026-11-01", "01:30", 0, datetime(2026, 11, 1, 8, 30, tzinfo=UTC)),
+        ("2026-11-01", "01:30:12", 1, datetime(2026, 11, 1, 9, 30, 12, tzinfo=UTC)),
+    ],
+)
+async def test_strict_wall_proposal_dst_requires_real_instant(
+    conversation_env, date, local_time, fold, expected
+):
+    env = conversation_env
+    now = datetime(2026, 3, 1, tzinfo=UTC)
+    env.coordinator.clock = lambda: now
+    request = ingest(env, "Pot，到指定的洛杉矶时间提醒我提交清单。", now, now)
+    timing = {"kind": "wall", "date": date, "local_time": local_time}
+    if fold is not None:
+        timing["fold"] = fold
+
+    def ask_for_valid_time(turn):
+        receipt = tool_receipt(turn)
+        assert receipt["code"] == expected and not receipt["committed"]
+        return finish("请指定一个明确存在的本地时刻。", needs_input=True)
+
+    action = call(
+        "apply_business_action",
+        "wall-time",
+        action={
+            "op": "create_schedule",
+            "title": "提交清单",
+            "timing": timing,
+            "time_zone": "America/Los_Angeles",
+            "prepared_message": {"purpose": "explicit_reminder", "text": "提交清单"},
+        },
+        finish_on_commit=True,
+    )
+    env.models[request.id] = (
+        ModelScript(action, ask_for_valid_time)
+        if isinstance(expected, str)
+        else ModelScript(action)
+    )
+    result = await env.coordinator.process(request)
+    rules = env.coordinator.scheduler.list(env.actor)
+    if isinstance(expected, str):
+        assert result.action_result is None and rules == []
+    else:
+        (rule,) = rules
+        assert result.action_result and rule.timing.kind == "at"
+        assert rule.next_due_at == expected
+        assert rule.time_zone == "America/Los_Angeles"

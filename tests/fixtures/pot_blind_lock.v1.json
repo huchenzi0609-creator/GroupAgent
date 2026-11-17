@@ -1,6 +1,6 @@
 {
   "format_version": 1,
-  "dataset_sha256": "7be45936cf4da43192bafc0498af81cb685d74385af7e47f675d79364d7f4d74",
+  "dataset_sha256": "ee42bd84a07a85afaa8b0a32776c341092899b0e04125be6449224ce28c171a2",
   "case_ids": [
     "CHAT-01",
     "CHAT-02",
@@ -28,5 +28,24 @@
     "OPS-01",
     "OPS-02"
   ],
-  "visibility": "Independent synthetic cases kept outside the implementation/test fixture tree; prompts frozen before calling the real model"
+  "changed_case_ids": [
+    "CHAT-02",
+    "CHAT-04",
+    "CHAT-05",
+    "GROUP-01",
+    "GROUP-02",
+    "GROUP-03",
+    "WORK-02",
+    "WORK-03",
+    "TIME-01",
+    "TIME-02",
+    "TIME-03",
+    "TIME-04",
+    "WORK-05",
+    "SEARCH-01",
+    "SEARCH-02",
+    "FILE-01",
+    "OPS-02"
+  ],
+  "visibility": "Independent private inputs. Only case IDs and the frozen byte digest are committed."
 }

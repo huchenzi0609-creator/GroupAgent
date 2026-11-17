@@ -57,7 +57,9 @@ class RosterRefresher:
     async def query(
         self, actor: ActorContext, event: GroupEvent, context: dict[str, Any]
     ) -> dict[str, Any] | None:
-        if actor.role not in {Role.OWNER, Role.MEMBER} or not roster_query(event, context):
+        if actor.role not in {Role.OWNER, Role.MEMBER} or (
+            context.get("_refresh_roster") is not True and not roster_query(event, context)
+        ):
             return None
         if actor.group_id != self.actor.group_id:
             raise DomainError("scope_denied", "Roster query belongs to another group")

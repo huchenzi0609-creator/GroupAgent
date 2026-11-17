@@ -636,6 +636,23 @@ class ConversationCoordinator(Coordinator):
             and resolved.refs[0].revision != decision.expected_revision
         ):
             raise DomainError("version_conflict", "The exact work reference is stale")
+        if not readonly and context.get("_react_session") and selector.quantifier == "one":
+            target_id = resolved.refs[0].id
+            compared = context.get("_work_target_reads", {}).values()
+            if any(target_id in choices and len(choices) > 1 for choices in compared):
+                authored = outside_quotes(event.text).casefold()
+                named = selector.title_query and selector.title_query.casefold() in authored
+                if (
+                    target_id != context.get("_quoted_work_id")
+                    and target_id.casefold() not in authored
+                    and not named
+                    and selector.basis != "focus"
+                ):
+                    raise DomainError(
+                        "ambiguous_reference",
+                        "Several works match. Select an author-named or quoted target, "
+                        "or ask which one before applying a single modification",
+                    )
         return resolved
 
     def _fast_control(self, event: GroupEvent, context: dict) -> Decision | None:
@@ -1065,7 +1082,11 @@ class ConversationCoordinator(Coordinator):
                     authorization_event_id=event.id,
                     allow_silent_result=action.allow_silent_result,
                     now=self.clock(),
-                    time_zone=self.config.group.time_zone,
+                    time_zone=(
+                        action.time_zone
+                        if action.time_zone is not None
+                        else self.config.group.time_zone
+                    ),
                     valid_until=action.valid_until,
                     request_key="chat:" + event.id,
                     budget=self.config.execution.model_dump(mode="json"),
@@ -1081,6 +1102,7 @@ class ConversationCoordinator(Coordinator):
                     action.schedule_id,
                     expected_revision=action.expected_revision,
                     timing=action.timing,
+                    time_zone=action.time_zone,
                     goal=action.goal,
                     prepared_message=action.prepared_message,
                     authorization_event_id=event.id,
@@ -1417,13 +1439,17 @@ class ConversationCoordinator(Coordinator):
                 self.execution_guard(tx)
                 self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
 
-        async def read_group_context(resource: str, term: str | None) -> Any:
+        async def read_group_context(
+            resource: str, term: str | None, *, refresh: bool = False
+        ) -> Any:
             if resource == "clock":
                 await assert_source()
                 return read_clock()
             status = None
-            if resource == "members" and self.refresh_roster is not None:
-                status = await self.refresh_roster(actor, event, context)
+            if resource == "members" and refresh and self.refresh_roster is not None:
+                status = await self.refresh_roster(
+                    actor, event, {**context, "_refresh_roster": True}
+                )
             query = ContextQuery(
                 resources=frozenset({resource}),
                 model_led=True,
@@ -1537,6 +1563,10 @@ class ConversationCoordinator(Coordinator):
                     raise DomainError("source_unavailable", "The human request was withdrawn")
                 observed = query_work_in_tx(tx, event, candidate, context, WorkFacts(self.store))
                 rows = observed["facts"]
+                if selector.basis != "ids":
+                    context.setdefault("_work_target_reads", {})[selector] = frozenset(
+                        row["id"] for row in rows
+                    )
                 context["_last_work_fact_read"] = observed
                 context["_work_fact_source_ids"] = sorted(
                     set(context.get("_work_fact_source_ids", []))

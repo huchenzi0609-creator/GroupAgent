@@ -1198,6 +1198,7 @@ if fmt == "md":
 elif fmt == "docx":
     inspect_office(raw, "docx", for_edit=True)
     from docx import Document
+    from docx.oxml.ns import qn
     doc = Document(io.BytesIO(raw))
     pieces = []
     for block in doc.iter_inner_content():
@@ -1212,7 +1213,13 @@ elif fmt == "docx":
     for section in doc.sections:
         for story in (section.header, section.footer):
             pieces.extend(p.text for p in story.paragraphs)
-    result.update(text="\n".join(pieces), units=[])
+    linked_images = []
+    for drawing in doc.element.xpath(".//a:blip"):
+        image_part = doc.part.related_parts.get(drawing.get(qn("r:embed")))
+        if image_part is not None and image_part.content_type.startswith("image/"):
+            linked_images.append({"sha256": hashlib.sha256(image_part.blob).hexdigest(),
+                                  "content_type": image_part.content_type})
+    result.update(text="\n".join(pieces), units=[], embedded_images=linked_images)
 elif fmt == "pptx":
     inspect_office(raw, "pptx", for_edit=True)
     from pptx import Presentation
@@ -1220,7 +1227,12 @@ elif fmt == "pptx":
     for i, slide in enumerate(deck.slides, 1):
         texts=[]
         for shape in slide.shapes:
-            if shape.has_text_frame: texts.append(shape.text)
+            if shape.has_text_frame:
+                texts.append(shape.text)
+                for paragraph in shape.text_frame.paragraphs:
+                    for run in paragraph.runs:
+                        if run.hyperlink.address:
+                            result["links"].append(run.hyperlink.address)
             if shape.has_table:
                 rows=[[cell.text for cell in row.cells] for row in shape.table.rows]
                 result["tables"].append(rows)
@@ -1230,6 +1242,14 @@ elif fmt == "pptx":
 elif fmt == "pdf":
     from groupagent.media.validation import ocr_pdf
     pdf = open_pdf(raw); pages = ocr_pdf(raw).pages
+    for page in pdf.pages:
+        for ref in page.get("/Annots", []):
+            annotation = ref.get_object()
+            action = annotation.get("/A")
+            if action:
+                uri = action.get_object().get("/URI")
+                if isinstance(uri, str):
+                    result["links"].append(uri)
     units=[{"index":p.page_number,"text":p.text,"content_sha256":hashlib.sha256(p.text.encode()).hexdigest()} for p in pages]
     result.update(units=units,unit_count=len(pdf.pages),rendered_pages=len(pdf.pages),text="\n".join(p.text for p in pages))
 elif fmt in ("png","jpeg","jpg","gif","webp"):

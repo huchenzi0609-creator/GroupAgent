@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import time
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -22,12 +23,22 @@ class EveryTiming(DomainModel):
     start_at: AwareDatetime | None = None
 
 
-class WallClockTiming(DomainModel):
-    local_time: time
+_LOCAL_TIME_PATTERN = r"^(?:[01][0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9])?$"
+LocalTimeInput = Annotated[str, Field(pattern=_LOCAL_TIME_PATTERN)]
 
-    @field_validator("local_time")
+
+class WallClockTiming(DomainModel):
+    local_time: time = Field(
+        description="Local clock time in HH:MM or HH:MM:SS, without an offset."
+    )
+
+    @field_validator("local_time", mode="before", json_schema_input_type=LocalTimeInput)
     @classmethod
-    def wall_clock(cls, value: time) -> time:
+    def wall_clock(cls, value: object) -> time:
+        if isinstance(value, str) and re.fullmatch(_LOCAL_TIME_PATTERN, value):
+            return time.fromisoformat(value)
+        if not isinstance(value, time):
+            raise ValueError("Use a local time in HH:MM or HH:MM:SS form")
         if value.tzinfo is not None or value.microsecond:
             raise ValueError("Local time must have whole seconds and no UTC offset")
         return value
@@ -40,7 +51,10 @@ class DailyTiming(WallClockTiming):
 class WeeklyTiming(WallClockTiming):
     kind: Literal["weekly"] = "weekly"
     weekdays: list[Annotated[int, Field(strict=True, ge=0, le=6)]] = Field(
-        min_length=1, max_length=7
+        min_length=1,
+        max_length=7,
+        description="Distinct weekday indices counting from Monday=0 through Sunday=6.",
+        json_schema_extra={"uniqueItems": True},
     )
 
     @field_validator("weekdays")

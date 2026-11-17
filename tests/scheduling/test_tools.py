@@ -105,6 +105,19 @@ def create_args(**extra):
     }
 
 
+async def test_background_relative_schedule_keeps_verified_message_anchor(env):
+    invoke = client(env)
+    result = await invoke(
+        "schedule_create",
+        create_args(timing={"kind": "after", "seconds": 300}),
+        "relative-time",
+    )
+    assert result.success
+    rule = env.scheduler.get(env.actor, result.output["id"])
+    assert rule.timing.kind == "at"
+    assert rule.timing.at == env.request.occurred_at + timedelta(seconds=300)
+
+
 async def test_tool_goal_update_cannot_keep_a_stale_reminder_hint(env):
     with env.store.transaction(env.actor) as tx:
         fingerprints = {env.request.id: tx.event_fingerprint(env.request.id)}
