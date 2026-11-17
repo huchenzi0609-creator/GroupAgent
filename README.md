@@ -2,9 +2,9 @@
 
 大学微信群协作智能体。工程名 GroupAgent，群内名 **Pot**，文本带 **【Pot】** 标识。
 
-当前迁移分支为 `refactor/pot-durable-agent-core`，使用 LangChain 标准 Agent Loop 与 LangGraph 持久检查点。前后台复用同一内核、独立会话；现有微信接入、成员群昵称、长期记忆、任务分工、文档与媒体工具、定时规则和交付回执继续复用。旧 Scoped 自写循环与原生 Harness 执行路径已经退出。
+当前修复分支为 `fix/pot-conversation-contract`，基于 `refactor/pot-durable-agent-core`，使用 LangChain 标准 Agent Loop 与 LangGraph 持久检查点。前后台复用同一内核、独立会话；统一判断对话对象、信息依据与需要的执行回执，群内默认简短纯文本输出。现有微信接入、成员群昵称、长期记忆、任务分工、文档与媒体工具、定时规则和交付回执继续复用。旧 Scoped 自写循环与原生 Harness 执行路径已经退出。
 
-本轮已更新至 `test_2`，通过本地任务、故障恢复与真实群功能及共存验收；10 秒首次回复目标尚未达到，详见[验收记录](docs/development/DURABLE_CORE_VALIDATION.zh-CN.md)。任务、成员和有效成果保留，到期原文与原始输入沿用原保留策略。2GB 服务器重型工具单并发，按实时内存准入并为小游戏保留空间。
+本轮已更新至 `test_2`，完整脱敏对话、683项最终关联回归及CI四项作业通过；真实群已取得Python运行回执、385结果与回声忽略证据，最终版本健康、数据与小游戏共存核对通过。详见[群聊契约验收](docs/development/CONVERSATION_CONTRACT_VALIDATION.zh-CN.md)；此前执行内核验收见[原记录](docs/development/DURABLE_CORE_VALIDATION.zh-CN.md)。10秒首次回复目标尚未达到。任务、成员和有效成果保留，到期原文与原始输入沿用原保留策略。2GB服务器重型工具单并发，按实时内存准入并为小游戏保留空间。
 
 用户已取消金额、token 和目标累计步数预算；保留费用记录、单次工具资源约束与异常退避。语音输入识别在范围内，TTS、插画生成服务和视频处理不在当前计划。
 
@@ -22,6 +22,7 @@ UV_CACHE_DIR="$PWD/.cache/uv" uv --no-config sync --locked
 ## 架构与工程资料
 
 - [标准持久内核决策](docs/adr/0006-standard-durable-agent-core.md)与[执行器契约](src/groupagent/execution/README.md)
+- [群聊对象、执行证据与微信呈现契约](docs/adr/0007-group-conversation-contract.md)
 - [Spec](docs/SPEC_V0.1.zh-CN.md)、[技术契约](docs/spec/TECHNICAL_CONTRACTS_V0.1.md)、[工程纪律](docs/ENGINEERING.md)
 - [2GB 部署档](deploy/SERVER_2GB.md)、[worker 构建](deploy/worker/README.md)
 - [历史本地运行与验收记录](docs/development/LOCAL_RUNBOOK.md)、[前期修复报告](docs/development/FOUR_FAILURE_REPAIR.md)

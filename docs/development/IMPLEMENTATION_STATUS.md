@@ -1,5 +1,7 @@
 # 实现与验证状态（进行中）
 
+2026-11-17 当前入口：[群聊对象、简短纯文本与执行承诺验收](CONVERSATION_CONTRACT_VALIDATION.zh-CN.md)，分支 `fix/pot-conversation-contract`，[PR15](https://github.com/huchenzi0609-creator/GroupAgent/pull/15)。最终683项本地关联回归通过，双Python核心CI各3621通过/53跳过，隔离worker与文档渲染通过；真实test_2已验证同一工作实际Python=385、诚实受理、纯文本结果和回声忽略。最终薄更新健康、同lease稳定105.7秒、数据与小游戏共存核对通过；原文TTL脱敏逐行归因。10秒首答目标未达。用户已取消累计金额、token与任务步数预算；下文旧预算/部署限制保留其历史语境，不作为当前政策。标准持久内核、2GB档及小游戏共存约束继续有效。
+
 **CI字体兼容小修：** 完整30/30实模验收绑定c411源码。最终提交另含`5c9c4640ac097c4a4c94b7a9c7a26708eb6ddd5a4ee982c0cb134b9b8880029e`的负数折线图标签避让修复；Linux DejaVu字体已复现原FAIL并验证修复PASS，正数验收样例及恒定/零值PNG字节不变。仅图表相关回归（13项及文档绘图选集172项）和必要CI重新验证，未重跑付费30项，旧CI失败记录保留。
 
 更新：2026-11-16。当前适配分支：`feat/pot-2gb-server`，基于 `feat/local-readiness`。已按用户授权备份并退役旧 bot，保留微信 client 与小游戏；新版 Pot 已在目标服务器的 test_2 运行，尚未扩展到正式群。此页保留前轮验收历史，不表示 v1 或全部发布门槛完成。Pot 身份、2GB 档及目标机证据见 [2GB报告](POT_2GB_VALIDATION.md) 和 [当前部署](../../deploy/POT_TEST2.md)。
