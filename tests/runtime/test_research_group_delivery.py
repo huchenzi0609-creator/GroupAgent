@@ -27,7 +27,10 @@ def test_shared_policy_keeps_explicit_requirements_separate_from_display_default
     assert policy["instruction"] == group_reply_instruction("one_to_three_short_sentences")
     assert policy["short_reply_style"] == "one_to_three_short_sentences"
     assert policy["retrieval_time_display_default"] == "internal_evidence_only"
-    assert set(policy["requirement_sources"]) >= {"original_request", "required_outputs"}
+    assert set(policy["requirement_sources"]) >= {
+        "human_requirements.requests",
+        "human_requirements.required_outputs",
+    }
     assert "不做字数硬截断" in policy["instruction"]
     assert "邀约" in policy["instruction"]
 
@@ -61,10 +64,11 @@ async def test_default_lookup_keeps_actual_provenance_internal_without_a_visible
     async def critic(request):
         requests.append(request)
         payload = json.loads(request.messages[1].content)
-        assert payload["answer"] == answer and payload["original_request"]["text"] == text
+        assert payload["answer"] == answer
+        assert payload["human_requirements"]["requests"][0]["text"] == text
         assert payload["delivery_policy"] == objective["delivery_policy"]
         assert objective["delivery_policy"]["instruction"] in objective["instructions"]
-        assert payload["required_outputs"] == objective["required_outputs"]
+        assert payload["human_requirements"]["required_outputs"] == objective["required_outputs"]
         metrics = payload["research_source_metrics"][0]
         assert metrics["retrieved_at"] == source["retrieved_at"]
         assert metrics["citation"] == source["citation"]
@@ -112,9 +116,9 @@ async def test_explicit_time_requirement_reaches_critic_even_when_goal_is_abbrev
     async def explicit_time_critic(request):
         seen.append(request)
         payload = json.loads(request.messages[1].content)
-        assert payload["original_request"]["text"] == text
-        assert payload["required_outputs"] == [{"format": "text"}]
-        assert "真人明确要求的引用、时间" in request.messages[0].content
+        assert payload["human_requirements"]["requests"][0]["text"] == text
+        assert payload["human_requirements"]["required_outputs"] == [{"format": "text"}]
+        assert "真人明确要求的细节、引用和访问时间" in request.messages[0].content
         # The fixture declares the human's explicit requirement; it does not
         # pretend an offline keyword parser establishes semantic reliability.
         try:

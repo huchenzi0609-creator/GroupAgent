@@ -38,12 +38,12 @@ def group_delivery_policy(
         "short_reply_style": short_reply_style,
         "instruction": group_reply_instruction(short_reply_style),
         "requirement_sources": [
-            "original_request",
-            "goal",
-            "acceptance_criteria",
-            "criteria",
-            "required_outputs",
+            "human_requirements.requests",
+            "human_requirements.required_outputs",
+            "human_requirements.reminder_body",
+            "human_requirements.retained_authorized_context",
         ],
+        "execution_plan_authority": "internal_execution_reference_only",
         "source_display_default": "minimal_when_useful",
         "retrieval_time_display_default": "internal_evidence_only",
     }

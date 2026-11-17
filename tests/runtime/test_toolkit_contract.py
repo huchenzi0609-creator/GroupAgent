@@ -1039,9 +1039,12 @@ async def test_canonical_original_request_is_bounded_redacted_and_shared_with_re
         run.workspace,
     )
     review = setup.model.requests[-1]
-    assert json.loads(review.messages[1].content)["original_request"] == context
+    authoritative = json.loads(review.messages[1].content)["human_requirements"]
+    assert {key: authoritative["requests"][0][key] for key in context} == context
+    assert authoritative["history_complete"] is not long_request
     assert secret not in review.model_dump_json()
-    assert "goal" in review.messages[0].content and "criteria" in review.messages[0].content
+    assert "human_requirements" in review.messages[0].content
+    assert "execution_plan" in review.messages[0].content
     assert "不添加用户未要求的标准" in review.messages[0].content
     assert "ASR" not in review.messages[0].content  # This case contains no audio evidence.
     assert "pre_delivery" in review.messages[0].content

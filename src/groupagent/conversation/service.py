@@ -33,6 +33,7 @@ from groupagent.domain import (
     GroupEvent,
     Role,
     TeamTaskState,
+    WorkOrder,
     WorkState,
 )
 from groupagent.identity import BotIdentity, control_request
@@ -191,6 +192,59 @@ class ConversationCoordinator(Coordinator):
                 (tx.group_id,),
             ).fetchone()
         return row["mode"] if row and row["mode"] else self.config.group.participation_mode
+
+    @staticmethod
+    def _human_request_provenance(
+        tx: UnitOfWork, event: GroupEvent, previous_work: WorkOrder | None = None
+    ) -> dict[str, Any]:
+        """Record trusted instruction references, separately from input grants.
+
+        Historical fingerprints are immutable provenance. They neither keep raw
+        messages alive nor authorize reading an expired message as a new input.
+        """
+        current = tx._reply_source(event.id)
+        if current.kind == EventKind.FORWARDED:
+            raise DomainError("permission_denied", "Forwarded data cannot authorize work")
+        fingerprint = tx.event_fingerprint(current.id)
+        scope = previous_work.scope if previous_work is not None else {}
+        prior_ids = scope.get("human_request_event_ids")
+        if prior_ids is None:
+            identifiers: list[str] = []
+            fingerprints: dict[str, str] = {}
+            complete = previous_work is None
+        else:
+            prior_fingerprints = scope.get("human_request_fingerprints")
+            if (
+                not isinstance(prior_ids, list)
+                or not prior_ids
+                or any(
+                    not isinstance(identifier, str) or not identifier for identifier in prior_ids
+                )
+                or not isinstance(prior_fingerprints, dict)
+                or set(prior_fingerprints) != set(prior_ids)
+                or any(
+                    not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
+                    for value in prior_fingerprints.values()
+                )
+            ):
+                raise DomainError("scope_violation", "Human request provenance is malformed")
+            identifiers = list(
+                dict.fromkeys(identifier for identifier in prior_ids if isinstance(identifier, str))
+            )
+            fingerprints = {
+                key: value for key, value in prior_fingerprints.items() if isinstance(value, str)
+            }
+            complete = scope.get("human_request_history_complete") is True
+        if current.id in fingerprints and fingerprints[current.id] != fingerprint:
+            raise DomainError("source_unavailable", "An accepted human request changed")
+        if current.id not in identifiers:
+            identifiers.append(current.id)
+        fingerprints[current.id] = fingerprint
+        return {
+            "human_request_event_ids": identifiers,
+            "human_request_fingerprints": fingerprints,
+            "human_request_history_complete": complete,
+        }
 
     def accepts_event(self, event: GroupEvent) -> bool:
         if self.current_mode() != "disabled":
@@ -2285,6 +2339,7 @@ class ConversationCoordinator(Coordinator):
                                     )
                                 ),
                                 "derived_depth": 0,
+                                **self._human_request_provenance(tx, event),
                             },
                             budget=self.config.execution.model_dump(mode="json"),
                             required_checks=["result"]
@@ -2319,6 +2374,7 @@ class ConversationCoordinator(Coordinator):
                             for value in decision.outputs
                         ]
                         previous_work = tx.get_work(decision.target_work_id or "")
+                        human_provenance = self._human_request_provenance(tx, event, previous_work)
                         quantity = normalize_image_quantity(
                             tx,
                             event,
@@ -2432,6 +2488,20 @@ class ConversationCoordinator(Coordinator):
                                 "UPDATE ga_work_orders SET scope=%s WHERE group_id=%s AND id=%s",
                                 (Jsonb(scope), tx.group_id, work.id),
                             )
+                        # This metadata belongs to the accepted goal revision,
+                        # not to planner-provided scope or the latest prompt.
+                        latest = tx.get_work(work.id)
+                        scope = {**latest.scope, **human_provenance}
+                        tx.conn.execute(
+                            "UPDATE ga_work_orders SET scope=%s WHERE group_id=%s AND id=%s",
+                            (Jsonb(scope), actor.group_id, work.id),
+                        )
+                        tx.conn.execute(
+                            "UPDATE ga_work_revisions SET body=jsonb_set(body,'{scope}',%s) "
+                            "WHERE group_id=%s AND work_id=%s AND goal_revision=%s",
+                            (Jsonb(scope), actor.group_id, work.id, work.goal_revision),
+                        )
+                        work = latest.model_copy(update={"scope": scope})
                         if work.state == WorkState.WAITING_INPUT:
                             work = tx.transition_work(
                                 work.id,

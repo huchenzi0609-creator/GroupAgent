@@ -315,7 +315,10 @@ async def test_legacy_planning_five_does_not_block_four_valid_png_images(convers
     assert setup.http_calls == []
     review = setup.model.requests[-1]
     review_payload = json.loads(review.messages[1].content)
-    assert "五张" in review_payload["goal"] and "五张" in review_payload["criteria"][0]
+    assert (
+        "五张" in review_payload["execution_plan"]["goal"]
+        and "五张" in review_payload["execution_plan"]["criteria"][0]
+    )
     assert review_payload["image_quantity_requirement"]["public_image_count"] is None
     assert "only the host-verified image_quantity_requirement" in review.messages[0].content
 
