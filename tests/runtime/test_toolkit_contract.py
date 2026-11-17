@@ -114,7 +114,13 @@ class FixtureSemanticReviewer:
         self.requests.append(request)
         assert not request.tools
         return ModelReply(
-            text=json.dumps({"passed": self.passed, "reason": "offline reviewer fixture"}),
+            text=json.dumps(
+                {
+                    "content_passed": self.passed,
+                    "group_reply_passed": True,
+                    "reason": "offline reviewer fixture",
+                }
+            ),
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )
 
@@ -601,7 +607,7 @@ async def test_semantic_model_retries_respect_original_grant_and_keep_unknown_ch
         if len(calls) <= failures:
             raise DomainError("provider_unavailable", "Synthetic model transport failure")
         return ModelReply(
-            text='{"passed":true,"reason":"Synthetic content verified"}',
+            text='{"content_passed":true,"group_reply_passed":true,"reason":"Synthetic content verified"}',
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )
 
@@ -748,7 +754,13 @@ async def test_semantic_review_evidence_is_version_bound_redacted_and_privacy_re
     )
     secret = "sk-" + "synthetic_only_" * 3
     reply = ModelReply(
-        text=json.dumps({"passed": False, "reason": "Missing footer; " + secret}),
+        text=json.dumps(
+            {
+                "content_passed": False,
+                "group_reply_passed": True,
+                "reason": "Missing footer; " + secret,
+            }
+        ),
         usage=TokenUsage(input_tokens=10, output_tokens=5),
     )
 
@@ -782,7 +794,13 @@ async def test_semantic_review_evidence_is_version_bound_redacted_and_privacy_re
     assert secret not in json.dumps(evidence)
     assert len(audits) == 1 and "reason" not in audits[0]["details"]
     reply = ModelReply(
-        text=json.dumps({"passed": True, "reason": "Corrected final candidate"}),
+        text=json.dumps(
+            {
+                "content_passed": True,
+                "group_reply_passed": True,
+                "reason": "Corrected final candidate",
+            }
+        ),
         usage=TokenUsage(input_tokens=10, output_tokens=5),
     )
     await setup.toolkit.validate(

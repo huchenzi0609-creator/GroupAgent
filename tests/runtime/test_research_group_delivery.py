@@ -74,7 +74,7 @@ async def test_default_lookup_keeps_actual_provenance_internal_without_a_visible
         assert manifest["retrieved_at"] == source["retrieved_at"]
         assert manifest["evidence_ref"] == source["evidence_ref"]
         return ModelReply(
-            text='{"passed":true,"reason":"Synthetic source supports unknown exact fees"}',
+            text='{"content_passed":true,"group_reply_passed":true,"reason":"Synthetic source supports unknown exact fees"}',
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )
 
@@ -123,7 +123,13 @@ async def test_explicit_time_requirement_reaches_critic_even_when_goal_is_abbrev
         except DomainError:
             passed = False
         return ModelReply(
-            text=json.dumps({"passed": passed, "reason": "Explicit requested time checked"}),
+            text=json.dumps(
+                {
+                    "content_passed": passed,
+                    "group_reply_passed": True,
+                    "reason": "Explicit requested time checked",
+                }
+            ),
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )
 
@@ -188,7 +194,7 @@ async def test_brief_message_cannot_replace_unknown_fees_with_an_unsupported_pri
         assert payload["research_source_content"][0]["received_content_excerpt"] == SOURCE
         assert payload["answer"] == "每月99元。"
         return ModelReply(
-            text='{"passed":false,"reason":"The actual source gives no exact price"}',
+            text='{"content_passed":false,"group_reply_passed":true,"reason":"The actual source gives no exact price"}',
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )
 

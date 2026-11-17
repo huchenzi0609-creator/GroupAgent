@@ -91,7 +91,13 @@ from .artifacts import ArtifactRegistry
 from .contracts import DeliveryDraft, PreparedExecution, ValidatedCandidate
 from .inputs import InputProcessor
 from .resource_profile import worker_limits, worker_tool_names
-from .review import review_fingerprint, review_request, tool_observation
+from .review import (
+    SemanticReviewFailure,
+    parse_review,
+    review_fingerprint,
+    review_request,
+    tool_observation,
+)
 from .scheduling_tools import register_scheduling_tools
 from .team_tools import register_team_tools
 from .text import visible_text
@@ -1165,6 +1171,8 @@ class WorkToolkit:
                     if isinstance(item, dict)
                     and item.get("request_sha256") == fingerprint
                     and item.get("accepted") is True
+                    and item.get("content_passed") is True
+                    and item.get("group_reply_passed") is True
                     and item.get("finish_reason") == "stop"
                 ),
                 None,
@@ -1192,14 +1200,9 @@ class WorkToolkit:
             ),
         )
         result = await review.complete(request)
-        try:
-            assessment = json.loads(result.text or "")
-        except ValueError:
-            assessment = None
-        passed = assessment.get("passed") if isinstance(assessment, dict) else None
-        passed = passed if type(passed) is bool else None
-        raw_reason = assessment.get("reason") if isinstance(assessment, dict) else None
-        reason = redact_credentials(raw_reason) if isinstance(raw_reason, str) else None
+        assessment = parse_review(result.text)
+        passed = assessment.passed if assessment is not None else None
+        reason = assessment.reason if assessment is not None else None
         evidence = {
             "execution_intent": _execution_intent(work),
             "goal_revision": lease.goal_revision,
@@ -1208,6 +1211,8 @@ class WorkToolkit:
             "candidate_sha256": candidate_sha256,
             "request_sha256": fingerprint,
             "passed": passed,
+            "content_passed": assessment.content_passed if assessment is not None else None,
+            "group_reply_passed": assessment.group_reply_passed if assessment is not None else None,
             "accepted": result.finish_reason == "stop" and passed is True,
             "reason": reason[:1200] if reason is not None else None,
             "reason_truncated": reason is not None and len(reason) > 1200,
@@ -1238,12 +1243,14 @@ class WorkToolkit:
                 attempt_id=lease.attempt_id,
                 version_ids=evidence["version_ids"],
                 passed=passed,
+                content_passed=evidence["content_passed"],
+                group_reply_passed=evidence["group_reply_passed"],
                 accepted=evidence["accepted"],
                 finish_reason=result.finish_reason,
                 response_sha256=evidence["response_sha256"],
                 request_sha256=fingerprint,
             )
-        if passed is None:
+        if assessment is None:
             raise DomainError(
                 "validation_failed", "Independent review did not return a valid result"
             )
@@ -1253,10 +1260,12 @@ class WorkToolkit:
                 "Independent review did not complete (finish_reason=" + result.finish_reason + ")",
             )
         if passed is not True:
-            raise DomainError(
-                "validation_failed",
-                "Independent review found incomplete content: "
-                + (reason[:1000] if reason is not None else "No textual reason returned"),
+            raise SemanticReviewFailure(
+                assessment,
+                work_id=work.id,
+                goal_revision=lease.goal_revision,
+                candidate_sha256=candidate_sha256,
+                request_sha256=fingerprint,
             )
 
     async def validate(
