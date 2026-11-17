@@ -10,13 +10,22 @@ from uuid import uuid4
 
 import pytest
 
-from groupagent.domain import ActorContext, DeliveryState, DomainError, Role, WorkState
+from groupagent.domain import (
+    ActorContext,
+    DeliveryState,
+    DomainError,
+    EventKind,
+    GroupEvent,
+    Role,
+    WorkState,
+)
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.scheduling import (
     AtTiming,
     DailyTiming,
     EveryTiming,
     OccurrenceState,
+    PreparedMessage,
     Scheduler,
     ScheduleState,
     WeeklyTiming,
@@ -112,6 +121,60 @@ def test_latest_only_catchup_creates_one_work_atomically(
         assert source.occurred_at == occurrence.scheduled_at
         assert tx.get_decision(source.id) is not None
         assert tx.list_pending_events() == []
+
+
+def test_only_verified_future_goals_can_allow_silent_results(
+    store: PostgresStore, scheduler: Scheduler, actor: ActorContext
+) -> None:
+    request = GroupEvent(
+        id=uuid4().hex,
+        source_key="synthetic-silent-schedule:" + uuid4().hex,
+        group_id=actor.group_id,
+        actor_id=actor.member_id,
+        kind=EventKind.TEXT,
+        text="每小时重新查看，没新情况就别出声。",
+        occurred_at=START,
+        received_at=START,
+    )
+    with store.transaction(actor) as tx:
+        tx.ingest_event(request, stream_id=request.id, cursor="1", expected_cursor_revision=0)
+    with pytest.raises(DomainError, match="verified request"):
+        hourly(scheduler, actor, allow_silent_result=True)
+    with pytest.raises(DomainError, match="Only a future goal"):
+        scheduler.create(
+            actor,
+            "Prepared synthetic text",
+            None,
+            EveryTiming(interval_seconds=3600),
+            now=START,
+            prepared_message=PreparedMessage(text="没新情况就别出声"),
+            authorization_event_id=request.id,
+            allow_silent_result=True,
+        )
+    rule = hourly(scheduler, actor, allow_silent_result=True, authorization_event_id=request.id)
+    rule = scheduler.update(
+        actor,
+        rule.id,
+        expected_revision=rule.revision,
+        timing=EveryTiming(interval_seconds=7200),
+        now=START,
+    )
+    assert rule.scope["allow_silent_result_source_id"] == request.id
+    assert scheduler.facts(actor, schedule_id=rule.id)[0].allow_silent_result
+    occurrence = scheduler.wake(actor, START + timedelta(hours=2))[0]
+    assert occurrence.work_id
+    with store.transaction(actor) as tx:
+        assert tx.get_work(occurrence.work_id).scope["allow_silent_result"] is True
+    current = scheduler.get(actor, rule.id)
+    revised = scheduler.update(
+        actor,
+        rule.id,
+        expected_revision=current.revision,
+        allow_silent_result=False,
+        now=START,
+    )
+    assert "allow_silent_result" not in revised.scope
+    assert "allow_silent_result_source_id" not in revised.scope
 
 
 def test_restart_concurrent_scanners_and_clock_rollback_do_not_duplicate(

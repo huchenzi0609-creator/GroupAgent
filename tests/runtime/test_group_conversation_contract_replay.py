@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from conversation.turn_model_fixture import finish_fixture_reply
 
 from groupagent.config import AppConfig, GroupConfig
 from groupagent.conversation.provider import ModelDecisionProvider
@@ -45,39 +46,18 @@ class DialogueModel:
     def __init__(self, *steps, recipient="agent", required=(), work_context=False):
         self.steps = list(steps)
         self.normal_requests = []
-        self.assessment = {
-            "recipient": recipient,
-            "intent": "action"
-            if required
-            else "observe"
-            if recipient != "agent"
-            else "conversation",
-            "required_actions": [{"kind": name} for name in required],
-            "work_context_required": work_context,
-        }
+        self.recipient = recipient
 
     async def complete(self, request):
-        marker = request.messages[0].content or ""
-        if marker.startswith("TURN_CONTRACT_V1"):
-            return reply(json.dumps(self.assessment))
-        if marker.startswith("TURN_OUTCOME_V1"):
-            payload = json.loads(request.messages[1].content)
-            committed = any(row.get("committed") is True for row in payload["host_receipts"])
-            ordinary = self.assessment["intent"] == "conversation"
-            return reply(
-                json.dumps(
-                    {
-                        "outcome": "committed" if committed or ordinary else "missing_evidence",
-                        "explanation": "Synthetic assessment: a public lookup can proceed using the available tools.",
-                        "required_actions": self.assessment["required_actions"],
-                        "reply_required": self.assessment["recipient"] == "agent",
-                    }
-                )
-            )
         self.normal_requests.append(request)
+        if self.recipient != "agent" and not self.steps:
+            return tool("finish_turn", {"disposition": "observe"})
         assert self.steps, "Unexpected extra model or repair turn"
         step = self.steps.pop(0)
-        return step(request) if callable(step) else step
+        result = step(request) if callable(step) else step
+        return (
+            result if result.text == "我现在去网上搜。" else finish_fixture_reply(request, result)
+        )
 
 
 def observation(request):
@@ -228,7 +208,7 @@ async def test_complete_redacted_group_dialogue_preserves_silence_style_and_real
     def casual(text):
         def check(request):
             context = json.loads(request.messages[1].content)["context"]
-            assert "works" not in context and "work_facts_overview" not in context
+            assert context["trusted_routing"]["recipient"] == "agent"
             assert "短句" in request.messages[0].content
             return reply(text)
 
@@ -253,7 +233,7 @@ async def test_complete_redacted_group_dialogue_preserves_silence_style_and_real
         silent = DialogueModel(recipient="other")
         _, result, before = await r.say(text, silent, **values)
         assert result.decision.kind in {"observe", "ignore"} and not result.delivery_id
-        assert len(r.works()) == before and not silent.normal_requests
+        assert len(r.works()) == before and len(silent.normal_requests) == 1
 
     lookup_goal = "公开检索Polaris Studio官网，核实官方下载入口及Windows和Mac安装步骤。"
     promise = "我现在去网上搜。"

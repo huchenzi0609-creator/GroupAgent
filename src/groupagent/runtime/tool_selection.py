@@ -23,6 +23,7 @@ from groupagent.conversation.intent import (
     task_write_request,
 )
 from groupagent.domain import ActorContext, DomainError, Role, WorkOrder
+from groupagent.evolution import EVOLUTION_OWNER_TOOLS, EVOLUTION_TOOLS
 from groupagent.identity import DEFAULT_IDENTITY, BotIdentity
 from groupagent.scheduling.reminders import get_reminder_body
 
@@ -210,6 +211,10 @@ def authorized_tools(
     eligible = _names(registered_names)
     selected = set(eligible)
     derived = _derived(work)
+    if derived:
+        selected.difference_update(EVOLUTION_TOOLS)
+    elif actor.role != Role.OWNER:
+        selected.difference_update(EVOLUTION_OWNER_TOOLS)
     if derived or work.scope.get("team_task_write_allowed") is not True:
         selected.difference_update(_TEAM_WRITES)
     if derived or work.scope.get("schedule_creation_allowed") is not True:

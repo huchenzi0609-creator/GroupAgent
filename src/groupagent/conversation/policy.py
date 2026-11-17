@@ -11,10 +11,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from groupagent.domain import ActorContext, DeliveryIntent, EventKind, GroupEvent
+from groupagent.domain import (
+    ActorContext,
+    DeliveryIntent,
+    DomainError,
+    EventKind,
+    GroupEvent,
+    WorkOrder,
+)
 from groupagent.identity import DEFAULT_IDENTITY, BotIdentity
 from groupagent.memory.common import memory_lock
 from groupagent.persistence import UnitOfWork
+from groupagent.scheduling.reminders import get_reminder_body
+from groupagent.scheduling.service import VERIFIED_SCHEDULE_ORIGINS
 
 from .quiet import is_quiet
 from .text import EXPLANATION, outside_quotes
@@ -428,6 +437,58 @@ def delivery_admission_in_tx(
     shared_account: bool = False,
 ) -> DeliveryAdmission:
     """Derive purpose from durable provenance, never from model labels."""
+    if intent.idempotency_key.startswith("react-observer:"):
+        requester = tx.conn.execute(
+            "SELECT e.actor_id FROM ga_react_observations o JOIN ga_events e "
+            "ON e.group_id=o.group_id AND e.id=o.source_event_id "
+            "WHERE o.group_id=%s AND o.delivery_id=%s AND o.state='published'",
+            (tx.group_id, intent.id),
+        ).fetchone()
+        if requester is None:
+            return DeliveryAdmission(False, "observer_source_unavailable", retire=True)
+        policies = _policies(tx, requester["actor_id"])
+        mode = next((row["mode"] for row in policies if row["subject_id"] == "*"), default_mode)
+        if mode != "natural":
+            return DeliveryAdmission(False, "observer_participation_changed", retire=True)
+        quiet = is_quiet(policies, now or datetime.now(UTC), time_zone, quiet_hours)
+        return DeliveryAdmission(not quiet, "quiet_hold" if quiet else "policy_allows")
+    if (
+        intent.work_id is None
+        and intent.request_event_id is None
+        and intent.idempotency_key.startswith("schedule-occurrence:")
+    ):
+        policies = _policies(tx, intent.created_by)
+        scheduled = tx.conn.execute(
+            "SELECT o.id,o.delivery_purpose,s.creator_id,s.state,s.valid_until,s.policy_revision "
+            "FROM ga_schedule_occurrences o JOIN ga_schedules s "
+            "ON s.group_id=o.group_id AND s.id=o.schedule_id "
+            "WHERE o.group_id=%s AND o.delivery_id=%s",
+            (tx.group_id, intent.id),
+        ).fetchone()
+        if (
+            scheduled is None
+            or scheduled["creator_id"] != intent.created_by
+            or intent.idempotency_key != "schedule-occurrence:" + scheduled["id"]
+            or not intent.payload_ref.startswith("text:")
+        ):
+            return DeliveryAdmission(False, "invalid_schedule_delivery", retire=True)
+        current = now or datetime.now(UTC)
+        if scheduled["state"] == "cancelled":
+            return DeliveryAdmission(False, "schedule_cancelled", retire=True)
+        if scheduled["policy_revision"] != intent.policy_revision:
+            return DeliveryAdmission(False, "schedule_policy_changed", retire=True)
+        if current > scheduled["valid_until"]:
+            return DeliveryAdmission(False, "schedule_validity_expired", retire=True)
+        if scheduled["state"] == "paused":
+            return DeliveryAdmission(False, "schedule_paused")
+        return _scheduled_quiet(
+            policies,
+            current,
+            time_zone,
+            quiet_hours,
+            default_mode,
+            explicit=scheduled["delivery_purpose"] == "explicit_reminder",
+        )
     notice = tx.conn.execute(
         "SELECT work_id FROM ga_progress_notices WHERE group_id=%s AND intent_id=%s",
         (tx.group_id, intent.id),
@@ -449,6 +510,14 @@ def delivery_admission_in_tx(
         saved_contract = body.get("turn_contract")
         if saved_contract is not None and not TurnContract.model_validate(saved_contract).visible:
             return DeliveryAdmission(False, "turn_not_addressed_to_agent", retire=True)
+        saved_result = body.get("result")
+        saved_decision = saved_result.get("decision") if isinstance(saved_result, dict) else None
+        if (
+            not body.get("agent_pending_response")
+            and isinstance(saved_decision, dict)
+            and saved_decision.get("kind") in ("observe", "ignore")
+        ):
+            return DeliveryAdmission(False, "turn_not_addressed_to_agent", retire=True)
         admission = ingress_admission(
             tx,
             tx.get_event(intent.request_event_id),
@@ -464,11 +533,77 @@ def delivery_admission_in_tx(
             admission.allowed, admission.reason_code, retire=not admission.allowed
         )
     policies = _policies(tx, work.requester_id if work else intent.created_by)
+    if work and not notice and work.scope.get("origin_schedule_id"):
+        return _scheduled_quiet(
+            policies,
+            now or datetime.now(UTC),
+            time_zone,
+            quiet_hours,
+            default_mode,
+            explicit=_exact_legacy_reminder(tx, intent, work),
+        )
     mode = next((row["mode"] for row in policies if row["subject_id"] == "*"), default_mode)
     held = mode in {"paused", "disabled"} or is_quiet(
         policies, now or datetime.now(UTC), time_zone, quiet_hours
     )
     return DeliveryAdmission(not held, "quiet_hold" if held else "policy_allows")
+
+
+def _scheduled_quiet(
+    policies: list[dict],
+    now: datetime,
+    time_zone: str,
+    quiet_hours: list[str] | None,
+    default_mode: str,
+    *,
+    explicit: bool,
+) -> DeliveryAdmission:
+    group_policies = [row for row in policies if row["subject_id"] == "*"]
+    mode = group_policies[0]["mode"] if group_policies else default_mode
+    if mode in {"paused", "disabled"}:
+        return DeliveryAdmission(False, "group_" + mode)
+    if is_quiet(group_policies, now, time_zone, quiet_hours):
+        return DeliveryAdmission(False, "group_quiet_hold")
+    if not explicit and is_quiet(policies, now, time_zone, quiet_hours):
+        return DeliveryAdmission(False, "quiet_hold")
+    return DeliveryAdmission(True)
+
+
+def _exact_legacy_reminder(tx: UnitOfWork, intent: DeliveryIntent, work: WorkOrder) -> bool:
+    """Recognize only an existing scheduled WorkOrder delivering its exact authorized body."""
+    try:
+        body = get_reminder_body(work.scope)
+    except DomainError:
+        return False
+    if not body or intent.payload_ref not in {"text:" + body, "text:提醒：" + body}:
+        return False
+    occurrence = tx.conn.execute(
+        "SELECT 1 FROM ga_schedule_occurrences WHERE group_id=%s AND work_id=%s "
+        "AND id=%s AND schedule_id=%s",
+        (
+            tx.group_id,
+            work.id,
+            work.scope.get("origin_occurrence_id"),
+            work.scope["origin_schedule_id"],
+        ),
+    ).fetchone()
+    if not occurrence:
+        return False
+    source_id = work.scope["reminder_body_source_event_id"]
+    fingerprints = work.scope.get("source_fingerprints")
+    if not isinstance(source_id, str) or not isinstance(fingerprints, dict):
+        return False
+    try:
+        source = tx.get_event(source_id)
+    except DomainError:
+        return False
+    return (
+        source.actor_id == work.requester_id
+        and source.trusted_actor_origin in VERIFIED_SCHEDULE_ORIGINS
+        and source.content_state == "active"
+        and body in source.text
+        and tx.event_fingerprint(source_id) == fingerprints.get(source_id)
+    )
 
 
 def retire_delivery_in_tx(tx: UnitOfWork, intent_id: str, *, reason: str = "quiet_barrier") -> None:

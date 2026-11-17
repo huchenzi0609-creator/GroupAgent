@@ -5,7 +5,7 @@ umask 077
 archive=${1:?Pass the reviewed public-source/dependency archive}
 test -f "$archive"
 release=/opt/pot-test2/releases/source-$(date -u +%Y%m%dT%H%M%SZ)
-install -d -m 700 "$release/source"
+install -d -m 700 "$release" "$release/source"
 cp /etc/pot-test2/config.json "$release/config.before.json"
 cp /opt/pot-test2/worker.iid "$release/image.before"
 tar -czf "$release/source.before.tar.gz" -C /opt/pot-test2/app src/groupagent
@@ -19,6 +19,10 @@ root=Path(sys.argv[1])
 m=json.loads((root/'manifest.json').read_text())
 assert m['schema']=='pot.standard-core.release.v1'
 assert m['local_gates_passed'] is True and m['dependency_arch']=='x86_64'
+rollout=m.get('react_rollout',{})
+assert isinstance(rollout,dict) and set(rollout)<= {'proactive_mode','evolution_enabled'}
+assert rollout.get('proactive_mode','off') in ('off','shadow','active')
+assert type(rollout.get('evolution_enabled',False)) is bool
 files={str(p.relative_to(root)).replace('\\','/'):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((root/'src/groupagent').rglob('*.py'))}
 actual=hashlib.sha256(json.dumps(files,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 assert actual==m['product_source_sha256'], 'Source differs from accepted release'
@@ -34,6 +38,8 @@ if test -d "$release/source/deps"; then
 fi
 previous=$(cat "$release/image.before")
 [[ "$previous" =~ ^sha256:[a-f0-9]{64}$ ]]
+rollout=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("react_rollout",{}),sort_keys=True))' "$release/source/manifest.json")
+react_flags=()
 # Prove the actual non-root runtime can read the public package before stopping
 # the existing sender. Bind only public package trees, never release backups.
 public_mounts=(--mount "type=bind,src=$release/source/src/groupagent,dst=/groupagent,readonly")
@@ -70,8 +76,53 @@ PY
 )
 test "$pg_bin" = /opt/pot-test2/postgresql/bin
 chown 994:990 "$release/config.before.canonical.json"
+cp "$release/config.before.canonical.json" "$release/config.rollback.json"
+chown 994:990 "$release/config.rollback.json"
 group_hash=$(cat /etc/pot-test2/group.sha256)
 [[ "$group_hash" =~ ^[a-f0-9]{64}$ ]]
+
+if [[ "$rollout" != '{}' ]]; then
+  test "$rollout" = '{"evolution_enabled": true, "proactive_mode": "shadow"}'
+  react_flags=(--react-test-rollout)
+  rollback_helper=${2:?Pass the reviewed rollback bridge builder for a ReAct rollout}
+  test -f "$rollback_helper"
+  python3 - "$release/source/manifest.json" "$rollback_helper" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+m=json.loads(Path(sys.argv[1]).read_text())
+assert hashlib.sha256(Path(sys.argv[2]).read_bytes()).hexdigest()==m['rollback_preparer_sha256']
+PY
+  install -d -m 700 "$release/rollback-base" "$release/rollback-build"
+  docker cp "$old_container:/usr/local/lib/python3.13/site-packages/groupagent" \
+    "$release/rollback-base/groupagent"
+  docker run --rm --pull=never --network=none --read-only --cap-drop=ALL \
+    --security-opt=no-new-privileges:true --memory=128m --memory-swap=128m --cpus=0.25 \
+    --mount "type=bind,src=$release/rollback-base,dst=/legacy,readonly" \
+    --mount "type=bind,src=$release/rollback-build,dst=/output" \
+    --mount "type=bind,src=$rollback_helper,dst=/prepare.py,readonly" \
+    --entrypoint python3 "$previous" -I /prepare.py /legacy/groupagent /output/overlay \
+    > "$release/rollback-bridge-proof.json"
+  {
+    printf 'FROM %s\n' "$previous"
+    printf 'COPY groupagent /usr/local/lib/python3.13/site-packages/groupagent\n'
+  } > "$release/rollback-build/overlay/Dockerfile"
+  DOCKER_BUILDKIT=0 docker build --network=none --memory=256m --memory-swap=256m \
+    --cpu-period=100000 --cpu-quota=25000 --iidfile "$release/image.rollback" \
+    "$release/rollback-build/overlay" > "$release/rollback-build.log" 2>&1
+  bridge=$(cat "$release/image.rollback")
+  [[ "$bridge" =~ ^sha256:[a-f0-9]{64}$ ]]
+  python3 - "$release/config.before.canonical.json" "$bridge" <<'PY' > "$release/config.rollback.json"
+import json,sys
+original=json.load(open(sys.argv[1]))
+original['runtime']['worker_image']=sys.argv[2]
+print(json.dumps(original,indent=2))
+PY
+  docker run --rm --pull=never --network=none --read-only --cap-drop=ALL \
+    --security-opt=no-new-privileges:true --memory=256m --memory-swap=256m --cpus=0.25 \
+    --user=994:990 --entrypoint python3 "$bridge" -I -c \
+    'from groupagent.runtime.app import RuntimeApp; from groupagent.scheduling.service import Scheduler' \
+    > "$release/rollback-import.log"
+fi
 
 maintenance() {
   local image=$1
@@ -86,6 +137,7 @@ maintenance() {
     --mount type=bind,src=/var/lib/pot-test2,dst=/var/lib/pot-test2 \
     --mount type=bind,src="$release/config.before.canonical.json",dst=/before.json,readonly \
     --mount type=bind,src="$release/config.after.json",dst=/after.json,readonly \
+    --mount type=bind,src="$release/config.rollback.json",dst=/rollback.json,readonly \
     --entrypoint python3 "$image" -I "$@"
 }
 
@@ -128,6 +180,7 @@ PY
 candidate_started=false
 handoff_applied=false
 source_replaced=false
+migration_attempted=false
 rollback() {
   trap - ERR
   set +e
@@ -151,16 +204,44 @@ rollback() {
         return 1
       }
   fi
-  if $handoff_applied; then
-    maintenance "$next" -m groupagent.ops.release --before-config /after.json \
-      --after-config /before.json --dsn-file /etc/pot-test2/database.dsn \
-      --expected-digest "$new_digest" > "$release/rollback-handoff.log" 2>&1 || {
+  local restore_image=$previous restore_file="$release/config.before.json"
+  local restore_target=/before.json
+  if $migration_attempted && test -f "$release/image.rollback"; then
+    restore_image=$(cat "$release/image.rollback")
+    restore_file="$release/config.rollback.json"
+    restore_target=/rollback.json
+  fi
+  if $handoff_applied || [[ "$restore_target" == /rollback.json ]]; then
+    local stored from=/before.json expected=$old_digest
+    local reverse_flags=()
+    stored=$(maintenance "$next" -c '
+from pathlib import Path
+from groupagent.config import AppConfig
+from groupagent.persistence import PostgresStore
+c=AppConfig.model_validate_json(Path("/before.json").read_text())
+s=PostgresStore(Path("/etc/pot-test2/database.dsn").read_text().strip())
+with s.connect() as conn:
+ conn.read_only=True
+ print(conn.execute("SELECT sha256 FROM ga_runtime_configuration WHERE group_id=%s",(c.group.internal_id,)).fetchone()["sha256"])
+') || return 1
+    if $handoff_applied && [[ "$stored" == "$new_digest" ]]; then
+      from=/after.json
+      expected=$new_digest
+      reverse_flags=("${react_flags[@]}")
+    elif [[ "$stored" != "$old_digest" ]]; then
+      echo POT_ROLLBACK_UNEXPECTED_CONFIGURATION >&2
+      return 1
+    fi
+    maintenance "$next" -m groupagent.ops.release --before-config "$from" \
+      --after-config "$restore_target" --dsn-file /etc/pot-test2/database.dsn \
+      --expected-digest "$expected" "${reverse_flags[@]}" \
+      > "$release/rollback-handoff.log" 2>&1 || {
         echo POT_ROLLBACK_HANDOFF_NEEDS_ATTENTION >&2
         return 1
       }
   fi
-  cp "$release/image.before" /opt/pot-test2/worker.iid
-  cp "$release/config.before.json" /etc/pot-test2/config.json
+  printf '%s\n' "$restore_image" > /opt/pot-test2/worker.iid
+  cp "$restore_file" /etc/pot-test2/config.json
   chown 994:990 /etc/pot-test2/config.json
   chmod 600 /etc/pot-test2/config.json
   if $source_replaced; then
@@ -266,6 +347,7 @@ next=$(cat "$release/image.after")
 maintenance "$next" -c 'from importlib.metadata import version; from groupagent.runtime.app import RuntimeApp; assert version("langchain")=="1.5.0"; assert version("langgraph")=="1.2.22"; assert version("markdown-it-py")=="4.3.0"; assert version("mdurl")=="0.1.2"; print("standard_core_and_text_renderer_import_verified")' > "$release/import-check.log"
 # Explicit migration boundary: the original schema/receipts are already backed
 # up and verified. Nullable frozen text must neither backfill nor rewrite them.
+migration_attempted=true
 maintenance "$next" -c '
 import hashlib,json
 from pathlib import Path
@@ -284,13 +366,22 @@ def frozen():
   if not exists: return None
   rows=conn.execute("SELECT jsonb_build_array(group_id,intent_id,position)::text AS key,rendered_text FROM ga_delivery_parts WHERE group_id=%s",(c.group.internal_id,)).fetchall()
   return {row["key"]:row["rendered_text"] for row in rows}
+def legacy_schedule_state():
+ with s.connect() as conn:
+  conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+  rules=conn.execute("SELECT id,(to_jsonb(s)-%s)::text AS body FROM ga_schedules s WHERE group_id=%s",("execution_kind",c.group.internal_id)).fetchall()
+  occurrences=conn.execute("SELECT id,(to_jsonb(o)-%s::text[])::text AS body FROM ga_schedule_occurrences o WHERE group_id=%s",(["delivery_id","delivery_purpose","delivery_sources"],c.group.internal_id)).fetchall()
+  return ({r["id"]:hashlib.sha256(r["body"].encode()).hexdigest() for r in rules},
+          {r["id"]:hashlib.sha256(r["body"].encode()).hexdigest() for r in occurrences})
 with s.connect() as conn:
  before_version=conn.execute("SELECT max(version) AS version FROM ga_schema_migrations").fetchone()["version"]
 before=parts()
 before_frozen=frozen()
+legacy_schedules=legacy_schedule_state()
 version=s.migrate()
 after=parts()
 assert before==after,"Migration changed an existing part, receipt, key or payload hash"
+assert legacy_schedules==legacy_schedule_state(),"Migration changed legacy rules or occurrences"
 if before_frozen is not None:
  assert before_frozen==frozen(),"Migration rewrote already frozen wire text"
 with s.connect() as conn:
@@ -300,9 +391,23 @@ with s.connect() as conn:
   frozen=conn.execute("SELECT count(*) AS count FROM ga_delivery_parts WHERE group_id=%s AND rendered_text IS NOT NULL",(c.group.internal_id,)).fetchone()["count"]
   assert frozen==0,"Migration backfilled legacy text"
  assert version>=16
-print(json.dumps({"schema_before":before_version,"schema_after":version,"legacy_parts":len(before),"legacy_part_rows_and_receipts_unchanged":True,"nullable_frozen_text_verified":True,"legacy_backfill":False}))
+print(json.dumps({"schema_before":before_version,"schema_after":version,"legacy_parts":len(before),"legacy_part_rows_and_receipts_unchanged":True,"legacy_schedules":len(legacy_schedules[0]),"legacy_occurrences":len(legacy_schedules[1]),"legacy_schedule_rows_unchanged":True,"nullable_frozen_text_verified":True,"legacy_backfill":False}))
 ' > "$release/migration-verified.json" 2> "$release/migration.log"
-maintenance "$next" -c 'import json,sys; from pathlib import Path; from groupagent.config import AppConfig; d=json.loads(Path("/before.json").read_text()); d["runtime"].update(engine="langgraph",worker_image=sys.argv[1],harness_image=None); d["engine"].update(candidate="langgraph",approved_runtime_version="langchain1.5.0/langgraph1.2.22"); print(AppConfig.model_validate(d).model_dump_json(indent=2))' "$next" > "$release/config.after.pending.json"
+# Materialize the reviewed candidate configuration only after migration verification.
+maintenance "$next" -c '
+import json,sys
+from pathlib import Path
+from groupagent.config import AppConfig
+d=json.loads(Path("/before.json").read_text())
+d["runtime"].update(engine="langgraph",worker_image=sys.argv[1],harness_image=None)
+d["engine"].update(candidate="langgraph",approved_runtime_version="langchain1.5.0/langgraph1.2.22")
+rollout=json.loads(sys.argv[2])
+if "proactive_mode" in rollout:
+ d["conversation"]["proactive_mode"]=rollout["proactive_mode"]
+if "evolution_enabled" in rollout:
+ d["runtime"]["evolution_enabled"]=rollout["evolution_enabled"]
+print(AppConfig.model_validate(d).model_dump_json(indent=2))
+' "$next" "$rollout" > "$release/config.after.pending.json"
 chown 994:990 "$release/config.after.pending.json"
 mv "$release/config.after.pending.json" "$release/config.after.json"
 new_digest=$(python3 - "$release/config.after.json" <<'PY'
@@ -315,7 +420,7 @@ PY
 handoff_applied=true
 maintenance "$next" -m groupagent.ops.release --before-config /before.json \
   --after-config /after.json --dsn-file /etc/pot-test2/database.dsn \
-  --expected-digest "$old_digest" > "$release/configuration-handoff.json"
+  --expected-digest "$old_digest" "${react_flags[@]}" > "$release/configuration-handoff.json"
 # Record physical quiescence only; runtime reconciles each isolated effect separately.
 maintenance "$next" -c 'from pathlib import Path; from groupagent.config import AppConfig; from groupagent.domain import ActorContext,Role; from groupagent.persistence import PostgresStore; from groupagent.runtime.checkpoint_codec import decode_checkpoint; from groupagent.tools.models import EffectState; c=AppConfig.model_validate_json(Path("/after.json").read_text()); s=PostgresStore(Path("/etc/pot-test2/database.dsn").read_text().strip()); a=ActorContext(group_id=c.group.internal_id,member_id=c.group.owner_ids[0],role=Role.OWNER,policy_revision=c.group.policy_revision)
 with s.transaction(a) as tx:

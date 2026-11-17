@@ -24,8 +24,10 @@ async def accepted_reply(env, app):
 async def test_echo_uses_control_lane_without_idle_batch_or_history(runtime_env, monkeypatch):
     env = runtime_env
     app, model, _ = setup_chat(env)
+    model.text = "我叫Pot。"
     try:
         message_id = await accepted_reply(env, app)
+        assert len(model.requests) == 1
 
         def forbidden(*args):
             raise AssertionError("A verified echo must not reconstruct conversation history")
@@ -36,7 +38,7 @@ async def test_echo_uses_control_lane_without_idle_batch_or_history(runtime_env,
         assert await app.process_pending(controls_only=True) == 1
         with env.store.transaction(env.actor) as tx:
             assert tx.get_decision(echo.id)["result"]["decision"]["kind"] == "ignore"
-        assert model.requests == []
+        assert len(model.requests) == 1
         assert len(list((env.root / "channel/outgoing").glob("*.json"))) == 1
     finally:
         await app.close()

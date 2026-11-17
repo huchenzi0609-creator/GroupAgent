@@ -138,7 +138,7 @@ async def test_candidate_maintenance_reader_supports_pre16_backup_and_additive_u
                 "SELECT * FROM ga_delivery_parts WHERE intent_id=%s", (intent.id,)
             ).fetchone()
             old_checksums = tx.conn.execute(
-                "SELECT * FROM ga_schema_migrations ORDER BY version"
+                "SELECT * FROM ga_schema_migrations WHERE version<=15 ORDER BY version"
             ).fetchall()
             assert not has_rendered_text(tx.conn)
         memory = MemoryService(store)
@@ -149,7 +149,7 @@ async def test_candidate_maintenance_reader_supports_pre16_backup_and_additive_u
         manager = BackupManager(store, tmp_path / "before-migration", pg_bin)
         backup = manager.create(actor)
         assert manager.verify(actor, backup.id).archive_bytes > 0
-        assert store.migrate() == 16
+        assert store.migrate() == 19
         with store.transaction(actor) as tx:
             after = tx.conn.execute(
                 "SELECT * FROM ga_delivery_parts WHERE intent_id=%s", (intent.id,)

@@ -833,11 +833,14 @@ class ContextBuilder:
                         continue
                     if hit.kind in {"fact", "decision"}:
                         fact = tx.conn.execute(
-                            "SELECT revision,predicate,value FROM ga_memory_facts WHERE group_id=%s AND id=%s AND state='active'",
+                            "SELECT revision,predicate,value,subject_id FROM ga_memory_facts "
+                            "WHERE group_id=%s AND id=%s AND state='active'",
                             (tx.group_id, hit.id),
                         ).fetchone()
                         if fact:
                             item.update(fact)
+                            if item["subject_id"] == actor.group_id:
+                                item["subject_id"] = None
                     original_items.append(item)
                     memory_items.append(
                         {
@@ -853,6 +856,7 @@ class ContextBuilder:
                                     "revision",
                                     "predicate",
                                     "value",
+                                    "subject_id",
                                     "validity",
                                     "retrieval_reason",
                                     "incomplete",
@@ -1008,7 +1012,11 @@ class ContextBuilder:
                 or member.display_name != "群昵称待补充"
                 and member.display_name in text_for_names
             ]
-            all_ids = sorted({member.member_id for member in member_rows} | selected_actor_ids)
+            all_ids = sorted(
+                {member.member_id for member in member_rows}
+                | selected_actor_ids
+                | {row["subject_id"] for row in memory_items if row.get("subject_id")}
+            )
             aliases = {f"member_{i + 1}": member_id for i, member_id in enumerate(all_ids)}
             inverse = {member_id: alias for alias, member_id in aliases.items()}
             payload = {
@@ -1134,6 +1142,11 @@ class ContextBuilder:
                 row for row in original_items if "memory:" + row["kind"] + ":" + row["id"] in keys
             ]
             snapshot = evidence.snapshot(actor, topic_id, snapshot_items, keys, input_ids)
+            snapshot["source_fact_revisions"] = {
+                row["id"]: row["revision"]
+                for row in snapshot_items
+                if row["kind"] in {"fact", "decision"} and "revision" in row
+            }
             snapshot["task_queries"] = task_queries
             snapshot["context_artifact_versions"] = [row["version_id"] for row in payload["files"]]
             kept_works = {row["id"] for row in payload["works"]}

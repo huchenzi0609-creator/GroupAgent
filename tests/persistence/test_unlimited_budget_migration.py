@@ -84,7 +84,7 @@ def test_unlimited_upgrade_retains_old_checksums_ledger_and_administrative_freez
             checksums = conn.execute(
                 "SELECT * FROM ga_schema_migrations ORDER BY version"
             ).fetchall()
-        assert store.migrate() == 16 and store.migrate() == 16
+        assert store.migrate() == 19 and store.migrate() == 19
         assert snapshot() == before
         with store.connect() as conn:
             assert (

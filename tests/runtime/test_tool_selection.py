@@ -32,7 +32,7 @@ from groupagent.runtime.tool_selection import (
     research_evidence_required,
     select_tools,
 )
-from groupagent.scheduling import AtTiming, EveryTiming, Scheduler
+from groupagent.scheduling import AtTiming, EveryTiming, ScheduleKind, Scheduler
 from groupagent.scheduling.triggers import EventTriggerService
 from groupagent.tools import ToolContext, ToolScope
 
@@ -221,7 +221,7 @@ async def test_toolkit_validated_image_refs_can_bind_the_minimal_gateway_grant(
         ("把安排改为只提醒我核对最新清单", "核对最新清单", True),
     ],
 )
-async def test_goal_change_recomputes_reminder_before_scheduled_work_selection(
+async def test_schedule_change_preserves_the_typed_payload_and_work_authority(
     runtime_env, text, goal, reminder
 ):
     env = runtime_env
@@ -234,6 +234,7 @@ async def test_goal_change_recomputes_reminder_before_scheduled_work_selection(
         "Synthetic reminder",
         "检查清单",
         EveryTiming(interval_seconds=3600),
+        request_key="chat:" + authorization.id,
         scope={"reminder_only": True, "source_fingerprints": fingerprints},
     )
     update = event(env, text)
@@ -250,7 +251,11 @@ async def test_goal_change_recomputes_reminder_before_scheduled_work_selection(
                     "op": "change_schedule",
                     "schedule_id": rule.id,
                     "expected_revision": rule.revision,
-                    "goal": goal,
+                    **(
+                        {"prepared_message": {"text": goal, "purpose": "explicit_reminder"}}
+                        if reminder
+                        else {"goal": goal}
+                    ),
                 },
             )
         },
@@ -261,23 +266,27 @@ async def test_goal_change_recomputes_reminder_before_scheduled_work_selection(
             update, stream_id="synthetic-schedule-update", cursor="1", verified_channel=True
         )
         revised = scheduler.get(env.actor, rule.id)
-        assert revised.goal == goal and revised.scope["reminder_only"] is reminder
+        assert revised.goal == goal
+        assert revised.execution_kind == (
+            ScheduleKind.EXPLICIT_REMINDER if reminder else ScheduleKind.GOAL
+        )
+        assert "reminder_only" not in revised.scope
         assert revised.next_due_at is not None
         occurrence = scheduler.due(env.actor, revised.next_due_at)[0]
         with env.store.transaction(env.actor) as tx:
-            current = tx.get_work(occurrence.work_id)
-        selected = admitted(current)
-        if reminder:
-            expected = (
-                frozenset()
-                if current.scope.get("reminder_body_literal") is True
-                else {"request_input"}
-            )
-            assert selected == expected
-        else:
-            assert selected != frozenset() and selected != {"request_input"}
-        if not reminder:
-            assert {"web_search", "web_fetch"} <= selected
+            if reminder:
+                assert occurrence.work_id is None and occurrence.delivery_id is not None
+                assert set(occurrence.delivery_sources) == {authorization.id, update.id}
+                assert tx.list_work() == []
+                assert tx.get_delivery(occurrence.delivery_id).payload_ref == "text:" + goal
+            else:
+                assert occurrence.work_id is not None and occurrence.delivery_id is None
+                current = tx.get_work(occurrence.work_id)
+                assert current.requester_id == env.actor.member_id and current.goal == goal
+                assert current.scope["origin_schedule_id"] == rule.id
+                selected = admitted(current)
+                assert {"web_search", "web_fetch"} <= selected
+                assert not selected & (TEAM_WRITES | SCHEDULE_WRITES)
         assert not models
     finally:
         await app.close()

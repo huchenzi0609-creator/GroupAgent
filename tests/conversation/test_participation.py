@@ -23,14 +23,7 @@ from groupagent.coordinator import Decision
 from groupagent.domain import EventKind, GroupEvent
 from groupagent.execution.models import ModelReply, TokenUsage
 
-from .turn_model_fixture import semantic_fixture_reply
-
-
-class NeverCalledFixtureModel:
-    name = "explicit-no-provider-expected"
-
-    async def complete(self, request):
-        raise AssertionError("This proven participation decision must not call a provider")
+from .test_react_turn import ModelScript, finish
 
 
 class RecipientCandidateFixtureModel:
@@ -44,16 +37,6 @@ class RecipientCandidateFixtureModel:
             "confidence": 0.95,
             **candidate,
         }
-
-    async def complete(self, request):
-        self.requests.append(request)
-        assessed = semantic_fixture_reply(request, recipient="other", intent="observe")
-        if assessed is not None:
-            return assessed
-        return ModelReply(
-            text=json.dumps(self.candidate, ensure_ascii=False),
-            usage=TokenUsage(input_tokens=100, output_tokens=50),
-        )
 
 
 def validate_declaration(model, source, ctx):
@@ -118,12 +101,12 @@ def context(role="member"):
     ],
 )
 async def test_verified_other_member_address_reaches_router_then_non_declaration_stays_silent(text):
-    model = RecipientCandidateFixtureModel(kind="reply", response="Synthetic unsolicited reply")
+    model = ModelScript(finish("Synthetic unsolicited reply"), finish(disposition="observe"))
     assert fast_observe(event(text), context()) is None
     assert verified_human_addressee(text, context()) == "other"
     result = await ModelDecisionProvider(model).decide(event(text), context())
     assert result.kind == "observe" and result.action is None
-    assert result.directness == "other" and len(model.requests) == 1
+    assert len(model.requests) == 2
 
 
 @pytest.mark.parametrize("role", ["member", "owner"])
@@ -176,7 +159,7 @@ async def test_verified_recipient_keeps_owned_progress_and_owner_assignment_sile
 )
 async def test_verified_human_direction_cannot_be_overridden_by_model_direct_label(candidate):
     model = RecipientCandidateFixtureModel(**candidate)
-    result = await ModelDecisionProvider(model).decide(event("夏禾，请你处理这件事。"), context())
+    result = validate_declaration(model, event("夏禾，请你处理这件事。"), context())
     assert result.kind == "observe" and result.directness == "other" and result.action is None
 
 
@@ -255,9 +238,7 @@ def test_owner_assignments_ambiguous_names_and_untrusted_name_sources_are_not_si
     ],
 )
 async def test_reference_only_or_explicit_one_off_decline_is_observed(text):
-    assert (
-        await ModelDecisionProvider(NeverCalledFixtureModel()).decide(event(text), context())
-    ).kind == "observe"
+    assert fast_observe(event(text), context()).kind == "observe"
 
 
 @pytest.mark.parametrize(
@@ -271,9 +252,7 @@ async def test_reference_only_or_explicit_one_off_decline_is_observed(text):
     ],
 )
 async def test_complete_source_wrapper_without_outer_request_is_silent(text):
-    result = await ModelDecisionProvider(NeverCalledFixtureModel()).decide(
-        event(text, kind=EventKind.QUOTE), context()
-    )
+    result = fast_observe(event(text, kind=EventKind.QUOTE), context())
     assert result.kind == "observe" and result.response is None and result.action is None
     assert result.reason_code == "reference_data_without_outer_request"
 
@@ -322,9 +301,7 @@ def test_explicit_data_marker_does_not_erase_actual_outer_request(text):
     ],
 )
 async def test_quoted_actions_and_explicit_outer_decline_still_stay_silent(text):
-    result = await ModelDecisionProvider(NeverCalledFixtureModel()).decide(
-        event(text, kind=EventKind.QUOTE), context()
-    )
+    result = fast_observe(event(text, kind=EventKind.QUOTE), context())
     assert result.kind == "observe" and result.action is None and result.response is None
 
 
@@ -386,7 +363,7 @@ async def test_outer_request_reaches_normal_interpretation_without_promoting_quo
     ],
 )
 async def test_standalone_observation_does_not_invite_unsolicited_help(text):
-    result = await ModelDecisionProvider(NeverCalledFixtureModel()).decide(event(text), context())
+    result = fast_observe(event(text), context())
     assert result.kind == "observe" and result.response is None and result.action is None
     assert result.reason_code == "standalone_state_without_request"
 
@@ -539,23 +516,20 @@ def test_explicit_outer_question_survives_reference_markers(text):
 async def test_policy_semantics_map_to_correct_boolean_or_mode_without_role_reconfirmation(
     text, role, expected
 ):
-    result = await ModelDecisionProvider(NeverCalledFixtureModel()).decide(
-        event(text), context(role)
-    )
-    assert result.kind == "reply" and result.action == expected
+    intent = policy_intent(event(text), context(role))
+    assert intent is not None and intent.action() == expected
 
 
 async def test_personal_duration_and_explicit_daily_window_are_distinct():
-    provider = ModelDecisionProvider(NeverCalledFixtureModel())
-    result = await provider.decide(event("先安静十分钟，不是暂停制作报告。"), context())
-    assert result.action == {
+    result = policy_intent(event("先安静十分钟，不是暂停制作报告。"), context())
+    assert result.action() == {
         "op": "quiet",
         "scope": "self",
         "enabled": True,
         "until": "2030-06-08T09:10:00+08:00",
     }
-    result = await provider.decide(event("全群每天22点到早8点保持安静。"), context("owner"))
-    assert result.action == {
+    result = policy_intent(event("全群每天22点到早8点保持安静。"), context("owner"))
+    assert result.action() == {
         "op": "quiet",
         "scope": "group",
         "enabled": True,
@@ -563,12 +537,14 @@ async def test_personal_duration_and_explicit_daily_window_are_distinct():
     }
 
 
-async def test_member_does_not_gain_group_policy_permission_by_self_declared_owner():
-    result = await ModelDecisionProvider(NeverCalledFixtureModel()).decide(
-        event("我作为负责人让全群先保持安静。"), context("member")
+def test_member_does_not_gain_group_policy_permission_by_self_declared_owner():
+    statement = event("我作为负责人让全群先保持安静。")
+    proposed = RecipientCandidateFixtureModel(
+        kind="command",
+        action={"op": "quiet", "scope": "group", "enabled": True},
     )
-    assert result.action is None and result.kind == "reply"
-    assert "权限" in result.response and "确认" not in result.response
+    with pytest.raises(_InvalidCandidate):
+        validate_declaration(proposed, statement, context("member"))
 
 
 @pytest.mark.parametrize(

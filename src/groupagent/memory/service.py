@@ -195,6 +195,24 @@ class MemoryService(RetrievalMethods, FactMethods, CompactionMethods, ForgetMeth
         ):
             raise DomainError("memory_changed", "Evidence is outside this turn's causal boundary")
         tx.assert_task_sources(snapshot.get("source_task_revisions", {}))
+        facts = snapshot.get("source_fact_revisions", {})
+        if (
+            not isinstance(facts, dict)
+            or len(facts) > 100
+            or any(
+                not isinstance(identifier, str) or type(revision) is not int
+                for identifier, revision in facts.items()
+            )
+        ):
+            raise DomainError("scope_violation", "Fact revision witnesses must be bounded")
+        if facts:
+            rows = tx.conn.execute(
+                "SELECT id,revision FROM ga_memory_facts "
+                "WHERE group_id=%s AND id=ANY(%s) AND state='active'",
+                (tx.group_id, list(facts)),
+            ).fetchall()
+            if {row["id"]: row["revision"] for row in rows} != facts:
+                raise DomainError("memory_changed", "A consumed memory fact changed")
         queries = snapshot.get("task_queries", [])
         if not isinstance(queries, list) or len(queries) > 8:
             raise DomainError("scope_violation", "Task query witnesses must be bounded")

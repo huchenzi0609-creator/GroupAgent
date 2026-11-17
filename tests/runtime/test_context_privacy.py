@@ -513,7 +513,7 @@ def capture_actual_router_payload(monkeypatch):
             payload = json.loads(result)
         except (TypeError, ValueError):
             return result
-        if isinstance(payload, dict) and set(payload) == {"event", "context"}:
+        if isinstance(payload, dict) and {"event", "context"}.issubset(payload):
             captured.append((result, payload))
         return result
 

@@ -17,6 +17,7 @@ from groupagent.identity import DEFAULT_BOT_BADGE, BotIdentity, without_bot_badg
 from .artifacts import ArtifactRegistry
 from .contracts import ActorResolver, ProcessLease
 from .notices import check_notice
+from .observers import OBSERVER_PREFIX, guard_observer_delivery
 from .state import RuntimeState
 from .text import render_wechat_text
 
@@ -87,6 +88,7 @@ class Dispatcher:
         identity: BotIdentity | None = None,
         bot_member_id: str | None = None,
         shared_account: bool = False,
+        proactive_mode: str = "off",
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not badge.strip():
@@ -102,7 +104,23 @@ class Dispatcher:
         self.participation_mode = participation_mode
         self.identity = identity or BotIdentity(badge=badge)
         self.bot_member_id, self.shared_account = bot_member_id, shared_account
+        self.proactive_mode = proactive_mode
         self._clock, self._retry_at, self._channel_failures = clock, 0.0, 0
+
+    def _observer_ready(self, tx, intent: DeliveryIntent) -> bool:
+        if not intent.idempotency_key.startswith(OBSERVER_PREFIX):
+            return True
+        reason = "proactive_disabled"
+        if self.proactive_mode == "active":
+            try:
+                guard_observer_delivery(tx, intent)
+                return True
+            except DomainError as error:
+                if error.code not in {"source_unavailable", "scope_violation", "not_found"}:
+                    raise
+                reason = error.code
+        retire_delivery_in_tx(tx, intent.id, reason=reason)
+        return False
 
     async def tick(self, *, limit: int = 20) -> int:
         async with self._lock:
@@ -211,7 +229,8 @@ class Dispatcher:
                 "WHEN d.request_event_id IS NOT NULL AND d.work_id IS NULL "
                 "AND left(d.payload_ref,5)='text:' "
                 "AND d.idempotency_key='reply:'||d.request_event_id||':1' THEN 0 "
-                "WHEN left(d.payload_ref,5)='text:' THEN 1 ELSE 2 END,d.created_at,d.id LIMIT 1",
+                "WHEN starts_with(d.idempotency_key,'schedule-occurrence:') THEN 1 "
+                "WHEN left(d.payload_ref,5)='text:' THEN 2 ELSE 3 END,d.created_at,d.id LIMIT 1",
                 (tx.group_id, list(visited)),
             ).fetchone()
 
@@ -239,8 +258,13 @@ class Dispatcher:
             # Legacy parts have hashes but no frozen text. Reconstruct only their
             # original recipe, and fail closed if settings no longer reproduce it.
             # In particular, never re-render an accepted/unknown legacy part.
-            body = text if parts else render_wechat_text(without_bot_badge(text, self.badge))
-            chunks = split_text(without_bot_badge(body, self.badge), maximum=self.chunk_characters)
+            if intent.idempotency_key.startswith("schedule-occurrence:"):
+                # Policy authorizes this key only through the linked occurrence.
+                body = text
+            else:
+                body = text if parts else render_wechat_text(without_bot_badge(text, self.badge))
+                body = without_bot_badge(body, self.badge)
+            chunks = split_text(body, maximum=self.chunk_characters)
             payloads = tuple(
                 (
                     "text",
@@ -295,8 +319,10 @@ class Dispatcher:
         payloads: tuple[tuple[str, str, bytes | None], ...],
     ) -> None:
         with self.state.store.transaction(actor) as tx:
-            current = tx.get_delivery(intent.id)
             check_notice(tx, intent.id)
+            current = tx.get_delivery(intent.id)
+            if current.state != DeliveryState.PENDING:
+                raise DomainError("cancelled", "Delivery changed before its text was frozen")
             if (
                 current.payload_hash != intent.payload_hash
                 or current.payload_ref != intent.payload_ref
@@ -382,6 +408,8 @@ class Dispatcher:
             message_id, job_id = receipt.platform_message_id, receipt.job_id or receipt.send_id
         with self.state.store.transaction(actor) as tx:
             if receipt is None and not unknown:
+                if not self._observer_ready(tx, tx.get_delivery(intent_id)):
+                    return False
                 admission = delivery_admission_in_tx(
                     tx,
                     tx.get_delivery(intent_id),
@@ -396,7 +424,7 @@ class Dispatcher:
                     if admission.retire:
                         retire_delivery_in_tx(tx, intent_id, reason=admission.reason_code)
                     else:
-                        self._release_unsubmitted_in_tx(tx, intent_id)
+                        self._release_unsubmitted_in_tx(tx, intent_id, admission.reason_code)
                     return False
                 check_notice(tx, intent_id)
                 current = tx._lock_delivery_work(intent_id)
@@ -499,18 +527,20 @@ class Dispatcher:
         return True
 
     @staticmethod
-    def _release_unsubmitted_in_tx(tx, intent_id: str) -> None:
+    def _release_unsubmitted_in_tx(tx, intent_id: str, reason: str) -> None:
         tx.conn.execute(
-            "UPDATE ga_deliveries d SET state='pending',claim_expires_at=NULL,"
+            "UPDATE ga_deliveries d SET state='pending',claim_expires_at=NULL,reason=%s,"
             "revision=revision+1,updated_at=clock_timestamp() WHERE d.group_id=%s AND d.id=%s "
             "AND d.state IN ('dispatching','unknown') AND NOT EXISTS "
             "(SELECT 1 FROM ga_delivery_parts p WHERE p.group_id=d.group_id AND p.intent_id=d.id "
             "AND p.state IN ('submitted','unknown'))",
-            (tx.group_id, intent_id),
+            (reason, tx.group_id, intent_id),
         )
 
     async def _dispatch(self, actor: ActorContext, intent: DeliveryIntent) -> bool:
         with self.state.store.transaction(actor) as tx:
+            if not self._observer_ready(tx, intent):
+                return False
             admission = delivery_admission_in_tx(
                 tx,
                 intent,
@@ -524,6 +554,13 @@ class Dispatcher:
             if not admission.allowed:
                 if admission.retire:
                     retire_delivery_in_tx(tx, intent.id, reason=admission.reason_code)
+                else:
+                    tx.conn.execute(
+                        "UPDATE ga_deliveries SET reason=%s,revision=revision+1,"
+                        "updated_at=clock_timestamp() WHERE group_id=%s AND id=%s "
+                        "AND state='pending' AND reason IS DISTINCT FROM %s",
+                        (admission.reason_code, tx.group_id, intent.id, admission.reason_code),
+                    )
                 return False
             predecessor = tx.conn.execute(
                 "SELECT 1 FROM ga_delivery_bundles b JOIN ga_delivery_bundles earlier ON earlier.group_id=b.group_id AND earlier.bundle_id=b.bundle_id AND earlier.position<b.position JOIN ga_deliveries d ON d.group_id=earlier.group_id AND d.id=earlier.intent_id WHERE b.group_id=%s AND b.intent_id=%s AND d.state NOT IN ('accepted','rejected') LIMIT 1",
@@ -677,7 +714,7 @@ class Dispatcher:
                 if admission.retire:
                     retire_delivery_in_tx(tx, intent.id, reason=admission.reason_code)
                 else:
-                    self._release_unsubmitted_in_tx(tx, intent.id)
+                    self._release_unsubmitted_in_tx(tx, intent.id, admission.reason_code)
                 current = tx.get_delivery(intent.id)
                 if current.state in {DeliveryState.ACCEPTED, DeliveryState.REJECTED}:
                     return current.state == DeliveryState.ACCEPTED

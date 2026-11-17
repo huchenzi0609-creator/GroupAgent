@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, Field, JsonValue, TypeAdapter, ValidationError, field_validator
 
-from groupagent.domain import DomainError, DomainModel, Identifier, Role
+from groupagent.domain import DeliveryState, DomainError, DomainModel, Identifier, Role
 
 
 class AtTiming(DomainModel):
@@ -76,6 +76,17 @@ class ScheduleState(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ScheduleKind(StrEnum):
+    GOAL = "goal"
+    NOTIFICATION = "notification"
+    EXPLICIT_REMINDER = "explicit_reminder"
+
+
+class PreparedMessage(DomainModel):
+    text: str = Field(min_length=1, max_length=3000)
+    purpose: Literal["notification", "explicit_reminder"] = "notification"
+
+
 class OccurrenceState(StrEnum):
     PENDING = "pending"
     ENQUEUED = "enqueued"
@@ -94,6 +105,7 @@ class Schedule(DomainModel):
     request_key: str | None = None
     title: Identifier
     goal: Identifier
+    execution_kind: ScheduleKind = ScheduleKind.GOAL
     timing: Timing
     time_zone: str = "Asia/Shanghai"
     starts_at: AwareDatetime
@@ -119,8 +131,46 @@ class ScheduleOccurrence(DomainModel):
     scheduled_at: AwareDatetime
     state: OccurrenceState
     work_id: str | None = None
+    delivery_id: str | None = None
+    delivery_purpose: ScheduleKind | None = None
+    delivery_sources: list[str] = Field(default_factory=list, exclude=True)
     coalesced_from: AwareDatetime | None = None
     reason: str | None = None
     revision: int = Field(ge=1)
     created_at: AwareDatetime
     updated_at: AwareDatetime
+
+
+class ScheduleDeliveryFacts(DomainModel):
+    id: str
+    state: DeliveryState
+    reason: str | None = None
+    accepted_at: AwareDatetime | None = None
+    platform_message_id: str | None = None
+    platform_job_id: str | None = None
+
+
+class ScheduleOccurrenceFacts(DomainModel):
+    id: str
+    scheduled_at: AwareDatetime
+    state: OccurrenceState
+    reason: str | None = None
+    work_id: str | None = None
+    deliveries: list[ScheduleDeliveryFacts]
+
+
+class ScheduleFacts(DomainModel):
+    id: str
+    title: str
+    goal: str
+    execution_kind: ScheduleKind
+    state: ScheduleState
+    revision: int
+    time_zone: str
+    timing: Timing
+    valid_until: AwareDatetime
+    next_due_at: AwareDatetime | None
+    pause_reason: str | None
+    owned_by_requester: bool
+    allow_silent_result: bool = False
+    occurrences: list[ScheduleOccurrenceFacts]

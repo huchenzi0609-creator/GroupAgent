@@ -185,7 +185,9 @@ class RuntimeCleanupHandler:
             deliveries = tx.conn.execute(
                 "SELECT d.id,d.idempotency_key,d.state,d.platform_message_id FROM ga_deliveries d WHERE d.group_id=%s AND d.reason IN ('source_expired','source_forgotten','source_recalled') AND "
                 "(d.request_event_id=%s OR d.work_id=ANY(%s) OR d.request_event_id IN (SELECT event_id FROM ga_decisions WHERE group_id=%s AND (body->'source_fingerprints' ? %s OR body->'source_event_ids' ? %s)) "
-                "OR d.id IN (SELECT intent_id FROM ga_progress_notices WHERE group_id=%s AND work_id=ANY(%s)))",
+                "OR d.id IN (SELECT intent_id FROM ga_progress_notices WHERE group_id=%s AND work_id=ANY(%s)) "
+                "OR d.id IN (SELECT delivery_id FROM ga_schedule_occurrences WHERE group_id=%s "
+                "AND delivery_id IS NOT NULL AND delivery_sources @> ARRAY[%s]::text[]))",
                 (
                     job.group_id,
                     job.event_id,
@@ -195,6 +197,8 @@ class RuntimeCleanupHandler:
                     job.event_id or "",
                     job.group_id,
                     list(work_ids),
+                    job.group_id,
+                    job.event_id,
                 ),
             ).fetchall()
             parts = tx.conn.execute(

@@ -11,7 +11,7 @@ import stat
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
@@ -31,7 +31,15 @@ from groupagent.conversation.image_requirements import (
     projected_image_quantity,
 )
 from groupagent.delivery import group_delivery_policy, group_reply_instruction
-from groupagent.domain import ActorContext, DomainError, ExecutionLease, GroupEvent, WorkOrder
+from groupagent.domain import (
+    ActorContext,
+    DomainError,
+    ExecutionLease,
+    GroupEvent,
+    WorkOrder,
+    allows_silent_result,
+)
+from groupagent.evolution import DevelopmentManifest, EvolutionRegistry, register_evolution_tools
 from groupagent.execution import ExecutionRequest, LangGraphEngine, RunSnapshot
 from groupagent.execution.models import ExecutionBudget
 from groupagent.execution.ports import ModelPort
@@ -456,13 +464,23 @@ class PublishOutput(ToolData):
 
 
 class ToolCatalogInput(ToolData):
-    capabilities: tuple[WorkCapability, ...] = Field(min_length=1, max_length=8)
+    capabilities: tuple[WorkCapability | Literal["evolution"], ...] = Field(
+        min_length=1, max_length=9
+    )
 
 
 class ToolCatalogOutput(ToolData):
     tool_names: tuple[str, ...]
     tools: tuple[dict[str, JsonValue], ...]
     instructions: tuple[str, ...]
+
+
+class FinishSilentlyInput(ToolData):
+    reason: str = Field(min_length=1, max_length=300)
+
+
+class FinishSilentlyResult(ToolData):
+    disposition: Literal["no_notification"] = "no_notification"
 
 
 class MemorySearchInput(ToolData):
@@ -586,6 +604,11 @@ class WorkToolkit:
         self.inputs = inputs
         self.scheduler, self.triggers = scheduler, triggers
         self.resource_governor = resource_governor
+        evolution_manifest = config.runtime.evolution_manifest
+        self.evolution = EvolutionRegistry(store) if config.runtime.evolution_enabled else None
+        self.development = (
+            DevelopmentManifest.load(Path(evolution_manifest)) if evolution_manifest else None
+        )
 
     def release_attempt(self, work_id: str, attempt_id: str) -> None:
         # The supervisor calls this only after the engine and all isolated
@@ -722,6 +745,28 @@ class WorkToolkit:
         gateway = RecordingGateway(policy, self.registry, self.artifacts, actor, lease)
         register_request_input_tool(gateway)
         register_workspace_tools(gateway)
+        if allows_silent_result(work.scope):
+
+            async def finish_silently(_args: FinishSilentlyInput, _context: ToolContext):
+                self._sources(actor, work, lease)
+                return FinishSilentlyResult()
+
+            gateway.register(
+                ToolDefinition(
+                    name="finish_silently",
+                    description=(
+                        "After checking current facts, choose no group message if the schedule's "
+                        "notification condition is not met. Give the reason for internal use."
+                    ),
+                    input_model=FinishSilentlyInput,
+                    output_model=FinishSilentlyResult,
+                    handler=finish_silently,
+                    risk_class="read_only",
+                    idempotency_mode=IdempotencyMode.READ_ONLY,
+                )
+            )
+        if self.evolution is not None:
+            register_evolution_tools(gateway, self.evolution, lease, development=self.development)
         register_team_tools(
             gateway, self.store, MemberService(self.store), self.memory, work, lease, actor
         )
@@ -1148,6 +1193,7 @@ class WorkToolkit:
             )
             | required_tools
         )
+        visible_tools |= allowed & {"finish_silently"}
         if allowed - visible_tools:
             catalog_names = allowed
 
@@ -1718,6 +1764,24 @@ class WorkToolkit:
             raise DomainError(
                 "validation_failed", "Requested actual execution has no successful tool receipt"
             )
+        last_receipt = snapshot.receipts[-1] if snapshot.receipts else None
+        if (
+            last_receipt is not None
+            and last_receipt.tool_name == "finish_silently"
+            and last_receipt.success
+        ):
+            if (
+                not allows_silent_result(work.scope)
+                or outputs
+                or set(work.required_checks) != {"result"}
+                or work.scope.get("team_task_write_allowed") is True
+            ):
+                raise DomainError("validation_failed", "Required output cannot be closed silently")
+            evidence = (
+                "silent-schedule:"
+                + hashlib.sha256(last_receipt.model_dump_json().encode()).hexdigest()
+            )
+            return ValidatedCandidate({"result": evidence}, (), silent_evidence=evidence)
         if not answer and not outputs:
             raise DomainError(
                 "validation_failed", "Execution produced neither an answer nor a file"

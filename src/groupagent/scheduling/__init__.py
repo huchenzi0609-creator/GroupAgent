@@ -1,11 +1,14 @@
-"""Durable bounded schedules and atomic occurrence-to-work admission."""
+"""Durable bounded schedules and atomic occurrence admission."""
 
 from groupagent.scheduling.models import (
     AtTiming,
     DailyTiming,
     EveryTiming,
     OccurrenceState,
+    PreparedMessage,
     Schedule,
+    ScheduleFacts,
+    ScheduleKind,
     ScheduleOccurrence,
     ScheduleState,
     WeeklyTiming,
@@ -17,7 +20,10 @@ __all__ = [
     "DailyTiming",
     "EveryTiming",
     "OccurrenceState",
+    "PreparedMessage",
     "Schedule",
+    "ScheduleFacts",
+    "ScheduleKind",
     "ScheduleOccurrence",
     "ScheduleState",
     "Scheduler",

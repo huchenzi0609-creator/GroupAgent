@@ -2,7 +2,7 @@
 
 ## Subagent model preference
 
-- User preference confirmed on 2026-11-15: use GPT-6.1 Sol with Max reasoning for all subagents on this project, unless the user changes it.
+- User preference updated on 2026-11-18: use GPT-6.2 Sol with xhigh reasoning for ReAct refactoring subagents.
 
 ## Current stage
 
@@ -12,6 +12,8 @@
 - Video understanding, frame extraction, video-audio analysis and video generation are outside the current development plan. Unsupported-video metadata handling is in scope. Speech generation/TTS is deferred by the user on 2026-11-16; inbound audio transcription/ASR remains in scope.
 
 ## Evidence and changes
+
+- ReAct owns decisions about the next action. Before adding semantic routes, improve the observations or tool contracts. Require named held-out behaviors and actual effect evidence when changing the decision path.
 
 - Record source URLs, access dates, upstream revisions, uncertainty and test evidence for technical decisions.
 - Keep changes scoped to the assigned objective; do not modify the adjacent legacy project as part of documentation work.

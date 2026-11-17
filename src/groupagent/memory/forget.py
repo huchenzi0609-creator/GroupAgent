@@ -31,9 +31,13 @@ class ForgetMethods:
         quotes: dict[str, dict] = {}
         works: set[str] = set()
         schedules: set[str] = set()
+        derived_deliveries: set[str] = set()
         triggers: set[str] = set()
         features = tx.conn.execute(
-            "SELECT to_regclass('ga_delivery_parts') AS parts,to_regclass('ga_progress_notices') AS notices,to_regclass('ga_trigger_rules') AS triggers"
+            "SELECT to_regclass('ga_delivery_parts') AS parts,to_regclass('ga_progress_notices') AS notices,"
+            "to_regclass('ga_trigger_rules') AS triggers,to_regclass('ga_react_observations') AS observations,"
+            "EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('ga_schedule_occurrences') "
+            "AND attname='delivery_sources' AND NOT attisdropped) AS prepared_deliveries"
         ).fetchone()
         while True:
             before = (
@@ -43,6 +47,7 @@ class ForgetMethods:
                 len(quotes),
                 len(works),
                 len(schedules),
+                len(derived_deliveries),
                 len(triggers),
             )
             quoted = tx.conn.execute(
@@ -61,16 +66,37 @@ class ForgetMethods:
                 (tx.group_id, list(controls), list(controls), list(controls)),
             ).fetchall()
             controls.update(row["event_id"] for row in decisions)
-            rules = tx.conn.execute(
-                "SELECT id FROM ga_schedules WHERE group_id=%s AND (request_key=ANY(%s) OR scope->'source_fingerprints' ?| %s::text[] OR scope->>'request_source_id'=ANY(%s))",
-                (
-                    tx.group_id,
-                    ["chat:" + identifier for identifier in controls],
-                    list(controls),
-                    list(controls),
-                ),
-            ).fetchall()
-            schedules.update(row["id"] for row in rules)
+            if include_human_requests:
+                # A decision can have looked at unrelated turns. Only evidence
+                # explicitly captured by a schedule can revoke that grant.
+                rules = tx.conn.execute(
+                    "SELECT id FROM ga_schedules WHERE group_id=%s AND (request_key=ANY(%s) OR scope->'source_fingerprints' ?| %s::text[] OR scope->>'request_source_id'=ANY(%s))",
+                    (
+                        tx.group_id,
+                        ["chat:" + identifier for identifier in changed],
+                        list(changed),
+                        list(changed),
+                    ),
+                ).fetchall()
+                schedules.update(row["id"] for row in rules)
+                if features and features["prepared_deliveries"]:
+                    derived_deliveries.update(
+                        row["delivery_id"]
+                        for row in tx.conn.execute(
+                            "SELECT delivery_id FROM ga_schedule_occurrences WHERE group_id=%s "
+                            "AND delivery_id IS NOT NULL AND delivery_sources && %s::text[]",
+                            (tx.group_id, list(changed)),
+                        ).fetchall()
+                    )
+            if features and features["observations"]:
+                derived_deliveries.update(
+                    row["delivery_id"]
+                    for row in tx.conn.execute(
+                        "SELECT delivery_id FROM ga_react_observations WHERE group_id=%s "
+                        "AND delivery_id IS NOT NULL AND source_fingerprints ?| %s::text[]",
+                        (tx.group_id, list(controls)),
+                    ).fetchall()
+                )
             if features and features["triggers"]:
                 trigger_rows = tx.conn.execute(
                     "SELECT id FROM ga_trigger_rules WHERE group_id=%s AND (request_key=ANY(%s) OR scope->'source_fingerprints' ?| %s::text[] OR scope->>'request_source_id'=ANY(%s))",
@@ -131,7 +157,7 @@ class ForgetMethods:
                     tx.group_id,
                     list(controls),
                     list(works),
-                    notice_ids,
+                    sorted(derived_deliveries | set(notice_ids)),
                     ["reply:" + identifier + ":1" for identifier in controls],
                 ),
             ).fetchall()
@@ -163,6 +189,7 @@ class ForgetMethods:
                 len(quotes),
                 len(works),
                 len(schedules),
+                len(derived_deliveries),
                 len(triggers),
             )
             if after == before:
@@ -173,6 +200,7 @@ class ForgetMethods:
                     list(works),
                     list(schedules),
                     list(triggers),
+                    sorted(derived_deliveries),
                 )
 
     @staticmethod
@@ -399,7 +427,15 @@ class ForgetMethods:
                 by_id.update({alias["id"]: alias for alias in aliases})
         rows = list(by_id.values())
         ids = list(by_id)
-        rows, quotes, related_ids, closure_works, schedule_ids, trigger_ids = self._privacy_closure(
+        (
+            rows,
+            quotes,
+            related_ids,
+            closure_works,
+            schedule_ids,
+            trigger_ids,
+            derived_deliveries,
+        ) = self._privacy_closure(
             tx, rows, referenced_event_ids or [], include_human_requests=forget_facts
         )
         affected_tasks: set[str] = set(task_ids or [])
@@ -417,13 +453,19 @@ class ForgetMethods:
                     if tx.get_team_task(identifier).content_state == "forgotten"
                 ]
                 extra = task_dependents(tx, whole) if whole else []
-                rows, quotes, related_ids, closure_works, schedule_ids, trigger_ids = (
-                    self._privacy_closure(
-                        tx,
-                        rows,
-                        list(set(related_ids) | set(extra) | set(referenced_event_ids or [])),
-                        include_human_requests=forget_facts,
-                    )
+                (
+                    rows,
+                    quotes,
+                    related_ids,
+                    closure_works,
+                    schedule_ids,
+                    trigger_ids,
+                    derived_deliveries,
+                ) = self._privacy_closure(
+                    tx,
+                    rows,
+                    list(set(related_ids) | set(extra) | set(referenced_event_ids or [])),
+                    include_human_requests=forget_facts,
                 )
         ids = [row["id"] for row in rows]
         affected_facts = set(fact_ids)
@@ -686,13 +728,13 @@ class ForgetMethods:
                     related_ids,
                     work_ids,
                     ["reply:" + identifier + ":1" for identifier in related_ids],
-                    notice_ids,
+                    sorted(set(notice_ids) | set(derived_deliveries)),
                 ),
             )
             redact_removed_text(tx.conn, tx.group_id)
         if forget_facts:
             tx.conn.execute(
-                "UPDATE ga_schedules SET title='[source removed]',goal='[source removed]',acceptance_criteria='[]',state='cancelled',pause_reason=NULL,revision=revision+1,updated_at=clock_timestamp() WHERE group_id=%s AND id=ANY(%s)",
+                "UPDATE ga_schedules SET title='[source removed]',goal='[source removed]',acceptance_criteria='[]',state='cancelled',next_due_at=NULL,pause_reason=NULL,revision=revision+1,updated_at=clock_timestamp() WHERE group_id=%s AND id=ANY(%s)",
                 (tx.group_id, schedule_ids),
             )
             tx.conn.execute(

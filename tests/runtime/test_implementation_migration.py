@@ -29,6 +29,13 @@ def config(actor):
     )
 
 
+def rollout_config(before):
+    raw = before.model_dump(mode="json")
+    raw["conversation"]["proactive_mode"] = "shadow"
+    raw["runtime"]["evolution_enabled"] = True
+    return raw
+
+
 @pytest.mark.postgres
 def test_quiesced_upgrade_changes_only_config_bookmark_and_preserves_work(runtime_env):
     env = runtime_env
@@ -72,17 +79,125 @@ def test_quiesced_upgrade_changes_only_config_bookmark_and_preserves_work(runtim
 def test_implementation_handoff_cannot_silently_change_authority_or_limits(section, key, value):
     before = AppConfig.model_validate(
         {
+            "deployment_mode": "test",
             "group": {
                 "internal_id": "synthetic",
                 "external_group_id": "local",
                 "owner_ids": ["owner"],
-            }
+            },
         }
     )
     raw = before.model_dump()
     raw[section][key] = value
     with pytest.raises(DomainError, match="cannot change"):
         verify_implementation_only_change(before, AppConfig.model_validate(raw))
+
+    rollout = rollout_config(before)
+    rollout[section][key] = value
+    with pytest.raises(DomainError, match="cannot change"):
+        verify_implementation_only_change(
+            before, AppConfig.model_validate(rollout), react_test_rollout=True
+        )
+
+
+@pytest.mark.parametrize(
+    "section,key,value",
+    [
+        ("conversation", "proactive_mode", "active"),
+        ("conversation", "proactive_mode", "off"),
+        ("runtime", "evolution_enabled", False),
+        ("runtime", "evolution_manifest", "/private/development.json"),
+    ],
+)
+def test_react_rollout_refuses_changes_outside_approved_pair(section, key, value):
+    before = AppConfig.model_validate(
+        {
+            "deployment_mode": "test",
+            "group": {
+                "internal_id": "synthetic",
+                "external_group_id": "local",
+                "owner_ids": ["owner"],
+            },
+        }
+    )
+    raw = rollout_config(before)
+    raw[section][key] = value
+    after = AppConfig.model_validate(raw)
+    for start, end in ((before, after), (after, before)):
+        with pytest.raises(DomainError, match="reversible off-to-shadow"):
+            verify_implementation_only_change(start, end, react_test_rollout=True)
+
+
+@pytest.mark.parametrize("mode", ["development", "production"])
+def test_react_rollout_requires_a_test_deployment(mode):
+    before = AppConfig.model_validate(
+        {
+            "deployment_mode": mode,
+            "group": {
+                "internal_id": "synthetic",
+                "external_group_id": "local",
+                "owner_ids": ["owner"],
+            },
+        }
+    )
+    with pytest.raises(DomainError, match="requires a test deployment"):
+        verify_implementation_only_change(
+            before, AppConfig.model_validate(rollout_config(before)), react_test_rollout=True
+        )
+
+
+@pytest.mark.postgres
+def test_opted_in_react_rollout_and_rollback_restore_old_digest_idempotently(runtime_env):
+    env = runtime_env
+    before = config(env.actor).model_copy(update={"deployment_mode": "test"})
+    after = AppConfig.model_validate(rollout_config(before))
+    legacy = before.model_dump(mode="json")
+    del legacy["conversation"]["proactive_mode"]
+    del legacy["runtime"]["evolution_enabled"]
+    del legacy["runtime"]["evolution_manifest"]
+    old_digest = hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest()
+    with env.store.transaction(env.actor) as tx:
+        tx.conn.execute(
+            "INSERT INTO ga_runtime_configuration(group_id,policy_revision,sha256) VALUES(%s,%s,%s)",
+            (tx.group_id, env.actor.policy_revision, old_digest),
+        )
+    with pytest.raises(DomainError, match="cannot change"):
+        verify_implementation_only_change(before, after)
+    for _ in range(2):
+        assert register_implementation_change(
+            env.store,
+            env.actor,
+            before,
+            after,
+            expected_previous_digest=old_digest,
+            before_snapshot=legacy,
+            react_test_rollout=True,
+        ) == config_digest(after)
+    for _ in range(2):
+        assert (
+            register_implementation_change(
+                env.store,
+                env.actor,
+                after,
+                before,
+                expected_previous_digest=config_digest(after),
+                after_snapshot=legacy,
+                react_test_rollout=True,
+            )
+            == old_digest
+        )
+    with env.store.transaction(env.actor) as tx:
+        bookmark = tx.conn.execute(
+            "SELECT policy_revision,sha256 FROM ga_runtime_configuration WHERE group_id=%s",
+            (tx.group_id,),
+        ).fetchone()
+        assert bookmark == {"policy_revision": env.actor.policy_revision, "sha256": old_digest}
+        audits = tx.conn.execute(
+            "SELECT count(*) AS n FROM ga_audit_events WHERE group_id=%s "
+            "AND action='implementation_configuration_migrated'",
+            (tx.group_id,),
+        ).fetchone()
+        assert audits["n"] == 2
 
 
 @pytest.mark.postgres

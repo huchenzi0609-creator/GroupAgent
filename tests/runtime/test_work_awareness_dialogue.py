@@ -42,7 +42,7 @@ from groupagent.tools import (
 )
 
 from .conftest import source
-from .foreground_model_fixture import candidate_reply, observation_reply, semantic_fixture_reply
+from .foreground_model_fixture import candidate_reply, observation_reply
 from .test_app import app_for, event
 from .test_async_delivery_supervision import NativeQueueFixture, prepared_supervisor
 from .test_early_ack import intake
@@ -86,42 +86,7 @@ def foreground_model(harness):
     class ForegroundModel:
         name = "synthetic-work-awareness-router"
 
-        def __init__(self):
-            self.current_intent = None
-            self.current_requirements = []
-
         async def complete(self, request):
-            marker = request.messages[0].content or ""
-            if marker.startswith("TURN_OUTCOME_V1"):
-                assessed = semantic_fixture_reply(
-                    request, required_actions=self.current_requirements
-                )
-                verdict = json.loads(assessed.text)
-                # The fixture's scenario specifies whether this turn asks the
-                # agent for a reply. Initial intent is not a production gate.
-                verdict["reply_required"] = self.current_intent in {
-                    "start_profile",
-                    "start_memes",
-                    "query_memes",
-                    "ordinary_reply",
-                }
-                return assessed.model_copy(update={"text": json.dumps(verdict)})
-            if marker.startswith("TURN_CONTRACT_V1"):
-                payload = json.loads(request.messages[1].content)
-                current_intent = harness.scenarios[payload["event"]["id"]]["intent"]
-                required = (
-                    [{"kind": "start_work"}]
-                    if current_intent in {"start_profile", "start_memes"}
-                    else ([{"kind": "read_work_facts"}] if current_intent == "query_memes" else [])
-                )
-                self.current_intent = current_intent
-                self.current_requirements = required
-                return semantic_fixture_reply(
-                    request,
-                    required_actions=required,
-                    intent="observe" if current_intent == "peer_conversation" else None,
-                    work_context_required=bool(required),
-                )
             final = observation_reply(request)
             if final is not None:
                 return final
@@ -176,7 +141,7 @@ def foreground_model(harness):
                 )
             else:
                 decision = Decision(kind="observe", reason_code="synthetic_peer_conversation")
-            return candidate_reply(decision)
+            return candidate_reply(decision, request=request)
 
     return ForegroundModel()
 

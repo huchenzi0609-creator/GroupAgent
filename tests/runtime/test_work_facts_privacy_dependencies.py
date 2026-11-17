@@ -23,7 +23,7 @@ from groupagent.memory import MemberService, MemoryService
 from groupagent.runtime.work_facts import WorkFacts
 from groupagent.scheduling import Scheduler
 
-from .foreground_model_fixture import candidate_reply, observation_reply, semantic_fixture_reply
+from .foreground_model_fixture import candidate_reply, observation_reply
 from .test_app import event
 
 pytestmark = [pytest.mark.postgres, pytest.mark.work_awareness]
@@ -45,19 +45,12 @@ def harness(env, decide, *, required_actions=()):
             self.requests = []
 
         async def complete(self, request):
-            assessed = semantic_fixture_reply(
-                request,
-                required_actions=list(required_actions),
-                work_context_required=True,
-            )
-            if assessed is not None:
-                return assessed
             final = observation_reply(request)
             if final is not None:
                 return final
             payload = json.loads(request.messages[1].content)
             self.requests.append(payload)
-            return candidate_reply(decide(payload))
+            return candidate_reply(decide(payload), request=request)
 
     model = ForegroundFixture()
     provider = ModelDecisionProvider(model)
