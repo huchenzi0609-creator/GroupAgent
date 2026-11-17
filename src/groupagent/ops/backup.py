@@ -26,8 +26,9 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from groupagent.domain import ActorContext, DomainError, Role
-from groupagent.memory import MemoryService
+from groupagent.memory import CleanupJob, MemoryService
 from groupagent.memory.common import memory_lock
+from groupagent.ops.cleanup_proof import local_cleanup_proof
 from groupagent.ops.common import (
     RESTORE_LOCK_KEY,
     atomic_json,
@@ -246,14 +247,18 @@ class BackupManager:
                 ]
                 self._scope(actor, groups)
                 pending = conn.execute(
-                    "SELECT 1 FROM ga_memory_cleanup WHERE group_id=ANY(%s) AND state='pending' AND resource_kind<>'backup_tombstone' LIMIT 1",
+                    "SELECT * FROM ga_memory_cleanup WHERE group_id=ANY(%s) AND state='pending' AND resource_kind<>'backup_tombstone' ORDER BY group_id,created_at,id",
                     (groups,),
-                ).fetchone()
-                if pending:
-                    raise DomainError(
-                        "privacy_cleanup_pending",
-                        "Finish source-derived cleanup before creating a fresh archive",
-                    )
+                ).fetchall()
+                for row in pending:
+                    # A channel cache is outside this database archive. Keep
+                    # that erasure obligation pending, but require trusted local
+                    # removal/redaction proof for this exact job and generation.
+                    if local_cleanup_proof(conn, CleanupJob.model_validate(row)) is None:
+                        raise DomainError(
+                            "privacy_cleanup_pending",
+                            "Finish verified local source-derived cleanup before creating a fresh archive",
+                        )
                 snapshot = conn.execute("SELECT pg_export_snapshot() AS id").fetchone()
                 assert snapshot is not None
                 for group in held:

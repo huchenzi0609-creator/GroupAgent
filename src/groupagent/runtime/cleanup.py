@@ -9,6 +9,7 @@ import json
 import os
 import stat
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from groupagent.domain import ActorContext, DomainError, Role
 from groupagent.memory import CleanupJob, MemoryService
 from groupagent.memory.common import memory_lock
 from groupagent.memory.deletions import DeletionSink
+from groupagent.ops.cleanup_proof import local_cleanup_proof, record_local_cleanup
 from groupagent.persistence import PostgresStore, UnitOfWork
 
 
@@ -73,9 +75,15 @@ class RuntimeCleanupHandler:
         )
 
     def _plan(
-        self, actor: ActorContext, job: CleanupJob, *, check_busy: bool = True
+        self,
+        actor: ActorContext,
+        job: CleanupJob,
+        *,
+        check_busy: bool = True,
+        tx: UnitOfWork | None = None,
     ) -> dict[str, Any]:
-        with self.store.transaction(actor) as tx:
+        context = self.store.transaction(actor) if tx is None else nullcontext(tx)
+        with context as tx:
             memory_lock(tx)
             row = tx.conn.execute(
                 "SELECT * FROM ga_memory_cleanup WHERE group_id=%s AND id=%s FOR SHARE",
@@ -219,6 +227,10 @@ class RuntimeCleanupHandler:
                     item["state"] in {"dispatching", "submitted", "unknown"}
                     for item in [*deliveries, *parts]
                 ),
+                "channel_payloads": any(
+                    item["state"] in {"dispatching", "submitted", "accepted", "unknown"}
+                    for item in [*deliveries, *parts]
+                ),
                 "preserve": preserve,
                 "preserve_versions": preserve_versions,
                 "keys": tuple(sorted({item["idempotency_key"] for item in [*deliveries, *parts]})),
@@ -269,10 +281,11 @@ class RuntimeCleanupHandler:
         if self.quiesce is not None:
             preliminary = self._plan(actor, job, check_busy=False)
             await self.quiesce(preliminary["works"], (job.event_id,) if job.event_id else ())
-        plan = self._plan(actor, job)
-        reason, work_ids, event = plan["reason"], plan["works"], plan["event"]
         with self.store.transaction(actor) as tx:
-            memory_lock(tx)
+            # Plan and purge use the same memory lock and canonical job/source
+            # snapshot. An older plan cannot establish a newer local proof.
+            plan = self._plan(actor, job, tx=tx)
+            reason, work_ids, event = plan["reason"], plan["works"], plan["event"]
             for work_id in sorted(work_ids):
                 current = tx._work_row(work_id)
                 if current["state"] not in {"paused", "cancelled", "failed", "completed"}:
@@ -286,38 +299,64 @@ class RuntimeCleanupHandler:
                 work_ids=list(work_ids),
                 retained_files=len(plan["preserve"]),
             )
-        purge = getattr(self.channel, "purge_event", None)
-        if purge is None:
-            if self.channel is not None or (
-                event and (event.channel_account_id or event.platform_message_id)
-            ):
-                raise DomainError(
-                    "upstream_cleanup_unsupported",
-                    "The channel has no reliable cache erasure interface",
-                )
-        else:
-            receipt = purge(
-                job.group_id,
-                event.id if event else None,
-                source_key=event.source_key if event else None,
-                platform_message_id=event.platform_message_id if event else None,
-                replacement=event,
-                delivery_keys=plan["keys"],
+            record_local_cleanup(
+                tx,
+                job,
                 reason=reason,
+                work_ids=list(work_ids),
+                retained_files=len(plan["preserve"]),
+                retained_versions=sorted(plan["preserve_versions"]),
+                redacted_artifact_versions=len(plan["catalog"]) - len(plan["preserve_versions"]),
+                removed_workspace_scopes=len(work_ids),
+                removed_input_scopes=int(event is not None),
             )
-            evidence = (
-                await asyncio.wait_for(receipt, timeout=30)
-                if inspect.isawaitable(receipt)
-                else receipt
-            )
-            if not isinstance(evidence, str) or not evidence.strip():
-                raise DomainError(
-                    "upstream_cleanup_unverified", "Channel erasure returned no evidence"
+        try:
+            purge = getattr(self.channel, "purge_event", None)
+            if purge is None:
+                if (
+                    self.channel is not None
+                    or (event and (event.channel_account_id or event.platform_message_id))
+                    or plan["channel_payloads"]
+                ):
+                    raise DomainError(
+                        "upstream_cleanup_unsupported",
+                        "The channel has no reliable cache erasure interface",
+                    )
+            else:
+                receipt = purge(
+                    job.group_id,
+                    event.id if event else None,
+                    source_key=event.source_key if event else None,
+                    platform_message_id=event.platform_message_id if event else None,
+                    replacement=event,
+                    delivery_keys=plan["keys"],
+                    reason=reason,
                 )
-        if plan["uncertain_delivery"]:
-            raise DomainError(
-                "delivery_unknown", "Late delivery receipts still need privacy reconciliation"
-            )
+                evidence = (
+                    await asyncio.wait_for(receipt, timeout=30)
+                    if inspect.isawaitable(receipt)
+                    else receipt
+                )
+                if not isinstance(evidence, str) or not evidence.strip():
+                    raise DomainError(
+                        "upstream_cleanup_unverified", "Channel erasure returned no evidence"
+                    )
+            if plan["uncertain_delivery"]:
+                raise DomainError(
+                    "delivery_unknown", "Late delivery receipts still need privacy reconciliation"
+                )
+        except Exception as error:
+            with self.store.transaction(actor) as tx:
+                memory_lock(tx)
+                proof = local_cleanup_proof(tx.conn, job)
+                tx._audit(
+                    "runtime_upstream_cleanup_pending",
+                    job.id,
+                    local_proof_id=str(proof["id"]) if proof is not None else None,
+                    limitation="channel_cache_erasure_not_verified",
+                    error_code=error.code if isinstance(error, DomainError) else "cleanup_failed",
+                )
+            raise
         return "runtime-cache-purge:" + job.id
 
     def _remove_payloads(self, actor: ActorContext, job: CleanupJob, plan: dict[str, Any]) -> None:

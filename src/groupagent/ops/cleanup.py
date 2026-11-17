@@ -6,7 +6,10 @@ from typing import Any, Protocol
 
 from groupagent.domain import ActorContext, DomainError
 from groupagent.memory import CleanupJob, MemoryService
+from groupagent.memory.common import memory_lock, technical
 from groupagent.ops.backup import BackupManager
+from groupagent.ops.cleanup_proof import DEFERRED_CLEANUP_ACTION, local_cleanup_proof
+from groupagent.ops.common import clock
 from groupagent.ops.journal import DeletionJournal
 from groupagent.ops.models import CleanupResult
 
@@ -34,7 +37,32 @@ class CleanupRunner:
         errors = {}
         expired_versions: list[str] = []
         deleted_audits = 0
-        for job in self.memory.pending_cleanup(actor, now=now, limit=limit):
+        with self.memory.store.transaction(actor) as tx:
+            technical(tx)
+            # Local work takes precedence over already proved channel-only
+            # obligations. Within each phase, failed attempts rotate fairly;
+            # neither the original deadline nor completion state is changed.
+            rows = tx.conn.execute(
+                "SELECT c.* FROM ga_memory_cleanup c LEFT JOIN LATERAL "
+                "(SELECT max(a.created_at) AS attempted_at FROM ga_audit_events a "
+                "WHERE a.group_id=c.group_id AND a.resource_ref=c.id AND a.action=%s) retry ON true "
+                "WHERE c.group_id=%s AND c.state='pending' AND c.not_before<=%s "
+                "ORDER BY retry.attempted_at NULLS FIRST,c.created_at,c.id",
+                (DEFERRED_CLEANUP_ACTION, actor.group_id, clock(now)),
+            ).fetchall()
+            batch_limit = min(max(limit, 1), 1000)
+            jobs = []
+            upstream_jobs = []
+            for row in rows:
+                job = CleanupJob.model_validate(row)
+                if local_cleanup_proof(tx.conn, job) is None:
+                    jobs.append(job)
+                    if len(jobs) == batch_limit:
+                        break
+                else:
+                    upstream_jobs.append(job)
+            jobs.extend(upstream_jobs[: batch_limit - len(jobs)])
+        for job in jobs:
             try:
                 if job.resource_kind == "backup_tombstone":
                     if self.backups is None:
@@ -82,6 +110,18 @@ class CleanupRunner:
             except Exception as error:
                 failed.append(job.id)
                 errors[job.id] = error.code if isinstance(error, DomainError) else "cleanup_failed"
+                with self.memory.store.transaction(actor) as tx:
+                    technical(tx)
+                    memory_lock(tx)
+                    proof = local_cleanup_proof(tx.conn, job)
+                    tx._audit(
+                        DEFERRED_CLEANUP_ACTION,
+                        job.id,
+                        job_revision=job.revision,
+                        pending_phase="upstream" if proof is not None else "local",
+                        local_proof_id=str(proof["id"]) if proof is not None else None,
+                        error_code=errors[job.id],
+                    )
         retention = getattr(self.handler, "expire_artifacts", None)
         if retention is not None:
             retention_result: Any = retention(actor, now=now, limit=limit)

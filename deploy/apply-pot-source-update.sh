@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Trusted operator: one sender, verified backup, offline package, reversible handoff.
-set -euo pipefail
+set -Eeuo pipefail
 umask 077
 archive=${1:?Pass the reviewed public-source/dependency archive}
 test -f "$archive"
@@ -188,18 +188,8 @@ printf 'old_controller_removed=%s\ngroup_hash=%s\nmanaged_workers_absent=true\n'
 # Placeholder for the read-only bind used by the common maintenance launcher.
 cp "$release/config.before.canonical.json" "$release/config.after.json"
 chown 994:990 "$release/config.after.json"
-maintenance "$previous" -m groupagent.cli backup --config /etc/pot-test2/config.json \
-  --dsn-file /etc/pot-test2/database.dsn --root /var/lib/pot-test2/app --pg-bin "$pg_bin" \
-  > "$release/backup.json" 2> "$release/backup.log"
-backup_id=$(python3 - "$release/backup.json" <<'PY'
-import json,sys
-print(json.load(open(sys.argv[1]))['id'])
-PY
-)
-maintenance "$previous" -m groupagent.cli backup-verify --config /etc/pot-test2/config.json \
-  --dsn-file /etc/pot-test2/database.dsn --root /var/lib/pot-test2/app --pg-bin "$pg_bin" \
-  --backup-id "$backup_id" > "$release/backup-verified.json" 2> "$release/backup-verify.log"
-
+# Build the reviewed maintenance reader after physical quiescence. No controller,
+# source, config or configuration bookmark is switched until backup verifies.
 {
   printf 'FROM %s\n' "$previous"
   if test -d "$release/source/deps"; then
@@ -217,6 +207,63 @@ DOCKER_BUILDKIT=0 docker build --network=none --memory=512m --memory-swap=512m \
 next=$(cat "$release/image.after")
 [[ "$next" =~ ^sha256:[a-f0-9]{64}$ ]]
 maintenance "$next" -c 'from importlib.metadata import version; from groupagent.runtime.app import RuntimeApp; assert version("langchain")=="1.5.0"; assert version("langgraph")=="1.2.22"; print("standard_core_import_verified")' > "$release/import-check.log"
+# Finish only the proven local phase of canonical queued erasures. Unsupported
+# upstream erasure remains pending; no job is declared complete to make backup pass.
+maintenance "$next" -c '
+import asyncio,json
+from collections import Counter
+from pathlib import Path
+from groupagent.artifacts import ArtifactStore
+from groupagent.config import AppConfig
+from groupagent.domain import ActorContext,DomainError,Role
+from groupagent.memory import CleanupJob,MemoryService
+from groupagent.ops import BackupManager,CleanupRunner
+from groupagent.ops.cleanup_proof import local_cleanup_proof
+from groupagent.persistence import PostgresStore
+from groupagent.runtime.cleanup import RuntimeCleanupHandler
+
+async def main():
+ c=AppConfig.model_validate_json(Path("/etc/pot-test2/config.json").read_text())
+ s=PostgresStore(Path("/etc/pot-test2/database.dsn").read_text().strip())
+ a=ActorContext(group_id=c.group.internal_id,member_id="service:release-maintenance",role=Role.MAINTAINER,policy_revision=c.group.policy_revision)
+ root=Path("/var/lib/pot-test2/app")
+ manager=BackupManager(s,root/"backups",Path(c.runtime.pg_bin_dir))
+ artifacts=ArtifactStore(root/"artifacts")
+ handler=RuntimeCleanupHandler(s,artifacts,root,technical=a,channel=None,audit_days=c.retention.audit_days)
+ runner=CleanupRunner(MemoryService(s),handler,journal=manager.journal,backups=manager)
+ def pending():
+  with s.transaction(a) as tx:
+   rows=tx.conn.execute("SELECT * FROM ga_memory_cleanup WHERE group_id=%s AND state=%s AND resource_kind<>%s ORDER BY created_at,id",(a.group_id,"pending","backup_tombstone")).fetchall()
+   proofs=[(row["id"],local_cleanup_proof(tx.conn,CleanupJob.model_validate(row))) for row in rows]
+   return {key for key,proof in proofs if proof is None},[proof for key,proof in proofs if proof is not None],len(rows)
+ seen=set(); batches=0; errors=Counter()
+ try:
+  missing,proofs,total=pending(); initial=total
+  while missing:
+   signature=frozenset(missing)
+   if signature in seen:
+    raise DomainError("privacy_cleanup_pending","Canonical local erasure made no further progress; pending jobs and external erasure status are preserved. Error counts: "+json.dumps(dict(errors),sort_keys=True))
+   seen.add(signature)
+   result=await runner.run(a,limit=100)
+   errors.update(result.errors.values()); batches+=1
+   missing,proofs,total=pending()
+  retained={version for proof in proofs for version in proof["details"].get("retained_versions",[])}
+  print(json.dumps({"canonical_jobs_initial":initial,"canonical_rerun_batches":batches,"pending_jobs_with_exact_local_proof":total,"missing_local_proofs":0,"retained_validated_version_references":len(retained),"redacted_artifact_version_scope_sum":sum(proof["details"].get("redacted_artifact_versions",0) for proof in proofs),"removed_workspace_scope_sum":sum(proof["details"].get("removed_workspace_scopes",0) for proof in proofs),"observed_error_counts":dict(errors),"upstream_erasure_acknowledged":False,"limitation":"Pending upstream/client cleanup remains unresolved; this proves only local erasure and archive eligibility."}))
+ finally:
+  artifacts.close()
+asyncio.run(main())
+' > "$release/cleanup-local-proof.json" 2> "$release/cleanup-local-proof.log"
+maintenance "$next" -m groupagent.cli backup --config /etc/pot-test2/config.json \
+  --dsn-file /etc/pot-test2/database.dsn --root /var/lib/pot-test2/app --pg-bin "$pg_bin" \
+  > "$release/backup.json" 2> "$release/backup.log"
+backup_id=$(python3 - "$release/backup.json" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1]))['id'])
+PY
+)
+maintenance "$next" -m groupagent.cli backup-verify --config /etc/pot-test2/config.json \
+  --dsn-file /etc/pot-test2/database.dsn --root /var/lib/pot-test2/app --pg-bin "$pg_bin" \
+  --backup-id "$backup_id" > "$release/backup-verified.json" 2> "$release/backup-verify.log"
 maintenance "$next" -c 'import json,sys; from pathlib import Path; from groupagent.config import AppConfig; d=json.loads(Path("/before.json").read_text()); d["runtime"].update(engine="langgraph",worker_image=sys.argv[1],harness_image=None); d["engine"].update(candidate="langgraph",approved_runtime_version="langchain1.5.0/langgraph1.2.22"); print(AppConfig.model_validate(d).model_dump_json(indent=2))' "$next" > "$release/config.after.pending.json"
 chown 994:990 "$release/config.after.pending.json"
 mv "$release/config.after.pending.json" "$release/config.after.json"
