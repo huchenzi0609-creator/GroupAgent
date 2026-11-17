@@ -353,15 +353,21 @@ class Scheduler:
             assert goal is not None
             _text(goal, "goal")
             occurred_at = event.occurred_at if event is not None else None
+            source_text = event.text if event is not None else None
             rule, time_zone = resolve_schedule_timing(
-                timing, occurred_at=occurred_at, time_zone=time_zone
+                timing, occurred_at=occurred_at, time_zone=time_zone, source_text=source_text
             )
             rule = self._timing(rule, now)
             self._check_new_instant(rule, now, time_zone, event)
             if isinstance(rule, AtTiming):
                 scope["default_one_shot_validity"] = valid_until is None
             if valid_until is not None:
-                end = resolve_instant(valid_until, occurred_at=occurred_at, time_zone=time_zone)
+                end = resolve_instant(
+                    valid_until,
+                    occurred_at=occurred_at,
+                    time_zone=time_zone,
+                    source_text=source_text,
+                )
             else:
                 end = (
                     rule.at + self.one_shot_grace
@@ -680,18 +686,25 @@ class Scheduler:
                 _schedule_evidence(tx, scope)
             reference = parse_timing(row["timing"])
             occurred_at = event.occurred_at if event is not None else None
+            source_text = event.text if event is not None else None
             rule, time_zone = resolve_schedule_timing(
                 timing if timing is not None else reference,
                 occurred_at=occurred_at,
                 time_zone=time_zone if time_zone is not None else row["time_zone"],
                 reference_timing=reference,
+                source_text=source_text,
             )
             rule = self._timing(rule, now)
             if timing is not None and event is not None:
                 self._check_new_instant(rule, now, time_zone, event)
             end = row["valid_until"]
             if valid_until is not None:
-                end = resolve_instant(valid_until, occurred_at=occurred_at, time_zone=time_zone)
+                end = resolve_instant(
+                    valid_until,
+                    occurred_at=occurred_at,
+                    time_zone=time_zone,
+                    source_text=source_text,
+                )
                 scope["default_one_shot_validity"] = False
             elif (
                 isinstance(rule, AtTiming)

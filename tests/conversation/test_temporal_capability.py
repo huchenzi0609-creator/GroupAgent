@@ -239,24 +239,41 @@ async def test_iana_weekly_creation_and_clock_only_edit_keep_zone_and_all_weekda
 
 @pytest.mark.postgres
 @pytest.mark.parametrize(
-    ("date", "local_time", "fold", "expected"),
+    ("date", "local_time", "fold", "fold_evidence", "expected"),
     [
-        ("2026-03-08", "02:30", None, "nonexistent_local_time"),
-        ("2026-11-01", "01:30", None, "ambiguous_dst_fold"),
-        ("2026-11-01", "01:30", 0, datetime(2026, 11, 1, 8, 30, tzinfo=UTC)),
-        ("2026-11-01", "01:30:12", 1, datetime(2026, 11, 1, 9, 30, 12, tzinfo=UTC)),
+        ("2026-03-08", "02:30", None, None, "nonexistent_local_time"),
+        ("2026-11-01", "01:30", None, None, "ambiguous_dst_fold"),
+        ("2026-11-01", "01:30", 0, None, "ambiguous_dst_fold"),
+        (
+            "2026-11-01",
+            "01:30",
+            0,
+            "选择当地重复时刻中的第一次。",
+            datetime(2026, 11, 1, 8, 30, tzinfo=UTC),
+        ),
+        (
+            "2026-11-01",
+            "01:30:12",
+            1,
+            "选择当地重复时刻中的第二次。",
+            datetime(2026, 11, 1, 9, 30, 12, tzinfo=UTC),
+        ),
     ],
 )
 async def test_strict_wall_proposal_dst_requires_real_instant(
-    conversation_env, date, local_time, fold, expected
+    conversation_env, date, local_time, fold, fold_evidence, expected
 ):
     env = conversation_env
     now = datetime(2026, 3, 1, tzinfo=UTC)
     env.coordinator.clock = lambda: now
-    request = ingest(env, "Pot，到指定的洛杉矶时间提醒我提交清单。", now, now)
+    request = ingest(
+        env, "Pot，到指定的洛杉矶时间提醒我提交清单。" + (fold_evidence or ""), now, now
+    )
     timing = {"kind": "wall", "date": date, "local_time": local_time}
     if fold is not None:
         timing["fold"] = fold
+    if fold_evidence:
+        timing["fold_evidence"] = fold_evidence
 
     def ask_for_valid_time(turn):
         receipt = tool_receipt(turn)

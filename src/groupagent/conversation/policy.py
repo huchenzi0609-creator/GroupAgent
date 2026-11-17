@@ -424,6 +424,35 @@ def ingress_admission(
     return PolicyAdmission(True, invocation_root_event_id=root, recipient=recipient)
 
 
+def _pending_obsolete_notices(
+    tx: UnitOfWork, cutoff: int, subject_id: str, *, intent_id: str | None = None
+) -> list[str]:
+    """Find unsubmitted status text linked to work accepted before the barrier."""
+    rows = tx.conn.execute(
+        "SELECT d.id FROM ga_deliveries d "
+        "WHERE d.group_id=%s AND d.state='pending' "
+        "AND d.work_id IS NULL AND d.request_event_id IS NULL AND d.payload_ref LIKE 'text:%%' "
+        "AND (%s::text IS NULL OR d.id=%s) "
+        "AND d.platform_message_id IS NULL AND d.platform_job_id IS NULL "
+        "AND EXISTS (SELECT 1 FROM ga_progress_notices n "
+        "    JOIN ga_work_orders w ON w.group_id=n.group_id AND w.id=n.work_id "
+        "    JOIN ga_events e ON e.group_id=w.group_id AND e.id=w.request_event_id "
+        "    WHERE n.group_id=d.group_id AND n.intent_id=d.id "
+        "    AND d.created_by=w.requester_id AND e.sequence<=%s "
+        "    AND (%s='*' OR w.requester_id=%s) "
+        "    AND NOT (w.state IN ('waiting_input','paused','failed') "
+        "        AND split_part(n.notice_key,':',1)=w.state "
+        "        AND split_part(n.notice_key,':',2)=w.goal_revision::text)) "
+        "AND NOT EXISTS (SELECT 1 FROM ga_schedule_occurrences o "
+        "    WHERE o.group_id=d.group_id AND o.delivery_id=d.id) "
+        "AND NOT EXISTS (SELECT 1 FROM ga_delivery_parts p "
+        "    WHERE p.group_id=d.group_id AND p.intent_id=d.id AND p.state<>'pending') "
+        "ORDER BY d.id FOR UPDATE OF d",
+        (tx.group_id, intent_id, intent_id, cutoff, subject_id, subject_id),
+    ).fetchall()
+    return [row["id"] for row in rows]
+
+
 def delivery_admission_in_tx(
     tx: UnitOfWork,
     intent: DeliveryIntent,
@@ -533,6 +562,11 @@ def delivery_admission_in_tx(
             admission.allowed, admission.reason_code, retire=not admission.allowed
         )
     policies = _policies(tx, work.requester_id if work else intent.created_by)
+    if notice and (
+        cutoff := max((row.get("quiet_since_sequence") or 0 for row in policies), default=0)
+    ):
+        if _pending_obsolete_notices(tx, cutoff, "*", intent_id=intent.id):
+            return DeliveryAdmission(False, "quiet_barrier", retire=True)
     if work and not notice and work.scope.get("origin_schedule_id"):
         return _scheduled_quiet(
             policies,
@@ -650,4 +684,7 @@ def apply_quiet_barrier_in_tx(tx: UnitOfWork, event: GroupEvent, subject_id: str
     ).fetchall()
     for row in rows:
         retire_delivery_in_tx(tx, row["id"])
-    return len(rows)
+    obsolete_notices = _pending_obsolete_notices(tx, sequence, subject_id)
+    for intent_id in obsolete_notices:
+        retire_delivery_in_tx(tx, intent_id)
+    return len(rows) + len(obsolete_notices)

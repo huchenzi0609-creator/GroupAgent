@@ -228,7 +228,10 @@ class Dispatcher:
                 "ORDER BY CASE "
                 "WHEN d.request_event_id IS NOT NULL AND d.work_id IS NULL "
                 "AND left(d.payload_ref,5)='text:' "
-                "AND d.idempotency_key='reply:'||d.request_event_id||':1' THEN 0 "
+                "AND (d.idempotency_key='reply:'||d.request_event_id||':1' OR EXISTS ("
+                "SELECT 1 FROM ga_decisions a WHERE a.group_id=d.group_id "
+                "AND a.event_id=d.request_event_id AND a.body#>>'{work_admission,delivery_id}'=d.id"
+                ")) THEN 0 "
                 "WHEN starts_with(d.idempotency_key,'schedule-occurrence:') THEN 1 "
                 "WHEN left(d.payload_ref,5)='text:' THEN 2 ELSE 3 END,d.created_at,d.id LIMIT 1",
                 (tx.group_id, list(visited)),

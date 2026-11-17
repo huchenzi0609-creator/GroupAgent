@@ -166,3 +166,109 @@ async def test_case_concurrency_keeps_the_report_and_evidence_separate(
     for result in report["cases"]:
         evidence = oracles.read_json(args.output / result["id"] / "evidence.json")
         assert evidence["checks"]["witness"]["evidence"] == [{"probe": result["id"]}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_source", [True, False])
+async def test_admission_driver_observes_native_ack_at_its_actual_time(
+    oracles, tmp_path, same_source
+):
+    import asyncio
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from groupagent.channels import AgentWechatConfig
+    from groupagent.channels.local import LocalChannel
+
+    group = "synthetic-admission-driver"
+    channel = LocalChannel(
+        tmp_path / "spool",
+        AgentWechatConfig(
+            base_url="http://127.0.0.1",
+            account_id="synthetic-account",
+            external_group_id="local-only@chatroom",
+            internal_group_id=group,
+            source_epoch="driver-test",
+        ),
+    )
+    source_id = "current-source"
+    queued_source = source_id if same_source else "other-source"
+    queued = False
+    accepted = asyncio.Event()
+    receipt = None
+    finished = None
+
+    async def reference_foreground(*, batched):
+        nonlocal queued, finished
+        assert not batched
+        queued = True
+        if same_source:
+            await asyncio.wait_for(accepted.wait(), 2)
+        else:
+            await asyncio.sleep(0.08)
+        finished = datetime.now(UTC)
+
+    async def local_send():
+        nonlocal receipt, queued
+        if queued:
+            queued = False
+            receipt = await channel.send_text(
+                group, "Accepted scoped work", f"early_ack:{queued_source}:1"
+            )
+            accepted.set()
+
+    scenario = oracles.Scenario.__new__(oracles.Scenario)
+    scenario.app = SimpleNamespace(
+        process_pending=reference_foreground, dispatcher=SimpleNamespace(tick=local_send)
+    )
+    scenario.pending_admission = lambda candidate: queued and candidate == queued_source
+    await scenario.process_with_admission_receipts(source_id)
+
+    assert receipt is not None and finished is not None
+    assert receipt.state == "accepted"
+    assert await channel.lookup_delivery(group, receipt.idempotency_key) == receipt
+    assert (receipt.observed_at <= finished) is same_source
+    assert len(list((channel.root / "outgoing").glob("*.json"))) == 1
+
+
+def test_review_oracle_matches_the_actual_fetched_page(oracles):
+    urls = oracles.fetch_source_urls(
+        {
+            "source": {
+                "url": "https://example.org/public/verified/",
+                "final_url": "https://example.org/public/verified/",
+                "content": "Unfetched link https://example.org/public/unobserved",
+            },
+        }
+    )
+    assert oracles.page_url_key("https://example.org/public/verified/#content") in urls
+    assert oracles.page_url_key("https://example.org/public/unobserved") not in urls
+    assert oracles.page_url_key("https://example.org/public/verified/?version=2") not in urls
+
+
+def test_inspector_extracts_live_relationship_of_link_inside_docx_table(oracles, tmp_path):
+    from docx import Document
+    from docx.opc.constants import RELATIONSHIP_TYPE
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from runtime_acceptance_checks import _INSPECT
+
+    document = Document()
+    paragraph = document.add_table(rows=1, cols=1).cell(0, 0).paragraphs[0]
+    address = "https://example.org/verified?case=one"
+    rel_id = paragraph.part.relate_to(address, RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), rel_id)
+    run = OxmlElement("w:r")
+    text = OxmlElement("w:t")
+    text.text = "Source label"
+    run.append(text)
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+
+    path = tmp_path / "table-link.docx"
+    document.save(path)
+    decoded = json.loads(
+        subprocess.check_output([sys.executable, "-c", _INSPECT, str(path), "docx"], text=True)
+    )
+    assert decoded["links"] == [address]

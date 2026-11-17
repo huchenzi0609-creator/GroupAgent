@@ -142,6 +142,23 @@ async def test_natural_literal_reminder_reconciles_lost_ack_after_restart(runtim
         and receipt.state == "accepted"
         and receipt.platform_message_id == receipt_data["platform_message_id"]
     )
+
+    def confirm_platform_status(turn):
+        facts = observation(turn)["facts"]["facts"]
+        current = next(item for item in facts if item["id"] == rule.id)
+        status = current["latest_occurrence_status"]
+        assert status["execution_state"] == "succeeded"
+        assert status["platform_accepted_count"] == status["delivery_intent_count"] == 1
+        assert datetime.fromisoformat(status["scheduled_at"]) == due
+        assert status["last_platform_accepted_at"] is not None
+        return reply("平台已经接受这条提醒。")
+
+    await replay.say(
+        "Pot，那条提醒送达了吗？",
+        DialogueModel(
+            tool("read_group_context", {"resource": "schedules"}), confirm_platform_status
+        ),
+    )
     assert replay.works() == []
 
 
@@ -173,3 +190,57 @@ async def test_natural_schedule_time_is_anchored_even_when_late(runtime_env):
     assert Scheduler(env.store).list(env.actor) == [] and replay.works() == []
     [sent] = outgoing(env)
     assert "次日00:03" in sent["payload"]["text"] and "已经过了" in sent["payload"]["text"]
+
+
+def test_admission_pump_selects_only_exact_durable_work_binding(runtime_env, monkeypatch):
+    import importlib
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    env = runtime_env
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+    evaluator = importlib.import_module("pot_blind_acceptance")
+    scenario = evaluator.Scenario.__new__(evaluator.Scenario)
+    scenario.store = env.store
+    scenario.app = SimpleNamespace(owner=env.actor)
+    scenario.group = env.actor.group_id
+    replay = Replay(env)
+    legacy = replay.source("合成预告旧请求")
+    wrong_work = replay.source("合成错误绑定请求")
+    wrong_delivery = replay.source("合成错误投递绑定")
+    verified = replay.source("合成实际委托")
+    with env.store.transaction(env.actor) as tx:
+        tx.enqueue_early_ack(legacy.id, "旧式预告")
+        decoy_intent = tx.enqueue_early_ack(wrong_work.id, "不应采用的错误绑定")
+        wrong_intent = tx.enqueue_early_ack(wrong_delivery.id, "不应采用的投递关联")
+        intended_work = tx.create_work("真正已登记的实际工作", verified.id)
+        intended_ack = tx.enqueue_work_admission(intended_work.id, "已登记实际工作。")
+        assert intended_ack is not None
+        other_work = tx.create_work("来源不符的工作", wrong_delivery.id)
+        tx.record_decision(
+            wrong_work.id,
+            {
+                "kind": "start_work",
+                "work_admission": {"work_id": intended_work.id, "delivery_id": decoy_intent.id},
+            },
+        )
+        tx.record_decision(
+            wrong_delivery.id,
+            {
+                "kind": "start_work",
+                "work_admission": {"work_id": other_work.id, "delivery_id": intended_ack.id},
+            },
+        )
+        tx.record_decision(
+            verified.id,
+            {
+                "kind": "start_work",
+                "work_admission": {"work_id": intended_work.id, "delivery_id": intended_ack.id},
+            },
+        )
+        assert intended_ack.idempotency_key == f"early_ack:{verified.id}:1"
+        assert intended_ack.id != wrong_intent.id
+    assert not scenario.pending_admission(legacy.id)
+    assert not scenario.pending_admission(wrong_work.id)
+    assert not scenario.pending_admission(wrong_delivery.id)
+    assert scenario.pending_admission(verified.id)

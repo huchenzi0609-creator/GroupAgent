@@ -71,7 +71,12 @@ def review_request(
     formats = {row.get("format") for row in payload.get("artifacts", [])}
     if formats & {"md", "docx", "pdf", "pptx"}:
         guidance.append(
-            "格式/页数已有程序检查，重点核对文件内容。标题引号通常是定界符，除非用户要求保留；"
+            "artifacts是主机从已选定file_id/version_id/sha256的真实文件中独立读取的证据。"
+            "verified_selected_artifact记录已通过的文件文字断言与测得页数。"
+            "要求写入文件的文字和数值，可以由这些断言和该文件的实际text满足。"
+            "即使群回复只说产物已准备好，也要核对文件证据。除非明确要求群内同时列出，不能要求在群回复重复文件内容。"
+            "仍需拒绝实际文件或独立答复中未满足的真人要求。"
+            "格式/页数已有程序检查，重点核对文件内容。标题引号通常是定界符，除非用户要求保留。"
             "PPT metadata.title是文件主题，不要求额外重复在页内。unit.editable仅是编辑接口能力；"
             "metadata.native_table_count来自实际Office结构，正数证明原生表格，零或缺失不能证明。"
         )

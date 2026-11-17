@@ -414,9 +414,16 @@ class RuntimeApp:
         """Cancel only old source-bound placeholders with no submitted part."""
         with self.store.transaction(self.technical) as tx:
             rows = tx.conn.execute(
-                "SELECT id,created_by FROM ga_deliveries WHERE group_id=%s AND state='pending' "
-                "AND request_event_id IS NOT NULL AND work_id IS NULL "
-                "AND left(idempotency_key,10)='early_ack:' ORDER BY created_at,id LIMIT 100",
+                "SELECT d.id,d.created_by FROM ga_deliveries d "
+                "WHERE d.group_id=%s AND d.state='pending' "
+                "AND d.request_event_id IS NOT NULL AND d.work_id IS NULL "
+                "AND left(d.idempotency_key,10)='early_ack:' AND NOT EXISTS ("
+                "SELECT 1 FROM ga_decisions a JOIN ga_work_orders w ON w.group_id=a.group_id "
+                "AND w.id=a.body#>>'{work_admission,work_id}' "
+                "WHERE a.group_id=d.group_id AND a.event_id=d.request_event_id "
+                "AND w.request_event_id=d.request_event_id AND w.requester_id=d.created_by "
+                "AND a.body#>>'{work_admission,delivery_id}'=d.id"
+                ") ORDER BY d.created_at,d.id LIMIT 100",
                 (tx.group_id,),
             ).fetchall()
         count = 0

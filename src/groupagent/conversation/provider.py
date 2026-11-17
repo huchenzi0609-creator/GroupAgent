@@ -50,9 +50,9 @@ SYSTEM = """你是群内协作伙伴，结合当前事件和观察自主选择�
 当前问题需要公开事实或最新状态时先查证。读取已可用的事实再决定是否执行新工具。content_origin为authenticated_audio_transcription的消息正文就是已取得的语音转写，询问这段内容可直接引用其事实。只有用户独有且现有信息与工具均无法取得的输入才澄清，不把陌生公开名称推给用户补充。稳定原理、示例和写法可直接回答；用户要求实际搜索、运行指定工具或交付文件时须先调用真实工具。能力开关来自context.capabilities。识别人脸身份不可用，可描述画面。拒绝、排队、运行、完成与交付是不同事实。
 主机根据已提交的回执显示动作确认、排队状态和提醒时刻。仅需提交一项动作并确认结果时，单独调用该动作并设置finish_on_commit=true，或和一个finish_turn(reply)同时提交；主机只在实际提交成功后用真实回执结束，拒绝后仍可修正。组合提交的response只用于独立补充答案，动作的排队、时间和状态由主机给出。多个动作或还要读取事实时，先查看结果，再单独用finish_turn。若同时有可见的动作确认，直接输出的结束语由主机确认替换。对工作进度、验证或交付先用read_work_facts读真实记录。观察或失败不是写入。没有已授权能力或失败时如实说明，不用承诺代替执行。不揭示工具协议。"""
 
-ACTION_GUIDANCE = """单个简短公开事实可先用获准的web_search、web_fetch快速查证，再直接回答。搜索摘要不能当成已阅读网页。需要交付产物、多步核查，或快速查证未取得足够证据时，用start_work委托完整目标。委托与前台公开查询分开调用；已经决定委托的调研无需在提交前重复查找。读取附件、运行计算、制作或修改产物直接用start_work；修订既有目标用update_work并定位同一个工作，控制用control_work。人类分工tasks、机器人works、提醒schedules不能混用。即时人类任务、记忆、提醒、偏好写入用apply_business_action；清楚的本人承诺或获授权分工应实际登记为人类任务，尚在讨论的草案只观察。本人认领claim_task，本人进展update_task，owner分工assign_task，群级策略仅owner。补全已核对成员的显示名用confirm_name。成员事实中的request_reference对应真人在本条消息给出的编号，使用其成员别名和当前版本。读取名单后仍需实际提交改名。quiet是停止主动发言，与暂停工作分开。
+ACTION_GUIDANCE = """单个简短公开事实可先用获准的web_search、web_fetch快速查证，再直接回答。搜索摘要不能当成已阅读网页。需要交付产物、多步核查，或快速查证未取得足够证据时，用start_work委托完整目标。委托与前台公开查询分开调用；已经决定委托的调研无需在提交前重复查找。读取附件、运行计算、制作或修改产物直接用start_work；修订既有目标用update_work并定位同一个工作，控制用control_work。人类分工tasks、机器人works、提醒schedules不能混用。即时人类任务、记忆、提醒、偏好写入用apply_business_action；清楚的本人承诺或获授权分工应实际登记为人类任务，尚在讨论的草案只观察。本人认领claim_task，本人进展update_task，owner分工assign_task，群级策略仅owner。查到当前群昵称可直接回答。只有owner明确要求为缺少群昵称的在群成员登记姓名例外时才用confirm_name。成员事实中的request_reference对应真人在本条消息给出的编号，使用其成员别名和当前版本。quiet是停止主动发言，与暂停工作分开。
 同一条真人请求的运行工作使用一个完整目标，可另行登记同时交办的提醒和分工。到点只需发送提醒或通知时，现在写好prepared_message，一次和周期提醒都用这条路径。要求逐字时用explicit_reminder。到点还需查资料、运算、判断或执行步骤时用goal。只改时间不填新goal或prepared_message。只用fact_source_ids引用定时内容确实所需的当前授权材料。
-时间以context.clock和真实规则为准。相对本条消息用after及seconds，明确的日历时刻用wall，指定地区采用其IANA time_zone。周期只改钟点用clock，整体移动用shift，改周期用daily/weekly/every且周一为0。多个时刻仍是待选项或遇到重复、缺失的夏令时时刻时，只问缺少的选择。已有明确选择或获准代选时可执行。主机计算生效时刻。
+时间以context.clock和真实规则为准。相对本条消息用after及seconds，明确的日历时刻用wall，指定地区采用其IANA time_zone。周期只改钟点用clock，整体移动用shift，改周期用daily/weekly/every且周一为0。多个时刻仍待选择或遇到缺失时刻，就问具体选项。夏令时重复而真人已选择时，fold_evidence引用本条明确选择的原话。主机计算生效时刻。查送达看latest_occurrence_status中的平台接受数量和时刻，规则结束不代表发送失败。
 输出格式、页数、图片数量和逐字内容只取真人要求。真人明确要求用特定程序或手段取得结果时，在required_work_tools填实际工具（如明确用Python计算填python_compute，明确实际运行Shell填process_run，明确实际搜索填web_search）；代码示例不要求运行。exact_units精确、min_units下限、max_units上限；expected_text只含逐字内容或独立单元格，关系/禁止事项放acceptance_criteria。public_image_count须有真人来源。input_event_ids只填目标实际需要的已授权附件消息，input_versions只填需要处理的确切文件版本。纯文本、普通引用和公开查询线索写进goal，附件字段没有输入时留空。只填本次动作有关字段，null可能清空。
 被拒动作没有执行，结合具体host_message修正或说明阻碍；不要重提已成功提交的同一动作。不要求原已授权低风险操作再次批准。"""
 
@@ -71,9 +71,9 @@ RECOVERABLE_FOREGROUND_ERRORS = {"rate_limited", "provider_unavailable", "resear
 FOREGROUND_PUBLIC_READS = {"web_search", "web_fetch"}
 FINISHABLE_ACTIONS = {"apply_business_action", "start_work", "update_work", "control_work"}
 WORK_TOOLS = {
-    "start_work": "Queue one complete goal for background research, computation, attachment work or artifact delivery. A quick inline read may answer a simple question. Submit background work separately from inline public reads. Use finish_on_commit when the queued receipt fully answers the current turn. Omit attachment fields unless the goal needs actual visible attachments or exact file versions.",
+    "start_work": "Queue one complete goal for background research, computation, attachment work or artifact delivery. A quick inline read may answer a simple question. Submit background work separately from inline public reads. Use finish_on_commit when the queued receipt fully answers the current turn. A work_admission delivery ID means the host already queued the initial receipt, so refine the same work if needed and do not repeat the acknowledgement. Omit attachment fields unless the goal needs actual visible attachments or exact file versions.",
     "update_work": "Revise the selected existing work and preserve its current human requirements, inputs and outputs. Supply its exact visible ID and revision.",
-    "control_work": "Pause, cancel, resume or retry selected work when authorized. A human pause persists until an explicit resume.",
+    "control_work": "Pause, cancel, resume or retry selected work when authorized. When the requester asked for the complete set under a state or title filter, select basis=query and quantifier=all with those restrictions. Use IDs only for verified requester-selected targets. A human pause persists until an explicit resume.",
 }
 
 
@@ -898,6 +898,17 @@ def work_action_schema(kind: str, catalog: dict[str, Any] | None = None) -> dict
         raise ValueError("A named work primitive is required")
     parameters = _parameters_for_branch(kind, catalog)
     parameters["properties"].update(ActionCompletion.model_json_schema()["properties"])
+    if kind == "start_work":
+        parameters["properties"]["admission_ack"] = {
+            "type": "string",
+            "enum": ["immediate", "deferred", "silent"],
+            "description": (
+                "Immediate normally sends a verified queue receipt after a sole first write. "
+                "Use deferred for one combined reply with a separate answer or additional "
+                "actions. Use silent only when the current human expressly requests no "
+                "admission acknowledgement. The work can still be refined after admission."
+            ),
+        }
     if kind in {"start_work", "update_work"}:
         parameters["properties"]["input_event_ids"]["description"] = (
             "Authorized attachment-bearing event IDs from reference_catalog. Omit when no "
@@ -1027,6 +1038,7 @@ class ModelDecisionProvider:
         observations: dict[str, tuple[dict[str, Any], tuple[str, ...]]] = {}
         action_trace: list[dict[str, str]] = []
         deferred_read_ids: set[str] = set()
+        early_admission_call: str | None = None
         deferred_finish: tuple[str, FinishTurn] | None = None
         finish_after_commit: FinishTurn | None = None
         write_lock = asyncio.Lock()
@@ -1176,19 +1188,25 @@ class ModelDecisionProvider:
                     return observation(
                         call, {"status": "rejected", "code": "source_unavailable"}, kind=action_kind
                     )
-                if operation in {"create_schedule", "change_schedule"} and any(
-                    row.get("missed_relative_schedule") is True
-                    and row.get("operation") == operation
-                    and row.get("schedule_id") == schedule_id
-                    for row in receipts.values()
-                ):
+                resolved_refusal = next(
+                    (
+                        row
+                        for row in receipts.values()
+                        if operation in {"create_schedule", "change_schedule"}
+                        and row.get("timing_requires_author") is True
+                        and row.get("operation") == operation
+                        and row.get("schedule_id") == schedule_id
+                    ),
+                    None,
+                )
+                if resolved_refusal is not None:
                     return observation(
                         call,
                         {
                             "status": "rejected",
-                            "code": "schedule_time_missed",
+                            "code": resolved_refusal["code"],
                             "operation": operation,
-                            "instruction": "原消息指定的相对时刻已错过。当前请求不能自行换一个时刻。",
+                            "instruction": resolved_refusal["instruction"],
                             "committed": False,
                         },
                         kind=action_kind,
@@ -1217,6 +1235,17 @@ class ModelDecisionProvider:
                     completion = ActionCompletion.model_validate(
                         {"finish_on_commit": arguments.pop("finish_on_commit", False)}
                     )
+                    admission_ack = (
+                        arguments.pop("admission_ack", "immediate")
+                        if kind == "start_work"
+                        else None
+                    )
+                    if kind == "start_work" and admission_ack not in (
+                        "immediate",
+                        "deferred",
+                        "silent",
+                    ):
+                        raise _InvalidCandidate("admission_ack", "unknown_admission_ack_mode")
                     silent_declaration = (
                         arguments.pop("silent_declaration", False) if kind == "command" else False
                     )
@@ -1255,6 +1284,16 @@ class ModelDecisionProvider:
                         None,
                     )
                     repairing = kind == "update_work" and owned_effect is not None
+                    # A committed same-turn receipt can select the current
+                    # work even before the small context has listed it.
+                    if repairing and owned_effect is not None:
+                        authorize = context.get("_authorize_work_repair")
+                        if authorize is not None:
+                            repair = await authorize(str(target_id), owned_effect["goal_revision"])
+                            if repair.get("status") != "repair_available":
+                                raise DomainError(
+                                    repair.get("code", "version_conflict"), "Work changed"
+                                )
                     candidate = validate_candidate(
                         json.dumps(
                             {
@@ -1278,16 +1317,15 @@ class ModelDecisionProvider:
                     )
                     if candidate.kind != kind:
                         raise _InvalidCandidate("kind", "not_addressed_to_agent")
-                    if repairing and owned_effect is not None:
-                        authorize = context.get("_authorize_work_repair")
-                        if authorize is not None:
-                            repair = await authorize(str(target_id), owned_effect["goal_revision"])
-                            if repair.get("status") != "repair_available":
-                                raise DomainError(
-                                    repair.get("code", "version_conflict"), "Work changed"
-                                )
                     context["_turn_execution_pending"] = True
-                    receipt = await context["_apply_business_action"](candidate, call.id)
+                    if admission_ack == "silent" or (
+                        admission_ack == "immediate" and call.id == early_admission_call
+                    ):
+                        context["_work_admission_ack"] = (call.id, admission_ack)
+                    try:
+                        receipt = await context["_apply_business_action"](candidate, call.id)
+                    finally:
+                        context.pop("_work_admission_ack", None)
                 except DomainError as error:
                     if error.retryable:
                         raise
@@ -1323,15 +1361,23 @@ class ModelDecisionProvider:
                             "只选当前可用的现有主题ID，或省略topic_id交由主机关联。"
                         )
                 timing = action.get("timing") if isinstance(action, dict) else None
+                if receipt.get("code") == "room_nickname_verified":
+                    receipt["instruction"] = "直接报告已查证的当前群昵称，无需登记姓名例外。"
                 if (
                     receipt.get("code") == "schedule_time_missed"
                     and isinstance(timing, dict)
                     and timing.get("kind") == "after"
                 ):
                     receipt.update(
-                        missed_relative_schedule=True,
+                        timing_requires_author=True,
                         schedule_id=schedule_id,
                         instruction="原消息指定的相对时刻已过，直接说明，不能重设锚点。",
+                    )
+                elif receipt.get("code") in {"ambiguous_dst_fold", "nonexistent_local_time"}:
+                    receipt.update(
+                        timing_requires_author=True,
+                        schedule_id=schedule_id,
+                        instruction="按时钟工具的结果说明重复或缺失的时刻，并请真人选择。不要替换成猜测时刻。",
                     )
                 if receipt.get("committed") is True:
                     context["_turn_execution_pending"] = True
@@ -1395,7 +1441,25 @@ class ModelDecisionProvider:
                 and not candidate.open_request
                 and not effects
             ):
-                return Decision(kind="observe", reason_code="agent_observed", confidence=1)
+                scoped = context.get("_last_work_fact_read", {}).get("facts", [])
+                owned_work = event is not None and any(
+                    row.get("requester_id") == event.actor_id for row in scoped
+                )
+                owned_schedule = any(
+                    row.get("resource") == "schedules"
+                    and any(
+                        fact.get("owned_by_requester")
+                        for fact in row.get("facts", {}).get("facts", [])
+                    )
+                    for row in receipts.values()
+                )
+                control_response = any(
+                    row.get("kind") == "control_work"
+                    and row.get("code") in {"ambiguous_reference", "work_selection_scope_required"}
+                    for row in receipts.values()
+                )
+                if not owned_work and not owned_schedule and not control_response:
+                    return Decision(kind="observe", reason_code="agent_observed", confidence=1)
             if candidate.disposition == "proactive" and not proactive_allowed:
                 raise _InvalidCandidate("disposition", "proactive_not_allowed")
             if candidate.disposition == "proactive" and effects:
@@ -1412,15 +1476,37 @@ class ModelDecisionProvider:
                         raise _InvalidCandidate("blocker", "write_grant_is_available")
                 elif context.get("capabilities", {}).get(blocker) is not False:
                     raise _InvalidCandidate("blocker", "capability_is_available")
-            messages = [text for row in effects.values() if (text := receipt_message(row))]
+            messages = [
+                text
+                for row in effects.values()
+                if not row.get("work_admission") and (text := receipt_message(row))
+            ]
+            admissions = [
+                row["work_admission"] for row in effects.values() if row.get("work_admission")
+            ]
+            admission_text = next(
+                (row["text"] for row in admissions if row.get("delivery_id")), None
+            )
             response = candidate.response
-            if messages and natural_text:
+            if natural_text and (messages or admissions):
                 response = None
             if response:
-                for message in messages:
-                    response = response.replace(message, "")
+                repeated = [
+                    text
+                    for row in receipts.values()
+                    if row.get("work_admission") and (text := receipt_message(row))
+                ]
+                for message in [*messages, *repeated, admission_text]:
+                    if message:
+                        response = response.replace(message, "")
                 response = response.strip()
             text = "\n".join(dict.fromkeys(filter(None, [response, *messages])))
+            if not text and admissions:
+                if admission_text is None:
+                    return Decision(
+                        kind="observe", reason_code="agent_admission_silent", confidence=1
+                    )
+                text = admission_text
             if not text.strip() or len(text) > 12000 or len(text.encode()) > 64000:
                 raise _InvalidCandidate("response", "invalid_visible_reply")
             return Decision(
@@ -1465,7 +1551,7 @@ class ModelDecisionProvider:
             )
 
         async def after_model(candidate: ModelReply, messages: tuple[ModelMessage, ...]):
-            nonlocal deferred_finish, final, finish_after_commit
+            nonlocal deferred_finish, early_admission_call, final, finish_after_commit
             if reason := terminal_effect():
                 final = Decision(kind="observe", reason_code=reason, confidence=1)
                 record_outcome(final)
@@ -1480,6 +1566,7 @@ class ModelDecisionProvider:
                 record_outcome(final)
                 return KernelDirective(messages=messages[:-1], jump_to="end")
             deferred_finish = None
+            early_admission_call = None
             if candidate.finish_reason not in {"stop", "tool_calls"}:
                 return correction("incomplete_model_output", messages, drop=True)
             terminal = [call for call in candidate.tool_calls if call.name == "finish_turn"]
@@ -1544,7 +1631,11 @@ class ModelDecisionProvider:
             prior_progress = durable_progress(list(write_effects().values()))
             batch: dict[str, str] = {}
             for call in calls:
-                arguments = {k: v for k, v in call.arguments.items() if k != "finish_on_commit"}
+                arguments = {
+                    key: value
+                    for key, value in call.arguments.items()
+                    if key not in {"finish_on_commit", "admission_ack"}
+                }
                 key = json.dumps([call.name, arguments], ensure_ascii=False, sort_keys=True)
                 if call.id in tool_args and tool_args[call.id] != key:
                     return correction("tool_call_id_already_used", messages, drop=True)
@@ -1562,6 +1653,14 @@ class ModelDecisionProvider:
                     )
                     return correction(code, messages, drop=True)
             tool_args.update(batch)
+            if (
+                closing is None
+                and not completing
+                and not receipts
+                and len(calls) == 1
+                and calls[0].name == "start_work"
+            ):
+                early_admission_call = calls[0].id
             deferred_read_ids.clear()
             if any(call.name == "start_work" for call in calls):
                 deferred_read_ids.update(

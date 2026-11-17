@@ -1647,6 +1647,27 @@ class UnitOfWork:
             request_event_id, text, slot="early_ack", read_only_authorized=read_only_authorized
         )
 
+    def enqueue_work_admission(self, work_id: str, text: str) -> DeliveryIntent | None:
+        """Enqueue a source-bound acknowledgement of an actually queued work order."""
+        self._writer()
+        work = self._work_row(work_id)
+        if work["requester_id"] != self.actor.member_id or work["state"] != WorkState.QUEUED:
+            raise DomainError(
+                "permission_denied", "Admission receipt requires the requester's queued work"
+            )
+        self._check_work_source(work)
+        request_id = work["request_event_id"]
+        if self.conn.execute(
+            "SELECT 1 FROM ga_deliveries WHERE group_id=%s AND idempotency_key=%s",
+            (self.group_id, "early_ack:" + request_id + ":1"),
+        ).fetchone():
+            # A legacy intent already owns this source-bound slot. Its
+            # history remains immutable; the normal final reply is available.
+            return None
+        return self._enqueue_request_text(
+            request_id, text, slot="early_ack", read_only_authorized=False
+        )
+
     def _enqueue_request_text(
         self,
         request_event_id: str,

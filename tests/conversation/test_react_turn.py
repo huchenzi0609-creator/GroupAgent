@@ -4,8 +4,9 @@ import json
 
 import pytest
 
+from groupagent.conversation.policy import apply_quiet_barrier_in_tx, delivery_admission_in_tx
 from groupagent.conversation.provider import ModelDecisionProvider
-from groupagent.domain import DomainError, WorkState
+from groupagent.domain import DeliveryState, DomainError, WorkState
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
 from .test_agent_dialogue import source
@@ -263,6 +264,176 @@ async def test_invalid_paired_report_recovers_without_reexecuting_committed_writ
 
 
 @pytest.mark.postgres
+@pytest.mark.parametrize("supplement", [None, "已保留表格的列名。"])
+async def test_real_queued_ack_precedes_same_work_refinement_and_is_not_repeated(
+    conversation_env, supplement
+):
+    env = conversation_env
+    event = source(env, "Pot，请从同一份资料生成 Word、PDF 和 PPT。")
+    initial = call(
+        "start_work",
+        "initial",
+        goal=event.text,
+        work_capabilities=["documents"],
+        outputs=[{"format": "docx"}, {"format": "pdf"}],
+    )
+    admission_ids = []
+
+    def refine(request):
+        receipt = tool_receipt(request)
+        work = receipt["work_effects"][0]
+        admission = receipt["work_admission"]
+        assert receipt["committed"] is True and work["goal_revision"] == 1
+        with env.store.transaction(env.actor) as tx:
+            (queued,) = tx.list_delivery()
+            assert queued.id == admission["delivery_id"]
+            assert queued.request_event_id == event.id
+            assert queued.idempotency_key == "early_ack:" + event.id + ":1"
+            assert queued.payload_ref.startswith("text:这项工作已排队。")
+            assert tx.get_work(work["id"]).state == WorkState.QUEUED
+            assert delivery_admission_in_tx(tx, queued).allowed
+            claimed = tx.claim_delivery("fixture-sender", intent_id=queued.id)
+            assert claimed is not None
+            tx.finish_delivery(
+                claimed.id,
+                claimed.claim_token,
+                DeliveryState.ACCEPTED,
+                platform_message_id="fixture:work-admission",
+            )
+        admission_ids.append(queued.id)
+        return call(
+            "update_work",
+            "refined",
+            goal=event.text,
+            target_work_id=work["id"],
+            expected_revision=work["revision"],
+            work_capabilities=["documents"],
+            outputs=[{"format": "docx"}, {"format": "pdf"}, {"format": "pptx"}],
+        )
+
+    def close(request):
+        receipt = tool_receipt(request)
+        assert receipt["committed"] is True and receipt["satisfies_kind"] == "start_work", receipt
+        assert receipt["work_admission"]["delivery_id"] == admission_ids[0]
+        return finish(supplement, reports=[("refined", "committed")])
+
+    model = ModelScript(initial, refine, close)
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.work_id and len(model.requests) == 3
+    with env.store.transaction(env.actor) as tx:
+        work = tx.get_work(result.work_id)
+        assert work.goal_revision == 2
+        assert {row["format"] for row in work.scope["outputs"]} == {"docx", "pdf", "pptx"}
+        assert len(tx.list_work()) == 1
+        deliveries = tx.list_delivery()
+        assert len(deliveries) == 1 + (supplement is not None)
+        admitted = next(row for row in deliveries if row.id == admission_ids[0])
+        assert admitted.state == DeliveryState.ACCEPTED
+        if supplement:
+            answer = next(row for row in deliveries if row.id != admission_ids[0])
+            assert answer.payload_ref == "text:" + supplement
+            assert result.delivery_id == answer.id
+        else:
+            assert result.delivery_id == admitted.id
+            assert result.decision.response == admitted.payload_ref.removeprefix("text:")
+        assert tx.get_decision(event.id)["work_admission"]["delivery_id"] == admitted.id
+
+
+@pytest.mark.postgres
+async def test_untyped_model_ack_uses_the_already_queued_canonical_receipt(conversation_env):
+    env = conversation_env
+    event = source(env, "Pot，请计算一个合成数值。")
+    env.models[event.id] = ModelScript(
+        queued_compute(event),
+        ModelReply(text="好的，我已经把这个任务放进队列了。", usage=USAGE),
+    )
+    result = await env.coordinator.process(event)
+    with env.store.transaction(env.actor) as tx:
+        (admission,) = tx.list_delivery()
+        assert result.delivery_id == admission.id
+        assert result.decision.response == admission.payload_ref.removeprefix("text:")
+        assert admission.idempotency_key == "early_ack:" + event.id + ":1"
+
+
+@pytest.mark.postgres
+async def test_existing_legacy_ack_slot_preserves_work_and_falls_back_to_final_reply(
+    conversation_env,
+):
+    env = conversation_env
+    event = source(env, "Pot，请用 Python 计算一个平方。")
+    with env.store.transaction(env.actor) as tx:
+        legacy = tx.enqueue_early_ack(event.id, "Legacy placeholder.")
+        claimed = tx.claim_delivery("fixture-sender", intent_id=legacy.id)
+        assert claimed is not None
+        tx.finish_delivery(
+            legacy.id,
+            claimed.claim_token,
+            DeliveryState.ACCEPTED,
+            platform_message_id="fixture:accepted-legacy",
+        )
+
+    def close(request):
+        receipt = tool_receipt(request)
+        assert receipt["committed"] is True and receipt["work_admission"] is None
+        return finish()
+
+    env.models[event.id] = ModelScript(queued_compute(event), close)
+    result = await env.coordinator.process(event)
+    assert result.work_id and result.delivery_id != legacy.id
+    with env.store.transaction(env.actor) as tx:
+        kept = tx.get_delivery(legacy.id)
+        assert kept.state == DeliveryState.ACCEPTED
+        assert kept.payload_ref == legacy.payload_ref
+        assert tx.get_delivery(result.delivery_id).idempotency_key == "reply:" + event.id + ":1"
+        assert len(tx.list_work()) == 1
+
+
+@pytest.mark.postgres
+async def test_explicit_silent_admission_keeps_work_without_a_visible_receipt(conversation_env):
+    env = conversation_env
+    event = source(env, "Pot，请计算并只在结果完成时发消息。")
+    model = ModelScript(queued_compute(event, admission_ack="silent"), finish())
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.work_id and not result.delivery_id
+    assert result.decision.kind == "observe"
+    with env.store.transaction(env.actor) as tx:
+        assert len(tx.list_work()) == 1 and not tx.list_delivery()
+        assert tx.get_decision(event.id)["work_admission"] == {
+            "work_id": result.work_id,
+            "silent": True,
+        }
+
+
+@pytest.mark.postgres
+async def test_quiet_barrier_retires_unsent_admission_without_cancelling_work(conversation_env):
+    env = conversation_env
+    event = source(env, "Pot，请运行 Python 计算平方。")
+
+    def quiet_before_send(request):
+        receipt = tool_receipt(request)
+        quiet = source(env, "Pot，请暂时保持安静。")
+        with env.store.transaction(env.actor) as tx:
+            tx.conn.execute(
+                "INSERT INTO ga_conversation_policy(group_id,subject_id,quiet) VALUES(%s,'*',true)",
+                (env.actor.group_id,),
+            )
+            assert apply_quiet_barrier_in_tx(tx, quiet, "*") == 1
+            pending = tx.get_delivery(receipt["work_admission"]["delivery_id"])
+            assert pending.state == DeliveryState.REJECTED and not pending.platform_message_id
+        return finish()
+
+    env.models[event.id] = ModelScript(queued_compute(event), quiet_before_send)
+    result = await env.coordinator.process(event)
+    assert result.work_id and result.decision.kind == "observe"
+    with env.store.transaction(env.actor) as tx:
+        assert tx.get_work(result.work_id).state == WorkState.QUEUED
+        (ack,) = tx.list_delivery()
+        assert ack.state == DeliveryState.REJECTED
+
+
+@pytest.mark.postgres
 async def test_receipt_reused_after_model_interruption_and_event_replay(conversation_env):
     env = conversation_env
     event = source(env, "Pot，用 Python 实际算一遍 7 的平方。")
@@ -280,13 +451,25 @@ async def test_receipt_reused_after_model_interruption_and_event_replay(conversa
     with pytest.raises(DomainError, match="Model interrupted"):
         await env.coordinator.process(event)
     with env.store.transaction(env.actor) as tx:
-        assert len(tx.list_work()) == 1 and not tx.list_delivery()
+        assert len(tx.list_work()) == 1
+        (ack,) = tx.list_delivery()
+        assert ack.state == DeliveryState.PENDING
         body = tx.get_decision(event.id)
         assert body["agent_pending_response"] and body["agent_needs_execution"]
+        assert body["work_admission"]["delivery_id"] == ack.id
+        claimed = tx.claim_delivery("fixture-sender", intent_id=ack.id)
+        assert claimed is not None
+        tx.finish_delivery(
+            claimed.id,
+            claimed.claim_token,
+            DeliveryState.ACCEPTED,
+            platform_message_id="fixture:admitted-before-replay",
+        )
 
     def resumed(request):
         prior = json.loads(request.messages[1].content)["prior_receipts"]
         assert len(prior) == 1 and prior[0]["tool_call_id"] == "python-start"
+        assert prior[0]["work_admission"]["delivery_id"] == ack.id
         return finish(reports=[("python-start", "queued")])
 
     model = ModelScript(resumed)

@@ -1208,11 +1208,18 @@ elif fmt == "docx":
             pieces.append("\n".join(" | ".join(row) for row in rows))
         else:
             pieces.append(block.text)
-            for link in block.hyperlinks:
-                if link.url: result["links"].append(link.url)
+    surfaces = [(doc.element, doc.part)]
     for section in doc.sections:
         for story in (section.header, section.footer):
             pieces.extend(p.text for p in story.paragraphs)
+            surfaces.append((story._element, story.part))
+    links = set()
+    for element, part in surfaces:
+        for link in element.xpath(".//w:hyperlink"):
+            relationship = part.rels.get(link.get(qn("r:id")))
+            if relationship is not None and relationship.is_external:
+                links.add(relationship.target_ref)
+    result["links"] = sorted(links)
     linked_images = []
     for drawing in doc.element.xpath(".//a:blip"):
         image_part = doc.part.related_parts.get(drawing.get(qn("r:embed")))

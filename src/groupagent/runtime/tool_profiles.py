@@ -41,6 +41,7 @@ _DOCUMENTS = (
 
 _IMAGES = (
     "Use image_analyze's exact file/version/source_sha256-to-normalized_view_sha256 binding to verify the current image. Normalization can change bytes; OCR is an extraction aid and can misread text. Do not infer a real person's identity from pixels.",
+    "When a request combines visible text or scene description with identifying or matching a real person by appearance, complete the readable or descriptive part using the authorized image. Keep visual tool calls scoped to that part. Attribute any printed name to the text, and explain that appearance cannot confirm the person's identity or whether two people are the same. That limit does not require another upload.",
 )
 
 _PUBLIC_IMAGES = (

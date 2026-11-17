@@ -17,7 +17,7 @@ from groupagent.research import (
     source_citation,
     validate_research_citations,
 )
-from groupagent.research.citations import CitationProvenance
+from groupagent.research.citations import CitationProvenance, UnverifiedCitation
 
 URL = "https://docs.python.org/3/howto/sorting.html"
 SECOND_URL = "https://docs.python.org/zh-cn/3.14/howto/sorting.html"
@@ -48,6 +48,25 @@ def test_canonical_utc_citation_keeps_the_original_aware_time_and_ignores_other_
     assert actual.retrieved_at.isoformat() == "2026-11-15T00:08:23.973776+08:00"
     assert "2020" not in line and "2099" not in line
     validate_research_citations(line, [actual], require_access_time=True)
+
+
+def test_apostrophe_inside_a_verified_url_is_not_a_citation_delimiter():
+    actual = source("https://example.com/reference/team's-guide", operation="search")
+    validate_research_citations(source_citation(actual), [actual], require_access_time=True)
+    validate_research_citations("'" + actual.url + "'", [actual])
+    validate_research_citations(f"[Source]({actual.url})", [actual])
+
+
+def test_apostrophe_does_not_let_an_unknown_path_pass_as_a_verified_prefix():
+    actual = source("https://example.com/reference/team")
+    fabricated = actual.url + "'s-guide"
+    with pytest.raises(UnverifiedCitation, match="no successful research provenance") as rejected:
+        validate_research_citations(fabricated, [actual])
+    assert rejected.value.details == {
+        "unverified_urls": [fabricated],
+        "unverified_url_count": 1,
+        "verified_sources": [{"source_id": actual.source_id, "url": actual.url}],
+    }
 
 
 def test_old_web01_local_time_was_correct_but_utc_record_was_not_disclosed():

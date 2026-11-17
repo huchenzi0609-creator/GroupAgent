@@ -20,7 +20,7 @@ from groupagent.domain import DomainError
 from .models import ResearchSource
 
 _URL = re.compile(
-    r"https?://[^\s<>\]\"'，。；：！？、（）【】《》〈〉“”‘’「」『』〔〕［］｛｝]+",
+    r"https?://[^\s<>\]\"，。；：！？、（）【】《》〈〉“”‘’「」『』〔〕［］｛｝]+",
     re.I,
 )
 _ACCESS = re.compile(r"访问|检索|查阅|读取|access(?:ed)?|retriev(?:ed|al)|fetch(?:ed)?", re.I)
@@ -29,6 +29,42 @@ _STAMP = re.compile(
     r"(?:Z|[+-]\d{2}:?\d{2})?)(?![\d:+-])",
     re.I,
 )
+
+
+class UnverifiedCitation(DomainError):
+    """Bounded repair data for an exact URL miss, without granting the proposed locator."""
+
+    def __init__(
+        self,
+        failed: list[str],
+        sources: list[ResearchSource | CitationProvenance],
+    ) -> None:
+        super().__init__(
+            "validation_failed",
+            "A cited URL has no successful research provenance. Use an exact verified source "
+            "locator, fetch the intended public page, or remove the unsupported reference.",
+        )
+        hosts = {urlsplit(url).netloc.lower() for url in failed}
+        verified = sorted(
+            {source.url: source for source in sources}.values(),
+            key=lambda source: (urlsplit(source.url).netloc.lower() not in hosts, source.url),
+        )[:6]
+        self.details = {
+            "unverified_urls": [url for url in failed if len(url.encode()) <= 1_200][:4],
+            "unverified_url_count": len(failed),
+            "verified_sources": [
+                {
+                    **(
+                        {"source_id": source.source_id}
+                        if isinstance(source, ResearchSource)
+                        else {}
+                    ),
+                    **({"url": source.url} if len(source.url.encode()) <= 640 else {}),
+                }
+                for source in verified
+                if isinstance(source, ResearchSource) or len(source.url.encode()) <= 640
+            ],
+        }
 
 
 class CitationProvenance(BaseModel):
@@ -85,6 +121,10 @@ def _citation_urls(text: str) -> list[tuple[str, int, int]]:
     while match := _URL.search(text, position):
         value, end = match[0], match.end()
         position = end
+        # Apostrophes are legal inside a URL path/query. Strip only the closing
+        # quote of an explicitly quoted whole URL.
+        if value.endswith("'") and match.start() > 0 and text[match.start() - 1] == "'":
+            value, end = value[:-1], end - 1
         if text[: match.start()].rstrip().endswith("]("):
             depth = 1
             for index, char in enumerate(value):
@@ -170,8 +210,10 @@ def validate_research_citations(
             "validation_failed", "Research source provenance must be a collection"
         ) from None
     observed: dict[str, list[datetime]] = {}
+    verified_sources = []
     for value in source_values:
         source = _source(value)
+        verified_sources.append(source)
         observed.setdefault(_url(source.url), []).append(source.retrieved_at)
     matches = _citation_urls(text)
     if not matches:
@@ -182,7 +224,10 @@ def validate_research_citations(
         return
     cited = {_url(match[0]) for match in matches}
     if not cited.issubset(observed):
-        raise DomainError("validation_failed", "A cited URL has no successful research provenance")
+        failed = list(
+            dict.fromkeys(match[0] for match in matches if _url(match[0]) not in observed)
+        )
+        raise UnverifiedCitation(failed, verified_sources)
     verified: set[str] = set()
     for index, match in enumerate(matches):
         url = _url(match[0])

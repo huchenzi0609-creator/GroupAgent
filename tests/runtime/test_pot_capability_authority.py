@@ -91,7 +91,9 @@ async def test_reading_multiple_work_targets_does_not_authorize_a_guess(
         if explicit_reference:
             assert observed["status"] == "committed"
             return reply("已停止指定的工作。")
-        assert observed["status"] == "rejected" and observed["code"] == "ambiguous_reference"
+        assert (
+            observed["status"] == "rejected" and observed["code"] == "work_selection_scope_required"
+        )
         return tool(
             "finish_turn",
             {"disposition": "reply", "response": "要停止哪一项暂停的工作？", "needs_input": True},
@@ -142,4 +144,42 @@ async def test_direct_native_acceptance_quote_targets_known_work(runtime_env):
         DialogueModel(quoted),
         reply_to=native,
     )
+    assert len(replay.works()) == 1
+
+
+async def test_scoped_status_reply_survives_an_interleaved_human_message(runtime_env):
+    env = runtime_env
+    replay = Replay(env)
+    _, result, _ = await replay.say(
+        "Pot，请把一份合成材料整理成可读说明。",
+        DialogueModel(
+            tool(
+                "start_work",
+                {"goal": "整理合成材料为说明", "finish_on_commit": True},
+            )
+        ),
+    )
+    await replay.say(
+        "我看到了窗外的雾。",
+        DialogueModel(tool("finish_turn", {"disposition": "observe"})),
+        actor="synthetic-peer",
+    )
+
+    def status_answer(request):
+        shown = observation(request)
+        assert shown["facts"][0]["id"] == result.work_id
+        assert shown["facts"][0]["state"] == "queued"
+        return tool(
+            "finish_turn",
+            {"disposition": "reply", "response": "你的材料说明已登记，仍在排队。"},
+        )
+
+    _, followup, _ = await replay.say(
+        "刚才那份说明做到哪一步了？",
+        DialogueModel(
+            tool("read_work_facts", {"selector": {"basis": "ids", "ids": [result.work_id]}}),
+            status_answer,
+        ),
+    )
+    assert followup.delivery_id and followup.decision.kind == "reply"
     assert len(replay.works()) == 1

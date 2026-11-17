@@ -63,7 +63,7 @@ from groupagent.research import (
     validate_research_citations,
 )
 from groupagent.research.browser import ControlledBrowser, PublicPageBroker
-from groupagent.research.citations import CitationProvenance
+from groupagent.research.citations import CitationProvenance, UnverifiedCitation
 from groupagent.research.deepseek import DeepSeekResearchClient
 from groupagent.research.image_transforms import (
     ImageTransformService,
@@ -100,7 +100,6 @@ from groupagent.tools.models import (
     successful_required_tools,
 )
 from groupagent.tools.paths import open_parent
-from groupagent.vision_policy import FACE_ID_RESPONSE, requests_face_identification
 
 from .artifact_tools import register_export_tool
 from .artifacts import ArtifactRegistry
@@ -769,11 +768,6 @@ class WorkToolkit:
     async def prepare(
         self, work: WorkOrder, lease: ExecutionLease, actor: ActorContext, workspace: Path
     ) -> PreparedExecution:
-        if requests_face_identification(
-            work.goal,
-            image_context=bool(work.input_versions or work.scope.get("attachment_event_ids")),
-        ):
-            raise DomainError("face_identification_unavailable", FACE_ID_RESPONSE)
         documents, media, control_context, worker = self.services(work, lease, actor, workspace)
 
         async def policy(scope):
@@ -1795,11 +1789,23 @@ class WorkToolkit:
                     {
                         "name": version.name,
                         "format": version.format,
+                        "file_id": version.file_id,
+                        "version_id": version.version_id,
+                        "sha256": version.sha256,
                         "text": text[:16000],
                         "excerpt_truncated": not read.complete or len(text) > 16000,
                         "total_units": read.total_units,
                         "page_count": record.page_count,
                         "metadata": read.metadata,
+                        "verified_selected_artifact": {
+                            "validation_id": record.validation_id,
+                            "content_passed": record.content_passed,
+                            "rendered": record.rendered,
+                            "checked_literals": (
+                                expected if isinstance(expected_raw, list) and expected_raw else ()
+                            ),
+                            "page_count_verified": record.page_count,
+                        },
                     }
                 )
             else:
@@ -2080,7 +2086,6 @@ class WorkToolkit:
                 "Requested research requires actual research tool evidence with retrieval provenance",
             )
         if research_sources:
-            full_answer = answer + "\n" + "\n".join(str(item.get("text", "")) for item in excerpts)
             # Receipts retain their complete, actual provenance independently
             # of the brief group answer. Every displayed link/time is checked,
             # but a bibliography is not itself proof that the facts are sound.
@@ -2098,7 +2103,18 @@ class WorkToolkit:
                 citation_sources,
                 require_access_time=True,
             )
-            validate_research_citations(full_answer, citation_sources, require_citation=False)
+            for surface, text in [
+                ("group_reply", answer),
+                *(
+                    (str(artifact.get("version_id", "artifact")), str(artifact.get("text", "")))
+                    for artifact in excerpts
+                ),
+            ]:
+                try:
+                    validate_research_citations(text, citation_sources, require_citation=False)
+                except UnverifiedCitation as error:
+                    error.details["surface"] = surface
+                    raise
         if research_evidence_required(work):
             if (
                 not outputs

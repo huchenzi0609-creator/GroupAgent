@@ -12,7 +12,7 @@ from groupagent.conversation.policy import (
     delivery_admission_in_tx,
     ingress_admission,
 )
-from groupagent.domain import DeliveryState, EventKind, WorkState
+from groupagent.domain import ActorContext, DeliveryState, EventKind, Role, WorkState
 from groupagent.runtime.dispatch import Dispatcher
 
 from .conftest import source
@@ -76,6 +76,68 @@ def test_quiet_barrier_retires_old_replies_and_preserves_accepted_work(runtime_e
             "UPDATE ga_conversation_policy SET quiet=false WHERE group_id=%s", (tx.group_id,)
         )
         assert not ingress_admission(tx, earlier).allowed
+
+
+def legacy_notice(tx, work_id, key):
+    text = "Synthetic work notice " + key
+    intent = tx.enqueue_delivery(
+        None, "text:" + text, hashlib.sha256(text.encode()).hexdigest(), "notice-test:" + key
+    )
+    tx.conn.execute(
+        "INSERT INTO ga_progress_notices(group_id,work_id,notice_key,intent_id) VALUES(%s,%s,%s,%s)",
+        (tx.group_id, work_id, key, intent.id),
+    )
+    return intent
+
+
+def test_quiet_barrier_retires_scoped_legacy_progress_and_preserves_native_evidence(runtime_env):
+    env = runtime_env
+    request = source(env, "Pot，请整理合成材料。")
+    incomplete = source(env, "Pot，请按我稍后给的资料完成这项工作。")
+    guest = ActorContext(group_id=env.actor.group_id, member_id="synthetic-other", role=Role.MEMBER)
+    theirs = ingest(env, "Pot，请处理我的材料。", actor_id=guest.member_id)
+    with env.store.transaction(guest) as tx:
+        guest_work = tx.create_work("Synthetic guest work", theirs.id)
+        guest_notice = legacy_notice(tx, guest_work.id, "recovery:guest")
+    with env.store.transaction(env.actor) as tx:
+        work = tx.create_work("Synthetic continuing work", request.id)
+        outdated = legacy_notice(tx, work.id, "recovery:legacy")
+        waiting = tx.create_work(
+            "Synthetic waiting work", incomplete.id, state=WorkState.WAITING_INPUT
+        )
+        question = legacy_notice(tx, waiting.id, "waiting_input:1")
+        accepted = legacy_notice(tx, work.id, "recovery:accepted")
+        unknown = legacy_notice(tx, work.id, "recovery:unknown")
+        for intent, state in ((accepted, DeliveryState.ACCEPTED), (unknown, DeliveryState.UNKNOWN)):
+            claim = tx.claim_delivery("old-sender", intent_id=intent.id)
+            tx.finish_delivery(
+                claim.id,
+                claim.claim_token,
+                state,
+                platform_message_id="synthetic-native-receipt"
+                if state == DeliveryState.ACCEPTED
+                else None,
+            )
+    stop = source(env, "Pot，只对我保持静默。")
+    assert quiet(env, stop, subject=env.actor.member_id) == 1
+    with env.store.transaction(env.actor) as tx:
+        retired = tx.get_delivery(outdated.id)
+        assert retired.state == DeliveryState.REJECTED and retired.reason == "quiet_barrier"
+        assert tx.get_delivery(guest_notice.id).state == DeliveryState.PENDING
+        assert tx.get_delivery(question.id).state == DeliveryState.PENDING
+        assert tx.get_delivery(accepted.id).platform_message_id == "synthetic-native-receipt"
+        assert tx.get_delivery(unknown.id).state == DeliveryState.UNKNOWN
+        assert tx.get_work(work.id).state == WorkState.QUEUED
+        tx.conn.execute(
+            "UPDATE ga_conversation_policy SET quiet=false WHERE group_id=%s AND subject_id=%s",
+            (tx.group_id, env.actor.member_id),
+        )
+        delayed = legacy_notice(tx, work.id, "recovery:delayed")
+        admission = delivery_admission_in_tx(tx, delayed)
+        assert (
+            not admission.allowed and admission.retire and admission.reason_code == "quiet_barrier"
+        )
+        assert delivery_admission_in_tx(tx, question).allowed
 
 
 def test_explicit_invocation_roots_natural_followups_until_another_human_speaks(runtime_env):

@@ -36,6 +36,12 @@ class WallTiming(WallClockTiming):
         default=None,
         description="For a repeated local time, 0 selects the first instant and 1 the second.",
     )
+    fold_evidence: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        description="Exact words from the current requester selecting the earlier or later instant.",
+    )
 
     @field_validator("date", mode="before")
     @classmethod
@@ -117,7 +123,10 @@ def _plus(instant: datetime, seconds: int) -> datetime:
 
 
 def _instant(
-    proposal: InstantProposal, occurred_at: datetime | None, time_zone: str
+    proposal: InstantProposal,
+    occurred_at: datetime | None,
+    time_zone: str,
+    source_text: str | None,
 ) -> tuple[datetime, str]:
     if isinstance(proposal, datetime):
         return utc(proposal), time_zone
@@ -142,7 +151,12 @@ def _instant(
         raise DomainError(
             "nonexistent_local_time", "The local time was skipped when the clocks changed"
         )
-    if first != second and proposal.fold is None:
+    selection = (proposal.fold_evidence or "").strip()
+    if first != second and (
+        proposal.fold is None
+        or source_text is not None
+        and (not selection or selection not in source_text)
+    ):
         raise DomainError(
             "ambiguous_dst_fold", "The local time occurs twice. Choose the first or second instant"
         )
@@ -154,6 +168,7 @@ def resolve_instant(
     *,
     occurred_at: datetime | None,
     time_zone: str,
+    source_text: str | None = None,
 ) -> datetime:
     """Resolve a one-shot proposal for a deadline, quiet end or validity bound."""
     try:
@@ -162,7 +177,7 @@ def resolve_instant(
         raise DomainError(
             "invalid_schedule_time", "An aware instant or one-shot proposal is required"
         ) from error
-    return _instant(proposal, occurred_at, time_zone)[0]
+    return _instant(proposal, occurred_at, time_zone, source_text)[0]
 
 
 def _shift(rule: Timing, seconds: int) -> Timing:
@@ -194,6 +209,7 @@ def resolve_schedule_timing(
     occurred_at: datetime | None,
     time_zone: str,
     reference_timing: Timing | None = None,
+    source_text: str | None = None,
 ) -> tuple[Timing, str]:
     """Return existing stored timing and its display zone from a typed proposal."""
     if isinstance(value, dict) and value.get("kind") not in ("after", "wall", "clock", "shift"):
@@ -204,7 +220,7 @@ def resolve_schedule_timing(
     except (ValidationError, OverflowError) as error:
         raise DomainError("invalid_schedule_time", "Schedule timing is invalid") from error
     if isinstance(proposal, (AfterTiming, WallTiming)):
-        instant, time_zone = _instant(proposal, occurred_at, time_zone)
+        instant, time_zone = _instant(proposal, occurred_at, time_zone, source_text)
         zone(time_zone)
         return AtTiming(at=instant), time_zone
     zone(time_zone)

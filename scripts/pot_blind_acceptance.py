@@ -18,7 +18,7 @@ import unicodedata
 from datetime import UTC, datetime, timedelta
 from datetime import time as WallTime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from pot_release_gate import (
@@ -141,6 +141,40 @@ def official_source(url, spec):
         return False
     patterns = spec.get("official_source_patterns", ())
     return not patterns or any(re.search(pattern, url, re.I) for pattern in patterns)
+
+
+def page_url_key(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value.strip())
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+        ):
+            return None
+    except ValueError:
+        return None
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc.lower(),
+            parsed.path.rstrip("/") or "/",
+            parsed.query,
+            "",
+        )
+    )
+
+
+def fetch_source_urls(output):
+    source = output.get("source", output)
+    return {
+        key
+        for value in (source.get("url"), source.get("final_url"))
+        if (key := page_url_key(value)) is not None
+    }
 
 
 class Scenario:
@@ -281,6 +315,35 @@ class Scenario:
                 (self.group, list(source_ids)),
             ).fetchall()
 
+    def pending_admission(self, source_event_id):
+        with self.store.transaction(self.app.owner) as tx:
+            return (
+                tx.conn.execute(
+                    "SELECT 1 FROM ga_deliveries d "
+                    "JOIN ga_decisions c ON c.group_id=d.group_id AND c.event_id=d.request_event_id "
+                    "JOIN ga_work_orders w ON w.group_id=d.group_id AND w.request_event_id=c.event_id "
+                    "AND w.id=c.body->'work_admission'->>'work_id' AND w.requester_id=d.created_by "
+                    "WHERE d.group_id=%s AND d.request_event_id=%s AND d.idempotency_key=%s "
+                    "AND d.id=c.body->'work_admission'->>'delivery_id' AND d.state='pending' LIMIT 1",
+                    (self.group, source_event_id, f"early_ack:{source_event_id}:1"),
+                ).fetchone()
+                is not None
+            )
+
+    async def process_with_admission_receipts(self, source_event_id):
+        foreground = asyncio.create_task(self.app.process_pending(batched=False))
+        try:
+            while not foreground.done():
+                if self.pending_admission(source_event_id):
+                    await self.app.dispatcher.tick()
+                await asyncio.wait((foreground,), timeout=0.05)
+            await foreground
+        finally:
+            if not foreground.done():
+                foreground.cancel()
+                await asyncio.gather(foreground, return_exceptions=True)
+        await self.app.dispatcher.tick()
+
     async def event(
         self,
         key,
@@ -331,17 +394,20 @@ class Scenario:
         )
         self.app.channel.append_incoming(record)
         await self.app.poll_intake()
-        if process:
-            await self.app.process_pending(batched=False)
-        if dispatch:
-            await self.app.dispatcher.tick()
+        if process and dispatch:
+            await self.process_with_admission_receipts(record.id)
+        else:
+            if process:
+                await self.app.process_pending(batched=False)
+            if dispatch:
+                await self.app.dispatcher.tick()
         with self.store.transaction(self.app.owner) as tx:
             event = tx.conn.execute(
                 "SELECT 1 FROM ga_events WHERE group_id=%s AND id=%s", (self.group, record.id)
             ).fetchone()
             decision = tx.get_decision(record.id)
             parts = tx.conn.execute(
-                "SELECT p.platform_message_id,p.state,p.intent_id "
+                "SELECT p.platform_message_id,p.state,p.intent_id,d.idempotency_key,d.accepted_at "
                 "FROM ga_delivery_parts p JOIN ga_deliveries d ON d.id=p.intent_id "
                 "AND d.group_id=p.group_id WHERE d.group_id=%s AND d.request_event_id=%s "
                 "ORDER BY d.created_at,p.position",
@@ -351,11 +417,19 @@ class Scenario:
         receipts = [
             row for row in self.spool() if row["receipt"]["platform_message_id"] in platform_ids
         ]
-        delay = None
-        if receipts and event_time is None:
-            delay = min(
-                (dt(row["receipt"]["observed_at"]) - stamp).total_seconds() for row in receipts
-            )
+        first_acceptance = min(
+            (
+                dt(row["receipt"]["observed_at"])
+                for row in receipts
+                if row["receipt"]["state"] == "accepted"
+            ),
+            default=None,
+        )
+        delay = (
+            (first_acceptance - stamp).total_seconds()
+            if first_acceptance and event_time is None
+            else None
+        )
         evidence = {
             "turn": key,
             "event_id": record.id,
@@ -365,6 +439,7 @@ class Scenario:
             "work_id": (decision or {}).get("result", {}).get("work_id"),
             "parts": parts,
             "receipts": receipts,
+            "first_accepted_at": first_acceptance.isoformat() if first_acceptance else None,
             "first_receipt_seconds": delay,
             "latency_required": latency,
             "model_rounds": sum(call["source_event_id"] == record.id for call in self.model_calls),
@@ -897,15 +972,23 @@ async def chat04(s):
     if not markdown:
         return
     body = markdown["decoded"].get("text", "")
-    urls = re.findall(r"https://[^\s)。]+", body)
+    urls = {page_url_key(url) for url in re.findall(r"https://[^\s)。]+", body)}
+    fetched_pages = {
+        url
+        for receipt in successful_tools(work, {"web_fetch", "browser_open"})
+        for url in fetch_source_urls(receipt["output"])
+    }
+    verified_official = {
+        url for url in urls & fetched_pages if url and official_source(url, s.spec)
+    }
     s.check(
         "long_complete_cited_artifact",
         all(marker in body for marker in s.spec["long_markers"])
         and len(re.findall(r"[\u3400-\u9fff]", body)) >= s.spec["long_min_han"]
-        and any(official_source(url, s.spec) for url in urls)
-        and bool(successful_tools(work, {"web_fetch", "browser_open", "web_search"})),
+        and bool(verified_official),
         work,
         markdown,
+        {"official_pages_shared_by_output_and_fetch_receipt": sorted(verified_official)},
     )
     s.check("accepted_bytes", markdown["accepted_sha256"] == markdown["sha256"], markdown)
 
@@ -915,10 +998,10 @@ async def chat05(s):
     # Use a pending legacy progress notice to test suppression across policy changes.
     started = None
     progress_id = None
+    body = "例行后台进度提示"
     if request["work_id"]:
         with s.store.transaction(s.app.owner) as tx:
             started = tx.get_work(request["work_id"])
-            body = "例行后台进度提示"
             progress_id = tx._insert_delivery(
                 None,
                 "text:" + body,
@@ -933,27 +1016,51 @@ async def chat05(s):
     quiet = await s.event("quiet")
     discussion = await s.event("discussion", actor=GUEST)
     after = s.spool()
+    with s.store.transaction(s.app.owner) as tx:
+        quiet_policy = tx.conn.execute(
+            "SELECT quiet,quiet_since_sequence FROM ga_conversation_policy "
+            "WHERE group_id=%s AND subject_id='*'",
+            (s.group,),
+        ).fetchone()
+        quiet_notice = tx.get_delivery(progress_id) if progress_id else None
     s.check(
         "immediate_silence",
-        not quiet["receipts"] and not discussion["receipts"] and before == after,
+        bool(quiet_policy and quiet_policy["quiet"] and quiet_policy["quiet_since_sequence"])
+        and not quiet["receipts"]
+        and not discussion["receipts"]
+        and before == after,
         quiet,
         discussion,
-        {"native_count": len(after)},
+        {"native_count": len(after), "group_policy": quiet_policy},
     )
     quiet_phase = await s.settle(request["work_id"], allow_delivery_hold=True)
     result = quiet_phase
     lift = None
-    if quiet_phase and quiet_phase["work"]["state"] == "delivering":
+    ready_to_publish = bool(quiet_phase and quiet_phase["work"]["state"] == "delivering")
+    if ready_to_publish or quiet_notice and quiet_notice.state.value != "rejected":
         lift = await s.event("lift_quiet")
-        result = await s.settle(request["work_id"])
+        if ready_to_publish:
+            result = await s.settle(request["work_id"])
     if progress_id:
         with s.store.transaction(s.app.owner) as tx:
             progress = tx.get_delivery(progress_id).model_dump(mode="json")
+            accepted_parts = tx.conn.execute(
+                "SELECT platform_message_id FROM ga_delivery_parts "
+                "WHERE group_id=%s AND intent_id=%s AND state='accepted'",
+                (s.group, progress_id),
+            ).fetchall()
         s.check(
             "pending_notice_retired",
             progress["state"] == "rejected"
+            and not progress["platform_message_id"]
+            and not accepted_parts
             and not any(spool_text(item).removeprefix("【Pot】") == body for item in s.spool()),
-            progress,
+            {
+                "quiet_notice": quiet_notice.model_dump(mode="json") if quiet_notice else None,
+                "final_notice": progress,
+                "accepted_parts": accepted_parts,
+            },
+            lift or {"lift": "not required"},
         )
     artifact_rows = (
         await s.artifacts(result) if result and result["work"]["state"] == "completed" else []
@@ -974,10 +1081,12 @@ async def chat05(s):
             and result["work"]["goal_revision"]
             == quiet_phase["work"]["goal_revision"]
             == started.goal_revision
+            and len(s.work_state()) == 1
             and len(work_file_receipts) == 1
             and len(artifact_rows) == 1
             and artifact_rows[0]["format"] == "pdf"
             and artifact_rows[0]["accepted_sha256"] == artifact_rows[0]["sha256"]
+            and artifact_rows[0]["decoded"].get("unit_count") == 1
             and all(
                 marker in artifact_rows[0]["decoded"].get("text", "")
                 for marker in s.spec["expected_pdf_text"]
@@ -1048,13 +1157,29 @@ async def group01(s):
     await s.app.roster.sync_pending()
     idle = len(refresh_calls)
     updated = await s.event("refresh")
+    after_refresh = {
+        identity: members.get(s.app.owner, identity).model_dump(mode="json") for identity in initial
+    }
+    manual_fields = ("confirmed_name", "confirmed_by")
     s.check(
         "on_demand_refresh_only",
         idle == 0
         and len(refresh_calls) == 1
-        and useful_text(updated, [re.escape(s.spec["renamed"])]),
+        and useful_text(updated, [re.escape(s.spec["renamed"])])
+        and after_refresh[OWNER]["room_name"] == s.spec["renamed"]
+        and all(
+            after_refresh[identity].get(field) == after_manual[identity].get(field)
+            for identity in initial
+            for field in manual_fields
+        )
+        and not any(item.get("committed") for item in foreground_observations(s, updated))
+        and not ((updated.get("decision") or {}).get("result", {}).get("action_result")),
         updated,
-        {"synthetic_roster_transport_calls": refresh_calls},
+        {
+            "synthetic_roster_transport_calls": refresh_calls,
+            "members_before_refresh": after_manual,
+            "members_after_refresh": after_refresh,
+        },
     )
 
 
@@ -1316,8 +1441,12 @@ async def work03(s):
     s.check(
         "only_essential_clarification",
         work_map(s) == prior
-        and useful_text(ambiguous, ["说的是|哪一个|哪项|哪件|哪个"])
-        and not any(call["name"] == "control_work" for call in foreground_tools(s, ambiguous)),
+        and useful_text(ambiguous, ["说的是|哪一个|哪项|哪件|哪个|(?:是|选).{1,80}还是"])
+        and not any(
+            item.get("kind") == "control_work" and item.get("committed")
+            for item in foreground_observations(s, ambiguous)
+        )
+        and not ((ambiguous.get("decision") or {}).get("result", {}).get("controlled_work_ids")),
         ambiguous,
         {"matching_paused": [item["id"] for item in prior.values() if item["state"] == "paused"]},
     )

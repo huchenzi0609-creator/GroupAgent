@@ -20,7 +20,7 @@ from groupagent.research.models import FetchInput, FetchOutput, SearchInput, Sea
 
 _Arguments = TypeVar("_Arguments", bound=BaseModel)
 _Result = TypeVar("_Result", SearchOutput, FetchOutput)
-_INLINE_READ_SECONDS = 4.0
+_INLINE_READ_SECONDS = 5.0
 _INLINE_UNAVAILABLE = {"rate_limited", "provider_unavailable", "research_timeout"}
 
 
@@ -40,7 +40,7 @@ class ForegroundResearch:
         ):
             return ()
 
-        inline_deadline: float | None = None
+        inline_deadline = asyncio.get_running_loop().time() + _INLINE_READ_SECONDS
         inline_unavailable = False
 
         def defer() -> DomainError:
@@ -57,13 +57,11 @@ class ForegroundResearch:
             invoke: Callable[[_Arguments], Awaitable[_Result]],
         ) -> KernelTool:
             async def handle(call: ModelToolCall) -> str:
-                nonlocal inline_deadline, inline_unavailable
+                nonlocal inline_unavailable
                 arguments = input_model.model_validate(call.arguments)
                 # The short lane shares one elapsed window across model turns
                 # and concurrent reads. A durable work has its own lifecycle.
                 now = asyncio.get_running_loop().time()
-                if inline_deadline is None:
-                    inline_deadline = now + _INLINE_READ_SECONDS
                 deadline = inline_deadline
                 if inline_unavailable or deadline <= now:
                     raise defer()

@@ -305,11 +305,13 @@ def register_scheduling_tools(
                 value.fact_source_ids
             ) <= set(raw):
                 raise DomainError("source_unavailable", "Schedule evidence was not in this work")
+            source = tx.get_event(current.request_event_id)
             end = (
                 resolve_instant(
                     value.valid_until,
-                    occurred_at=tx.get_event(current.request_event_id).occurred_at,
+                    occurred_at=source.occurred_at,
                     time_zone=value.time_zone,
+                    source_text=source.text,
                 )
                 if value.valid_until is not None
                 else None
@@ -356,11 +358,13 @@ def register_scheduling_tools(
                 len(set(sources)) != len(sources) or not set(sources) <= set(raw)
             ):
                 raise DomainError("source_unavailable", "Schedule evidence was not in this work")
+            source = tx.get_event(current.request_event_id)
             end = (
                 resolve_instant(
                     value.valid_until,
-                    occurred_at=tx.get_event(current.request_event_id).occurred_at,
+                    occurred_at=source.occurred_at,
                     time_zone=value.time_zone or original.time_zone,
+                    source_text=source.text,
                 )
                 if value.valid_until is not None
                 else original.valid_until

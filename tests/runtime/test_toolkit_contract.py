@@ -27,7 +27,7 @@ from groupagent.artifacts.formats import build_markdown, extract
 from groupagent.artifacts.worker_operations import unpack_document
 from groupagent.billing import BudgetLedger, PriceSnapshot
 from groupagent.config import AppConfig, GroupConfig, RuntimeConfig, SpendConfig
-from groupagent.domain import DomainError, WorkState
+from groupagent.domain import DomainError, EventKind, WorkState
 from groupagent.execution import LangGraphEngine
 from groupagent.execution.models import (
     EngineCheckpoint,
@@ -41,6 +41,7 @@ from groupagent.execution.models import (
 from groupagent.media.validation import inspect_image
 from groupagent.memory import MemoryService
 from groupagent.research import DeepSeekResearchClient
+from groupagent.research.citations import UnverifiedCitation
 from groupagent.runtime.dispatch import Dispatcher
 from groupagent.runtime.inputs import InputProcessor
 from groupagent.runtime.state import source_fingerprint
@@ -50,6 +51,8 @@ from groupagent.tools import EffectState, ToolContext, ToolScope
 from groupagent.tools.models import ToolFailureDisposition, failure_disposition
 
 from .conftest import source
+from .test_app import event
+from .test_inputs import attached
 
 pytestmark = pytest.mark.postgres
 
@@ -77,6 +80,12 @@ class SyntheticFixtureWorker:
         if operation == "image_validate":
             metadata, preview = inspect_image(inputs[0])
             return metadata.model_dump(mode="json"), (preview,)
+        if operation == "ocr_image":
+            return {
+                "pages": [
+                    {"page_number": 1, "text": "值班：测试乙，展架 L-187", "method": "tesseract"}
+                ]
+            }, ()
         assert params.get("format") == "md", "Synthetic host fixture never parses Office/PDF"
         if operation == "document_generate":
             document = unpack_document(params["document"], lambda i: inputs[i])
@@ -423,10 +432,79 @@ async def test_generated_document_is_catalogued_then_selected_and_independently_
         for item in result.deliveries
     )
     assert len(setup.model.requests) == 1
+    review_request = setup.model.requests[0]
+    selected_content = json.loads(review_request.messages[1].content)["artifacts"][0]
+    assert selected_content["version_id"] == generated.output["version_id"]
+    assert selected_content["sha256"] == generated.output["sha256"]
+    assert selected_content["verified_selected_artifact"]["content_passed"] is True
+    assert selected_content["verified_selected_artifact"]["checked_literals"] == ["87"]
+    assert "不能要求在群回复重复文件内容" in review_request.messages[0].content
     with setup.env.store.transaction(setup.env.actor) as tx:
         assert not tx.conn.execute(
             "SELECT 1 FROM ga_deliveries WHERE group_id=%s", (setup.env.actor.group_id,)
         ).fetchone(), "Validation drafts do not send by themselves"
+
+
+async def test_review_accepts_exact_citation_and_targets_the_unverified_artifact_locator(
+    toolkit_setup,
+):
+    setup = toolkit_setup
+    run = await prepare(
+        setup,
+        goal="Verify a public reference and deliver the synthetic report as Markdown",
+        scope={
+            "outputs": [{"format": "md"}],
+            "research_required": True,
+            "required_tools": ["web_fetch"],
+        },
+    )
+    url = "https://example.com/team's-guide"
+    fetched = await call(run, "web_fetch", {"url": url})
+    assert fetched.success and fetched.output["source"]["url"] == url
+
+    async def choose(citation, name):
+        document = await call(
+            run,
+            "document_generate",
+            {
+                "name": name + ".md",
+                "kind": "report",
+                "title": "Fixture findings",
+                "sections": [{"title": "Reference", "paragraphs": ["Evidence link " + citation]}],
+            },
+            key="generate-" + name,
+        )
+        assert document.success, document
+        selection = await call(
+            run,
+            "artifact_deliver",
+            {"version_ids": [document.output["version_id"]]},
+            key="deliver-" + name,
+        )
+        assert selection.success
+        return document
+
+    good = await choose(url, "verified")
+    answer = candidate(run, "The report is ready.", receipts=(fetched,))
+    validated = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, answer, run.workspace
+    )
+    assert any(
+        draft.payload_ref == "artifact:" + good.output["version_id"]
+        for draft in validated.deliveries
+    )
+
+    wrong = "https://example.com/team's-guess"
+    invalid = await choose(wrong, "unverified")
+    with pytest.raises(UnverifiedCitation) as rejected:
+        await setup.toolkit.validate(run.work, run.lease, setup.env.actor, answer, run.workspace)
+    details = rejected.value.details
+    assert details["surface"] == invalid.output["version_id"]
+    assert details["unverified_urls"] == [wrong]
+    assert details["verified_sources"] == [
+        {"source_id": fetched.output["source"]["source_id"], "url": url}
+    ]
+    assert len(setup.model.requests) == 1  # Wrong citation never reaches semantic review.
 
 
 async def test_search_import_same_work_and_other_work_create_scoped_immutable_copies(toolkit_setup):
@@ -535,6 +613,65 @@ async def test_wrong_artifact_reference_returns_model_to_existing_copy_and_deliv
     }
     with setup.env.store.transaction(setup.env.actor) as tx:
         assert tx.get_work(run.work.id).input_versions == [source_version]
+
+
+async def test_quoted_screenshot_prepared_for_ocr_when_appearance_identity_is_denied(toolkit_setup):
+    env = toolkit_setup.env
+    image = attached(env, kind="image", name="quoted-notice.png")
+    goal = (
+        f"读取附件截图 {image.id} 中的公告，识别值班人的可见姓名和展架编号。"
+        "若图中另有一名人物，判断是否与值班人为同一人。"
+    )
+    request = event(env, goal, kind=EventKind.QUOTE, reply_to=image.id)
+    with env.store.transaction(env.actor) as tx:
+        tx.ingest_event(request, "fixture:" + request.id, "1", 0)
+        work = tx.create_work(
+            goal,
+            request.id,
+            scope={
+                "source_fingerprints": {
+                    item.id: tx.event_fingerprint(item.id) for item in (request, image)
+                },
+                "attachment_event_ids": [image.id],
+                "work_capabilities": ["image_analysis"],
+            },
+        )
+        lease = tx.claim_work(work.id, "toolkit-fixture", ttl_seconds=300)
+        work = tx.get_work(work.id)
+    workspace = env.root / work.id
+    workspace.mkdir()
+    prepared = await toolkit_setup.toolkit.prepare(work, lease, env.actor, workspace)
+    objective = json.loads(prepared.request.objective)
+    (reference,) = objective["input_files"]
+    assert reference["status"] == "ready" and reference["source_event_id"] == image.id
+    gateway = prepared.engine.gateway
+    scope = ToolScope(
+        env.actor.group_id,
+        work.id,
+        env.actor,
+        workspace,
+        prepared.request.allowed_tools,
+        request.id,
+    )
+    gateway.bind_scope(scope)
+    run = SimpleNamespace(gateway=gateway, scope=scope)
+    handles = {key: reference[key] for key in ("file_id", "version_id")}
+
+    denied = await call(
+        run,
+        "image_analyze",
+        {
+            "images": [handles],
+            "prompt": "请确认这位男士的真实姓名。",
+            "route_id": "unneeded-for-refused-operation",
+        },
+    )
+    assert not denied.success and denied.error_code == "face_identification_unavailable"
+    assert denied.effect_state == EffectState.NO_EFFECT
+    observed = await call(run, "media_ocr", handles)
+    assert observed.success, observed
+    assert observed.output["source"]["source_event_id"] == image.id
+    assert observed.output["pages"][0]["text"] == "值班：测试乙，展架 L-187"
 
 
 async def test_worker_reuses_read_attachment_instead_of_waiting_for_another_upload(toolkit_setup):

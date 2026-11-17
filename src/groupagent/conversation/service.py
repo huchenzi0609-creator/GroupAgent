@@ -96,6 +96,10 @@ from .work_queries import query_work_in_tx, render_work_query
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
 _ERRORS = {
+    "work_selection_scope_required": (
+        "已查到多个对象。若真人要求整组选定状态的工作，请按完整条件选择；"
+        "若只要其中一项，请核对真人提供的编号或问清是哪一项。"
+    ),
     "feature_disabled": "这项能力目前已关闭，已有资料和任务会保留。",
     "permission_denied": "你目前没有这项操作的权限；可以处理自己的任务，其他分工请由负责人调整。",
     "ambiguous_reference": "有多个可能的对象，请说清楚是哪一项。",
@@ -151,6 +155,18 @@ def _work_admission_text(
     if files:
         return f"我会整理成 {files}，检查内容后发回来。"
     return "这项工作已排队；有结果或需要补充资料时我会回复。"
+
+
+def _admission_for_receipt(body: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any] | None:
+    admission = body.get("work_admission")
+    if (
+        isinstance(admission, dict)
+        and admission.get("work_id")
+        and admission["work_id"] == receipt.get("result", {}).get("work_id")
+        and (receipt.get("kind") == "start_work" or receipt.get("satisfies_kind") == "start_work")
+    ):
+        return admission
+    return None
 
 
 def _scope_sources(scope: dict[str, Any]) -> set[str]:
@@ -657,9 +673,9 @@ class ConversationCoordinator(Coordinator):
                 )
                 if not bound and not named and selector.basis != "focus":
                     raise DomainError(
-                        "ambiguous_reference",
-                        "Several works match. Select an author-named or quoted target, "
-                        "or ask which one before applying a single modification",
+                        "work_selection_scope_required",
+                        "Observed IDs are not a selection grant. Reapply a complete authorized filter "
+                        "for a set request, or obtain a single author-selected target",
                     )
         return resolved
 
@@ -957,6 +973,7 @@ class ConversationCoordinator(Coordinator):
                 action.due_at,
                 occurred_at=event.occurred_at,
                 time_zone=self.config.group.time_zone,
+                source_text=event.text,
             )
             if isinstance(action, (ClaimTask, AssignTask, UpdateTask)) and action.due_at is not None
             else None
@@ -1211,6 +1228,7 @@ class ConversationCoordinator(Coordinator):
                     action.until,
                     occurred_at=event.occurred_at,
                     time_zone=self.config.group.time_zone,
+                    source_text=event.text,
                 )
                 if quiet_until <= self.clock():
                     raise DomainError("invalid_input", "Quiet period must end in the future")
@@ -1281,7 +1299,17 @@ class ConversationCoordinator(Coordinator):
             member_id = context["_aliases"].get(action.member_id)
             if not member_id:
                 raise DomainError("ambiguous_reference", "Member alias is unavailable")
-            member = self.members.in_tx(tx).confirm_name(
+            members = self.members.in_tx(tx)
+            if context.get("_react_session"):
+                current = members.get(tx.actor, member_id)
+                if current.membership_state == "left":
+                    raise DomainError("not_found", "The member is no longer in the current group")
+                if current.room_name:
+                    nickname = redact_credentials(current.room_name)
+                    raise DomainError(
+                        "room_nickname_verified", f"群资料当前显示的昵称是「{nickname}」。"
+                    )
+            member = members.confirm_name(
                 tx.actor, member_id, action.name, expected_revision=action.expected_revision
             )
             return {
@@ -1510,7 +1538,29 @@ class ConversationCoordinator(Coordinator):
                     allowed = {row["id"] for row in loaded["schedules"]}
                     for fact in self.scheduler.in_tx(tx).facts(actor, limit=20):
                         if fact.id in allowed:
-                            schedule_facts.append(fact.model_dump(mode="json"))
+                            projection = fact.model_dump(mode="json")
+                            if fact.occurrences:
+                                occurrence = fact.occurrences[0]
+                                accepted = [
+                                    delivery.accepted_at
+                                    for delivery in occurrence.deliveries
+                                    if delivery.state.value == "accepted"
+                                    and delivery.accepted_at is not None
+                                ]
+                                projection["latest_occurrence_status"] = {
+                                    "scheduled_at": occurrence.scheduled_local,
+                                    "execution_state": occurrence.state.value,
+                                    "platform_accepted_count": len(accepted),
+                                    "delivery_intent_count": len(occurrence.deliveries),
+                                    "last_platform_accepted_at": (
+                                        max(accepted)
+                                        .astimezone(ZoneInfo(fact.time_zone))
+                                        .isoformat()
+                                        if accepted
+                                        else None
+                                    ),
+                                }
+                            schedule_facts.append(projection)
             key = "runtime_limits" if resource == "runtime" else resource
             # New roster entries may move alphabetical slots; the current
             # graph must keep all member aliases it has already seen.
@@ -1648,6 +1698,7 @@ class ConversationCoordinator(Coordinator):
                 "satisfies_kind": recorded.get("satisfies_kind"),
                 "code": result.decision.reason_code if not accepted else None,
                 "host_message": result.decision.response,
+                "work_admission": _admission_for_receipt(prior, recorded),
                 "result": self._model_aliases(result.model_dump(mode="json"), context),
             }
 
@@ -1752,6 +1803,9 @@ class ConversationCoordinator(Coordinator):
         if not body.get("agent_pending_response"):
             return previous.model_copy(update={"duplicate": True})
         react_session = context is not None and context.get("_react_session")
+        work_admission = body.get("work_admission") or {}
+        admission_id = work_admission.get("delivery_id")
+        admission_text = work_admission.get("text")
         if body.get("agent_context_revoked"):
             # The running model still has its pre-forget transcript. Only the
             # source-free committed host acknowledgement may cross this boundary.
@@ -1778,8 +1832,11 @@ class ConversationCoordinator(Coordinator):
                     acknowledgements = [
                         receipt.get("result", {}).get("decision", {}).get("response")
                         for receipt in body.get("action_receipts", [])
+                        if _admission_for_receipt(body, receipt) is None
                     ]
                     text = "\n".join(dict.fromkeys(value for value in acknowledgements if value))
+                    if not text and admission_id:
+                        text = admission_text
                 template = (
                     decision
                     if (
@@ -1831,14 +1888,18 @@ class ConversationCoordinator(Coordinator):
                 final = gated
         if sources_valid:
             self._record_invoked_attachment(tx, event, final, admission)
-        delivery_id = previous.delivery_id
+        delivery_id = previous.delivery_id or admission_id
         if final.response and final.kind not in {"ignore", "observe"}:
-            delivery = tx.enqueue_reply(
-                event.id,
-                final.response,
-                read_only_authorized=tx.actor.role.value in self.config.group.read_only_qa_roles,
-            )
-            delivery_id = delivery.id
+            if admission_id and final.response == admission_text:
+                delivery_id = admission_id
+            else:
+                delivery = tx.enqueue_reply(
+                    event.id,
+                    final.response,
+                    read_only_authorized=tx.actor.role.value
+                    in self.config.group.read_only_qa_roles,
+                )
+                delivery_id = delivery.id
             tx.conn.execute(
                 "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason,created_at,invocation_root_event_id) "
                 "VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
@@ -2109,6 +2170,7 @@ class ConversationCoordinator(Coordinator):
                         "tool_call_id": receipt.get("tool_call_id"),
                         "work_effects": receipt.get("work_effects", []),
                         "satisfies_kind": receipt.get("satisfies_kind"),
+                        "work_admission": _admission_for_receipt(previous, receipt),
                         "committed": bool(
                             receipt.get("result", {}).get("work_id")
                             or receipt.get("result", {}).get("action_result") is not None
@@ -2943,11 +3005,19 @@ class ConversationCoordinator(Coordinator):
                     raise
                 code = error.code if isinstance(error, DomainError) else "invalid_input"
                 response = _ERRORS.get(code, "这项操作暂时无法完成，现有记录已保留。")
-                if code == "schedule_time_missed" and isinstance(error, DomainError):
+                if code in {"schedule_time_missed", "room_nickname_verified"} and isinstance(
+                    error, DomainError
+                ):
                     response = str(error)
                 decision = Decision(
                     kind="clarify"
-                    if code in {"ambiguous_reference", "not_found", "invalid_input"}
+                    if code
+                    in {
+                        "ambiguous_reference",
+                        "work_selection_scope_required",
+                        "not_found",
+                        "invalid_input",
+                    }
                     else "reply",
                     reason_code=code,
                     response=response,
@@ -3007,6 +3077,27 @@ class ConversationCoordinator(Coordinator):
                         ),
                     ),
                 )
+            work_admission = previous.get("work_admission") if previous else None
+            acknowledgement = context.get("_work_admission_ack")
+            if (
+                tool_call_id is not None
+                and decision.kind == "start_work"
+                and work_id
+                and work_admission is None
+                and acknowledgement in {(tool_call_id, "silent"), (tool_call_id, "immediate")}
+            ):
+                if acknowledgement[1] == "silent":
+                    work_admission = {"work_id": work_id, "silent": True}
+                elif decision.response:
+                    text = "这项工作已排队。" + decision.response.removeprefix("这项工作已排队；")
+                    ack_delivery = tx.enqueue_work_admission(work_id, text)
+                    if ack_delivery is not None:
+                        delivery_id = ack_delivery.id
+                        work_admission = {
+                            "work_id": work_id,
+                            "delivery_id": ack_delivery.id,
+                            "text": text,
+                        }
             self._record_invoked_attachment(tx, event, decision)
             result = CoordinationResult(
                 event_id=event.id,
@@ -3061,6 +3152,8 @@ class ConversationCoordinator(Coordinator):
                     **task_revisions,
                 },
             }
+            if work_admission and not privacy_action:
+                body["work_admission"] = work_admission
             if isinstance(context.get("_turn_contract"), TurnContract):
                 body["turn_contract"] = context["_turn_contract"].model_dump(mode="json")
             if context.get("_turn_outcome"):

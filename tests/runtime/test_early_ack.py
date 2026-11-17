@@ -11,7 +11,7 @@ from conversation.turn_model_fixture import finish_fixture_reply
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import Decision
 from groupagent.domain import DeliveryState, WorkState
-from groupagent.execution.models import ModelReply, TokenUsage
+from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
 from .test_app import app_for, event
 from .test_application_controls import admit
@@ -218,6 +218,85 @@ async def test_start_retires_only_old_ack_parts_that_were_never_submitted(runtim
             assert tx.get_delivery(values[0].id).state == DeliveryState.REJECTED
             assert tx.get_delivery(values[1].id).state == DeliveryState.PENDING
     finally:
+        await app.close()
+
+
+async def test_real_admission_is_deliverable_while_foreground_still_waits(runtime_env):
+    env = runtime_env
+    app, _, _ = setup_chat(env)
+    request = event(env, "Pot，请运行 Python 计算一个合成数值。")
+    waiting, proceed = asyncio.Event(), asyncio.Event()
+
+    class AdmittingFixture:
+        calls = 0
+
+        async def complete(self, model_request):
+            self.calls += 1
+            if self.calls == 1:
+                action = ModelToolCall(
+                    id="start",
+                    name="start_work",
+                    arguments={
+                        "goal": "Calculate the requested synthetic value",
+                        "work_capabilities": ["compute"],
+                        "required_work_tools": ["python_compute"],
+                        "outputs": [{"format": "text"}],
+                    },
+                )
+            else:
+                waiting.set()
+                await proceed.wait()
+                action = ModelToolCall(
+                    id="close", name="finish_turn", arguments={"disposition": "reply"}
+                )
+            return ModelReply(
+                finish_reason="tool_calls",
+                tool_calls=(action,),
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            )
+
+    app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(AdmittingFixture())
+    await app.start()
+    old_request = event(env, "Pot，旧占位消息测试。")
+    with env.store.transaction(env.actor) as tx:
+        tx.ingest_event(old_request, old_request.id, "1", 0)
+        old = tx.enqueue_early_ack(old_request.id, "Legacy placeholder.")
+        tx.record_decision(
+            old_request.id,
+            {
+                "kind": "observe",
+                "result": {
+                    "event_id": old_request.id,
+                    "decision": {"kind": "observe", "reason_code": "fixture"},
+                },
+            },
+        )
+    await intake(app, env, request)
+    foreground = asyncio.create_task(app.process_pending(batched=False))
+    try:
+        await asyncio.wait_for(waiting.wait(), 3)
+        assert app._retire_pending_acknowledgements() == 1
+        with env.store.transaction(env.actor) as tx:
+            decision = tx.get_decision(request.id)
+            marker = decision["work_admission"]
+            current = tx.get_delivery(marker["delivery_id"])
+            assert current.state == DeliveryState.PENDING and decision["agent_pending_response"]
+            assert tx.get_delivery(old.id).state == DeliveryState.REJECTED
+            assert tx.get_work(marker["work_id"]).state == WorkState.QUEUED
+        assert await app.dispatcher.tick() == 1
+        assert not foreground.done()
+        assert sent(env) == ["【Pot】" + marker["text"]]
+        proceed.set()
+        await foreground
+        assert await app.dispatcher.tick() == 0
+        with env.store.transaction(env.actor) as tx:
+            final = tx.get_decision(request.id)
+            assert not final["agent_pending_response"]
+            assert final["result"]["delivery_id"] == current.id
+            assert tx.get_delivery(current.id).state == DeliveryState.ACCEPTED
+    finally:
+        proceed.set()
+        await asyncio.gather(foreground, return_exceptions=True)
         await app.close()
 
 

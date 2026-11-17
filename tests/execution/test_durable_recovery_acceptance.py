@@ -300,26 +300,50 @@ async def test_legacy_compute_recovery_archives_original_proof_and_resumes_same_
         await service.close()
 
 
-async def test_real_unknown_effect_keeps_durable_inspection_and_is_never_replayed(env):
+async def test_real_unknown_effect_keeps_durable_inspection_and_is_never_replayed(env, monkeypatch):
     work, original = legacy_unknown_work(env, external=True)
     factory = Factory()
     checks = []
+    quiesced = []
+    now = datetime.now(UTC)
+
+    class InspectionClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    async def acknowledge_fixture_quiescence(group_id, work_id):
+        # This fixture writes a legacy checkpoint and never launches a sandbox.
+        # Unrelated test daemons cannot consume this receipt inspection's deadline.
+        assert (group_id, work_id) == (env.actor.group_id, work.id)
+        quiesced.append(work_id)
 
     async def reconcile(current, checkpoint, actor):
+        assert quiesced == [work.id] * (len(checks) + 1)
+        assert current.id == work.id and actor == env.actor
         checks.append(checkpoint_digest(checkpoint))
         return None  # Native receipt service still cannot establish the result.
 
+    monkeypatch.setattr("groupagent.runtime.executor.datetime", InspectionClock)
+    monkeypatch.setattr(
+        "groupagent.runtime.executor.DockerSandbox.quiesce_work",
+        staticmethod(acknowledge_fixture_quiescence),
+    )
     service = supervisor(env, factory, reconcile_checkpoint=reconcile)
     try:
-        assert await service.run_once() is None and len(checks) == 1
+        assert await service.run_once() is None and checks == [checkpoint_digest(original)]
         first = work_state(env, work.id)
         plan = first.scope[RECONCILIATION_SCOPE_KEY]
         assert first.state == WorkState.PAUSED and plan["checks"] == 1
+        first_due = datetime.fromisoformat(plan["next_check_at"])
+        assert first_due > now
         assert await service.run_once() is None and len(checks) == 1
-        due_now(env, work.id, RECONCILIATION_SCOPE_KEY)
-        assert await service.run_once() is None and len(checks) == 2
+        now = first_due
+        assert await service.run_once() is None and checks == [checkpoint_digest(original)] * 2
         held = work_state(env, work.id)
-        assert held.scope[RECONCILIATION_SCOPE_KEY]["checks"] == 2
+        held_plan = held.scope[RECONCILIATION_SCOPE_KEY]
+        assert held.state == WorkState.PAUSED and held_plan["checks"] == 2
+        assert datetime.fromisoformat(held_plan["next_check_at"]) > first_due
         assert not factory.models and not deliveries(env, work.id)
         assert env.state.load_checkpoint(env.actor, work.id) == original
     finally:

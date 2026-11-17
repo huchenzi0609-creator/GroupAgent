@@ -55,7 +55,10 @@ def test_legacy_read_pause_explains_actual_page_failure_without_money_guess():
 
 
 @pytest.mark.postgres
-async def test_natural_query_refreshes_name_through_the_roster_tool(runtime_env):
+@pytest.mark.parametrize("attempt_confirmation", [False, True])
+async def test_natural_query_refreshes_name_through_the_roster_tool(
+    runtime_env, attempt_confirmation
+):
     env = runtime_env
     app, _, _ = setup_chat(env)
     calls = []
@@ -81,21 +84,44 @@ async def test_natural_query_refreshes_name_through_the_roster_tool(runtime_env)
         assert facts["status"]["fresh"] and facts["status"]["source"] == "remote_refresh"
         actor = json.loads(request.messages[1].content)["context"]["requester_member_id"]
         chosen = next(row for row in facts["members"] if row["member_id"] == actor)
+        if attempt_confirmation:
+            return call(
+                "apply_business_action",
+                "unnecessary-confirmation",
+                action={
+                    "op": "confirm_name",
+                    "member_id": chosen["member_id"],
+                    "name": chosen["name"],
+                    "expected_revision": chosen["revision"],
+                },
+            )
         return finish(f"能，群昵称是{chosen['name']}。", reports=[("roster", "observed")])
 
-    model = ModelScript(
-        call("read_group_context", "roster", resource="members", refresh=True), answer
-    )
+    def use_current_name(request):
+        receipt = tool_receipt(request)
+        assert receipt["status"] == "rejected" and not receipt["committed"]
+        assert receipt["code"] == "room_nickname_verified"
+        assert "合成群昵称" in receipt["host_message"]
+        return finish("当前群昵称是合成群昵称。", reports=[("roster", "observed")])
+
+    read = call("read_group_context", "roster", resource="members", refresh=True)
+    steps = (read, answer, use_current_name) if attempt_confirmation else (read, answer)
+    model = ModelScript(*steps)
     app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(model)
     try:
         await intake(app, env, request)
         result = await app.coordinator.process(request)
         assert "合成群昵称" in result.decision.response
-        assert len(calls) == 1 and len(model.requests) == 2
+        assert len(calls) == 1 and len(model.requests) == len(steps)
         assert (await app.coordinator.process(request)).duplicate
-        assert len(calls) == 1 and len(model.requests) == 2
+        assert len(calls) == 1 and len(model.requests) == len(steps)
         saved = app.coordinator.members.get(env.actor, env.actor.member_id)
         assert saved.room_name == "合成群昵称" and saved.confirmed_name is None
+        with env.store.transaction(env.actor) as tx:
+            assert not tx.conn.execute(
+                "SELECT 1 FROM ga_audit_events WHERE group_id=%s AND action='member_name_confirmed'",
+                (tx.group_id,),
+            ).fetchone()
     finally:
         await app.close()
 
