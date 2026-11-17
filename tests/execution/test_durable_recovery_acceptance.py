@@ -329,19 +329,25 @@ async def test_real_unknown_effect_keeps_durable_inspection_and_is_never_replaye
 async def test_slow_external_receipt_inspection_does_not_starve_other_authorized_work(env):
     uncertain, original = legacy_unknown_work(env, external=True)
     ready = new_work(env, "Produce another verified synthetic answer")
+    inspecting = asyncio.Event()
+    external_available = asyncio.Event()
     stopped = asyncio.Event()
 
     async def unavailable_receipt(current, checkpoint, actor):
         try:
-            await asyncio.sleep(30)
+            inspecting.set()
+            await external_available.wait()
         finally:
             stopped.set()
 
     service = supervisor(env, reconcile_checkpoint=unavailable_receipt)
     try:
-        result = await asyncio.wait_for(service.run_once(), timeout=2)
+        # The external dependency remains blocked throughout. Fairness is about
+        # independent progress and cancelling its inspection, not completing a
+        # real graph+PG task within a two-second CI machine-speed threshold.
+        result = await asyncio.wait_for(service.run_once(), timeout=10)
         assert result.id == ready.id and result.state == WorkState.DELIVERING
-        assert stopped.is_set()
+        assert inspecting.is_set() and stopped.is_set() and not external_available.is_set()
         held = work_state(env, uncertain.id)
         assert held.state == WorkState.PAUSED and RECONCILIATION_SCOPE_KEY in held.scope
         assert env.state.load_checkpoint(env.actor, uncertain.id) == original
