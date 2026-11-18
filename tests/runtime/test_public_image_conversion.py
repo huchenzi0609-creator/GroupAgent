@@ -67,6 +67,7 @@ async def imported_jpegs(
     count=2,
     request_text=None,
     output_format="png",
+    output_formats=None,
     colors=("navy", "red", "green", "gold", "purple"),
 ):
     text = request_text or f"请交付{count}张已验证的公开来源图片，全部使用PNG格式。"
@@ -74,7 +75,10 @@ async def imported_jpegs(
         setup,
         goal=text,
         request_text=text,
-        scope={"public_image_count": count, "outputs": [{"format": output_format}]},
+        scope={
+            "public_image_count": count,
+            "outputs": [{"format": name} for name in (output_formats or (output_format,))],
+        },
     )
     _, media, context = setup.toolkit._services[run.lease.attempt_id]
     original_source = await setup.toolkit._source(run.work, setup.env.actor, "image")
@@ -114,7 +118,7 @@ async def imported_jpegs(
     return run, originals
 
 
-async def convert_and_select(run, versions):
+async def convert_and_select(run, versions, *, selection_key="deliver-converted"):
     converted = []
     for version in versions:
         receipt = await call(
@@ -129,7 +133,7 @@ async def convert_and_select(run, versions):
         run,
         "artifact_deliver",
         {"version_ids": [item.output["version_id"] for item in converted]},
-        key="deliver-converted",
+        key=selection_key,
     )
     assert selected.success
     return (*converted, selected)
@@ -463,26 +467,38 @@ async def test_requested_source_page_survives_reviewed_reused_image_delivery(
 async def test_toolkit_missing_format_diagnostic_reuses_valid_existing_imports(conversion_setup):
     setup = conversion_setup
     run, originals = await imported_jpegs(setup)
-    selected = await call(
+    first = await convert_and_select(run, originals[:1], selection_key="deliver-first-png")
+    first_png = first[0].output["version_id"]
+
+    rejected = await call(
         run,
         "artifact_deliver",
         {"version_ids": [item.version_id for item in originals]},
         key="deliver-jpegs",
     )
-    assert selected.success
+    assert not rejected.success
+    assert rejected.error_code == "unexpected_final_artifact_format"
+    assert rejected.effect_state == EffectState.NOT_STARTED
+    inventory = setup.env.registry.outputs(setup.env.actor, run.work.id, run.lease.goal_revision)
+    assert {item["version_id"]: item["purpose"] for item in inventory} == {
+        first_png: "result",
+        **{item.version_id: "candidate" for item in originals},
+    }
+
     with pytest.raises(PublicImageValidationError) as failure:
         await setup.toolkit.validate(
             run.work,
             run.lease,
             setup.env.actor,
-            candidate(run, receipts=(selected,)),
+            candidate(run, receipts=(*first, rejected)),
             run.workspace,
         )
-    assert failure.value.details["validated_distinct_count"] == 2
-    assert failure.value.details["missing_count_by_format"] == {"png": 2}
+    assert failure.value.details["validated_distinct_count"] == 1
+    assert failure.value.details["missing_count_by_format"] == {"png": 1}
     assert failure.value.details["duplicate_version_ids"] == []
     assert {item["version_id"] for item in failure.value.details["reusable_images"]} == {
-        item.version_id for item in originals
+        first_png,
+        *(item.version_id for item in originals),
     }
     receipts = await convert_and_select(run, originals)
     result = await setup.toolkit.validate(
@@ -494,7 +510,10 @@ async def test_toolkit_missing_format_diagnostic_reuses_valid_existing_imports(c
 async def test_toolkit_two_encodings_of_one_source_cannot_satisfy_two_images(conversion_setup):
     setup = conversion_setup
     run, originals = await imported_jpegs(
-        setup, count=1, request_text="请交付2张已验证的公开来源图片，全部使用PNG格式。"
+        setup,
+        count=1,
+        request_text="请交付2张不同的已验证公开图片，同时交付PNG与JPEG两种格式。",
+        output_formats=("png", "jpeg"),
     )
     # Keep the accepted task count at two while creating only one source.
     with setup.env.store.transaction(setup.env.actor) as tx:
@@ -511,6 +530,8 @@ async def test_toolkit_two_encodings_of_one_source_cannot_satisfy_two_images(con
         {"version_ids": [originals[0].version_id, converted_id]},
         key="deliver-two-encodings",
     )
+    assert selected.success, selected
+    assert set(selected.output["selected_version_ids"]) == {originals[0].version_id, converted_id}
     with pytest.raises(PublicImageValidationError) as failure:
         await setup.toolkit.validate(
             work,
@@ -573,7 +594,9 @@ async def test_unspecified_quantity_still_rejects_empty_or_wrong_format_delivery
     for selected_ids in ([], [originals[0].version_id]):
         if selected_ids:
             selected = await call(run, "artifact_deliver", {"version_ids": selected_ids})
-            assert selected.success
+            assert not selected.success
+            assert selected.error_code == "unexpected_final_artifact_format"
+            assert selected.effect_state == EffectState.NOT_STARTED
         with pytest.raises(PublicImageValidationError):
             await setup.toolkit.validate(
                 run.work, run.lease, setup.env.actor, candidate(run), run.workspace

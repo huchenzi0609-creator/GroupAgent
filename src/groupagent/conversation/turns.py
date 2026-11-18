@@ -68,6 +68,14 @@ class MemoryConsent(TurnData):
         return self
 
 
+class LiteralReplyAssessment(TurnData):
+    exact_text: str | None = Field(
+        min_length=1,
+        max_length=4000,
+        description="The exact supplied body when the request explicitly asks for that text alone, or null.",
+    )
+
+
 class FinishTurn(TurnData):
     disposition: Literal["reply", "observe", "proactive"]
     open_request: StrictBool = Field(

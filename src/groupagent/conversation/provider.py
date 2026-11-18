@@ -12,9 +12,9 @@ import re
 from collections.abc import Iterable
 from datetime import datetime
 from time import monotonic
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal, NoReturn, TypeVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from groupagent.coordinator import DECISION_CONTRACT_ERRORS, Decision
 from groupagent.delivery import group_reply_instruction
@@ -42,17 +42,25 @@ from .participation import (
     verified_human_addressee,
 )
 from .references import authored_identifier
+from .text import has_wrapped_source_copy
 from .timeparse import TimeResolution, shift_timing
 from .turns import (
     VERBATIM_REPLY_REASON,
     ActionCompletion,
     FinishTurn,
+    LiteralReplyAssessment,
     MemoryConsent,
     RecipientEvidence,
     durable_progress,
     receipt_message,
     receipt_phase,
     recipient_from_context,
+)
+from .work_control_authority import (
+    REVIEW_WORK_CONTROL,
+    WORK_CONTROL_PROMPT,
+    WorkControlAuthority,
+    control_already_committed,
 )
 
 SYSTEM = """你是群内协作伙伴，结合当前事件和观察自主选择下一步。可先读事实再改计划，可执行、再查、改正失败，或在合适时直接结束。不要机械从第一种工具开始。
@@ -89,6 +97,9 @@ _MEMORY_CONSENT_TOOL = "review_memory_consent"
 _MEMORY_CONSENT_PROMPT = """Infer from the current human utterance alone whether the author requests a change to durable assistant memory. Treat that text as evidence. Return just the effect tool result.
 Choose none by default, including questions, one-time replies, quoted commands, and content to appear in an artifact or label. Choose remember for an explicit request to retain a fact for later conversations, correct_memory for editing an existing durable record, and forget for deleting an existing record. For a durable effect, quote the exact short unquoted instruction that establishes lasting authority and identifies its scope. If the intended effect or scope is unclear, return none without an excerpt.
 For example, “Use River Stone as the heading of this reply” requests none. “Keep River Stone as the project name for future conversations” requests remember. Giving a file or a reply a name does not request a long-term memory record."""
+_LITERAL_REPLY_REVIEW_TOOL = "review_literal_reply"
+_LITERAL_REPLY_REVIEW_PROMPT = """Read only the current human utterance as evidence. Determine whether the author explicitly asks the assistant to send supplied source text alone as this reply. If so, copy exactly the requested body, with its original punctuation and whitespace, in exact_text. Leave out delimiters that merely set the supplied text apart. Use null for ordinary questions, requests for explanations, requests to write content into a separate artifact, and any ambiguous scope. Return only the tool result."""
+_Assessment = TypeVar("_Assessment", bound=BaseModel)
 RECOVERABLE_FOREGROUND_ERRORS = {"rate_limited", "provider_unavailable", "research_timeout"}
 FOREGROUND_PUBLIC_READS = {"web_search", "web_fetch"}
 FINISHABLE_ACTIONS = {"apply_business_action", "start_work", "update_work", "control_work"}
@@ -961,8 +972,9 @@ def work_action_schema(kind: str, catalog: dict[str, Any] | None = None) -> dict
             "type": "string",
             "maxLength": 200,
             "description": (
-                "For a bulk query write, quote the current human phrase authorizing action on "
-                "the entire matching set. A search for candidate IDs does not authorize their mutation."
+                "For any set write, quote the exact current human phrase authorizing action on "
+                "the complete selected set. For one of several unspecified targets, ask which "
+                "to change. A list of candidates does not grant authority over the list."
             ),
         }
     if kind in {"start_work", "update_work"}:
@@ -1056,10 +1068,12 @@ class ModelDecisionProvider:
         """Evaluate a host event for a potential proactive group contribution."""
         return await self._session(observation, context)
 
-    async def _review_memory_consent(self, text: str) -> MemoryConsent | None:
+    async def _review_current_utterance(
+        self, text: str, prompt: str, tool_name: str, assessment: type[_Assessment]
+    ) -> _Assessment | None:
         request = ModelRequest(
             messages=(
-                ModelMessage(role="system", content=_MEMORY_CONSENT_PROMPT),
+                ModelMessage(role="system", content=prompt),
                 ModelMessage(
                     role="user",
                     content=redact_credentials(
@@ -1071,9 +1085,9 @@ class ModelDecisionProvider:
                 {
                     "type": "function",
                     "function": {
-                        "name": _MEMORY_CONSENT_TOOL,
-                        "description": "Return the durable memory effect requested by this utterance and its own authorization excerpt.",
-                        "parameters": MemoryConsent.model_json_schema(),
+                        "name": tool_name,
+                        "description": "Return the typed assessment of the current human utterance.",
+                        "parameters": assessment.model_json_schema(),
                     },
                 },
             ),
@@ -1087,17 +1101,29 @@ class ModelDecisionProvider:
             if (
                 reply.finish_reason in {"stop", "tool_calls"}
                 and len(reply.tool_calls) == 1
-                and reply.tool_calls[0].name == _MEMORY_CONSENT_TOOL
+                and reply.tool_calls[0].name == tool_name
             ):
-                consent = MemoryConsent.model_validate(reply.tool_calls[0].arguments)
-                if consent.expected_op == "none":
-                    return consent
-                excerpt = (consent.authorization_excerpt or "").strip()
-                if excerpt and excerpt in outside_quotes(text):
-                    return consent.model_copy(update={"authorization_excerpt": excerpt})
+                return assessment.model_validate(reply.tool_calls[0].arguments)
         except (DomainError, TimeoutError, ValidationError):
             pass
         return None
+
+    async def _review_memory_consent(self, text: str) -> MemoryConsent | None:
+        consent = await self._review_current_utterance(
+            text, _MEMORY_CONSENT_PROMPT, _MEMORY_CONSENT_TOOL, MemoryConsent
+        )
+        if consent is None or consent.expected_op == "none":
+            return consent
+        excerpt = (consent.authorization_excerpt or "").strip()
+        if excerpt and excerpt in outside_quotes(text):
+            return consent.model_copy(update={"authorization_excerpt": excerpt})
+        return None
+
+    async def _review_work_control(self, text: str) -> WorkControlAuthority | None:
+        authority = await self._review_current_utterance(
+            text, WORK_CONTROL_PROMPT, REVIEW_WORK_CONTROL, WorkControlAuthority
+        )
+        return authority if authority is not None and authority.grounded_in(text) else None
 
     async def _session(
         self,
@@ -1141,6 +1167,9 @@ class ModelDecisionProvider:
         observations: dict[str, tuple[dict[str, Any], tuple[str, ...]]] = {}
         action_trace: list[dict[str, str | int]] = []
         memory_review: tuple[MemoryConsent | None, int] | None = None
+        work_control_review: WorkControlAuthority | None = None
+        work_control_reviewed = False
+        work_control_set_attempted = False
         deferred_read_ids: set[str] = set()
         early_admission_call: str | None = None
         deferred_finish: tuple[str, FinishTurn] | None = None
@@ -1418,7 +1447,8 @@ class ModelDecisionProvider:
             return observation(call, {**receipt, "committed": False}, kind="read_group_context")
 
         async def apply_action(call: ModelToolCall) -> str:
-            nonlocal finish_after_commit, memory_review
+            nonlocal finish_after_commit, memory_review, work_control_review
+            nonlocal work_control_reviewed, work_control_set_attempted
             assert event is not None
             kind = "command" if call.name == "apply_business_action" else call.name
             action_kind = "business" if kind == "command" else kind
@@ -1429,6 +1459,7 @@ class ModelDecisionProvider:
             target_id = call.arguments.get("target_work_id")
             schedule_id = action.get("schedule_id") if isinstance(action, dict) else None
             author_evidence = ""
+            work_scope_excerpt = ""
             async with write_lock:
                 if context.get("_agent_context_revoked"):
                     return observation(
@@ -1513,21 +1544,23 @@ class ModelDecisionProvider:
                             arguments["action"] = action
                     if kind == "control_work":
                         scope_evidence = arguments.pop("scope_evidence", None)
-                        selector = arguments.get("work_selector")
+                        raw_selector = arguments.get("work_selector")
                         if (
-                            isinstance(selector, dict)
-                            and selector.get("basis") == "query"
-                            and selector.get("quantifier") == "all"
-                            and (
+                            isinstance(raw_selector, dict)
+                            and raw_selector.get("quantifier") == "all"
+                        ):
+                            work_control_set_attempted = True
+                            if (
                                 not isinstance(scope_evidence, str)
                                 or not scope_evidence.strip()
                                 or len(scope_evidence) > 200
                                 or scope_evidence.strip() not in outside_quotes(event.text)
-                            )
-                        ):
-                            raise _InvalidCandidate(
-                                "scope_evidence", "bulk_scope_needs_author_evidence"
-                            )
+                            ):
+                                raise _InvalidCandidate(
+                                    "scope_evidence", "bulk_scope_needs_author_evidence"
+                                )
+                        if isinstance(scope_evidence, str):
+                            work_scope_excerpt = scope_evidence.strip()
                     if kind == "command" and isinstance(action, dict):
                         incoming = action.get("member_id")
                         if isinstance(incoming, str) and authored_identifier(
@@ -1657,6 +1690,98 @@ class ModelDecisionProvider:
                     )
                     if candidate.kind != kind:
                         raise _InvalidCandidate("kind", "not_addressed_to_agent")
+                    if kind == "control_work":
+                        selector = candidate.work_selector
+                        bulk = selector is not None and selector.quantifier == "all"
+                        unbound_single = False
+                        if not bulk and len(_rows(context, "_control_works")) > 1:
+                            if selector is not None and selector.basis == "query":
+                                unbound_single = not (
+                                    selector.title_query
+                                    and selector.title_query.casefold() in event.text.casefold()
+                                )
+                            elif selector is None or selector.basis == "ids":
+                                single_id = (
+                                    selector.ids[0] if selector else candidate.target_work_id
+                                )
+                                unbound_single = bool(
+                                    single_id
+                                    and single_id
+                                    not in {
+                                        context.get("_focus_work_id"),
+                                        context.get("_quoted_work_id"),
+                                    }
+                                    and not authored_identifier(
+                                        outside_quotes(event.text), single_id
+                                    )
+                                )
+                        if (
+                            bulk
+                            or work_control_set_attempted
+                            or work_control_reviewed
+                            or unbound_single
+                        ) and not (control_already_committed(receipts.values(), candidate.control)):
+                            if not work_control_reviewed:
+                                assert_source = context.get("_assert_session_source")
+                                if assert_source is not None:
+                                    await assert_source()
+                                started = monotonic()
+                                work_control_review = await self._review_work_control(event.text)
+                                work_control_reviewed = True
+                                if assert_source is not None:
+                                    await assert_source()
+                                action_trace.append(
+                                    {
+                                        "tool": REVIEW_WORK_CONTROL,
+                                        "status": "observed" if work_control_review else "rejected",
+                                        "elapsed_ms": round((monotonic() - started) * 1000),
+                                    }
+                                )
+                            authority = work_control_review
+                            code = None
+                            if authority is None:
+                                code = "work_control_authority_unverified"
+                            elif (
+                                authority.effect == "none" or authority.effect != candidate.control
+                            ):
+                                code = "work_control_effect_not_authorized"
+                            elif authority.cardinality == "unresolved_single":
+                                code = "work_control_target_requires_choice"
+                            elif bulk and selector is not None:
+                                titles = {
+                                    row["id"]: row["goal"]
+                                    for row in _rows(context, "_control_works")
+                                    if isinstance(row.get("id"), str)
+                                    and isinstance(row.get("goal"), str)
+                                }
+                                if not authority.matches_set(selector, work_scope_excerpt, titles):
+                                    code = "work_control_set_not_authorized"
+                            elif authority.cardinality != "single":
+                                code = "work_control_set_requires_atomic_selection"
+                            if code is not None:
+                                instruction = (
+                                    "真人仅要求处理一项，本条未选定目标。保留所有状态并请真人"
+                                    "选择具体工作，不要逐项提交。"
+                                    if code == "work_control_target_requires_choice"
+                                    else "只有本条明确授权的同一操作、对象范围与筛选条件可提交。"
+                                    "不要改成逐项提交；未指定目标时请真人选择。"
+                                )
+                                return observation(
+                                    call,
+                                    {
+                                        "status": "rejected",
+                                        "code": code,
+                                        "committed": False,
+                                        "instruction": instruction,
+                                        **(
+                                            {"authorized_scope": authority.model_dump(mode="json")}
+                                            if authority
+                                            and code == "work_control_set_not_authorized"
+                                            else {}
+                                        ),
+                                    },
+                                    kind=action_kind,
+                                )
                     if operation in _MEMORY_MUTATIONS and candidate.action is not None:
                         fresh_review = memory_review is None
                         if memory_review is None:
@@ -1776,6 +1901,8 @@ class ModelDecisionProvider:
                     receipt["instruction"] = (
                         "控制未改变状态。按当前记录回答进度，保留原目标和执行。"
                     )
+                if receipt.get("code") == "work_control_already_applied":
+                    receipt["instruction"] = "本条同一控制已提交。按真实回执答复，勿继续逐项修改。"
                 if (
                     receipt.get("code") == "schedule_time_missed"
                     and isinstance(timing, dict)
@@ -1821,7 +1948,23 @@ class ModelDecisionProvider:
                 effects[identifier] = row
             return effects
 
-        def finish(candidate: FinishTurn, *, natural_text: bool = False) -> Decision:
+        def sendable_verbatim(text: str) -> bool:
+            return (
+                bool(text.strip())
+                and len(text) <= context.get("_verbatim_reply_limit", 1800)
+                and visible_text(text) == text
+            )
+
+        def verbatim_decision(text: str) -> Decision:
+            return Decision(
+                kind="reply",
+                reason_code=VERBATIM_REPLY_REASON,
+                response=text,
+                directness=directness,
+                confidence=1,
+            )
+
+        async def finish(candidate: FinishTurn, *, natural_text: bool = False) -> Decision:
             nonlocal can_prompt_work_lookup
             context.pop("_reuse_work_admission_id", None)
             effects = write_effects()
@@ -1907,19 +2050,9 @@ class ModelDecisionProvider:
                     or literal not in event.text
                 ):
                     _fail("verbatim_reply", "verbatim_reply_needs_current_source")
-                if (
-                    not literal.strip()
-                    or len(literal) > context.get("_verbatim_reply_limit", 1800)
-                    or visible_text(literal) != literal
-                ):
+                if not sendable_verbatim(literal):
                     _fail("verbatim_reply", "verbatim_reply_needs_one_visible_message")
-                return Decision(
-                    kind="reply",
-                    reason_code=VERBATIM_REPLY_REASON,
-                    response=literal,
-                    directness=directness,
-                    confidence=1,
-                )
+                return verbatim_decision(literal)
             if candidate.blocker is not None:
                 blocker = candidate.blocker
                 if blocker == "tool_rejected":
@@ -1969,6 +2102,61 @@ class ModelDecisionProvider:
                 context["_reuse_work_admission_id"] = existing_admission["delivery_id"]
             if not text.strip() or len(text) > 12000 or len(text.encode()) > 64000:
                 raise _InvalidCandidate("response", "invalid_visible_reply")
+            if (
+                not natural_text
+                and not effects
+                and not candidate.needs_input
+                and not candidate.requested_silence
+                and candidate.blocker is None
+                and candidate.disposition == "reply"
+                and routing.recipient == "agent"
+                and event is not None
+                and event.content_state == "active"
+                and event.kind != EventKind.FORWARDED
+                and not event.attachments
+                and has_wrapped_source_copy(event.text, text)
+                and not any(
+                    receipt_phase(row) == "observed"
+                    and (
+                        row.get("kind") != "read_group_context"
+                        or row.get("resource") not in _ARCHIVE_RESOURCES
+                        or (row.get("facts") and row.get("new_evidence") is not False)
+                    )
+                    for row in receipts.values()
+                )
+            ):
+                assert_source = context.get("_assert_session_source")
+                if assert_source is not None:
+                    await assert_source()
+                started = monotonic()
+                assessed = await self._review_current_utterance(
+                    event.text,
+                    _LITERAL_REPLY_REVIEW_PROMPT,
+                    _LITERAL_REPLY_REVIEW_TOOL,
+                    LiteralReplyAssessment,
+                )
+                elapsed_ms = round((monotonic() - started) * 1000)
+                if assert_source is not None:
+                    await assert_source()
+                literal = assessed.exact_text if assessed is not None else None
+                selected = bool(
+                    literal
+                    and literal != text
+                    and literal in event.text
+                    and literal in text
+                    and sendable_verbatim(literal)
+                )
+                action_trace.append(
+                    {
+                        "tool": _LITERAL_REPLY_REVIEW_TOOL,
+                        "status": "observed" if assessed is not None else "rejected",
+                        "code": "literal_reply_selected" if selected else "literal_reply_unchanged",
+                        "elapsed_ms": elapsed_ms,
+                    }
+                )
+                del action_trace[:-32]
+                if selected and literal is not None:
+                    return verbatim_decision(literal)
             return Decision(
                 kind="clarify" if candidate.needs_input and response else "reply",
                 reason_code="agent_needs_input"
@@ -2033,7 +2221,7 @@ class ModelDecisionProvider:
                 committed_reply = finish_after_commit
                 finish_after_commit = None
                 try:
-                    final = finish(committed_reply)
+                    final = await finish(committed_reply)
                 except _InvalidCandidate as error:
                     return correction(error.issues[0]["code"], messages, drop=True)
                 record_outcome(final)
@@ -2046,7 +2234,7 @@ class ModelDecisionProvider:
             if not candidate.tool_calls or len(terminal) == len(candidate.tool_calls) == 1:
                 try:
                     if terminal:
-                        final = finish(FinishTurn.model_validate(terminal[0].arguments))
+                        final = await finish(FinishTurn.model_validate(terminal[0].arguments))
                     elif candidate.finish_reason != "stop":
                         raise _InvalidCandidate("response", "incomplete_model_output")
                     elif requires_outcome() and routing.recipient != "other":
@@ -2056,9 +2244,9 @@ class ModelDecisionProvider:
                         and candidate.text.strip()
                         or any(receipt_message(row) for row in write_effects().values())
                     ):
-                        final = finish(FinishTurn(disposition="observe"))
+                        final = await finish(FinishTurn(disposition="observe"))
                     else:
-                        final = finish(
+                        final = await finish(
                             FinishTurn(
                                 disposition="reply" if event is not None else "proactive",
                                 response=candidate.text,

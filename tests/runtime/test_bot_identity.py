@@ -8,7 +8,7 @@ import re
 from datetime import timedelta
 
 import pytest
-from conversation.test_react_turn import ModelScript, finish
+from conversation.test_react_turn import ModelScript, call, finish, tool_receipt
 
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import Decision
@@ -113,6 +113,112 @@ async def test_verbatim_intent_and_frozen_part_roll_back_together(runtime_env, m
                 == 0
             )
         assert not outgoing(env)
+    finally:
+        await app.close()
+
+
+@pytest.mark.parametrize(
+    ("utterance", "body", "reviewed", "expected", "prior_read", "review_expected"),
+    [
+        ("Pot，这一轮只给我「竹阁号」。", "登记口令：竹阁号。", "竹阁号", "竹阁号", None, True),
+        ("Pot，请只发这个保管签 岩湾42", "保管签：岩湾42。", "岩湾42", "岩湾42", "memory", True),
+        (
+            "Pot，请用这一句作为保管签 鸢港17",
+            "建议你写“鸢港17”作为保管签。",
+            "鸢港17",
+            "鸢港17",
+            None,
+            True,
+        ),
+        (
+            "Pot，解释「杉牌」的命名。",
+            "你给出的名称：杉牌。",
+            None,
+            "你给出的名称：杉牌。",
+            None,
+            True,
+        ),
+        (
+            "Pot，解释「杉牌」的命名。",
+            "杉牌是这一批入库货箱的标识。",
+            None,
+            "杉牌是这一批入库货箱的标识。",
+            None,
+            False,
+        ),
+        (
+            "Pot，请只发「纸汐坊」。参考样例是「渔岸站」。",
+            "识别字样：渔岸站。",
+            "纸汐坊",
+            "识别字样：渔岸站。",
+            None,
+            True,
+        ),
+        (
+            "Pot，请只发「石塔甲」。",
+            "识别字样：石塔甲。",
+            None,
+            "识别字样：石塔甲。",
+            "clock",
+            False,
+        ),
+    ],
+)
+async def test_prose_literal_review_uses_only_current_source_and_keeps_grounded_wire(
+    runtime_env,
+    utterance,
+    body,
+    reviewed,
+    expected,
+    prior_read,
+    review_expected,
+):
+    env = runtime_env
+    app, _ = app_for(env, {})
+    request = event(env, utterance)
+
+    def compose(model_request):
+        if prior_read == "memory":
+            assert tool_receipt(model_request)["facts"] == []
+            assert tool_receipt(model_request)["new_evidence"] is False
+        return finish(body)
+
+    def review(model_request):
+        assert model_request.tool_choice == "required"
+        assert [tool["function"]["name"] for tool in model_request.tools] == [
+            "review_literal_reply"
+        ]
+        assert len(model_request.messages) == 2
+        assert json.loads(model_request.messages[1].content) == {"current_utterance": utterance}
+        assert not outgoing(env)
+        return call("review_literal_reply", "literal-proof", exact_text=reviewed)
+
+    steps = []
+    if prior_read:
+        args = {"term": "不存在的合成档案索引"} if prior_read == "memory" else {}
+        steps.append(call("read_group_context", "context", resource=prior_read, **args))
+    steps.append(compose)
+    if review_expected:
+        steps.append(review)
+    model = ModelScript(*steps)
+    app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(model)
+    try:
+        result = await admit(app, env, request)
+        assert result["result"]["decision"]["response"] == expected
+        assert len(model.requests) == len(steps) and not model.steps
+        trace = result["turn_outcome"]["actions"]
+        reviews = [row for row in trace if row["tool"] == "review_literal_reply"]
+        if review_expected:
+            (verified,) = reviews
+            assert verified["elapsed_ms"] >= 0
+            assert verified["code"] == (
+                "literal_reply_selected" if expected != body else "literal_reply_unchanged"
+            )
+        else:
+            assert not reviews
+        assert await app.dispatcher.tick() == 1
+        (wire,) = outgoing(env)
+        assert wire["payload"]["text"] == "【Pot】" + expected
     finally:
         await app.close()
 

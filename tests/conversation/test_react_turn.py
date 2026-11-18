@@ -167,6 +167,214 @@ async def test_continuation_of_live_work_reports_current_facts_without_a_revisio
         assert len(tx.list_work()) == len(tx.list_delivery()) == 1
 
 
+def paused_work(env, goal):
+    original = source(env, goal)
+    with env.store.transaction(env.actor) as tx:
+        work = tx.create_work(goal, original.id)
+        return tx.transition_work(work.id, WorkState.PAUSED, expected_revision=work.revision)
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("initial", ["set", "without_excerpt", "guessed_single"])
+async def test_unresolved_singular_authority_rejects_a_set_and_any_arbitrary_narrowing(
+    conversation_env,
+    initial,
+):
+    env = conversation_env
+    first = paused_work(env, "Workshop check-in draft")
+    second = paused_work(env, "Workshop seating diagram")
+    evidence = "Cancel just one of the two paused workshop jobs."
+    event = source(env, "Pot, " + evidence)
+
+    def review(request):
+        assert [item["function"]["name"] for item in request.tools] == [
+            "review_work_control_authority"
+        ]
+        assert json.loads(request.messages[1].content) == {"current_utterance": event.text}
+        assert (
+            first.id not in request.messages[1].content
+            and second.id not in request.messages[1].content
+        )
+        return call(
+            "review_work_control_authority",
+            "independent-authority",
+            effect="cancel",
+            cardinality="unresolved_single",
+            authorization_excerpt=evidence,
+            states=["paused"],
+        )
+
+    def attempt_arbitrary_selection(request):
+        outcome = tool_receipt(request)
+        if initial == "without_excerpt":
+            assert outcome["issues"][0]["code"] == "bulk_scope_needs_author_evidence"
+        else:
+            assert outcome["code"] == "work_control_target_requires_choice"
+        return call(
+            "control_work",
+            "arbitrarily-narrow",
+            control="cancel",
+            work_selector={"basis": "query", "title_query": second.goal, "quantifier": "one"},
+        )
+
+    def clarify(request):
+        assert tool_receipt(request)["code"] == "work_control_target_requires_choice"
+        with env.store.transaction(env.actor) as tx:
+            assert [tx.get_work(w.id) for w in (first, second)] == [first, second]
+        return finish("Which workshop job should I cancel, check-in or seating?")
+
+    selector = (
+        {"basis": "query", "title_query": first.goal, "quantifier": "one"}
+        if initial == "guessed_single"
+        else {"basis": "query", "states": ["paused"], "quantifier": "all"}
+    )
+    proposal = call(
+        "control_work",
+        "unselected-control",
+        control="cancel",
+        work_selector=selector,
+        **({"scope_evidence": evidence} if initial == "set" else {}),
+    )
+    checks = (
+        (attempt_arbitrary_selection, review)
+        if initial == "without_excerpt"
+        else (review, attempt_arbitrary_selection)
+    )
+    model = ModelScript(proposal, *checks, clarify)
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.decision.response == "Which workshop job should I cancel, check-in or seating?"
+    assert len(model.requests) == 4 and not result.controlled_work_ids
+    with env.store.transaction(env.actor) as tx:
+        assert [tx.get_work(w.id) for w in (first, second)] == [first, second]
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("race", [False, True])
+async def test_authorized_complete_work_set_preserves_filters_and_revision_atomicity(
+    conversation_env,
+    race,
+):
+    env = conversation_env
+    first = paused_work(env, "Proofread the print labels")
+    second = paused_work(env, "Draft the venue handout")
+    other_source = source(env, "Other active work")
+    with env.store.transaction(env.actor) as tx:
+        outside = tx.create_work("Other active work", other_source.id)
+    evidence = "Cancel every paused job."
+    event = source(env, "Pot, " + evidence)
+
+    def review(request):
+        assert json.loads(request.messages[1].content) == {"current_utterance": event.text}
+        if race:
+            with env.store.transaction(env.actor) as tx:
+                tx.transition_work(second.id, WorkState.QUEUED, expected_revision=second.revision)
+        return call(
+            "review_work_control_authority",
+            "confirmed-matching-set",
+            effect="cancel",
+            cardinality="matching_set",
+            authorization_excerpt=evidence,
+            states=["paused"],
+        )
+
+    def finish_control(request):
+        receipt = tool_receipt(request)
+        if race:
+            assert receipt["code"] == "version_conflict"
+            assert receipt["committed"] is False
+            return finish("A job changed state before the cancellation, so the set was left alone.")
+        assert receipt["committed"] is True
+        assert set(receipt["result"]["controlled_work_ids"]) == {first.id, second.id}
+        return finish(reports=(("cancel-confirmed-set", "committed"),))
+
+    def repair_filter(request):
+        receipt = tool_receipt(request)
+        assert receipt["code"] == "work_control_set_not_authorized"
+        assert receipt["authorized_scope"]["states"] == ["paused"]
+        with env.store.transaction(env.actor) as tx:
+            assert [tx.get_work(work.id) for work in (first, second, outside)] == [
+                first,
+                second,
+                outside,
+            ]
+        return call(
+            "control_work",
+            "cancel-confirmed-set",
+            control="cancel",
+            scope_evidence=evidence,
+            work_selector={"basis": "query", "states": ["paused"], "quantifier": "all"},
+        )
+
+    model = ModelScript(
+        call(
+            "control_work",
+            "cancel-confirmed-set" if race else "overbroad-set",
+            control="cancel",
+            scope_evidence=evidence,
+            work_selector={
+                "basis": "query",
+                "states": ["paused"] if race else [],
+                "quantifier": "all",
+            },
+        ),
+        review,
+        *(() if race else (repair_filter,)),
+        finish_control,
+    )
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.delivery_id and len(model.requests) == (3 if race else 4)
+    with env.store.transaction(env.actor) as tx:
+        assert tx.get_work(outside.id) == outside
+        if race:
+            assert tx.get_work(first.id) == first
+            assert tx.get_work(second.id).state == WorkState.QUEUED
+        else:
+            assert (
+                tx.get_work(first.id).state == tx.get_work(second.id).state == WorkState.CANCELLED
+            )
+
+
+@pytest.mark.postgres
+async def test_a_committed_single_control_cannot_be_expanded_with_another_single(conversation_env):
+    env = conversation_env
+    first = paused_work(env, "Review the visitor instructions")
+    second = paused_work(env, "Check the staff rota")
+    event = source(env, "Pot, cancel the work titled " + first.goal + ".")
+
+    def candidate_after_success(request):
+        assert tool_receipt(request)["committed"] is True
+        return call(
+            "control_work",
+            "unauthorized-second",
+            control="cancel",
+            work_selector={"basis": "query", "title_query": second.goal, "quantifier": "one"},
+        )
+
+    def done(request):
+        receipt = tool_receipt(request)
+        assert receipt["code"] == "work_control_already_applied" and receipt["committed"] is False
+        return finish(reports=(("first-authorized", "committed"),))
+
+    model = ModelScript(
+        call(
+            "control_work",
+            "first-authorized",
+            control="cancel",
+            work_selector={"basis": "query", "title_query": first.goal, "quantifier": "one"},
+        ),
+        candidate_after_success,
+        done,
+    )
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.delivery_id and len(model.requests) == 3
+    with env.store.transaction(env.actor) as tx:
+        assert tx.get_work(first.id).state == WorkState.CANCELLED
+        assert tx.get_work(second.id) == second
+
+
 @pytest.mark.postgres
 async def test_shared_literal_outputs_enqueue_once_and_keep_per_format_requirements(
     conversation_env,

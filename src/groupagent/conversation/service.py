@@ -97,6 +97,7 @@ from .policy import (
 )
 from .references import authored_identifier, resolve_work_selection
 from .turns import VERBATIM_REPLY_REASON, TurnContract
+from .work_control_authority import control_already_committed
 from .work_queries import query_work_in_tx, render_work_query
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
@@ -2451,6 +2452,13 @@ class ConversationCoordinator(Coordinator):
                             return CoordinationResult.model_validate(receipt["result"]).model_copy(
                                 update={"duplicate": True}
                             )
+                    if decision.kind == "control_work" and control_already_committed(
+                        receipts, decision.control
+                    ):
+                        raise DomainError(
+                            "work_control_already_applied",
+                            "This effect has already been committed for this human request",
+                        )
                 else:
                     return CoordinationResult.model_validate(previous["result"]).model_copy(
                         update={"duplicate": True}
