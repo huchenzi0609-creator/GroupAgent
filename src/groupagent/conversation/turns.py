@@ -76,6 +76,14 @@ class LiteralReplyAssessment(TurnData):
     )
 
 
+class HistoricalInputAuthority(TurnData):
+    authorization_excerpt: str | None = Field(
+        min_length=1,
+        max_length=240,
+        description="Exact current instruction explicitly asking to use an earlier attachment in addition to the current or directly quoted material, or null.",
+    )
+
+
 class FinishTurn(TurnData):
     disposition: Literal["reply", "observe", "proactive"]
     open_request: StrictBool = Field(

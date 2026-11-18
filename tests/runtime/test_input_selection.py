@@ -93,7 +93,7 @@ def image(
     return version, lease
 
 
-async def deliver_images(env, versions, lease):
+async def accepted_image_ids(env, versions, lease):
     with env.store.transaction(env.actor) as tx:
         work = tx.get_work(lease.work_id)
         validating = tx.transition_work(
@@ -122,7 +122,12 @@ async def deliver_images(env, versions, lease):
                 (tx.group_id, intent.id),
             ).fetchone()
             echoes.append(receipt["platform_message_id"])
-    return [emit(env, kind=EventKind.IMAGE, message_id=value) for value in echoes]
+    return echoes
+
+
+async def deliver_images(env, versions, lease):
+    identifiers = await accepted_image_ids(env, versions, lease)
+    return [emit(env, kind=EventKind.IMAGE, message_id=value) for value in identifiers]
 
 
 async def deliver_image(env, version, lease):

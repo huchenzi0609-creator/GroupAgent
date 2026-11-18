@@ -1,4 +1,4 @@
-"""Canonicalize already-authorized image inputs without creating new grants."""
+"""Scope and canonicalize authorized attachments without creating new grants."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from groupagent.persistence import UnitOfWork
 from .artifacts import ArtifactRegistry
 
 _IMAGE_FORMATS = frozenset({"png", "jpeg", "jpg", "gif", "webp"})
+_ATTACHMENT_EVENT_KINDS = frozenset({EventKind.IMAGE, EventKind.AUDIO, EventKind.FILE})
 _VERIFIED_CHANNEL_ORIGINS = frozenset(
     {"verified_channel_metadata", "agentwechat_authenticated_message_metadata"}
 )
@@ -88,6 +89,81 @@ def _preference(row: dict[str, Any]) -> tuple[bool, bool, bool]:
         )
     )
     return citations, bool(row["shared"]), not bool(provenance.get("input_version_id"))
+
+
+def direct_attachment_events(
+    tx: UnitOfWork, event: GroupEvent, allowed_sources: set[str]
+) -> list[GroupEvent]:
+    """Resolve current inputs and the direct, authorized reply target."""
+    anchors = []
+    for identifier in dict.fromkeys((event.id, event.reply_to)):
+        if identifier is None or identifier not in allowed_sources:
+            continue
+        source = tx.get_event(identifier)
+        if source.kind in _ATTACHMENT_EVENT_KINDS or any(
+            part.get("kind") in ("image", "audio", "file") for part in source.attachments
+        ):
+            anchors.append(source)
+    return anchors
+
+
+def anchored_start_inputs(
+    tx: UnitOfWork,
+    registry: ArtifactRegistry | None,
+    event: GroupEvent,
+    allowed_sources: set[str],
+    event_ids: Sequence[str],
+    version_ids: Sequence[str],
+    visible_versions: set[str],
+    quoted_message_id: str | None,
+) -> tuple[list[str], list[str]] | None:
+    """Return the anchored subset only when this proposal expands beyond it."""
+    anchors = {row.id: row for row in direct_attachment_events(tx, event, allowed_sources)}
+    native_ids = {
+        row.platform_message_id
+        for row in anchors.values()
+        if row.platform_message_id and row.trusted_actor_origin in _VERIFIED_CHANNEL_ORIGINS
+    }
+    if quoted_message_id:
+        native_ids.add(quoted_message_id)
+    receipt_versions: dict[str, set[str]] = {}
+    if native_ids:
+        receipts = tx.conn.execute(
+            "SELECT DISTINCT d.payload_ref, d.payload_hash FROM ga_delivery_parts p "
+            "JOIN ga_deliveries d ON d.group_id=p.group_id AND d.id=p.intent_id "
+            "WHERE p.group_id=%s AND p.platform_message_id=ANY(%s) AND p.state='accepted' "
+            "AND left(d.payload_ref,9)='artifact:'",
+            (tx.group_id, sorted(native_ids)),
+        ).fetchall()
+        for receipt in receipts:
+            version_id = receipt["payload_ref"].removeprefix("artifact:")
+            if version_id in visible_versions:
+                receipt_versions.setdefault(version_id, set()).add(receipt["payload_hash"])
+    if not anchors and not receipt_versions:
+        return None
+    scoped_versions = []
+    if registry is not None:
+        for version_id in dict.fromkeys((*version_ids, *sorted(receipt_versions))):
+            try:
+                row = registry._row(tx, version_id)
+            except DomainError as error:
+                if error.code not in {"not_found", "source_unavailable", "permission_denied"}:
+                    raise
+                continue
+            provenance = row["body"].get("provenance", {})
+            primary = provenance.get("source_event_id")
+            if (
+                isinstance(primary, str)
+                and primary in anchors
+                and primary in row["source_fingerprints"]
+                and provenance.get("origin_kind") == "channel"
+                and provenance.get("group_id") == tx.group_id
+                and provenance.get("member_id") == anchors[primary].actor_id
+            ) or row["sha256"] in receipt_versions.get(version_id, ()):
+                scoped_versions.append(version_id)
+    if set(event_ids).issubset(anchors) and set(version_ids).issubset(scoped_versions):
+        return None
+    return list(anchors), scoped_versions
 
 
 def canonicalize_input_selection(

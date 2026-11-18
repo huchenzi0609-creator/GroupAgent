@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -186,6 +186,16 @@ Action = Annotated[
 ACTION_ADAPTER: TypeAdapter[Action] = TypeAdapter(Action)
 
 
+def without_unpaged_unit_counts(output: dict[str, Any]) -> dict[str, Any]:
+    if output.get("format") in ("text", "md", "png", "jpeg", "wav", "ogg"):
+        return {
+            key: value
+            for key, value in output.items()
+            if key not in {"exact_units", "min_units", "max_units"}
+        }
+    return output
+
+
 class OutputRequirement(ActionData):
     format: Literal["text", "md", "docx", "pdf", "pptx", "png", "jpeg", "wav", "ogg"]
     exact_units: int | None = Field(
@@ -193,27 +203,32 @@ class OutputRequirement(ActionData):
         ge=1,
         le=200,
         strict=True,
-        description="An explicitly required exact page/slide count. Do not use for an upper/lower bound or an estimate; use min_units/max_units instead. Omit when count is unspecified.",
+        description="An explicitly required exact count of PDF/DOCX pages or PPTX slides. Use min_units/max_units for bounds. Omit for unpaged formats or when no count is specified.",
     )
     min_units: int | None = Field(
         default=None,
         ge=1,
         le=200,
         strict=True,
-        description="An explicitly required minimum page/slide count (at least). May accompany max_units; never combine with exact_units.",
+        description="An explicitly required minimum count of PDF/DOCX pages or PPTX slides. May accompany max_units. Omit for unpaged formats.",
     )
     max_units: int | None = Field(
         default=None,
         ge=1,
         le=200,
         strict=True,
-        description="An explicitly required maximum page/slide count (at most). A shorter valid document satisfies this bound; never turn it into an exact count or combine with exact_units.",
+        description="An explicitly required maximum count of PDF/DOCX pages or PPTX slides. A shorter valid document satisfies this bound. Omit for unpaged formats.",
     )
     expected_text: list[Annotated[str, Field(max_length=1000)]] = Field(
         default_factory=list,
         max_length=30,
         description="User-required visible text snippets only. Title declaration delimiters such as 《Title》 or quotation marks name Title; omit those delimiter characters unless explicitly requested as literal content. A PPTX topic/theme is document title metadata, not automatically visible slide text when different per-slide titles are explicitly given. Do not turn metadata naming or inferred summaries into extra visible-text requirements.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def supported_units(cls, value: Any) -> Any:
+        return without_unpaged_unit_counts(value) if isinstance(value, dict) else value
 
     @model_validator(mode="after")
     def coherent_units(self) -> OutputRequirement:

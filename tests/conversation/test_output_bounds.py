@@ -31,6 +31,18 @@ def test_unspecified_count_never_adds_a_length_requirement():
     assert all(output.accepts_unit_count(count) for count in (None, 1, 2, 5))
 
 
+@pytest.mark.parametrize("format_name", ["md", "text", "png", "jpeg", "wav", "ogg"])
+def test_unpaged_output_ignores_inapplicable_page_counts(format_name):
+    requirement = OutputRequirement.model_validate(
+        {"format": format_name, "min_units": 1, "max_units": 2, "expected_text": ["明日交接"]}
+    )
+    assert requirement.model_dump(exclude_unset=True) == {
+        "format": format_name,
+        "expected_text": ["明日交接"],
+    }
+    assert requirement.accepts_unit_count(None)
+
+
 @pytest.mark.parametrize(
     "requirement,code",
     [

@@ -26,7 +26,7 @@ from groupagent.billing import BudgetLedger
 from groupagent.billing.metering import LedgerModelBudget, MeteredModel
 from groupagent.config import AppConfig, ExecutionConfig
 from groupagent.control import WorkCapability
-from groupagent.conversation.actions import OutputRequirement
+from groupagent.conversation.actions import OutputRequirement, without_unpaged_unit_counts
 from groupagent.conversation.image_requirements import (
     IMAGE_QUANTITY_INSTRUCTION,
     is_public_image_work,
@@ -348,7 +348,9 @@ def _output_requirements(work: WorkOrder, event: GroupEvent) -> list[dict[str, A
     """
     raw = work.scope.get("outputs", [])
     outputs = (
-        [dict(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+        [without_unpaged_unit_counts(dict(item)) for item in raw if isinstance(item, dict)]
+        if isinstance(raw, list)
+        else []
     )
     if work.goal_revision != 1 or work.input_versions or work.scope.get("attachment_event_ids"):
         return outputs

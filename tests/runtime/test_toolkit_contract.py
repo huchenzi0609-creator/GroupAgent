@@ -453,7 +453,8 @@ async def test_generated_document_is_catalogued_then_selected_and_independently_
 
 async def test_explicit_final_artifact_formats_leave_unrequested_images_reusable(toolkit_setup):
     setup = toolkit_setup
-    run = await prepare(setup, scope={"outputs": [{"format": "md"}]})
+    # Previously stored Markdown work can carry a model's inapplicable page count.
+    run = await prepare(setup, scope={"outputs": [{"format": "md", "min_units": 1}]})
     report = await create_document(run)
     report_id = report.output["version_id"]
     image_path = run.workspace / "auxiliary.png"

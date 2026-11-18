@@ -50,6 +50,7 @@ from .turns import (
     VERBATIM_REPLY_REASON,
     ActionCompletion,
     FinishTurn,
+    HistoricalInputAuthority,
     LiteralReplyAssessment,
     MemoryConsent,
     RecipientEvidence,
@@ -103,6 +104,8 @@ Choose none by default, including questions, one-time replies, quoted commands, 
 For example, “Use River Stone as the heading of this reply” requests none. “Keep River Stone as the project name for future conversations” requests remember. Giving a file or a reply a name does not request a long-term memory record."""
 _LITERAL_REPLY_REVIEW_TOOL = "review_literal_reply"
 _LITERAL_REPLY_REVIEW_PROMPT = """Read only the current human utterance as evidence. Determine whether the author explicitly asks the assistant to send supplied source text alone as this reply. If so, copy exactly the requested body, with its original punctuation and whitespace, in exact_text. Leave out delimiters that merely set the supplied text apart. Use null for ordinary questions, requests for explanations, requests to write content into a separate artifact, and any ambiguous scope. Return only the tool result."""
+_HISTORICAL_INPUT_REVIEW_TOOL = "review_historical_inputs"
+_HISTORICAL_INPUT_REVIEW_PROMPT = """Read only the current human utterance as evidence. Determine whether the author explicitly asks to use earlier attachments beyond material attached or directly quoted in this message. If so, return the exact short unquoted instruction that requests the earlier materials and identifies their scope. “Compare this photo with the chart I sent above” requests both. A request to describe this photo does not also include a previous file, even if those files concern a related subject. Mere reference to a topic or past discussion, quoted instructions, and ambiguous requests carry no expansion authority. Use null in those cases. Return only the tool result."""
 _Assessment = TypeVar("_Assessment", bound=BaseModel)
 RECOVERABLE_FOREGROUND_ERRORS = {"rate_limited", "provider_unavailable", "research_timeout"}
 FOREGROUND_PUBLIC_READS = {"web_search", "web_fetch"}
@@ -956,6 +959,12 @@ def work_action_schema(kind: str, catalog: dict[str, Any] | None = None) -> dict
             "Exact available immutable file-version IDs from reference_catalog. Omit when "
             "no file version is needed."
         )
+        if kind == "start_work":
+            for field in ("input_event_ids", "input_versions"):
+                parameters["properties"][field]["description"] += (
+                    " For a new request with an attached or directly quoted file, use that "
+                    "material. Include earlier files only when the current human asks for them."
+                )
     return parameters
 
 
@@ -1133,6 +1142,7 @@ class ModelDecisionProvider:
         observations: dict[str, tuple[dict[str, Any], tuple[str, ...]]] = {}
         action_trace: list[dict[str, str | int]] = []
         memory_review: tuple[MemoryConsent | None, int] | None = None
+        historical_inputs_authorized: bool | None = None
         work_control_review: WorkControlAuthority | None = None
         work_control_reviewed = False
         work_control_set_attempted = False
@@ -1433,6 +1443,7 @@ class ModelDecisionProvider:
         async def apply_action(call: ModelToolCall) -> str:
             nonlocal finish_after_commit, memory_review, work_control_review
             nonlocal work_control_reviewed, work_control_set_attempted, work_control_recovery
+            nonlocal historical_inputs_authorized
             assert event is not None
             kind = "command" if call.name == "apply_business_action" else call.name
             action_kind = "business" if kind == "command" else kind
@@ -1670,6 +1681,8 @@ class ModelDecisionProvider:
                                 raise DomainError(
                                     repair.get("code", "version_conflict"), "Work changed"
                                 )
+                            if repair.get("attachment_scope_restricted") is True:
+                                historical_inputs_authorized = False
                     candidate = validate_candidate(
                         json.dumps(
                             {
@@ -1693,6 +1706,68 @@ class ModelDecisionProvider:
                     )
                     if candidate.kind != kind:
                         raise _InvalidCandidate("kind", "not_addressed_to_agent")
+                    inspect_inputs = context.get("_inspect_start_inputs")
+                    if (
+                        (kind == "start_work" or repairing)
+                        and inspect_inputs is not None
+                        and (candidate.input_event_ids or candidate.input_versions)
+                    ):
+                        anchors = await inspect_inputs(candidate)
+                        if anchors is not None:
+                            if historical_inputs_authorized is None:
+                                assert_source = context.get("_assert_session_source")
+                                if assert_source is not None:
+                                    await assert_source()
+                                started = monotonic()
+                                input_authority = await self._review_current_utterance(
+                                    event.text,
+                                    _HISTORICAL_INPUT_REVIEW_PROMPT,
+                                    _HISTORICAL_INPUT_REVIEW_TOOL,
+                                    HistoricalInputAuthority,
+                                )
+                                if assert_source is not None:
+                                    await assert_source()
+                                scope_excerpt = (
+                                    (input_authority.authorization_excerpt or "").strip()
+                                    if input_authority is not None
+                                    else ""
+                                )
+                                historical_inputs_authorized = bool(
+                                    scope_excerpt and scope_excerpt in outside_quotes(event.text)
+                                )
+                                action_trace.append(
+                                    {
+                                        "tool": _HISTORICAL_INPUT_REVIEW_TOOL,
+                                        "status": "observed"
+                                        if historical_inputs_authorized
+                                        else "rejected",
+                                        "code": "historical_input_authorized"
+                                        if historical_inputs_authorized
+                                        else "historical_input_restricted",
+                                        "elapsed_ms": round((monotonic() - started) * 1000),
+                                    }
+                                )
+                            if not historical_inputs_authorized:
+                                if not event.text.strip():
+                                    return observation(
+                                        call,
+                                        {
+                                            "status": "rejected",
+                                            "code": "current_attachment_goal_required",
+                                            "committed": False,
+                                            "instruction": "本条只有附件。请真人说明希望对当前附件做什么，不要沿用其他工作的目标。",
+                                        },
+                                        kind=action_kind,
+                                    )
+                                candidate = candidate.model_copy(
+                                    update={
+                                        "goal": event.text,
+                                        "acceptance_criteria": [],
+                                        "input_event_ids": anchors[0],
+                                        "input_versions": anchors[1],
+                                    }
+                                )
+                                context["_anchor_only_work_call"] = call.id
                     if kind == "control_work":
                         selector = candidate.work_selector
                         recovery = work_control_recovery
@@ -1874,6 +1949,7 @@ class ModelDecisionProvider:
                         receipt = await context["_apply_business_action"](candidate, call.id)
                     finally:
                         context.pop("_work_admission_ack", None)
+                        context.pop("_anchor_only_work_call", None)
                 except DomainError as error:
                     if error.retryable:
                         raise

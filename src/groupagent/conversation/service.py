@@ -41,11 +41,16 @@ from groupagent.domain import (
 from groupagent.execution.kernel import KernelTool
 from groupagent.identity import BotIdentity, control_request
 from groupagent.memory import MemberService, MemoryService
+from groupagent.memory.causality import causal_sources
 from groupagent.memory.common import source_rows
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
 from groupagent.runtime.delivery_parts import freeze_delivery_parts
-from groupagent.runtime.input_selection import canonicalize_input_selection
+from groupagent.runtime.input_selection import (
+    anchored_start_inputs,
+    canonicalize_input_selection,
+    direct_attachment_events,
+)
 from groupagent.runtime.text import visible_text
 from groupagent.runtime.tool_selection import message_only_research_request
 from groupagent.runtime.work_facts import WorkFacts
@@ -413,6 +418,17 @@ class ConversationCoordinator(Coordinator):
         )
         return bool(intent and intent.subject == "group" and intent.operation == "participation")
 
+    def _context_builder(self) -> ContextBuilder:
+        return ContextBuilder(
+            self.config,
+            self.store,
+            self.memory,
+            self.members,
+            self.scheduler,
+            self.artifacts,
+            self.clock,
+        )
+
     def _context(
         self,
         actor: ActorContext,
@@ -439,15 +455,7 @@ class ConversationCoordinator(Coordinator):
             query = replace(
                 query, new_request=False, continuation=True, resources=query.resources | {"works"}
             )
-        context = ContextBuilder(
-            self.config,
-            self.store,
-            self.memory,
-            self.members,
-            self.scheduler,
-            self.artifacts,
-            self.clock,
-        ).build(actor, event, query)
+        context = self._context_builder().build(actor, event, query)
         with self.store.transaction(actor, trace_id=event.id) as tx:
             admission = ingress_admission(
                 tx,
@@ -971,17 +979,35 @@ class ConversationCoordinator(Coordinator):
                 return Decision(kind="observe", reason_code="proactive_quota")
         return decision
 
+    def _anchored_input_context(
+        self, tx: UnitOfWork, event: GroupEvent, decision: Decision, context: dict
+    ) -> dict:
+        snapshot = context["_snapshot"]
+        active_sources = causal_sources(tx, {event.id, *decision.input_event_ids})
+        return {
+            **context,
+            "_snapshot": {
+                **snapshot,
+                "source_fingerprints": {
+                    key: digest
+                    for key, digest in snapshot["source_fingerprints"].items()
+                    if key in active_sources
+                },
+                "source_task_revisions": {},
+                "context_artifact_versions": decision.input_versions,
+                "items": [],
+                "retained_context_source_ids": [],
+                "artifact_retained_source_ids": [],
+            },
+        }
+
     def _inputs(
         self, tx: UnitOfWork, event: GroupEvent, decision: Decision, context: dict
     ) -> list[str]:
         snapshot = context["_snapshot"]
         allowed = set(snapshot["source_fingerprints"])
         selected = list(decision.input_event_ids)
-        for identifier in (event.id, event.reply_to):
-            if identifier and identifier in allowed:
-                source = tx.get_event(identifier)
-                if source.kind in {EventKind.IMAGE, EventKind.AUDIO, EventKind.FILE}:
-                    selected.append(identifier)
+        selected.extend(source.id for source in direct_attachment_events(tx, event, allowed))
         selected = list(dict.fromkeys(selected))
         if len(selected) + len(decision.input_versions) > self.config.limits.input_files_per_work:
             raise DomainError("quota_exceeded", "Too many input attachment events")
@@ -1873,10 +1899,27 @@ class ConversationCoordinator(Coordinator):
                 ),
             }
 
+        async def inspect_start_inputs(candidate: Decision) -> tuple[list[str], list[str]] | None:
+            with self.store.transaction(actor, trace_id=event.id) as tx:
+                self.execution_guard(tx)
+                snapshot = context["_snapshot"]
+                self.memory.assert_snapshot_in_tx(tx, snapshot)
+                return anchored_start_inputs(
+                    tx,
+                    self.artifacts,
+                    event,
+                    set(snapshot["source_fingerprints"]),
+                    candidate.input_event_ids,
+                    candidate.input_versions,
+                    {row["version_id"] for row in context.get("files", [])},
+                    self._context_builder()._quote_message_id(tx, event),
+                )
+
         context["_read_work_facts"] = read_facts
         context["_read_group_context"] = read_group_context
         context["_assert_session_source"] = assert_source
         context["_apply_business_action"] = apply_action
+        context["_inspect_start_inputs"] = inspect_start_inputs
         context["clock"] = read_clock()
         context["_verbatim_reply_limit"] = self.config.runtime.message_chunk_characters
         if self.foreground_tools is not None:
@@ -1921,6 +1964,8 @@ class ConversationCoordinator(Coordinator):
                 "expected_revision": work.revision,
                 "expected_goal_revision": expected_goal_revision,
                 "original_goal": event.text,
+                "attachment_scope_restricted": work.scope.get("attachment_scope_restricted")
+                is True,
                 "facts": facts,
                 "instruction": "用update_work提交同一工作的完整修正计划，包含work_capabilities、outputs与明确输入；不要另起工作。",
             }
@@ -2546,6 +2591,9 @@ class ConversationCoordinator(Coordinator):
                     )
             self.memory.assert_snapshot_in_tx(tx, context["_snapshot"])
             repair_admission = decision.reason_code == "repair_current_turn_admission"
+            restrict_attachments = (
+                tool_call_id is not None and context.get("_anchor_only_work_call") == tool_call_id
+            )
             if repair_admission:
                 repair_target = tx.get_work(decision.target_work_id or "")
                 expected_goal_revision = context.get("_admission_repair_targets", {}).get(
@@ -2754,9 +2802,14 @@ class ConversationCoordinator(Coordinator):
                             raise DomainError(
                                 "feature_disabled", "Requested output capability is disabled"
                             )
-                        snapshot = context["_snapshot"]
+                        input_context = (
+                            self._anchored_input_context(tx, event, decision, context)
+                            if restrict_attachments
+                            else context
+                        )
+                        snapshot = input_context["_snapshot"]
                         decision, attachment_ids = self._canonical_inputs(
-                            tx, event, decision, context
+                            tx, event, decision, input_context
                         )
                         topic_id = decision.topic_id or context["_topic_id"]
                         if topic_id is not None and topic_id not in {
@@ -2900,6 +2953,11 @@ class ConversationCoordinator(Coordinator):
                                 ),
                                 "source_event_ids": list(snapshot["source_fingerprints"]),
                                 "attachment_event_ids": [str(value) for value in attachment_ids],
+                                **(
+                                    {"attachment_scope_restricted": True}
+                                    if restrict_attachments
+                                    else {}
+                                ),
                                 "retained_fact_source_ids": retained,
                                 "outputs": [
                                     item.model_dump(mode="json", exclude_none=True)
@@ -2955,10 +3013,42 @@ class ConversationCoordinator(Coordinator):
                             update={"response": _work_receipt_text(work, work_plan_text)}
                         )
                     elif decision.kind == "update_work":
-                        decision, attachment_ids = self._canonical_inputs(
-                            tx, event, decision, context
-                        )
                         previous_work = tx.get_work(decision.target_work_id or "")
+                        input_context = context
+                        if (
+                            repair_admission
+                            and previous_work.scope.get("attachment_scope_restricted") is True
+                        ):
+                            restrict_attachments = True
+                            decision = decision.model_copy(
+                                update={
+                                    "acceptance_criteria": [],
+                                    "input_event_ids": _strings(
+                                        previous_work.scope.get("attachment_event_ids")
+                                    ),
+                                    "input_versions": previous_work.input_versions,
+                                }
+                            )
+                            # The exact prior inputs were already granted to this request.
+                            # Canonical input validation still rechecks their present availability.
+                            input_context = {
+                                **context,
+                                "files": [
+                                    *context.get("files", []),
+                                    *(
+                                        {"version_id": version}
+                                        for version in decision.input_versions
+                                    ),
+                                ],
+                            }
+                        if restrict_attachments:
+                            input_context = self._anchored_input_context(
+                                tx, event, decision, input_context
+                            )
+                        decision, attachment_ids = self._canonical_inputs(
+                            tx, event, decision, input_context
+                        )
+                        snapshot = input_context["_snapshot"]
                         human_provenance = self._human_request_provenance(tx, event, previous_work)
                         if (
                             tool_call_id is not None
@@ -2985,7 +3075,7 @@ class ConversationCoordinator(Coordinator):
                             tx,
                             event,
                             requester_id=actor.member_id,
-                            authorized=context["_snapshot"]["source_fingerprints"],
+                            authorized=snapshot["source_fingerprints"],
                             count=decision.public_image_count,
                             evidence=decision.public_image_count_evidence,
                             previous=previous_work,
@@ -2993,7 +3083,7 @@ class ConversationCoordinator(Coordinator):
                             or "public_images" in decision.work_capabilities,
                             identity=self.identity,
                         )
-                        quantity_sources = dict(context["_snapshot"]["source_fingerprints"])
+                        quantity_sources = dict(snapshot["source_fingerprints"])
                         if quantity.evidence is not None:
                             quantity_sources[quantity.evidence.event_id] = tx.event_fingerprint(
                                 quantity.evidence.event_id
@@ -3009,15 +3099,9 @@ class ConversationCoordinator(Coordinator):
                             if repair_admission
                             else decision.input_versions or None,
                             source_fingerprints=quantity_sources,
-                            source_task_revisions=context["_snapshot"].get(
-                                "source_task_revisions", {}
-                            ),
-                            context_artifact_versions=context["_snapshot"].get(
-                                "context_artifact_versions", []
-                            ),
-                            retained_fact_source_ids=context["_snapshot"].get(
-                                "artifact_retained_source_ids"
-                            )
+                            source_task_revisions=snapshot.get("source_task_revisions", {}),
+                            context_artifact_versions=snapshot.get("context_artifact_versions", []),
+                            retained_fact_source_ids=snapshot.get("artifact_retained_source_ids")
                             or None,
                             output_requirements=changed_outputs or None,
                             required_checks=(
@@ -3057,6 +3141,8 @@ class ConversationCoordinator(Coordinator):
                                     )
                                 ],
                             )
+                            if restrict_attachments:
+                                corrected_scope["attachment_scope_restricted"] = True
                             tx.conn.execute(
                                 "UPDATE ga_work_orders SET scope=%s WHERE group_id=%s AND id=%s",
                                 (Jsonb(corrected_scope), actor.group_id, work.id),
