@@ -603,6 +603,35 @@ async def test_explicit_silent_admission_keeps_work_without_a_visible_receipt(co
 
 
 @pytest.mark.postgres
+async def test_quiet_activation_with_redundant_silence_hint_commits_without_reply(
+    conversation_env,
+):
+    env = conversation_env
+    event = source(env, "Pot，现在整个群先安静下来。")
+    model = ModelScript(
+        call(
+            "apply_business_action",
+            "group-quiet",
+            action={"op": "quiet", "scope": "group", "enabled": True},
+            silent_declaration=True,
+            finish_on_commit=True,
+        ),
+        finish(disposition="observe", requested_silence=True),
+    )
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.decision.kind == "observe" and result.delivery_id is None
+    with env.store.transaction(env.actor) as tx:
+        policy = tx.conn.execute(
+            "SELECT quiet,quiet_since_sequence FROM ga_conversation_policy "
+            "WHERE group_id=%s AND subject_id='*'",
+            (event.group_id,),
+        ).fetchone()
+        assert policy and policy["quiet"] and policy["quiet_since_sequence"]
+        assert not tx.list_delivery()
+
+
+@pytest.mark.postgres
 async def test_quiet_barrier_retires_unsent_admission_without_cancelling_work(conversation_env):
     env = conversation_env
     event = source(env, "Pot，请运行 Python 计算平方。")

@@ -647,3 +647,25 @@ def test_docx_source_links_bind_each_accepted_png_to_its_own_caption(oracles, tm
     )["verified"]
     swapped = inspect(pages[::-1], "swapped.docx")
     assert not oracles.verified_docx_image_captions(swapped, imports, conversions, 2)["verified"]
+
+
+@pytest.mark.parametrize(
+    ("text", "physically_explanatory"),
+    [
+        ("湿热空气遇冷，在冷碗外壁凝结成水珠。", True),
+        ("潮湿的暖空气冷却并冷凝成小水滴。", True),
+        ("湿润的空气接触冷玻璃后凝结为水滴。", True),
+        ("干燥空气遇冷，在冷碗外壁凝结成水珠。", False),
+        ("桌子旁边有湿热空气，碗壁很冷。", False),
+        ("潮湿空气遇冷但没有凝结成水珠。", False),
+        ("湿热空气遇冷后全都凝结成水珠。", False),
+        ("整团潮湿空气冷却后变成水。", False),
+    ],
+)
+def test_short_condensation_reply_checks_causal_moist_air_phrasing(
+    oracles, text, physically_explanatory
+):
+    turn = {"receipts": [native_text("reply", text)]}
+    assert (
+        oracles.short_condensation_reply(turn, ["冷|降温", "水汽|水蒸气"]) is physically_explanatory
+    )

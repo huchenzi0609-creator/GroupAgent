@@ -1052,7 +1052,25 @@ async def work04(s):
 
 def short_condensation_reply(turn, topic_patterns):
     text = re.sub(r"冰凉|低温|温度(?:较|偏|很|相对)?低", "冷", response(turn))
-    return useful_text(turn) and pattern_all(text, topic_patterns)
+    if not useful_text(turn):
+        return False
+    if pattern_all(text, topic_patterns):
+        return True
+
+    # In an ordinary explanation "moist air cooled and condensed into drops"
+    # implies its water content; merely mentioning moist air does not.
+    moisture = re.search(r"(?:湿热|湿润|潮湿|湿)(?:的)?(?:暖|热)?空气|含水分的空气", text)
+    cooling = re.search(r"遇冷|受冷|冷却|降温|接触冷|碰到冷", text)
+    drops = re.search(r"(?:凝结|冷凝|凝成|液化)(?:形成|产生|成了?|为|出)?小?水(?:滴|珠)", text)
+    whole_air = re.search(
+        r"(?:整团|整股|全部)(?:的)?(?:湿热|湿润|潮湿)?空气.{0,18}(?:液化|凝结|化成|变成)"
+        r"|空气.{0,16}(?:整体|全都|全部|本身).{0,8}(?:液化|凝结|化成|变成)",
+        text,
+    )
+    negated = re.search(
+        r"(?:并未|没有|不会|不可能|不能|未能|不)(?:发生|出现)?(?:凝结|冷凝|凝成|液化)", text
+    )
+    return bool(moisture and cooling and drops and not whole_air and not negated)
 
 
 async def chat04(s):

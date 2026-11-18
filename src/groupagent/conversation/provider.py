@@ -1479,6 +1479,15 @@ class ModelDecisionProvider:
                     silent_declaration = (
                         arguments.pop("silent_declaration", False) if kind == "command" else False
                     )
+                    if type(silent_declaration) is not bool:
+                        raise _InvalidCandidate("silent_declaration", "expected_boolean")
+                    if (
+                        isinstance(action, dict)
+                        and action.get("op") == "quiet"
+                        and action.get("enabled") is True
+                    ):
+                        # Quiet activation is already a no-reply action.
+                        silent_declaration = False
                     if kind == "start_work" and any(
                         row.get("kind") == "start_work" and row.get("committed") is True
                         for row in receipts.values()
@@ -1515,14 +1524,12 @@ class ModelDecisionProvider:
                         context.get("requester_member_id"),
                         _rows(context, "tasks"),
                     )
-                    if (
-                        routing.recipient == "other"
-                        and not declaration
-                        or type(silent_declaration) is not bool
-                        or silent_declaration
-                        and not declaration
-                    ):
+                    if routing.recipient == "other" and not declaration:
                         raise _InvalidCandidate("kind", "not_addressed_to_agent")
+                    if silent_declaration and not declaration:
+                        raise _InvalidCandidate(
+                            "silent_declaration", "requires_team_task_declaration"
+                        )
                     # Revisions of a work admitted during this event must bind to the
                     # original verified revision. Another member's later edit/control wins.
                     owned_effect = next(
@@ -2036,7 +2043,7 @@ class ModelDecisionProvider:
             business_schema["properties"].update(ActionCompletion.model_json_schema()["properties"])
             business_schema["properties"]["silent_declaration"] = {
                 "type": "boolean",
-                "description": "Silently record a publicly declared authorized human task, when there was no request for a response.",
+                "description": "For an authorized public team-task declaration only. Quiet activation is inherently silent and needs no flag.",
             }
             tools.append(
                 KernelTool(
