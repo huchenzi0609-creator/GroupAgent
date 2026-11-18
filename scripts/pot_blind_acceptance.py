@@ -180,7 +180,9 @@ def markdown_urls(text):
             elif child.type == "text":
                 urls.update(
                     url.rstrip(".,，。；;：:")
-                    for url in re.findall(r"https?://[^\s<>\[\]()（）]+", child.content)
+                    for url in re.findall(
+                        r"https?://[^\s<>\[\]()（），。；！？：、】》」』]+", child.content
+                    )
                 )
     return urls
 
@@ -1989,6 +1991,29 @@ def explicit_changed_fallback(calls):
     )
 
 
+def search_route_witness(calls, backend, official_pages):
+    search_succeeded = any(
+        call["operation"] == "web_search" and call.get("result") for call in calls
+    ) or any(item["tool_name"] == "web_search" and item.get("success") for item in backend)
+    attempted = calls[0] if calls else {}
+    verified_direct_read_fallback = (
+        attempted.get("operation") == "web_search"
+        and attempted.get("fault_injected") is True
+        and not attempted.get("result")
+        and any(
+            call["operation"] == "web_fetch"
+            and not call.get("fault_injected")
+            and call.get("result")
+            and fetch_source_urls(call["result"]) & official_pages
+            for call in calls[1:]
+        )
+    )
+    return {
+        "successful_search": search_succeeded,
+        "verified_direct_read_fallback": verified_direct_read_fallback,
+    }
+
+
 async def search01(s):
     calls = inject_first_public_read(s)
     request = await s.event("request", latency=True)
@@ -2010,9 +2035,7 @@ async def search01(s):
         for url in fetch_source_urls(item["output"])
     )
     official = {url for url in fetched if official_source(url, s.spec)}
-    search = any(call["operation"] == "web_search" and call.get("result") for call in calls) or any(
-        item["tool_name"] == "web_search" for item in backend
-    )
+    route = search_route_witness(calls, backend, official)
     inspected = await s.artifacts(work) if work and work["work"]["state"] == "completed" else []
     delivered_files = [
         artifact for artifact in inspected if artifact["accepted_sha256"] == artifact["sha256"]
@@ -2032,10 +2055,14 @@ async def search01(s):
         "delivered_inspected_outputs": delivered_files,
         "official_fetched_pages": sorted(official),
         "accepted_verified_links": sorted(accepted_verified_links),
+        "search_route": route,
         "ledger": s.ledger([request["event_id"]]),
     }
     s.check(
-        "real_search_and_verified_official_source", bool(official and search), request, evidence
+        "real_search_and_verified_official_source",
+        bool(official and any(route.values())),
+        request,
+        evidence,
     )
     s.check("fallback_after_injected_failure", explicit_changed_fallback(calls), evidence)
     s.check(

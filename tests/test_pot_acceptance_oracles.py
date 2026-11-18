@@ -669,3 +669,56 @@ def test_short_condensation_reply_checks_causal_moist_air_phrasing(
     assert (
         oracles.short_condensation_reply(turn, ["冷|降温", "水汽|水蒸气"]) is physically_explanatory
     )
+
+
+def test_bare_url_stops_at_cjk_punctuation_but_explicit_destination_is_exact(oracles):
+    link = "https://example.org/topic"
+    encoded = "https://example.org/topic%EF%BC%8Cdetail?part=1,2"
+    assert oracles.markdown_urls(f"入口 {link}，后面是链接说明。") == {link}
+    assert oracles.markdown_urls(f"请见[源材料]({encoded})。") == {encoded}
+    assert oracles.markdown_urls("取 https://example.org/index?part=1,2，供核对。") == {
+        "https://example.org/index?part=1,2"
+    }
+
+
+def test_direct_read_substitutes_only_for_a_real_injected_search_failure(oracles):
+    official = "https://example.org/project"
+    failed_search = {
+        "operation": "web_search",
+        "fault_injected": True,
+        "arguments": {"query": "project"},
+    }
+    found = {
+        "operation": "web_fetch",
+        "fault_injected": False,
+        "arguments": {"url": official},
+        "result": {"source": {"url": official}},
+    }
+    assert oracles.search_route_witness([failed_search, found], [], {official}) == {
+        "successful_search": False,
+        "verified_direct_read_fallback": True,
+    }
+    assert not any(oracles.search_route_witness([found], [], {official}).values())
+    assert not any(
+        oracles.search_route_witness(
+            [failed_search, {**found, "result": None}], [], {official}
+        ).values()
+    )
+    assert not any(
+        oracles.search_route_witness(
+            [failed_search, found], [], {"https://example.org/other"}
+        ).values()
+    )
+    assert not any(
+        oracles.search_route_witness(
+            [failed_search, {**found, "fault_injected": True}], [], {official}
+        ).values()
+    )
+    assert oracles.search_route_witness(
+        [
+            failed_search,
+            {**failed_search, "fault_injected": False, "result": {"results": [{"url": official}]}},
+        ],
+        [],
+        {official},
+    )["successful_search"]

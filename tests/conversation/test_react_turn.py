@@ -518,6 +518,99 @@ async def test_untyped_model_ack_uses_the_already_queued_canonical_receipt(conve
 
 
 @pytest.mark.postgres
+async def test_ambient_work_followup_grounds_the_exact_owned_work_after_group_chatter(
+    conversation_env,
+):
+    env = conversation_env
+    work_ids = []
+    for index, goal in enumerate(("整理河道图例", "整理访谈纪要")):
+        order = source(env, "Pot，请" + goal + "，做成 PDF。")
+        env.models[order.id] = ModelScript(
+            call(
+                "start_work",
+                "order-" + str(index),
+                goal=goal,
+                work_capabilities=["documents"],
+                outputs=[{"format": "pdf"}],
+                finish_on_commit=True,
+            )
+        )
+        admitted = await env.coordinator.process(order)
+        assert admitted.work_id and admitted.delivery_id
+        work_ids.append(admitted.work_id)
+        with env.store.transaction(env.actor) as tx:
+            receipt = tx.claim_delivery("fixture-sender", intent_id=admitted.delivery_id)
+            assert receipt is not None
+            tx.finish_delivery(
+                receipt.id,
+                receipt.claim_token,
+                DeliveryState.ACCEPTED,
+                platform_message_id="fixture:admission-" + str(index),
+            )
+
+    chatter = source(env, "周末的花展还挺热闹。", actor="another-human")
+    env.models[chatter.id] = ModelScript(finish(disposition="observe"))
+    assert (await env.coordinator.process(chatter)).delivery_id is None
+
+    followup = source(env, "河道图例做到哪了？")
+
+    def ungrounded_reply(request):
+        public = json.loads(request.messages[1].content)["context"]
+        assert public["trusted_routing"]["recipient"] == "ambient"
+        assert {
+            row["id"]
+            for row in public["work_facts_overview"]["facts"]
+            if row["requester_id"] == public["requester_member_id"]
+        } == set(work_ids)
+        return finish("河道图例已经发出来了。")
+
+    def ground_reply(request):
+        assert json.loads(request.messages[-1].content)["code"] == "ambient_work_reply_needs_read"
+        with env.store.transaction(env.actor) as tx:
+            assert len(tx.list_delivery()) == 2
+        return call(
+            "read_work_facts",
+            "selected-work",
+            selector={"basis": "ids", "ids": [work_ids[0]], "requester_scope": "self"},
+        )
+
+    def report_facts(request):
+        facts = tool_receipt(request)["facts"]
+        assert [(row["id"], row["state"]) for row in facts] == [(work_ids[0], "queued")]
+        return finish("河道图例仍在排队，图件还没有发出。", reports=[("selected-work", "observed")])
+
+    model = ModelScript(ungrounded_reply, ground_reply, report_facts)
+    env.models[followup.id] = model
+    result = await env.coordinator.process(followup)
+    assert result.work_id == work_ids[0] and result.delivery_id
+    assert result.decision.response == "河道图例仍在排队，图件还没有发出。"
+    assert len(model.requests) == 3 and not model.steps
+
+    directed_to_human = source(env, "河道图例做到哪了？", reply_to=chatter.id)
+
+    def check_human_direction(request):
+        public = json.loads(request.messages[1].content)["context"]
+        assert public["trusted_routing"]["recipient"] == "other"
+        return finish("河道图例仍在排队。")
+
+    human_only = ModelScript(check_human_direction)
+    env.models[directed_to_human.id] = human_only
+    assert (await env.coordinator.process(directed_to_human)).decision.kind == "observe"
+    assert len(human_only.requests) == 1
+
+    unrelated = source(env, "今天窗边又落了几片红叶。")
+    aside = ModelScript(finish("确实很有秋天的感觉。"), finish("秋天的红叶很好看。"))
+    env.models[unrelated.id] = aside
+    assert (await env.coordinator.process(unrelated)).decision.kind == "observe"
+    assert len(aside.requests) == 2 and not aside.steps
+    with env.store.transaction(env.actor) as tx:
+        assert {work.id: work.state for work in tx.list_work()} == dict.fromkeys(
+            work_ids, WorkState.QUEUED
+        )
+        assert len(tx.list_delivery()) == 3
+
+
+@pytest.mark.postgres
 async def test_immediate_admission_keeps_a_later_committed_action_receipt(conversation_env):
     env = conversation_env
     event = source(env, "Pot，请用 Python 算 13 的平方，并记下项目代号是山鲸。")
