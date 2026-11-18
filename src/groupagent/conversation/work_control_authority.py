@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -72,6 +73,40 @@ class WorkControlAuthority(BaseModel):
             )
         }
         return len(excluded) == len(self.exclusions) and excluded == set(selector.exclude_ids)
+
+
+@dataclass
+class WorkControlRecovery:
+    """One refresh and reapplication of a previously verified matching set."""
+
+    control: str
+    selector: WorkSelector
+    scope_evidence: str
+    rejected_call_id: str
+    state: Literal["refresh", "retry", "empty", "incomplete", "exhausted", "done"] = "refresh"
+    redirected_finish: bool = False
+
+    def observation(self) -> dict[str, Any]:
+        selector = self.selector.model_dump(mode="json")
+        instruction = {
+            "refresh": "本条授权仍有效。用 read_work_facts 原样重读筛选条件，然后按刷新结果继续，勿要求再次确认。",
+            "retry": "直接重新执行下方同一操作及完整筛选，即使现在只匹配一项也保留 quantifier=all。"
+            "勿改成按编号选择或要求真人确认。",
+            "empty": "完整查询没有匹配项。说明当前没有符合原条件的工作，本次没有更改。",
+            "incomplete": "未能完整核对原范围。说明未执行修改，勿用部分结果执行。",
+            "exhausted": "重试未提交。按实际拒绝原因说明未执行修改，勿继续逐项修改。",
+            "done": "这项操作已经提交。根据实际回执答复。",
+        }[self.state]
+        detail: dict[str, Any] = {"state": self.state, "instruction": instruction}
+        if self.state == "refresh":
+            detail["read_work_facts"] = {"selector": selector}
+        elif self.state == "retry":
+            detail["control_work"] = {
+                "control": self.control,
+                "work_selector": selector,
+                "scope_evidence": self.scope_evidence,
+            }
+        return detail
 
 
 def control_already_committed(receipts: Iterable[Mapping[str, Any]], effect: str | None) -> bool:

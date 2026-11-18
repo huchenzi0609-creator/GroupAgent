@@ -41,6 +41,7 @@ from groupagent.domain import (
 from groupagent.execution.kernel import KernelTool
 from groupagent.identity import BotIdentity, control_request
 from groupagent.memory import MemberService, MemoryService
+from groupagent.memory.common import source_rows
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
 from groupagent.runtime.delivery_parts import freeze_delivery_parts
@@ -80,6 +81,7 @@ from .intent import (
     requests_speech_reply,
     task_write_request,
 )
+from .output_requirements import literal_output_requirements
 from .participation import (
     explicit_policy_intent,
     fast_observe,
@@ -98,10 +100,17 @@ from .policy import (
 from .references import authored_identifier, resolve_work_selection
 from .turns import VERBATIM_REPLY_REASON, TurnContract
 from .work_control_authority import control_already_committed
-from .work_queries import query_work_in_tx, render_work_query
+from .work_queries import query_work_in_tx, render_work_query, work_query_scope
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
 _CONTINUATION_STATES = {"resume": WorkState.PAUSED, "retry": WorkState.FAILED}
+
+
+class _WorkSelectionChanged(DomainError):
+    def __init__(self) -> None:
+        super().__init__("version_conflict", "A selected work changed before the command")
+
+
 _ERRORS = {
     "work_selection_scope_required": (
         "已查到多个对象。若真人要求整组选定状态的工作，请按完整条件选择；"
@@ -345,6 +354,54 @@ class ConversationCoordinator(Coordinator):
             "human_request_fingerprints": fingerprints,
             "human_request_history_complete": complete,
         }
+
+    @staticmethod
+    def _carried_output_literals(
+        tx: UnitOfWork, previous: WorkOrder, proposed_outputs: list[dict[str, JsonValue]]
+    ) -> dict[str, set[str]]:
+        """Recheck only literals still proposed for the same accepted output format."""
+        prior_outputs = previous.scope.get("outputs")
+        fingerprints = previous.scope.get("human_request_fingerprints")
+        if not isinstance(prior_outputs, list) or not isinstance(fingerprints, dict):
+            return {}
+        wanted = {
+            (str(output["format"]), literal)
+            for output in proposed_outputs
+            for literal in _strings(output.get("expected_text"))
+        }
+        retained = [
+            {
+                "format": output["format"],
+                "expected_text": [
+                    literal
+                    for literal in _strings(output.get("expected_text"))
+                    if (str(output["format"]), literal) in wanted
+                ],
+            }
+            for output in prior_outputs
+            if isinstance(output, dict) and isinstance(output.get("format"), str)
+        ]
+        if not any(output["expected_text"] for output in retained):
+            return {}
+        identifiers = _strings(previous.scope.get("human_request_event_ids"))
+        if len(identifiers) > 32:
+            identifiers = identifiers[:1] + identifiers[-31:]
+        verified: dict[str, set[str]] = {}
+        for identifier in identifiers:
+            try:
+                source_rows(tx, [identifier], shared=True)
+                source = tx.get_event(identifier)
+            except DomainError as error:
+                if error.code not in {"not_found", "permission_denied", "source_unavailable"}:
+                    raise
+                continue
+            if source.kind == EventKind.FORWARDED or tx.event_fingerprint(
+                identifier
+            ) != fingerprints.get(identifier):
+                continue
+            for output in literal_output_requirements(retained, source.text, carried_literals={}):
+                verified.setdefault(output["format"], set()).update(output["expected_text"])
+        return verified
 
     def accepts_event(self, event: GroupEvent) -> bool:
         if self.current_mode() != "disabled":
@@ -680,6 +737,13 @@ class ConversationCoordinator(Coordinator):
                 ids=(decision.target_work_id or "",),
                 requester_scope="any" if readonly or actor.role == Role.OWNER else "self",
             )
+        # An exact complete query is a transactional membership observation.
+        # The broader catalog may still contain a row that has left this filter.
+        refreshed = (
+            context.get("_complete_control_queries", {}).get(work_query_scope(selector))
+            if not readonly and selector.basis == "query" and selector.quantifier == "all"
+            else None
+        )
         if not readonly:
             target = {
                 "cancel": WorkState.CANCELLED,
@@ -716,10 +780,13 @@ class ConversationCoordinator(Coordinator):
             actor,
             event,
             selector,
-            context.get("_control_works", context.get("_works", [])),
+            refreshed
+            if refreshed is not None
+            else context.get("_control_works", context.get("_works", [])),
             focus_id=context.get("_focus_work_ids") or context.get("_focus_work_id"),
             quoted_id=context.get("_quoted_work_id"),
-            candidates_complete=context.get("_control_works_complete", True),
+            candidates_complete=refreshed is not None
+            or context.get("_control_works_complete", True),
             readonly=readonly,
         )
         if (
@@ -1698,6 +1765,13 @@ class ConversationCoordinator(Coordinator):
                     raise DomainError("source_unavailable", "The human request was withdrawn")
                 observed = query_work_in_tx(tx, event, candidate, context, WorkFacts(self.store))
                 rows = observed["facts"]
+                if selector.basis == "query" and selector.quantifier == "all":
+                    complete_queries = context.setdefault("_complete_control_queries", {})
+                    scope = work_query_scope(selector)
+                    if observed["complete"]:
+                        complete_queries[scope] = rows
+                    else:
+                        complete_queries.pop(scope, None)
                 if selector.basis != "ids":
                     context.setdefault("_work_target_reads", {})[selector] = frozenset(
                         row["id"] for row in rows
@@ -1738,6 +1812,13 @@ class ConversationCoordinator(Coordinator):
                 result = self._apply_decision(
                     actor, event, candidate, context, tool_call_id=tool_call_id
                 )
+            except _WorkSelectionChanged as error:
+                return {
+                    "status": "rejected",
+                    "code": error.code,
+                    "committed": False,
+                    "work_selection_changed": True,
+                }
             except DomainError as error:
                 if error.retryable:
                     raise
@@ -2638,6 +2719,14 @@ class ConversationCoordinator(Coordinator):
                                 for identifier in task_ids
                             }
                     elif decision.kind == "start_work":
+                        if tool_call_id is not None and context.get("_react_session"):
+                            decision = decision.model_copy(
+                                update={
+                                    "outputs": literal_output_requirements(
+                                        decision.outputs, event.text, carried_literals={}
+                                    ),
+                                }
+                            )
                         planner_outputs: list[JsonValue] = [value for value in decision.outputs]
                         message_only = bool(
                             event.kind == EventKind.TEXT
@@ -2869,14 +2958,29 @@ class ConversationCoordinator(Coordinator):
                         decision, attachment_ids = self._canonical_inputs(
                             tx, event, decision, context
                         )
+                        previous_work = tx.get_work(decision.target_work_id or "")
+                        human_provenance = self._human_request_provenance(tx, event, previous_work)
+                        if (
+                            tool_call_id is not None
+                            and context.get("_react_session")
+                            and decision.outputs
+                        ):
+                            carried = self._carried_output_literals(
+                                tx, previous_work, decision.outputs
+                            )
+                            decision = decision.model_copy(
+                                update={
+                                    "outputs": literal_output_requirements(
+                                        decision.outputs, event.text, carried_literals=carried
+                                    ),
+                                }
+                            )
                         changed_outputs = [
                             OutputRequirement.model_validate(value).model_dump(
                                 mode="json", exclude_none=True
                             )
                             for value in decision.outputs
                         ]
-                        previous_work = tx.get_work(decision.target_work_id or "")
-                        human_provenance = self._human_request_provenance(tx, event, previous_work)
                         quantity = normalize_image_quantity(
                             tx,
                             event,
@@ -3073,9 +3177,7 @@ class ConversationCoordinator(Coordinator):
                         for ref in resolved.refs:
                             row = tx._work_row(ref.id)
                             if row["revision"] != ref.revision or row["state"] != ref.state.value:
-                                raise DomainError(
-                                    "version_conflict", "A selected work changed before the command"
-                                )
+                                raise _WorkSelectionChanged()
                             work = tx.get_work(ref.id)
                             tx._check_work_source(row)
                             source = tx.get_event(work.request_event_id)
@@ -3153,7 +3255,11 @@ class ConversationCoordinator(Coordinator):
                 code = error.code if isinstance(error, DomainError) else "invalid_input"
                 if code != "work_control_state_observed":
                     context["_snapshot"] = original_snapshot
-                if tool_call_id is not None and isinstance(error, DomainError) and error.retryable:
+                if (
+                    tool_call_id is not None
+                    and isinstance(error, DomainError)
+                    and (error.retryable or isinstance(error, _WorkSelectionChanged))
+                ):
                     raise
                 response = _ERRORS.get(code, "这项操作暂时无法完成，现有记录已保留。")
                 if code in {

@@ -275,6 +275,7 @@ async def test_real_admission_is_deliverable_while_foreground_still_waits(
                         if preliminary_search
                         else ["python_compute"],
                         "outputs": [{"format": "text"}],
+                        **({"response": "我稍后核对再发。"} if preliminary_search else {}),
                     },
                 )
             else:
@@ -330,6 +331,7 @@ async def test_real_admission_is_deliverable_while_foreground_still_waits(
             work = tx.get_work(marker["work_id"])
             assert work.state == WorkState.QUEUED
             assert work.goal in marker["text"]
+            assert "我稍后核对再发。" not in marker["text"]
         assert await app.dispatcher.tick() == 1
         assert not foreground.done()
         assert sent(env) == ["【Pot】" + marker["text"]]

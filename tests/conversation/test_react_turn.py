@@ -250,7 +250,7 @@ async def test_unresolved_singular_authority_rejects_a_set_and_any_arbitrary_nar
 
 
 @pytest.mark.postgres
-@pytest.mark.parametrize("race", [False, True])
+@pytest.mark.parametrize("race", [None, "subset", "empty", "again"])
 async def test_authorized_complete_work_set_preserves_filters_and_revision_atomicity(
     conversation_env,
     race,
@@ -263,12 +263,27 @@ async def test_authorized_complete_work_set_preserves_filters_and_revision_atomi
         outside = tx.create_work("Other active work", other_source.id)
     evidence = "Cancel every paused job."
     event = source(env, "Pot, " + evidence)
+    selector = {"basis": "query", "states": ["paused"], "quantifier": "all"}
+
+    def propose(tool_id, work_selector=selector):
+        return call(
+            "control_work",
+            tool_id,
+            control="cancel",
+            scope_evidence=evidence,
+            work_selector=work_selector,
+        )
+
+    def read(tool_id):
+        return call("read_work_facts", tool_id, selector=selector)
 
     def review(request):
         assert json.loads(request.messages[1].content) == {"current_utterance": event.text}
         if race:
             with env.store.transaction(env.actor) as tx:
                 tx.transition_work(second.id, WorkState.QUEUED, expected_revision=second.revision)
+                if race == "empty":
+                    tx.transition_work(first.id, WorkState.QUEUED, expected_revision=first.revision)
         return call(
             "review_work_control_authority",
             "confirmed-matching-set",
@@ -280,13 +295,17 @@ async def test_authorized_complete_work_set_preserves_filters_and_revision_atomi
 
     def finish_control(request):
         receipt = tool_receipt(request)
-        if race:
+        if race == "again":
             assert receipt["code"] == "version_conflict"
             assert receipt["committed"] is False
-            return finish("A job changed state before the cancellation, so the set was left alone.")
+            assert receipt["control_recovery"]["state"] == "exhausted"
+            return finish("The matching work changed again. No cancellation was committed.")
         assert receipt["committed"] is True
-        assert set(receipt["result"]["controlled_work_ids"]) == {first.id, second.id}
-        return finish(reports=(("cancel-confirmed-set", "committed"),))
+        assert set(receipt["result"]["controlled_work_ids"]) == (
+            {first.id} if race else {first.id, second.id}
+        )
+        expected_id = "reapply-cancellation" if race else "cancel-confirmed-set"
+        return finish(reports=((expected_id, "committed"),))
 
     def repair_filter(request):
         receipt = tool_receipt(request)
@@ -298,37 +317,73 @@ async def test_authorized_complete_work_set_preserves_filters_and_revision_atomi
                 second,
                 outside,
             ]
-        return call(
-            "control_work",
-            "cancel-confirmed-set",
-            control="cancel",
-            scope_evidence=evidence,
-            work_selector={"basis": "query", "states": ["paused"], "quantifier": "all"},
-        )
+        return propose("cancel-confirmed-set")
 
-    model = ModelScript(
-        call(
-            "control_work",
-            "cancel-confirmed-set" if race else "overbroad-set",
-            control="cancel",
-            scope_evidence=evidence,
-            work_selector={
-                "basis": "query",
-                "states": ["paused"] if race else [],
-                "quantifier": "all",
-            },
-        ),
-        review,
-        *(() if race else (repair_filter,)),
-        finish_control,
-    )
+    def initially_matched(request):
+        assert {fact["id"] for fact in tool_receipt(request)["facts"]} == {first.id, second.id}
+        return propose("cancel-confirmed-set")
+
+    def stale(request):
+        refused = tool_receipt(request)
+        assert refused["code"] == "version_conflict" and refused["committed"] is False
+        assert refused["control_recovery"]["state"] == "refresh"
+        assert refused["control_recovery"]["read_work_facts"]["selector"]["states"] == ["paused"]
+        if race == "subset":
+            return finish("Should I still cancel the matching job?")
+        return read("fresh-scoped-read")
+
+    def corrected_finish(request):
+        guidance = json.loads(request.messages[-1].content)
+        assert guidance["type"] == "work_control_recovery" and guidance["state"] == "refresh"
+        return read("fresh-scoped-read")
+
+    def refreshed(request):
+        receipt = tool_receipt(request)
+        assert receipt["complete"] is True
+        if race == "empty":
+            assert receipt["facts"] == [] and receipt["control_recovery"]["state"] == "empty"
+            return finish("There are no currently matching paused jobs.")
+        assert [fact["id"] for fact in receipt["facts"]] == [first.id]
+        recovery = receipt["control_recovery"]
+        assert recovery["state"] == "retry" and recovery["control_work"]["control"] == "cancel"
+        assert recovery["control_work"]["work_selector"]["quantifier"] == "all"
+        if race == "again":
+            with env.store.transaction(env.actor) as tx:
+                tx.transition_work(first.id, WorkState.QUEUED, expected_revision=first.revision)
+        # Exact same arguments as the refused write, with a new call identity.
+        return propose("reapply-cancellation")
+
+    if race:
+        steps = [read("initial-scoped-read"), initially_matched, review, stale]
+        if race == "subset":
+            steps.append(corrected_finish)
+        steps.append(refreshed)
+        if race != "empty":
+            steps.append(finish_control)
+    else:
+        steps = [
+            propose("overbroad-set", {**selector, "states": []}),
+            review,
+            repair_filter,
+            finish_control,
+        ]
+    model = ModelScript(*steps)
     env.models[event.id] = model
     result = await env.coordinator.process(event)
-    assert result.delivery_id and len(model.requests) == (3 if race else 4)
+    assert result.delivery_id and len(model.requests) == len(steps) and not model.steps
+    assert (
+        sum(
+            req.tools[0]["function"]["name"] == "review_work_control_authority"
+            for req in model.requests
+        )
+        == 1
+    )
     with env.store.transaction(env.actor) as tx:
         assert tx.get_work(outside.id) == outside
         if race:
-            assert tx.get_work(first.id) == first
+            assert tx.get_work(first.id).state == (
+                WorkState.CANCELLED if race == "subset" else WorkState.QUEUED
+            )
             assert tx.get_work(second.id).state == WorkState.QUEUED
         else:
             assert (
@@ -409,6 +464,104 @@ async def test_shared_literal_outputs_enqueue_once_and_keep_per_format_requireme
             "docx": ["明日交接", "仓号 EQ-73"],
             "pdf": ["仓号 EQ-73"],
         }
+
+
+@pytest.mark.postgres
+async def test_computed_output_is_not_a_model_guessed_literal(conversation_env):
+    env = conversation_env
+    request = source(
+        env,
+        "Pot，请用 Python 实算 1467 加 23。做成 PDF，标题写兑换单，单元格原样写 42.75 和仓号 R-85。",
+    )
+    model = ModelScript(
+        call(
+            "start_work",
+            "calculate",
+            goal=request.text,
+            finish_on_commit=True,
+            work_capabilities=["compute", "documents"],
+            required_work_tools=["python_compute"],
+            outputs=[
+                {
+                    "format": "pdf",
+                    "expected_text": ["1480", "46", "42", "兑换单", "42.75", "仓号 R-85"],
+                }
+            ],
+            acceptance_criteria=["用实际 Python 输出验证计算结果。"],
+        )
+    )
+    env.models[request.id] = model
+    result = await env.coordinator.process(request)
+    assert result.work_id and result.delivery_id and len(model.requests) == 1
+    with env.store.transaction(env.actor) as tx:
+        work = tx.get_work(result.work_id)
+        assert work.scope["outputs"] == [
+            {"format": "pdf", "expected_text": ["兑换单", "42.75", "仓号 R-85"]}
+        ]
+        assert work.scope["planner_outputs"] == work.scope["outputs"]
+        assert work.scope["required_tools"] == ["python_compute"]
+        assert work.acceptance_criteria == ["用实际 Python 输出验证计算结果。"]
+
+
+@pytest.mark.postgres
+async def test_revision_only_carries_verified_literals_still_requested_on_the_same_work(
+    conversation_env,
+):
+    env = conversation_env
+    origin = source(env, "Pot，生成标题为「水灯目录」的 PDF，附上原档号 X-19。")
+    env.models[origin.id] = ModelScript(
+        call(
+            "start_work",
+            "original",
+            goal=origin.text,
+            finish_on_commit=True,
+            work_capabilities=["documents"],
+            outputs=[{"format": "pdf", "expected_text": ["水灯目录", "X-19"]}],
+        )
+    )
+    admitted = await env.coordinator.process(origin)
+    assert admitted.work_id
+
+    async def revise(text, goal, outputs=None):
+        request = source(env, "Pot，" + text)
+        with env.store.transaction(env.actor) as tx:
+            current = tx.get_work(admitted.work_id)
+        fields = {"outputs": outputs} if outputs is not None else {}
+        env.models[request.id] = ModelScript(
+            call(
+                "update_work",
+                "revise",
+                goal=goal,
+                work_capabilities=["documents"],
+                target_work_id=current.id,
+                expected_revision=current.revision,
+                finish_on_commit=True,
+                **fields,
+            )
+        )
+        result = await env.coordinator.process(request)
+        assert result.work_id == current.id
+        with env.store.transaction(env.actor) as tx:
+            return tx.get_work(current.id).scope["outputs"]
+
+    expected = [{"format": "pdf", "expected_text": ["水灯目录", "N-2"]}]
+    assert (
+        await revise(
+            "保留原来标题，把同一份目录的档号改成 N-2。",
+            "把原目录的档号替换为 N-2",
+            [{"format": "pdf", "expected_text": ["水灯目录", "N-2", "编造的新页眉"]}],
+        )
+        == expected
+    )
+    assert await revise("再把同一份目录的段落缩短。", "精简目录的正文") == expected
+    assert (
+        await revise(
+            "把现有目录的正文换成条目，保留现有标题和档号。",
+            "以条目形式排列现有目录",
+            [{"format": "pdf", "expected_text": ["水灯目录", "N-2", "X-19"]}],
+        )
+        == expected
+    )
 
 
 @pytest.mark.postgres

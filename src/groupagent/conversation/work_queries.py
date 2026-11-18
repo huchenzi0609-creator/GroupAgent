@@ -11,6 +11,16 @@ from groupagent.persistence import UnitOfWork
 from groupagent.runtime.work_facts import WorkFacts
 
 
+def work_query_scope(selector: WorkSelector) -> WorkSelector:
+    """Compare the same query independently of the order of its set filters."""
+    return selector.model_copy(
+        update={
+            "states": tuple(sorted(selector.states)),
+            "exclude_ids": tuple(sorted(selector.exclude_ids)),
+        }
+    )
+
+
 def compact_work_overview(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Keep live awareness small; this display is neither focus nor full history."""
     fields = (
