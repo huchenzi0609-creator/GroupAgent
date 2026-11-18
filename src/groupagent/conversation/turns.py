@@ -15,6 +15,7 @@ from pydantic import (
     ValidationInfo,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from groupagent.domain import GroupEvent
 from groupagent.identity import BotIdentity, trusted_name_source
@@ -32,6 +33,7 @@ class TurnData(BaseModel):
 
 
 ReceiptPhase = Literal["observed", "queued", "committed"]
+VERBATIM_REPLY_REASON = "agent_verbatim_reply"
 
 
 class TurnReport(TurnData):
@@ -86,6 +88,15 @@ class FinishTurn(TurnData):
             "acknowledgements, scheduling times and work phases."
         ),
     )
+    verbatim_reply: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=4000,
+        description=(
+            "When asked to send only an exact supplied phrase, copy that phrase alone from "
+            "the current human message. Omit response and submit this reply separately from any writes."
+        ),
+    )
     reports: list[TurnReport] = Field(
         default_factory=list,
         max_length=20,
@@ -111,6 +122,21 @@ class FinishTurn(TurnData):
         ]
         | None
     ) = None
+
+    @model_validator(mode="after")
+    def verbatim_reply_is_the_only_reply_body(self) -> FinishTurn:
+        if self.verbatim_reply is not None and (
+            self.disposition != "reply"
+            or self.response is not None
+            or self.needs_input
+            or self.requested_silence
+            or self.blocker is not None
+        ):
+            raise PydanticCustomError(
+                "verbatim_reply_requires_only_body",
+                "A verbatim reply is the only reply body and has no blocker",
+            )
+        return self
 
 
 def receipt_phase(receipt: dict[str, Any]) -> ReceiptPhase | None:

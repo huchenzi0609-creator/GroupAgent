@@ -3,9 +3,11 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from groupagent.conversation.policy import apply_quiet_barrier_in_tx, delivery_admission_in_tx
 from groupagent.conversation.provider import ModelDecisionProvider
+from groupagent.conversation.turns import FinishTurn
 from groupagent.domain import DeliveryState, DomainError, WorkState
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
@@ -87,6 +89,45 @@ async def test_answer_or_observe_in_one_model_call_without_fast_semantics(conver
     result = await env.coordinator.process(ambient)
     assert result.decision.kind == "observe" and not result.delivery_id
     assert len(silent.requests) == 1
+
+
+def test_verbatim_reply_and_prose_are_mutually_exclusive():
+    with pytest.raises(ValidationError):
+        FinishTurn(disposition="reply", response="A note", verbatim_reply="sample label")
+
+
+@pytest.mark.postgres
+async def test_verbatim_reply_requires_exact_current_authored_text(conversation_env):
+    env = conversation_env
+    earlier = source(env, "上一张纸卡的编号是棱岸4。")
+    request = source(env, "Pot，请只回复「收件架 A」。", reply_to=earlier.id)
+
+    def correct_literal(model_request):
+        assert (
+            json.loads(model_request.messages[-1].content)["code"]
+            == "verbatim_reply_needs_current_source"
+        )
+        with env.store.transaction(env.actor) as tx:
+            assert not tx.list_delivery()
+        return finish(verbatim_reply="收件架 A")
+
+    model = ModelScript(finish(verbatim_reply="棱岸4"), correct_literal)
+    env.models[request.id] = model
+    result = await env.coordinator.process(request)
+    assert result.decision.response == "收件架 A" and result.delivery_id
+    assert len(model.requests) == 2
+
+
+@pytest.mark.postgres
+async def test_verbatim_reply_does_not_override_human_recipient(conversation_env):
+    env = conversation_env
+    peer = source(env, "这张纸卡该写哪一组？", actor="another-human")
+    request = source(env, "请只回复「纸桥」。", reply_to=peer.id)
+    model = ModelScript(finish(verbatim_reply="纸桥"))
+    env.models[request.id] = model
+    result = await env.coordinator.process(request)
+    assert result.decision.kind == "observe" and not result.delivery_id
+    assert len(model.requests) == 1
 
 
 @pytest.mark.postgres

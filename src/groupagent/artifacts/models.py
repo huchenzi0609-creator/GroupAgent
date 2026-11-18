@@ -17,6 +17,11 @@ class ArtifactError(DomainError, ValueError):
         super().__init__(code, message)
 
 
+def canonical_artifact_format(value: str) -> str:
+    """Use one format for JPEG requirements without changing stored filenames."""
+    return "jpeg" if value == "jpg" else value
+
+
 @dataclass(frozen=True)
 class ArtifactScope:
     """A trusted caller supplies these values; documents cannot grant access."""

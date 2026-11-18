@@ -20,7 +20,7 @@ from pydantic import Field, JsonValue
 
 from groupagent.artifacts import ArtifactScope, ArtifactStore, ArtifactVersion
 from groupagent.artifacts.isolated import IsolatedDocumentService
-from groupagent.artifacts.models import image_page_binding
+from groupagent.artifacts.models import canonical_artifact_format, image_page_binding
 from groupagent.artifacts.tools import register_document_tools
 from groupagent.billing import BudgetLedger
 from groupagent.billing.metering import LedgerModelBudget, MeteredModel
@@ -394,6 +394,35 @@ def _output_requirements(work: WorkOrder, event: GroupEvent) -> list[dict[str, A
                 output["expected_text"] = [value for value in expected if value != topic[1]]
             output["metadata_title"] = topic[1]
     return outputs
+
+
+def _final_artifact_formats(requirements: object) -> set[str]:
+    if not isinstance(requirements, list):
+        return set()
+    return {
+        canonical_artifact_format(format_name)
+        for item in requirements
+        if isinstance(item, dict)
+        and isinstance(format_name := item.get("format"), str)
+        and format_name != "text"
+    }
+
+
+def _output_format_repair(selected: dict[str, str], allowed: set[str]) -> str | None:
+    if not allowed:
+        return None
+    unexpected = [
+        f"{version_id} ({format_name})"
+        for version_id, format_name in sorted(selected.items())
+        if canonical_artifact_format(format_name) not in allowed
+    ]
+    if not unexpected:
+        return None
+    return (
+        "Use artifact_deliver with only the requested final formats "
+        f"({', '.join(sorted(allowed))}). Leave these versions as reusable intermediates: "
+        + ", ".join(unexpected)
+    )
 
 
 _REQUEST_CONTEXT_INSTRUCTION = (
@@ -1318,6 +1347,8 @@ class WorkToolkit:
         async def publish(args, context):
             with self.store.transaction(actor) as tx:
                 tx.assert_lease(lease)
+                current = tx.get_work(work.id)
+                selected = {}
                 for version_id in args.version_ids:
                     row = self.registry._row(tx, version_id)
                     if row["work_id"] != work.id:
@@ -1325,6 +1356,19 @@ class WorkToolkit:
                             "scope_violation",
                             "Publish a scoped copy in this work, not another work's private version",
                         )
+                    selected[version_id] = row["format"]
+                repair = _output_format_repair(
+                    selected, _final_artifact_formats(current.scope.get("outputs"))
+                )
+                if repair is not None:
+                    raise ToolFailure(
+                        "unexpected_final_artifact_format",
+                        repair,
+                        not_started=True,
+                        origin=ToolFailureOrigin.PRECONDITION,
+                        disposition=ToolFailureDisposition.REPAIR,
+                    )
+                for version_id in args.version_ids:
                     found = tx.conn.execute(
                         "UPDATE ga_work_outputs SET purpose='result' WHERE group_id=%s AND work_id=%s AND goal_revision=%s AND version_id=%s RETURNING version_id",
                         (actor.group_id, work.id, lease.goal_revision, version_id),
@@ -1342,7 +1386,11 @@ class WorkToolkit:
         gateway.register(
             ToolDefinition(
                 name="artifact_deliver",
-                description="Select final artifact versions for independent validation and later group delivery. This does not itself send or claim completion.",
+                description=(
+                    "Select final artifact versions for independent validation and later group delivery. "
+                    "When required_outputs declares final artifact formats, select only those formats. "
+                    "Keep any other reusable files as intermediates. This does not itself send or claim completion."
+                ),
                 input_model=PublishInput,
                 output_model=PublishOutput,
                 handler=publish,
@@ -1723,28 +1771,27 @@ class WorkToolkit:
             original_event = tx.get_event(work.request_event_id)
             image_quantity = projected_image_quantity(tx, work)
         requirements = _output_requirements(work, original_event)
-        required_formats = {
-            row.get("format")
-            for row in requirements
-            if isinstance(row, dict) and row.get("format") != "text"
-        }
-        actual_formats = {row["artifact"]["format"] for row in outputs}
+        required_formats = _final_artifact_formats(requirements)
+        selected_formats = {row["version_id"]: row["artifact"]["format"] for row in outputs}
+        repair = _output_format_repair(selected_formats, required_formats)
+        if repair is not None:
+            raise DomainError("validation_failed", repair)
+        actual_formats = {canonical_artifact_format(value) for value in selected_formats.values()}
         requested_images = image_quantity.count or (1 if is_public_image_work(work) else None)
         if is_public_image_work(work) and not (required_formats & {"md", "docx", "pdf", "pptx"}):
             image_scope = ArtifactScope(actor.group_id, work.id, actor.member_id)
             selected_images = [ArtifactVersion(**row["artifact"]) for row in outputs]
-            requested_formats = {value for value in required_formats if isinstance(value, str)}
             reusable_images = [ArtifactVersion(**row["artifact"]) for row in produced]
             validate_public_image_delivery(
                 self.artifacts,
                 image_scope,
                 selected_images,
                 required_count=image_quantity.count or 1,
-                required_formats=requested_formats,
+                required_formats=required_formats,
                 reusable=reusable_images,
             )
             image_formats = {"png", "jpg", "jpeg", "webp", "gif"}
-            requested_image_formats = requested_formats & image_formats
+            requested_image_formats = required_formats & image_formats
             for version in selected_images:
                 if version.format not in image_formats:
                     continue
@@ -1758,7 +1805,10 @@ class WorkToolkit:
                     required_formats=set(),
                     reusable=reusable_images,
                 )
-                if requested_image_formats and version.format not in requested_image_formats:
+                if (
+                    requested_image_formats
+                    and canonical_artifact_format(version.format) not in requested_image_formats
+                ):
                     raise DomainError(
                         "validation_failed",
                         "Selected public images must use the requested image format",
@@ -2005,9 +2055,12 @@ class WorkToolkit:
                             "image_citation": lineage.image_citation,
                         }
             self.registry.validate_output(actor, lease, version.version_id, validation)
-            checks["artifact:" + version.format] = (
-                "artifact-validation:" + version.version_id + ":" + validation["validation_id"]
-            )
+            proof = "artifact-validation:" + version.version_id + ":" + validation["validation_id"]
+            checks["artifact:" + version.format] = proof
+            if "jpeg" in required_formats and canonical_artifact_format(version.format) == "jpeg":
+                checks["artifact:jpeg"] = proof
+                if "artifact:jpg" in work.required_checks:
+                    checks["artifact:jpg"] = proof
             if work.scope.get("delivery_artifacts", True):
                 drafts.append(
                     DeliveryDraft(

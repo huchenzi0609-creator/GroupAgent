@@ -11,7 +11,8 @@ from uuid import uuid4
 
 from groupagent.channels import ChannelReceipt
 from groupagent.conversation.policy import delivery_admission_in_tx, retire_delivery_in_tx
-from groupagent.domain import ActorContext, DeliveryIntent, DeliveryState, DomainError
+from groupagent.conversation.turns import VERBATIM_REPLY_REASON
+from groupagent.domain import ActorContext, DeliveryIntent, DeliveryState, DomainError, EventKind
 from groupagent.identity import DEFAULT_BOT_BADGE, BotIdentity, without_bot_badge
 
 from .artifacts import ArtifactRegistry
@@ -242,6 +243,31 @@ class Dispatcher:
             raise DomainError("stale_lease", "Sender has no process lease")
         self.state.assert_process(self.service_actor, self._lease)
 
+    def _verified_verbatim_reply(
+        self, actor: ActorContext, intent: DeliveryIntent, text: str
+    ) -> bool:
+        request_id = intent.request_event_id
+        if request_id is None or intent.idempotency_key != "reply:" + request_id + ":1":
+            return False
+        with self.state.store.transaction(actor) as tx:
+            result = (tx.get_decision(request_id) or {}).get("result")
+            if not isinstance(result, dict) or result.get("delivery_id") != intent.id:
+                return False
+            decision = result.get("decision")
+            if (
+                not isinstance(decision, dict)
+                or decision.get("reason_code") != VERBATIM_REPLY_REASON
+            ):
+                return False
+            source = tx._reply_source(request_id)
+            if (
+                source.kind == EventKind.FORWARDED
+                or decision.get("response") != text
+                or text not in source.text
+            ):
+                raise DomainError("source_unavailable", "Verbatim reply source changed")
+            return True
+
     def _payloads(
         self, actor: ActorContext, intent: DeliveryIntent
     ) -> tuple[tuple[str, str, bytes | None], ...]:
@@ -267,6 +293,12 @@ class Dispatcher:
             else:
                 body = text if parts else render_wechat_text(without_bot_badge(text, self.badge))
                 body = without_bot_badge(body, self.badge)
+                if (
+                    not parts
+                    and body != text
+                    and self._verified_verbatim_reply(actor, intent, text)
+                ):
+                    body = text
             chunks = split_text(body, maximum=self.chunk_characters)
             payloads = tuple(
                 (

@@ -1793,6 +1793,7 @@ class ConversationCoordinator(Coordinator):
         context["_assert_session_source"] = assert_source
         context["_apply_business_action"] = apply_action
         context["clock"] = read_clock()
+        context["_verbatim_reply_limit"] = self.config.runtime.message_chunk_characters
         if self.foreground_tools is not None:
             context["_foreground_tools"] = tuple(self.foreground_tools(actor, event, context))
 

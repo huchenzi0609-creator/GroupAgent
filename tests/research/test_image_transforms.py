@@ -146,6 +146,41 @@ async def test_different_encodings_count_once_and_report_exact_missing_constrain
         assert format_failure.value.details["missing_count_by_format"] == {"png": 1}
 
 
+async def test_jpeg_filename_alias_counts_only_with_matching_public_source_evidence(tmp_path):
+    ctx = context(tmp_path)
+    with ArtifactStore(tmp_path / "artifacts") as store:
+        media = MediaService(store, InlineTransformFixtureWorker())
+        original = await public_image(media, ctx)
+        scope = media.scope(ctx)
+        archived = store.create(
+            scope,
+            "archived.jpg",
+            store.read(scope, original.file_id, original.version_id),
+            provenance=original.provenance,
+        )
+        attestation = store.validations(scope, original.file_id, original.version_id)[0]
+        store.record_validation(
+            scope,
+            archived.file_id,
+            archived.version_id,
+            replace(
+                attestation,
+                file_id=archived.file_id,
+                version_id=archived.version_id,
+                format=archived.format,
+            ),
+        )
+        validate_public_image_delivery(
+            store, scope, [archived], required_count=1, required_formats={"jpeg"}
+        )
+        with pytest.raises(PublicImageValidationError) as caught:
+            validate_public_image_delivery(
+                store, scope, [original, archived], required_count=2, required_formats={"jpg"}
+            )
+        assert caught.value.details["validated_distinct_count"] == 1
+        assert caught.value.details["missing_count_by_format"] == {"jpeg": 1}
+
+
 async def test_workspace_metadata_and_ordinary_decoder_cannot_forge_transform_attestation(tmp_path):
     ctx = context(tmp_path)
     with ArtifactStore(tmp_path / "artifacts") as store:

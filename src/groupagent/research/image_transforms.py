@@ -15,6 +15,7 @@ from typing import Any, Literal
 from pydantic import AwareDatetime, Field
 
 from groupagent.artifacts import ArtifactScope, ArtifactStore, ArtifactVersion, ValidationRecord
+from groupagent.artifacts.models import canonical_artifact_format
 from groupagent.domain import DomainError
 from groupagent.media import MediaRef, MediaService, MediaSource
 from groupagent.media.models import ImageInfo
@@ -138,7 +139,9 @@ def validate_public_image_delivery(
     reusable: list[ArtifactVersion] | None = None,
 ) -> None:
     """Count verified original sources, never encodings of the same source twice."""
-    image_formats = required_formats & _IMAGE_FORMATS
+    image_formats = {
+        canonical_artifact_format(value) for value in required_formats & _IMAGE_FORMATS
+    }
     identities: set[str] = set()
     by_format: dict[str, set[str]] = {name: set() for name in sorted(image_formats)}
     duplicates, invalid, available = [], [], []
@@ -164,8 +167,9 @@ def validate_public_image_delivery(
         if lineage.source_sha256 in identities:
             duplicates.append(version.version_id)
         identities.add(lineage.source_sha256)
-        if version.format in by_format:
-            by_format[version.format].add(lineage.source_sha256)
+        format_name = canonical_artifact_format(version.format)
+        if format_name in by_format:
+            by_format[format_name].add(lineage.source_sha256)
     missing = {
         name: required_count - len(values)
         for name, values in by_format.items()
@@ -269,7 +273,7 @@ def resolve_public_image(
         if (
             info.source_sha256 != version.sha256
             or info.byte_length != version.size_bytes
-            or info.format != version.format
+            or info.format != canonical_artifact_format(version.format)
             or not 0 < info.width * info.height <= 40_000_000
         ):
             raise ValueError("Decoded metadata does not match stored bytes")
@@ -308,7 +312,10 @@ def resolve_public_image(
                 or (parent_info.width, parent_info.height) != (info.width, info.height)
                 or (
                     receipt.operation == "verified_copy"
-                    and (parent.sha256 != version.sha256 or parent.format != version.format)
+                    and (
+                        parent.sha256 != version.sha256
+                        or canonical_artifact_format(parent.format) != info.format
+                    )
                 )
                 or (
                     receipt.operation == "format_convert"

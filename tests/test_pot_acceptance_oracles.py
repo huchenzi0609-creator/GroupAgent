@@ -627,9 +627,9 @@ def test_docx_source_links_bind_each_accepted_png_to_its_own_caption(oracles, tm
         for url, content in zip(pages, blobs, strict=True)
     ]
 
-    def inspect(captions, name):
+    def inspect(captions, name, *, images=None):
         result = Document()
-        for blob, caption in zip(blobs, captions, strict=True):
+        for blob, caption in zip(blobs if images is None else images, captions, strict=True):
             result.add_picture(io.BytesIO(blob))
             result.add_paragraph(f"来源：{caption}（核对时间见说明）")
         path = tmp_path / name
@@ -647,6 +647,28 @@ def test_docx_source_links_bind_each_accepted_png_to_its_own_caption(oracles, tm
     )["verified"]
     swapped = inspect(pages[::-1], "swapped.docx")
     assert not oracles.verified_docx_image_captions(swapped, imports, conversions, 2)["verified"]
+
+    shared_pages = [pages[0], pages[0]]
+    shared_imports = [imports[0], imports[0]]
+    shared_conversions = [
+        {"output": {**row["output"], "page_citation": shared_pages[i]}}
+        for i, row in enumerate(conversions)
+    ]
+    shared = inspect(shared_pages, "shared.docx")
+    proof = oracles.verified_docx_image_captions(shared, shared_imports, shared_conversions, 2)
+    assert proof["verified"]
+    assert proof["verified_source_link_count"] == 1
+    assert proof["embedded_png_count"] == 2
+    assert all(pair["matched_pages"] == [pages[0]] for pair in proof["image_source_pairs"])
+
+    missing = inspect([pages[0], "https://example.org/unverified"], "missing-source.docx")
+    assert not oracles.verified_docx_image_captions(missing, shared_imports, shared_conversions, 2)[
+        "verified"
+    ]
+    duplicate = inspect(shared_pages, "duplicate-photo.docx", images=[blobs[0], blobs[0]])
+    assert not oracles.verified_docx_image_captions(
+        duplicate, shared_imports, shared_conversions, 2
+    )["verified"]
 
 
 @pytest.mark.parametrize(
@@ -748,3 +770,27 @@ def test_exact_one_off_delivery_requires_native_identity_exact_body_and_no_memor
     assert not oracles.exact_one_off_delivery(
         wire, receipt, body, [{"fact_id": "retained", "revision": 1, "state": "superseded"}]
     )
+
+
+def test_search_delivery_counts_only_requested_native_file_and_allows_text(oracles):
+    artifact = {"sha256": "a" * 64}
+    accepted_word = {
+        "receipt": {"state": "accepted", "platform_message_id": "real-word"},
+        "payload": {"kind": "file", "name": "comparison.docx", "sha256": artifact["sha256"]},
+    }
+    typed_image = {
+        "receipt": {"state": "accepted", "platform_message_id": "separate-visible-png"},
+        "payload": {"kind": "image", "name": "photo.png", "sha256": "b" * 64},
+    }
+    summary = native_text("summary", "文件附上。")
+    valid = oracles.requested_native_artifact(artifact, [summary, accepted_word], "docx")
+    assert valid["verified"] and len(valid["accepted_artifacts"]) == 1
+
+    added = oracles.requested_native_artifact(
+        artifact, [summary, accepted_word, typed_image], "docx"
+    )
+    assert not added["verified"] and len(added["accepted_artifacts"]) == 2
+    assert not oracles.requested_native_artifact({"sha256": "f" * 64}, [accepted_word], "docx")[
+        "verified"
+    ]
+    assert not oracles.requested_native_artifact(artifact, [summary], "docx")["verified"]

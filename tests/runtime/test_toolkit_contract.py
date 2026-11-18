@@ -22,7 +22,13 @@ import pytest
 from PIL import Image
 from psycopg.errors import QueryCanceled
 
-from groupagent.artifacts import ArtifactScope, ArtifactStore, DocumentService, Report
+from groupagent.artifacts import (
+    ArtifactScope,
+    ArtifactStore,
+    DocumentService,
+    Report,
+    ValidationRecord,
+)
 from groupagent.artifacts.formats import build_markdown, extract
 from groupagent.artifacts.worker_operations import unpack_document
 from groupagent.billing import BudgetLedger, PriceSnapshot
@@ -443,6 +449,107 @@ async def test_generated_document_is_catalogued_then_selected_and_independently_
         assert not tx.conn.execute(
             "SELECT 1 FROM ga_deliveries WHERE group_id=%s", (setup.env.actor.group_id,)
         ).fetchone(), "Validation drafts do not send by themselves"
+
+
+async def test_explicit_final_artifact_formats_leave_unrequested_images_reusable(toolkit_setup):
+    setup = toolkit_setup
+    run = await prepare(setup, scope={"outputs": [{"format": "md"}]})
+    report = await create_document(run)
+    report_id = report.output["version_id"]
+    image_path = run.workspace / "auxiliary.png"
+    Image.new("RGB", (64, 48), "navy").save(image_path)
+    image = await call(
+        run, "artifact_from_workspace", {"path": image_path.name, "name": image_path.name}
+    )
+    assert image.success
+    image_id = image.output["version_id"]
+    selection = await call(run, "artifact_deliver", {"version_ids": [report_id]}, "report-only")
+    assert selection.success
+
+    mixed = await call(
+        run, "artifact_deliver", {"version_ids": [report_id, image_id]}, "report-plus-auxiliary"
+    )
+    assert mixed.error_code == "unexpected_final_artifact_format"
+    assert mixed.effect_state == EffectState.NOT_STARTED
+    assert failure_disposition(mixed) == ToolFailureDisposition.REPAIR
+    assert mixed.message and image_id in mixed.message and "(png)" in mixed.message
+    assert "(md)" in mixed.message
+    inventory = setup.env.registry.outputs(setup.env.actor, run.work.id, run.work.goal_revision)
+    assert {item["version_id"]: item["purpose"] for item in inventory} == {
+        report_id: "result",
+        image_id: "candidate",
+    }
+    version, content = setup.env.registry.read(setup.env.actor, image_id)
+    assert version.format == "png" and content == image_path.read_bytes()
+
+    # An existing selection may have been recorded before the publication check existed.
+    with setup.env.store.transaction(setup.env.actor) as tx:
+        tx.conn.execute(
+            "UPDATE ga_work_outputs SET purpose='result' WHERE group_id=%s AND work_id=%s "
+            "AND goal_revision=%s AND version_id=%s",
+            (setup.env.actor.group_id, run.work.id, run.work.goal_revision, image_id),
+        )
+    snapshot = candidate(run, "The report is ready.", receipts=(report, image, selection))
+    with pytest.raises(DomainError, match="only the requested final formats") as rejected:
+        await setup.toolkit.validate(run.work, run.lease, setup.env.actor, snapshot, run.workspace)
+    assert rejected.value.code == "validation_failed"
+    assert not setup.model.requests
+    repaired = await call(run, "artifact_deliver", {"version_ids": [report_id]}, "repair-selection")
+    assert repaired.success
+    validated = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, snapshot, run.workspace
+    )
+    assert [
+        draft.payload_ref
+        for draft in validated.deliveries
+        if draft.payload_ref.startswith("artifact:")
+    ] == ["artifact:" + report_id]
+
+
+@pytest.mark.parametrize("formats", [[], ["text"], ["md", "jpeg"]])
+async def test_artifact_deliver_preserves_permitted_document_and_jpeg_pair(toolkit_setup, formats):
+    setup = toolkit_setup
+    run = await prepare(setup, scope={"outputs": [{"format": name} for name in formats]})
+    report = await create_document(run)
+    stream = io.BytesIO()
+    Image.new("RGB", (64, 48), "navy").save(stream, "JPEG")
+    image_bytes = stream.getvalue()
+    scope = ArtifactScope(setup.env.actor.group_id, run.work.id, setup.env.actor.member_id)
+    image = setup.env.artifacts.create(scope, "previous-filename.jpg", image_bytes)
+    decoded, _ = inspect_image(image_bytes)
+    assert decoded.source_sha256 == image.sha256 and decoded.format == "jpeg"
+    setup.env.artifacts.record_validation(
+        scope,
+        image.file_id,
+        image.version_id,
+        ValidationRecord(
+            image.file_id,
+            image.version_id,
+            image.sha256,
+            image.format,
+            structural_passed=True,
+            content_passed=True,
+            media_decoded=True,
+        ),
+    )
+    setup.env.registry.register(setup.env.actor, run.lease, image, purpose="candidate")
+    versions = [report.output["version_id"], image.version_id]
+    selection = await call(run, "artifact_deliver", {"version_ids": versions})
+    assert selection.success
+    validated = await setup.toolkit.validate(
+        run.work,
+        run.lease,
+        setup.env.actor,
+        candidate(run, receipts=(report, selection)),
+        run.workspace,
+    )
+    assert {
+        draft.payload_ref
+        for draft in validated.deliveries
+        if draft.payload_ref.startswith("artifact:")
+    } == {"artifact:" + identifier for identifier in versions}
+    assert "artifact:jpg" in validated.checks
+    assert ("artifact:jpeg" in validated.checks) == ("jpeg" in formats)
 
 
 async def test_review_accepts_exact_citation_and_targets_the_unverified_artifact_locator(

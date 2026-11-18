@@ -7,7 +7,9 @@ import re
 from datetime import timedelta
 
 import pytest
+from conversation.test_react_turn import ModelScript, finish
 
+from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import Decision
 from groupagent.domain import DeliveryState, DomainError, WorkState
 
@@ -27,6 +29,34 @@ def assert_pot_texts(rows):
         text = row["payload"]["text"]
         assert text.startswith("【Pot】") and not text[5:].lstrip().startswith("【Pot】")
         assert "机器人组长" not in text
+
+
+@pytest.mark.parametrize("verbatim", [True, False])
+async def test_source_bound_verbatim_body_keeps_exact_native_bytes(runtime_env, verbatim):
+    env = runtime_env
+    app, _ = app_for(env, {})
+    literal = "  **水刻编号 A-17**  "
+    request = event(
+        env, f"Pot，请只照原样发出「{literal}」。" if verbatim else "Pot，请给出水刻编号。"
+    )
+    model = ModelScript(finish(verbatim_reply=literal) if verbatim else finish(literal))
+    app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(model)
+    try:
+        result = await admit(app, env, request)
+        assert result["result"]["decision"]["reason_code"] == (
+            "agent_verbatim_reply" if verbatim else "agent_reply"
+        )
+        assert await app.dispatcher.tick() == 1
+        (wire,) = outgoing(env)
+        assert wire["payload"]["text"] == "【Pot】" + (literal if verbatim else "水刻编号 A-17")
+        echo = event(
+            env, wire["payload"]["text"], platform_message_id=wire["receipt"]["platform_message_id"]
+        )
+        assert (await admit(app, env, echo))["result"]["decision"]["kind"] == "ignore"
+        assert await app.dispatcher.tick() == 0
+        assert len(model.requests) == 1 and outgoing(env) == [wire]
+    finally:
+        await app.close()
 
 
 async def test_real_context_and_wire_identity_keep_shared_account_echo_receipt_based(runtime_env):

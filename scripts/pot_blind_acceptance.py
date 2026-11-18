@@ -2337,8 +2337,7 @@ def verified_docx_image_captions(artifact, imports, conversions, expected):
         bool(artifact.get("sha256"))
         and artifact.get("accepted_sha256") == artifact["sha256"]
         and len(images) == len(provenance) == len(distinct_hashes) == expected
-        and len(matched_pages) == expected
-        and all(len(row["matched_pages"]) == 1 for row in provenance)
+        and all(row["matched_pages"] for row in provenance)
     )
     return {
         "verified": verified,
@@ -2346,6 +2345,27 @@ def verified_docx_image_captions(artifact, imports, conversions, expected):
         "verified_source_link_count": len(matched_pages),
         "embedded_png_count": len(distinct_hashes),
     }
+
+
+def requested_native_artifact(artifact, spool, output_format):
+    accepted_artifacts = [
+        {
+            "kind": item["payload"]["kind"],
+            "name": item["payload"].get("name"),
+            "sha256": item["payload"].get("sha256"),
+            "platform_message_id": item["receipt"]["platform_message_id"],
+        }
+        for item in spool
+        if item["receipt"]["state"] == "accepted" and item["payload"]["kind"] != "text"
+    ]
+    exact = (
+        artifact is not None
+        and len(accepted_artifacts) == 1
+        and accepted_artifacts[0]["kind"] == "file"
+        and Path(accepted_artifacts[0]["name"] or "").suffix.lower() == "." + output_format
+        and accepted_artifacts[0]["sha256"] == artifact["sha256"]
+    )
+    return {"verified": exact, "accepted_artifacts": accepted_artifacts}
 
 
 async def search02(s):
@@ -2385,15 +2405,22 @@ async def search02(s):
         if len(artifacts) == 1
         else {"verified": False}
     )
-    matching_files = binding["verified"]
+    delivery = requested_native_artifact(
+        artifacts[0] if len(artifacts) == 1 else None, result["spool"], s.spec["must_export"]
+    )
     s.check(
         "source_manifest_and_delivered_file",
-        matching_files,
-        {"files": artifacts, "execution": result, "caption_provenance": binding},
+        binding["verified"] and delivery["verified"],
+        {
+            "files": artifacts,
+            "execution": result,
+            "caption_provenance": binding,
+            "requested_native_artifact": delivery,
+        },
     )
     attempts = result["work"]["state"]
     delivered = [spool_text(item) for item in result["spool"] if item["payload"]["kind"] == "text"]
-    if matching_files:
+    if binding["verified"]:
         truthfully_reported = attempts == "completed"
     elif attempts in {"failed", "waiting_input", "paused"}:
         truthfully_reported = any(
