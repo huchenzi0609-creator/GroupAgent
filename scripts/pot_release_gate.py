@@ -57,7 +57,7 @@ def _expected_worker_manifest() -> dict[str, Any]:
 
 
 def observe_worker_source(worker_image: str, docker_host: str | None) -> dict[str, Any]:
-    """Look through the actual isolated interpreter rather than trusting an image label."""
+    """Verify bytes from the same unprivileged identity as isolated worker commands."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", worker_image):
         raise ValueError("Worker image must be an immutable SHA-256 image ID")
     command = ["docker"]
@@ -90,10 +90,15 @@ print(json.dumps({
                 "--pull=never",
                 "--network=none",
                 "--read-only",
+                "--user",
+                "65532:65532",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
                 "--entrypoint",
                 "python3",
                 worker_image,
                 "-I",
+                "-B",
                 "-c",
                 probe,
             ],

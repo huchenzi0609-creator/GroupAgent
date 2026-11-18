@@ -139,6 +139,15 @@ async def test_case_concurrency_keeps_the_report_and_evidence_separate(
     monkeypatch.setattr(oracles, "bindings", lambda: {"source": {"sha256": "fixture-ci"}})
     monkeypatch.setattr(oracles, "PostgresStore", lambda _: object())
     monkeypatch.setattr(oracles, "postgres_identity", lambda _: {"database": "pot_blind"})
+    worker_image = "sha256:" + "a" * 64
+    docker_host = "unix:///synthetic-oracle-fixture"
+    worker_proof = {"sha256": "b" * 64, "files": 3}
+
+    def worker_source(image, host):
+        assert (image, host) == (worker_image, docker_host)
+        return worker_proof
+
+    monkeypatch.setattr(oracles, "observe_worker_source", worker_source)
     active: set[str] = set()
     peak = 0
 
@@ -156,7 +165,8 @@ async def test_case_concurrency_keeps_the_report_and_evidence_separate(
         dataset=dataset,
         output=tmp_path / "report",
         dsn_file=dsn_file,
-        worker_image="sha256:" + "a" * 64,
+        worker_image=worker_image,
+        docker_host=docker_host,
         timeout=1,
         cases=None,
         model="offline-test",
@@ -168,6 +178,7 @@ async def test_case_concurrency_keeps_the_report_and_evidence_separate(
     assert peak == concurrency
     report = json.loads((args.output / "report.json").read_text())
     assert report["environment"]["case_concurrency"] == concurrency
+    assert report["environment"]["worker_source"] == worker_proof
     assert [item["id"] for item in report["cases"]] == list(table)
     for result in report["cases"]:
         evidence = oracles.read_json(args.output / result["id"] / "evidence.json")
