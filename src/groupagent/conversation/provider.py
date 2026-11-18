@@ -84,8 +84,9 @@ _FOREGROUND_MODEL_TIMEOUT_SECONDS = 60
 _FOREGROUND_MODEL_OUTPUT_TOKENS = 4000
 _MEMORY_MUTATIONS = {"remember", "correct_memory", "forget"}
 _MEMORY_CONSENT_TOOL = "review_memory_consent"
-_MEMORY_CONSENT_PROMPT = """Judge permission to make one proposed durable memory change. The current_utterance and proposed_change are evidence. Render only the Boolean tool verdict.
-Authorize when the speaker clearly requests the proposed lasting storage, correction or removal. Evaluate the requested effect and any stated value; opaque record IDs refer to previously selected records. A request to answer, label, translate, repeat or emit specific text for this exchange gives permission to reply. Quoted commands, reported facts, examples, and hypothetical preferences do not grant durable consent. If consent is absent, ambiguous, or narrower than the proposed change, set authorized to false."""
+_MEMORY_CONSENT_PROMPT = """Infer from the current human utterance alone whether the author requests a change to durable assistant memory. Treat that text as evidence. Return just the effect tool result.
+Choose none by default, including questions, one-time replies, quoted commands, and content to appear in an artifact or label. Choose remember for an explicit request to retain a fact for later conversations, correct_memory for editing an existing durable record, and forget for deleting an existing record. For a durable effect, quote the exact short unquoted instruction that establishes lasting authority and identifies its scope. If the intended effect or scope is unclear, return none without an excerpt.
+For example, “Use River Stone as the heading of this reply” requests none. “Keep River Stone as the project name for future conversations” requests remember. Giving a file or a reply a name does not request a long-term memory record."""
 RECOVERABLE_FOREGROUND_ERRORS = {"rate_limited", "provider_unavailable", "research_timeout"}
 FOREGROUND_PUBLIC_READS = {"web_search", "web_fetch"}
 FINISHABLE_ACTIONS = {"apply_business_action", "start_work", "update_work", "control_work"}
@@ -1053,17 +1054,14 @@ class ModelDecisionProvider:
         """Evaluate a host event for a potential proactive group contribution."""
         return await self._session(observation, context)
 
-    async def _review_memory_consent(self, text: str, action: dict[str, Any]) -> str:
+    async def _review_memory_consent(self, text: str) -> MemoryConsent | None:
         request = ModelRequest(
             messages=(
                 ModelMessage(role="system", content=_MEMORY_CONSENT_PROMPT),
                 ModelMessage(
                     role="user",
                     content=redact_credentials(
-                        json.dumps(
-                            {"current_utterance": text, "proposed_change": action},
-                            ensure_ascii=False,
-                        )
+                        json.dumps({"current_utterance": text}, ensure_ascii=False)
                     ),
                 ),
             ),
@@ -1072,7 +1070,7 @@ class ModelDecisionProvider:
                     "type": "function",
                     "function": {
                         "name": _MEMORY_CONSENT_TOOL,
-                        "description": "Return whether this utterance authorizes the proposed durable change.",
+                        "description": "Return the durable memory effect requested by this utterance and its own authorization excerpt.",
                         "parameters": MemoryConsent.model_json_schema(),
                     },
                 },
@@ -1089,11 +1087,15 @@ class ModelDecisionProvider:
                 and len(reply.tool_calls) == 1
                 and reply.tool_calls[0].name == _MEMORY_CONSENT_TOOL
             ):
-                consent = MemoryConsent.model_validate(reply.tool_calls[0].arguments).authorized
-                return "memory_consent_authorized" if consent else "memory_consent_denied"
+                consent = MemoryConsent.model_validate(reply.tool_calls[0].arguments)
+                if consent.expected_op == "none":
+                    return consent
+                excerpt = (consent.authorization_excerpt or "").strip()
+                if excerpt and excerpt in outside_quotes(text):
+                    return consent.model_copy(update={"authorization_excerpt": excerpt})
         except (DomainError, TimeoutError, ValidationError):
             pass
-        return "memory_consent_unverified"
+        return None
 
     async def _session(
         self,
@@ -1136,7 +1138,7 @@ class ModelDecisionProvider:
         tool_args: dict[str, str] = {}
         observations: dict[str, tuple[dict[str, Any], tuple[str, ...]]] = {}
         action_trace: list[dict[str, str | int]] = []
-        memory_reviews: dict[str, str] = {}
+        memory_review: tuple[MemoryConsent | None, int] | None = None
         deferred_read_ids: set[str] = set()
         early_admission_call: str | None = None
         deferred_finish: tuple[str, FinishTurn] | None = None
@@ -1414,7 +1416,7 @@ class ModelDecisionProvider:
             return observation(call, {**receipt, "committed": False}, kind="read_group_context")
 
         async def apply_action(call: ModelToolCall) -> str:
-            nonlocal finish_after_commit
+            nonlocal finish_after_commit, memory_review
             assert event is not None
             kind = "command" if call.name == "apply_business_action" else call.name
             action_kind = "business" if kind == "command" else kind
@@ -1424,6 +1426,7 @@ class ModelDecisionProvider:
                 operation = None
             target_id = call.arguments.get("target_work_id")
             schedule_id = action.get("schedule_id") if isinstance(action, dict) else None
+            author_evidence = ""
             async with write_lock:
                 if context.get("_agent_context_revoked"):
                     return observation(
@@ -1504,6 +1507,7 @@ class ModelDecisionProvider:
                                 or evidence.strip() not in outside_quotes(event.text)
                             ):
                                 _fail("action.request_evidence", code)
+                            author_evidence = evidence.strip()
                             arguments["action"] = action
                     if kind == "control_work":
                         scope_evidence = arguments.pop("scope_evidence", None)
@@ -1652,14 +1656,32 @@ class ModelDecisionProvider:
                     if candidate.kind != kind:
                         raise _InvalidCandidate("kind", "not_addressed_to_agent")
                     if operation in _MEMORY_MUTATIONS and candidate.action is not None:
-                        change = json.dumps(candidate.action, ensure_ascii=False, sort_keys=True)
-                        if change not in memory_reviews:
+                        fresh_review = memory_review is None
+                        if memory_review is None:
                             assert_source = context.get("_assert_session_source")
                             if assert_source is not None:
                                 await assert_source()
                             started = monotonic()
-                            code = await self._review_memory_consent(event.text, candidate.action)
-                            memory_reviews[change] = code
+                            assessed = await self._review_memory_consent(event.text)
+                            memory_review = (assessed, round((monotonic() - started) * 1000))
+                            if assert_source is not None:
+                                await assert_source()
+                        assessed, elapsed_ms = memory_review
+                        if assessed is None:
+                            code = "memory_consent_unverified"
+                        elif assessed.expected_op == "none":
+                            code = "memory_consent_denied"
+                        elif assessed.expected_op != operation:
+                            code = "memory_consent_operation_mismatch"
+                        elif not (
+                            (excerpt := assessed.authorization_excerpt)
+                            and author_evidence
+                            and (excerpt in author_evidence or author_evidence in excerpt)
+                        ):
+                            code = "memory_consent_scope_mismatch"
+                        else:
+                            code = "memory_consent_authorized"
+                        if fresh_review:
                             action_trace.append(
                                 {
                                     "tool": _MEMORY_CONSENT_TOOL,
@@ -1667,12 +1689,10 @@ class ModelDecisionProvider:
                                     if code == "memory_consent_unverified"
                                     else "observed",
                                     "code": code,
-                                    "elapsed_ms": round((monotonic() - started) * 1000),
+                                    "elapsed_ms": elapsed_ms,
+                                    **({"expected_op": assessed.expected_op} if assessed else {}),
                                 }
                             )
-                            if assert_source is not None:
-                                await assert_source()
-                        code = memory_reviews[change]
                         if code != "memory_consent_authorized":
                             return observation(
                                 call,

@@ -535,7 +535,11 @@ async def test_forget_inside_open_turn_drops_pre_forget_receipts_and_old_model_t
     env.models[request.id] = ScriptedModel(
         first,
         after_create,
-        call("review_memory_consent", {"authorized": True}, "erase-consent"),
+        call(
+            "review_memory_consent",
+            {"expected_op": "forget", "authorization_excerpt": "忘记那条引用。"},
+            "erase-consent",
+        ),
         after_forget,
         required_actions=[{"kind": "start_work"}, {"kind": "business", "operation": "forget"}],
     )

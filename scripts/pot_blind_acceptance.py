@@ -3094,6 +3094,7 @@ async def run(args):
             "scope": "Real provider and local transport receipts; fault timing is explicitly injected, no WeChat",
             "admission_samples": "Synthetic headroom on local host; Docker worker uses real cgroup limits",
             "case_concurrency": args.concurrency,
+            "work_observation_timeout_seconds": args.timeout,
         },
         "selected": requested,
         "cases": [],
@@ -3175,8 +3176,10 @@ async def run(args):
         async with semaphore:
             return await independent_case(identity, rules)
 
+    execution_order = (*requested, *(identity for identity in table if identity not in requested))
     case_tasks = [
-        asyncio.create_task(admitted_case(identity, rules)) for identity, rules in table.items()
+        asyncio.create_task(admitted_case(identity, table[identity]))
+        for identity in execution_order
     ]
     results = {}
     samples = []

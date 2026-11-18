@@ -51,7 +51,19 @@ class ActionCompletion(TurnData):
 
 
 class MemoryConsent(TurnData):
-    authorized: StrictBool
+    expected_op: Literal["none", "remember", "correct_memory", "forget"]
+    authorization_excerpt: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=240,
+        description="The current speaker's exact short excerpt expressing lasting authority and its scope.",
+    )
+
+    @model_validator(mode="after")
+    def correct_evidence_shape(self) -> MemoryConsent:
+        if (self.expected_op != "none") != bool(self.authorization_excerpt):
+            raise ValueError("A memory effect needs a source excerpt; none carries no excerpt")
+        return self
 
 
 class FinishTurn(TurnData):
