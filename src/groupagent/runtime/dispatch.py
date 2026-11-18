@@ -17,6 +17,7 @@ from groupagent.identity import DEFAULT_BOT_BADGE, BotIdentity, without_bot_badg
 
 from .artifacts import ArtifactRegistry
 from .contracts import ActorResolver, ProcessLease
+from .delivery_parts import delivery_part_hash, freeze_delivery_parts
 from .notices import check_notice
 from .observers import OBSERVER_PREFIX, guard_observer_delivery
 from .state import RuntimeState
@@ -340,12 +341,7 @@ class Dispatcher:
                 "idempotency_conflict", "Outgoing frozen text does not match its hash"
             )
 
-    @staticmethod
-    def _hash(payload: tuple[str, str, bytes | None]) -> str:
-        kind, name, data = payload
-        return hashlib.sha256(
-            kind.encode() + b"\0" + name.encode() + b"\0" + (data or b"")
-        ).hexdigest()
+    _hash = staticmethod(delivery_part_hash)
 
     def _prepare(
         self,
@@ -369,44 +365,7 @@ class Dispatcher:
                 != "active"
             ):
                 raise DomainError("source_unavailable", "Reply source was removed")
-            for index, payload in enumerate(payloads):
-                key = (
-                    "part:"
-                    + hashlib.sha256(intent.idempotency_key.encode()).hexdigest()
-                    + ":"
-                    + str(index)
-                )
-                digest = self._hash(payload)
-                tx.conn.execute(
-                    "INSERT INTO ga_delivery_parts(group_id,intent_id,position,idempotency_key,payload_hash,rendered_text) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                    (
-                        actor.group_id,
-                        intent.id,
-                        index,
-                        key,
-                        digest,
-                        payload[1] if payload[0] == "text" else None,
-                    ),
-                )
-                stored = tx.conn.execute(
-                    "SELECT payload_hash,rendered_text FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s AND position=%s",
-                    (actor.group_id, intent.id, index),
-                ).fetchone()
-                if (
-                    stored is None
-                    or stored["payload_hash"] != digest
-                    or (
-                        stored["rendered_text"] is not None
-                        and stored["rendered_text"] != payload[1]
-                    )
-                ):
-                    raise DomainError("idempotency_conflict", "Outgoing segment contents changed")
-            row = tx.conn.execute(
-                "SELECT count(*) AS n FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s",
-                (actor.group_id, intent.id),
-            ).fetchone()
-            if row is None or row["n"] != len(payloads):
-                raise DomainError("idempotency_conflict", "Outgoing segment count changed")
+            freeze_delivery_parts(tx, current, payloads)
 
     def _parts(self, actor: ActorContext, intent_id: str) -> list[dict]:
         with self.state.store.transaction(actor) as tx:

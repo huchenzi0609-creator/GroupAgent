@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import timedelta
@@ -12,6 +13,7 @@ from conversation.test_react_turn import ModelScript, finish
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import Decision
 from groupagent.domain import DeliveryState, DomainError, WorkState
+from groupagent.runtime.dispatch import Dispatcher
 
 from .test_app import app_for, event
 from .test_application_controls import admit, waiting_work
@@ -46,6 +48,26 @@ async def test_source_bound_verbatim_body_keeps_exact_native_bytes(runtime_env, 
         assert result["result"]["decision"]["reason_code"] == (
             "agent_verbatim_reply" if verbatim else "agent_reply"
         )
+        with env.store.transaction(env.actor) as tx:
+            intent = tx.get_delivery(result["result"]["delivery_id"])
+            parts = tx.conn.execute(
+                "SELECT state, idempotency_key, payload_hash, rendered_text "
+                "FROM ga_delivery_parts WHERE group_id=%s AND intent_id=%s",
+                (tx.group_id, intent.id),
+            ).fetchall()
+        assert intent.state == DeliveryState.PENDING and not outgoing(env)
+        if verbatim:
+            (part,) = parts
+            native_text = "【Pot】" + literal
+            key_digest = hashlib.sha256(intent.idempotency_key.encode()).hexdigest()
+            assert part == {
+                "state": "pending",
+                "idempotency_key": f"part:{key_digest}:0",
+                "payload_hash": Dispatcher._hash(("text", native_text, None)),
+                "rendered_text": native_text,
+            }
+        else:
+            assert parts == []
         assert await app.dispatcher.tick() == 1
         (wire,) = outgoing(env)
         assert wire["payload"]["text"] == "【Pot】" + (literal if verbatim else "水刻编号 A-17")
@@ -55,6 +77,42 @@ async def test_source_bound_verbatim_body_keeps_exact_native_bytes(runtime_env, 
         assert (await admit(app, env, echo))["result"]["decision"]["kind"] == "ignore"
         assert await app.dispatcher.tick() == 0
         assert len(model.requests) == 1 and outgoing(env) == [wire]
+    finally:
+        await app.close()
+
+
+async def test_verbatim_intent_and_frozen_part_roll_back_together(runtime_env, monkeypatch):
+    from groupagent.conversation import service
+
+    env = runtime_env
+    app, _ = app_for(env, {})
+    literal = "  **合成原样 B-18** "
+    request = event(env, f"Pot，请照原样发出「{literal}」。")
+    app.coordinator.provider_factory = lambda *_: ModelDecisionProvider(
+        ModelScript(finish(verbatim_reply=literal))
+    )
+    original = service.freeze_delivery_parts
+
+    def fail_after_write(tx, intent, payloads):
+        original(tx, intent, payloads)
+        raise RuntimeError("synthetic failure after freezing")
+
+    monkeypatch.setattr(service, "freeze_delivery_parts", fail_after_write)
+    try:
+        with env.store.transaction(env.actor) as tx:
+            tx.ingest_event(request, request.id, "1", 0)
+        with pytest.raises(RuntimeError, match="synthetic failure after freezing"):
+            await app.coordinator.process(request)
+        with env.store.transaction(env.actor) as tx:
+            assert tx.list_delivery() == []
+            assert (
+                tx.conn.execute(
+                    "SELECT count(*) AS total FROM ga_delivery_parts WHERE group_id=%s",
+                    (tx.group_id,),
+                ).fetchone()["total"]
+                == 0
+            )
+        assert not outgoing(env)
     finally:
         await app.close()
 

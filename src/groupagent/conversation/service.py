@@ -28,6 +28,8 @@ from groupagent.coordinator import (
 from groupagent.domain import (
     WORK_TRANSITIONS,
     ActorContext,
+    DeliveryIntent,
+    DeliveryState,
     DomainError,
     EventKind,
     GroupEvent,
@@ -41,6 +43,7 @@ from groupagent.identity import BotIdentity, control_request
 from groupagent.memory import MemberService, MemoryService
 from groupagent.persistence import PostgresStore, UnitOfWork
 from groupagent.runtime.artifacts import ArtifactRegistry
+from groupagent.runtime.delivery_parts import freeze_delivery_parts
 from groupagent.runtime.input_selection import canonicalize_input_selection
 from groupagent.runtime.text import visible_text
 from groupagent.runtime.tool_selection import message_only_research_request
@@ -93,7 +96,7 @@ from .policy import (
     retire_delivery_in_tx,
 )
 from .references import authored_identifier, resolve_work_selection
-from .turns import TurnContract
+from .turns import VERBATIM_REPLY_REASON, TurnContract
 from .work_queries import query_work_in_tx, render_work_query
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
@@ -1876,6 +1879,32 @@ class ConversationCoordinator(Coordinator):
                 (tx.group_id, event.id, self.clock(), admission.invocation_root_event_id),
             )
 
+    def _enqueue_reply_in_tx(
+        self, tx: UnitOfWork, event: GroupEvent, decision: Decision, response: str
+    ) -> DeliveryIntent:
+        intent = tx.enqueue_reply(
+            event.id,
+            response,
+            read_only_authorized=tx.actor.role.value in self.config.group.read_only_qa_roles,
+        )
+        if (
+            decision.reason_code == VERBATIM_REPLY_REASON
+            and tx._delivery_row(intent.id)["state"] == DeliveryState.PENDING
+        ):
+            source = tx._reply_source(event.id)
+            if source.kind == EventKind.FORWARDED or response not in source.text:
+                raise DomainError("source_unavailable", "Verbatim reply source changed")
+            if (
+                not response.strip()
+                or len(response) > self.config.runtime.message_chunk_characters
+                or visible_text(response) != response
+            ):
+                raise DomainError("invalid_delivery", "Verbatim reply needs one visible message")
+            # An admitted verbatim reply fits one message. Preserve its exact
+            # native bytes in the same transaction as its durable intent.
+            freeze_delivery_parts(tx, intent, (("text", self.identity.badge + response, None),))
+        return intent
+
     def _finish_agent_response_in_tx(
         self,
         tx: UnitOfWork,
@@ -1995,12 +2024,7 @@ class ConversationCoordinator(Coordinator):
             if admission_id and reuse_admission:
                 delivery_id = admission_id
             else:
-                delivery = tx.enqueue_reply(
-                    event.id,
-                    final.response,
-                    read_only_authorized=tx.actor.role.value
-                    in self.config.group.read_only_qa_roles,
-                )
+                delivery = self._enqueue_reply_in_tx(tx, event, final, final.response)
                 delivery_id = delivery.id
             tx.conn.execute(
                 "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason,created_at,invocation_root_event_id) "
@@ -3171,11 +3195,7 @@ class ConversationCoordinator(Coordinator):
                 and decision.response
                 and decision.kind not in {"ignore", "observe"}
             ):
-                delivery = tx.enqueue_reply(
-                    event.id,
-                    decision.response,
-                    read_only_authorized=actor.role.value in self.config.group.read_only_qa_roles,
-                )
+                delivery = self._enqueue_reply_in_tx(tx, event, decision, decision.response)
                 delivery_id = delivery.id
                 tx.conn.execute(
                     "INSERT INTO ga_participation_log(group_id,event_id,proactive,reason,created_at,invocation_root_event_id) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
