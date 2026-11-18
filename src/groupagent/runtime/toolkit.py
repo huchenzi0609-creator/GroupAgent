@@ -1058,21 +1058,41 @@ class WorkToolkit:
                     "No artifact was published. For a text-only answer return the text directly; for a text file use an actual .md file. Supported result formats are MD/DOCX/PDF/PPTX, images and audio.",
                     no_effect=True,
                 )
-            with open_parent(context.workspace, arguments.path) as (parent, leaf):
-                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-                with os.fdopen(fd, "rb") as source_file:
-                    info = os.fstat(source_file.fileno())
-                    if (
-                        not stat.S_ISREG(info.st_mode)
-                        or info.st_nlink != 1
-                        or info.st_size > self.config.limits.output_file_bytes
-                    ):
-                        raise ToolFailure(
-                            "invalid_worker_output",
-                            "Only bounded regular output files may become artifacts",
-                            no_effect=True,
-                        )
-                    content = source_file.read(self.config.limits.output_file_bytes + 1)
+            # Opening and reading the workspace file cannot publish an artifact.
+            # Keep the importer and catalogue write outside this failure boundary.
+            try:
+                with open_parent(context.workspace, arguments.path) as (parent, leaf):
+                    fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                    with os.fdopen(fd, "rb") as source_file:
+                        info = os.fstat(source_file.fileno())
+                        if (
+                            not stat.S_ISREG(info.st_mode)
+                            or info.st_nlink != 1
+                            or info.st_size > self.config.limits.output_file_bytes
+                        ):
+                            raise ToolFailure(
+                                "invalid_worker_output",
+                                "Only bounded regular output files may become artifacts",
+                                no_effect=True,
+                            )
+                        content = source_file.read(self.config.limits.output_file_bytes + 1)
+            except (DomainError, OSError) as error:
+                if isinstance(error, DomainError) and error.code not in {
+                    "invalid_path",
+                    "scope_violation",
+                }:
+                    raise
+                raise ToolFailure(
+                    error.code if isinstance(error, DomainError) else "invalid_path",
+                    "The workspace file could not be opened and read safely. Check the output "
+                    "path in the worker receipt and supply the exact existing path relative to "
+                    "this work's workspace, such as results/report.docx. If the file does not "
+                    "exist, create it before retrying. A version already returned by a document "
+                    "tool can be selected directly with artifact_deliver.",
+                    not_started=True,
+                    origin=ToolFailureOrigin.PRECONDITION,
+                    disposition=ToolFailureDisposition.REPAIR,
+                ) from None
             extension = Path(arguments.name).suffix.lower()
             if extension in {".md", ".docx", ".pdf", ".pptx"}:
                 version = await documents.import_document(
@@ -1111,7 +1131,11 @@ class WorkToolkit:
         gateway.register(
             ToolDefinition(
                 name="artifact_from_workspace",
-                description="Import an actual output from isolated computation as a scoped document/image/audio artifact; format validation runs in the worker. Then select it with artifact_deliver.",
+                description=(
+                    "Import an existing output file by its exact relative path in this work's "
+                    "workspace as a scoped document, image or audio artifact. Format validation "
+                    "runs in the worker. Then select the returned version using artifact_deliver."
+                ),
                 input_model=AdoptInput,
                 output_model=AdoptOutput,
                 handler=adopt,

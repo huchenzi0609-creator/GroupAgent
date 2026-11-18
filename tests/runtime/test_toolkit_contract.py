@@ -1002,6 +1002,109 @@ async def test_artifact_import_keeps_ambiguous_failures_for_reconciliation(
         assert tx.get_work(run.work.id).input_versions == expected
 
 
+@pytest.mark.parametrize("missing_path", ["reports/absent.md", "absent-folder/result.md"])
+async def test_missing_workspace_output_repairs_in_same_run(toolkit_setup, missing_path):
+    setup = toolkit_setup
+    run = await prepare(setup, scope={"outputs": [{"format": "md"}]})
+    report = "# Notice\n\nThe synthetic workshop opens at 09:30.\n"
+    (run.workspace / "reports").mkdir()
+    good_path = "reports/result.md"
+    (run.workspace / good_path).write_text(report)
+    targets = {"path": missing_path, "name": "result.md"}
+    usage = TokenUsage(input_tokens=10, output_tokens=5)
+
+    def proposal(name, call_id, arguments):
+        return ModelReply(
+            tool_calls=(ModelToolCall(name=name, id=call_id, arguments=arguments),),
+            finish_reason="tool_calls",
+            usage=usage,
+        )
+
+    class Worker:
+        name = "offline-workspace-path-repair"
+        calls = 0
+
+        async def complete(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                return proposal("artifact_from_workspace", "missing-output", targets)
+            observed = json.loads(request.messages[-1].content)
+            if self.calls == 2:
+                assert observed["error_code"] == "invalid_path"
+                assert observed["effect_state"] == "not_started"
+                assert "relative to this work's workspace" in observed["message"]
+                assert not setup.env.registry.outputs(
+                    setup.env.actor, run.work.id, run.work.goal_revision
+                )
+                return proposal(
+                    "artifact_from_workspace", "actual-output", {**targets, "path": good_path}
+                )
+            if self.calls == 3:
+                assert observed["success"]
+                return proposal(
+                    "artifact_deliver",
+                    "select-output",
+                    {"version_ids": [observed["output"]["version_id"]]},
+                )
+            assert observed["success"]
+            return ModelReply(text="The workshop notice is ready.", usage=usage)
+
+    worker = Worker()
+    engine = LangGraphEngine(worker, run.gateway)
+    request = run.prepared.request.model_copy(
+        update={"visible_tools": frozenset({"artifact_from_workspace", "artifact_deliver"})}
+    )
+    result = await engine.wait(await engine.start(request))
+    assert result.state == RunState.CANDIDATE and result.checkpoint.safe_to_resume
+    assert worker.calls == 4
+    rejected, adopted, selected = result.receipts
+    assert failure_disposition(rejected) == ToolFailureDisposition.REPAIR
+    assert adopted.success and selected.success
+    delayed = run.workspace / missing_path
+    delayed.parent.mkdir(exist_ok=True)
+    delayed.write_text(report)
+    replay = await run.gateway.invoke(
+        "artifact_from_workspace",
+        targets,
+        ToolContext(run.scope, "after-path-fix", rejected.idempotency_key, asyncio.Event()),
+    )
+    assert replay.replayed and replay.effect_state == EffectState.NOT_STARTED
+    assert replay.error_code == "invalid_path"
+    outputs = setup.env.registry.outputs(setup.env.actor, run.work.id, run.work.goal_revision)
+    (output,) = outputs
+    assert output["version_id"] == adopted.output["version_id"] and output["purpose"] == "result"
+    validated = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, result, run.workspace
+    )
+    assert "artifact:md" in validated.checks
+
+
+async def test_workspace_adoption_preserves_uncertainty_after_catalog_commit(
+    toolkit_setup, monkeypatch
+):
+    setup = toolkit_setup
+    run = await prepare(setup)
+    path = run.workspace / "result.md"
+    path.write_text("# Synthetic fixture\n")
+    register = setup.env.registry.register
+    committed = []
+
+    def interrupted_register(actor, lease, version, **kwargs):
+        register(actor, lease, version, **kwargs)
+        committed.append(version.version_id)
+        raise DomainError("invalid_path", "Synthetic failure after catalog commit")
+
+    monkeypatch.setattr(setup.env.registry, "register", interrupted_register)
+    arguments = {"path": path.name, "name": path.name}
+    receipt = await call(run, "artifact_from_workspace", arguments)
+    assert receipt.error_code == "invalid_path" and receipt.effect_state == EffectState.UNKNOWN
+    assert failure_disposition(receipt) == ToolFailureDisposition.RECONCILE
+    replay = await call(run, "artifact_from_workspace", arguments)
+    assert replay.replayed and replay.effect_state == EffectState.UNKNOWN
+    outputs = setup.env.registry.outputs(setup.env.actor, run.work.id, run.work.goal_revision)
+    assert len(committed) == 1 and [item["version_id"] for item in outputs] == committed
+
+
 async def test_withdrawn_source_blocks_search_import_and_stale_work_tools(toolkit_setup):
     setup = toolkit_setup
     first = await prepare(setup)
