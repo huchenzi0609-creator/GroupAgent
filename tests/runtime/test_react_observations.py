@@ -52,6 +52,9 @@ async def test_shadow_replays_only_fresh_facts_after_interrupted_react(runtime_e
         assert event.id == origin.id and observation["task"]["id"] == task.id
         assert observation["task"]["revision"] == task.revision
         assert observation["signal"] == "deadline_approaching"
+        assert datetime.fromisoformat(observation["observed_at"]) == now
+        assert datetime.fromisoformat(observation["signal_at"]) == task.due_at
+        assert observation["seconds_until_due"] == 46 * 60
         seen.append(observation)
         return contributions()
 

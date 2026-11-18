@@ -511,7 +511,14 @@ async def test_forget_inside_open_turn_drops_pre_forget_receipts_and_old_model_t
     )
     forget = call(
         "apply_business_action",
-        action("command", action={"op": "forget", "event_ids": [original.id]}),
+        action(
+            "command",
+            action={
+                "op": "forget",
+                "event_ids": [original.id],
+                "request_evidence": "忘记那条引用。",
+            },
+        ),
         "forget",
     )
 

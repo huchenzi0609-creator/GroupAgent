@@ -244,8 +244,10 @@ async def test_model_can_refresh_clock_then_answer_in_one_completion(conversatio
 
 
 @pytest.mark.postgres
+@pytest.mark.parametrize("use_shift", [False, True])
 async def test_iana_weekly_creation_and_clock_only_edit_keep_zone_and_all_weekdays(
     conversation_env,
+    use_shift,
 ):
     env = conversation_env
     now = datetime(2026, 11, 17, 20, 35, 22, tzinfo=UTC)
@@ -256,9 +258,9 @@ async def test_iana_weekly_creation_and_clock_only_edit_keep_zone_and_all_weekda
         call(
             "apply_business_action",
             "new-weekly",
-            request_evidence=original.text,
             action={
                 "op": "create_schedule",
+                "request_evidence": original.text,
                 "title": "核对清单",
                 "timing": {"kind": "weekly", "local_time": "17:30", "weekdays": [3, 6]},
                 "time_zone": zone,
@@ -274,7 +276,17 @@ async def test_iana_weekly_creation_and_clock_only_edit_keep_zone_and_all_weekda
     assert schedule.timing.kind == "weekly" and schedule.timing.weekdays == [3, 6]
 
     now += timedelta(seconds=1)
-    edit = ingest(env, "Pot，只把刚才那个提醒的时间改成18:15，日期别动。", now, now)
+    instruction = (
+        "把刚才那个提醒推迟45分钟，日期照旧。"
+        if use_shift
+        else "只把刚才那个提醒的时间改成18:15，日期别动。"
+    )
+    edit = ingest(env, "Pot，" + instruction, now, now)
+    replacement = (
+        {"kind": "shift", "amount": 45, "unit": "minutes"}
+        if use_shift
+        else {"kind": "clock", "local_time": "18:15"}
+    )
 
     def change_selected_rule(request):
         observed = tool_receipt(request)
@@ -283,12 +295,12 @@ async def test_iana_weekly_creation_and_clock_only_edit_keep_zone_and_all_weekda
         return call(
             "apply_business_action",
             "clock-only-edit",
-            request_evidence=edit.text,
             action={
                 "op": "change_schedule",
+                "request_evidence": instruction,
                 "schedule_id": fact["id"],
                 "expected_revision": fact["revision"],
-                "timing": {"kind": "clock", "local_time": "18:15"},
+                "timing": replacement,
             },
             finish_on_commit=True,
         )

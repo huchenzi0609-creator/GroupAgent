@@ -524,3 +524,126 @@ def test_only_fresh_read_only_work_control_observation_counts_as_fact(oracles):
     assert extract({"kind": "read_work_facts", "status": "matched", "facts": [current]}) == [
         current
     ]
+
+
+def test_short_condensation_reply_accepts_equivalent_cold_surface_wording(oracles):
+    patterns = ["冷|降温", "水汽|水蒸气"]
+    for phrase in ("冰凉", "低温", "温度较低"):
+        reply = {"receipts": [native_text("reply", f"水蒸气遇到{phrase}的器壁，凝结成水滴。")]}
+        assert oracles.short_condensation_reply(reply, patterns)
+    no_vapor = {"receipts": [native_text("reply", "器壁温度较低。")]}
+    no_cold_surface = {"receipts": [native_text("reply", "空气里有水蒸气。")]}
+    assert not oracles.short_condensation_reply(no_vapor, patterns)
+    assert not oracles.short_condensation_reply(no_cold_surface, patterns)
+
+
+def test_group_summary_accepts_named_member_assignment_sections(oracles):
+    patterns = ["盘点"]
+
+    def reply(text):
+        return {"receipts": [native_text("reply", text)]}
+
+    for section in ("分工", "组员认领", "成员任务"):
+        assert oracles.categorized_group_summary(
+            reply(f"{section}：甲负责盘点。我的工作：无。提醒：无。"), patterns
+        )
+    assert not oracles.categorized_group_summary(reply("我负责盘点。分工：无。"), patterns)
+    assert not oracles.categorized_group_summary(
+        reply("组员任务：甲负责排版。我的工作：无。提醒：无。"), patterns
+    )
+
+
+def test_queued_progress_accepts_a_relevant_unproduced_output(oracles):
+    from types import SimpleNamespace
+
+    work = SimpleNamespace(
+        id="report-work",
+        goal="核验入口后制作核对报告",
+        scope={"outputs": [{"format": "pdf"}]},
+        model_dump=lambda **_: {"id": "report-work", "goal_revision": 3},
+    )
+    facts = [
+        {
+            "id": work.id,
+            "goal_revision": 3,
+            "state": "queued",
+            "goal": work.goal,
+            "outputs": {"candidate_count": 0, "validated_count": 0},
+        }
+    ]
+
+    def turn(text):
+        return {"receipts": [native_text("reply", text)]}
+
+    honest = turn("还在排队等执行，没有生成或交付 PDF。")
+    assert oracles.queued_progress_subjects(honest, facts, work) == {"PDF"}
+    assert not oracles.queued_progress_subjects(turn("这份 PDF 还在排队。"), facts, work)
+    assert not oracles.queued_progress_subjects(
+        honest, [{**facts[0], "outputs": {"candidate_count": 1, "validated_count": 0}}], work
+    )
+    assert not oracles.queued_progress_subjects(honest, [{**facts[0], "goal_revision": 2}], work)
+    assert not oracles.queued_progress_subjects(honest, [{**facts[0], "state": "completed"}], work)
+
+
+def test_identity_limitation_accepts_exact_uncertainty_in_plain_language(oracles):
+    assert oracles.identity_limitation_is_explicit("仅凭这张截图确定不了另一个人是谁。")
+    assert oracles.identity_limitation_is_explicit("只有一张模糊照片，没法确认身份。")
+    assert not oracles.identity_limitation_is_explicit("这就是另一个人，我能确定。")
+
+
+def test_markdown_url_parens_do_not_change_actual_fetched_source(oracles):
+    fetched = oracles.fetch_source_urls({"source": {"url": "https://example.org/project"}})
+    citations = {
+        oracles.page_url_key(url)
+        for url in oracles.markdown_urls("官方项目：https://example.org/project（正文链接）")
+    }
+    assert citations & fetched == {"https://example.org/project"}
+    assert not citations & oracles.fetch_source_urls(
+        {"source": {"url": "https://example.org/other"}}
+    )
+
+
+def test_docx_source_links_bind_each_accepted_png_to_its_own_caption(oracles, tmp_path):
+    import hashlib
+
+    from docx import Document
+    from runtime_acceptance_checks import _INSPECT
+
+    pages = ["https://example.org/first", "https://example.org/second"]
+    blobs = []
+    for color in ("red", "blue"):
+        stream = io.BytesIO()
+        Image.new("RGB", (12, 12), color).save(stream, format="PNG")
+        blobs.append(stream.getvalue())
+    imports = [{"output": {"page_citation": f"{url}（已核验）"}} for url in pages]
+    conversions = [
+        {
+            "output": {
+                "format": "png",
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "page_citation": f"{url}（已核验）",
+            }
+        }
+        for url, content in zip(pages, blobs, strict=True)
+    ]
+
+    def inspect(captions, name):
+        result = Document()
+        for blob, caption in zip(blobs, captions, strict=True):
+            result.add_picture(io.BytesIO(blob))
+            result.add_paragraph(f"来源：{caption}（核对时间见说明）")
+        path = tmp_path / name
+        result.save(path)
+        decoded = json.loads(
+            subprocess.check_output([sys.executable, "-c", _INSPECT, str(path), "docx"], text=True)
+        )
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return {"decoded": decoded, "sha256": digest, "accepted_sha256": digest}
+
+    correct = inspect(pages, "correct.docx")
+    assert oracles.verified_docx_image_captions(correct, imports, conversions, 2)["verified"]
+    assert not oracles.verified_docx_image_captions(
+        {**correct, "accepted_sha256": None}, imports, conversions, 2
+    )["verified"]
+    swapped = inspect(pages[::-1], "swapped.docx")
+    assert not oracles.verified_docx_image_captions(swapped, imports, conversions, 2)["verified"]

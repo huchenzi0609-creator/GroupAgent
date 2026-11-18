@@ -127,6 +127,42 @@ async def test_continuation_of_live_work_reports_current_facts_without_a_revisio
 
 
 @pytest.mark.postgres
+async def test_shared_literal_outputs_enqueue_once_and_keep_per_format_requirements(
+    conversation_env,
+):
+    env = conversation_env
+    event = source(
+        env,
+        "Pot，生成 Word 和 PDF，每份都原样写上仓号 EQ-73。Word 还要保留标题“明日交接”。",
+    )
+    model = ModelScript(
+        call(
+            "start_work",
+            "actual",
+            goal=event.text,
+            admission_ack="immediate",
+            finish_on_commit=True,
+            outputs=[
+                {"format": "docx", "expected_text": ["明日交接"]},
+                {"format": "pdf"},
+            ],
+            expected_text=["仓号 EQ-73"],
+        )
+    )
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.work_id and result.delivery_id
+    assert len(model.requests) == 1
+    with env.store.transaction(env.actor) as tx:
+        assert len(tx.list_work()) == len(tx.list_delivery()) == 1
+        work = tx.get_work(result.work_id)
+        assert {item["format"]: item["expected_text"] for item in work.scope["outputs"]} == {
+            "docx": ["明日交接", "仓号 EQ-73"],
+            "pdf": ["仓号 EQ-73"],
+        }
+
+
+@pytest.mark.postgres
 async def test_failed_probe_then_real_action_and_truthful_mixed_reply(conversation_env):
     env = conversation_env
     event = source(env, "Pot，这个数为什么大概是3？还请实际用 Python 算一下。")
@@ -488,7 +524,12 @@ async def test_immediate_admission_keeps_a_later_committed_action_receipt(conver
     additional = call(
         "apply_business_action",
         "remember-project",
-        action={"op": "remember", "predicate": "项目代号", "value": "山鲸"},
+        action={
+            "op": "remember",
+            "predicate": "项目代号",
+            "value": "山鲸",
+            "request_evidence": "记下项目代号是山鲸。",
+        },
     )
     acknowledgements = []
 

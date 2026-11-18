@@ -1220,12 +1220,36 @@ elif fmt == "docx":
             if relationship is not None and relationship.is_external:
                 links.add(relationship.target_ref)
     result["links"] = sorted(links)
+    def caption_for(drawing):
+        paragraph = next(drawing.iterancestors(qn("w:p")), None)
+        if paragraph is None or len(paragraph.xpath(".//a:blip")) != 1:
+            return "", []
+        # Prefer the image's inline caption, then its immediate following
+        # caption. A preceding caption is a fallback for above-image layout.
+        candidates = (paragraph, paragraph.getnext(), paragraph.getprevious())
+        for candidate in candidates:
+            if candidate is None or candidate.tag != qn("w:p"):
+                continue
+            if candidate is not paragraph and candidate.xpath(".//a:blip"):
+                continue
+            text = "".join(node.text or "" for node in candidate.xpath(".//w:t"))
+            addresses = []
+            for link in candidate.xpath(".//w:hyperlink"):
+                relationship = doc.part.rels.get(link.get(qn("r:id")))
+                if relationship is not None and relationship.is_external:
+                    addresses.append(relationship.target_ref)
+            if addresses or "https://" in text or "http://" in text:
+                return text, addresses
+        return "", []
+
     linked_images = []
     for drawing in doc.element.xpath(".//a:blip"):
         image_part = doc.part.related_parts.get(drawing.get(qn("r:embed")))
         if image_part is not None and image_part.content_type.startswith("image/"):
+            caption, addresses = caption_for(drawing)
             linked_images.append({"sha256": hashlib.sha256(image_part.blob).hexdigest(),
-                                  "content_type": image_part.content_type})
+                                  "content_type": image_part.content_type,
+                                  "caption_text": caption, "caption_links": addresses})
     result.update(text="\n".join(pieces), units=[], embedded_images=linked_images)
 elif fmt == "pptx":
     inspect_office(raw, "pptx", for_edit=True)

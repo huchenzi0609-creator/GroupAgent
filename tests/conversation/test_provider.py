@@ -444,7 +444,20 @@ def test_table_relations_are_cells_but_verbatim_and_code_stay_literal(environmen
 def test_named_tool_contracts_are_small_operations_without_decision_routing(environment):
     schema = business_action_schema(reference_catalog(environment.context, {}))
     Draft202012Validator.check_schema(schema)
-    assert set(schema["properties"]) == {"action", "request_evidence"}
+    assert set(schema["properties"]) == {"action"}
+    evidence_required = {
+        row["properties"]["op"]["const"]
+        for row in schema["$defs"].values()
+        if "request_evidence" in row.get("required", [])
+    }
+    assert evidence_required == {
+        "create_schedule",
+        "change_schedule",
+        "control_schedule",
+        "remember",
+        "correct_memory",
+        "forget",
+    }
     assert not Draft202012Validator(schema).is_valid({"kind": "start_work", "goal": "x"})
     for kind in ("start_work", "update_work", "control_work"):
         operation = work_action_schema(kind)

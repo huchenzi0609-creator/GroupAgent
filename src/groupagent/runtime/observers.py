@@ -357,12 +357,16 @@ class ProactiveObserver:
                 _check_snapshot(tx, item.row)
                 return self.work_facts.lookup_in_tx(tx, ids=(item.row["resource_id"],), limit=1)
 
+        now = self.clock()
+        signal_at = item.row["observed_at"]
         payload = {
             "signal": item.row["signal"],
-            "observed_at": item.row["observed_at"].astimezone(self.local_zone).isoformat(),
-            "now": self.clock().astimezone(self.local_zone).isoformat(),
+            "observed_at": now.astimezone(self.local_zone).isoformat(),
+            "signal_at": signal_at.astimezone(self.local_zone).isoformat(),
             **item.facts,
         }
+        if item.row["signal"] == "deadline_approaching":
+            payload["seconds_until_due"] = int((signal_at - now).total_seconds())
         try:
             decision = await self.observe(
                 item.source, payload, {"_read_work_facts": read_work_facts}

@@ -771,6 +771,11 @@ async def chat03(s):
     )
 
 
+def categorized_group_summary(turn, title_patterns):
+    member_assignment = r"分工|(?:组员|成员)(?:认领|分配|分派|任务|职责)"
+    return useful_text(turn, [*title_patterns, member_assignment, "提醒", "我|Pot"])
+
+
 async def group02(s):
     claim = await s.event("claim")
     initial = s.tasks()
@@ -802,7 +807,7 @@ async def group02(s):
     )
     s.check(
         "lists_separate_types",
-        useful_text(summary, [*s.spec["title_patterns"], "分工", "提醒", "我|Pot"])
+        categorized_group_summary(summary, s.spec["title_patterns"])
         and not s.work_state()
         and not s.rules(),
         summary,
@@ -1045,6 +1050,11 @@ async def work04(s):
         )
 
 
+def short_condensation_reply(turn, topic_patterns):
+    text = re.sub(r"冰凉|低温|温度(?:较|偏|很|相对)?低", "冷", response(turn))
+    return useful_text(turn) and pattern_all(text, topic_patterns)
+
+
 async def chat04(s):
     topic = await s.event("topic", actor=GUEST)
     short = await s.event("short", latency=True)
@@ -1052,7 +1062,7 @@ async def chat04(s):
         "brief_plain_text",
         not topic["receipts"]
         and not topic["work_id"]
-        and useful_text(short, s.spec["short_patterns"])
+        and short_condensation_reply(short, s.spec["short_patterns"])
         and len(response(short)) <= 100
         and MARKUP.search(response(short)) is None
         and "？" not in response(short),
@@ -1423,7 +1433,7 @@ def quoted_work_context(observations, source_event_id, work_id):
 
 
 def queued_progress_subjects(turn, facts, work):
-    """Reply against an actual work identity, version, phase and named subject."""
+    """Prove a queued reply references the observed work's subject or actual output."""
     accepted_text = response(turn)
     if not useful_text(turn) or not re.search(
         r"排队|待执行|等待开始|尚未开始|还没开始", accepted_text
@@ -1455,7 +1465,12 @@ def queued_progress_subjects(turn, facts, work):
         "and",
         "for",
     }
+    planned_formats = {
+        item.get("format") if isinstance(item, dict) else item
+        for item in (getattr(work, "scope", None) or {}).get("outputs", [])
+    }
     seen = set()
+    unproduced = set()
     for fact in facts:
         if (
             fact.get("state") == "queued"
@@ -1463,7 +1478,21 @@ def queued_progress_subjects(turn, facts, work):
             and isinstance(fact.get("goal"), str)
         ):
             seen.update(terms(fact["goal"]) & terms(work.goal) & terms(accepted_text))
-    return seen - common_words
+            actual_outputs = fact.get("outputs")
+            if (
+                "pdf" in planned_formats
+                and isinstance(actual_outputs, dict)
+                and actual_outputs.get("candidate_count")
+                == actual_outputs.get("validated_count")
+                == 0
+                and re.search(
+                    r"(?:尚未|没有|还没|未).{0,20}(?:生成|成稿|交付|产出).{0,12}PDF",
+                    accepted_text,
+                    re.I,
+                )
+            ):
+                unproduced.add("PDF")
+    return (seen - common_words) | unproduced
 
 
 async def work02(s):
@@ -1502,6 +1531,9 @@ async def work02(s):
     await s.event("chatter", actor=GUEST)
     progress = await s.event("progress", latency=True)
     after_progress = s.work_state()
+    read_only_progress = [(work.id, work.revision) for work in initial] == [
+        (work.id, work.revision) for work in after_progress
+    ]
     progress_facts = work_facts_observed(s, progress)
     progress_work = next((work for work in initial if work.id == second["work_id"]), None)
     progress_subjects = queued_progress_subjects(progress, progress_facts, progress_work)
@@ -1520,6 +1552,7 @@ async def work02(s):
     s.check(
         "same_version_for_progress_and_quote",
         same_work
+        and read_only_progress
         and (useful_text(progress, s.spec["progress_patterns"]) or bool(progress_subjects))
         and old is not None
         and useful_text(old, s.spec["old_patterns"])
@@ -1542,8 +1575,7 @@ async def work02(s):
     )
     s.check(
         "no_write_from_lookup",
-        [(work.id, work.revision) for work in initial]
-        == [(work.id, work.revision) for work in after_progress]
+        read_only_progress
         and not any(turn["work_id"] for turn in (empty, fresh))
         and progress["work_id"] in (None, second["work_id"]),
         empty,
@@ -1947,19 +1979,19 @@ async def search01(s):
     backend = (
         [] if not work else successful_tools(work, {"web_fetch", "web_search", "browser_open"})
     )
-    official = successful_public_calls(calls, s.spec)
-    if not official and backend:
-        official = [
-            item
-            for item in backend
-            if item["tool_name"] in {"web_fetch", "browser_open"}
-            and any(
-                official_source(url, s.spec)
-                for url in re.findall(
-                    r'https://[^"\s]+', json.dumps(item["output"], ensure_ascii=False)
-                )
-            )
-        ]
+    fetched = {
+        url
+        for call in calls
+        if call["operation"] == "web_fetch" and call.get("result")
+        for url in fetch_source_urls(call["result"])
+    }
+    fetched.update(
+        url
+        for item in backend
+        if item["tool_name"] in {"web_fetch", "browser_open"}
+        for url in fetch_source_urls(item["output"])
+    )
+    official = {url for url in fetched if official_source(url, s.spec)}
     search = any(call["operation"] == "web_search" and call.get("result") for call in calls) or any(
         item["tool_name"] == "web_search" for item in backend
     )
@@ -1973,16 +2005,15 @@ async def search01(s):
         + [item["decoded"].get("text", "") for item in delivered_files]
     )
     output_links = [url for item in delivered_files for url in item["decoded"].get("links", [])]
-    output_links.extend(
-        link.rstrip(")）】。.,，；;")
-        for text in output_segments
-        for link in re.findall(r"https://[^\s]+", text)
-    )
+    output_links.extend(url for text in output_segments for url in markdown_urls(text))
+    accepted_verified_links = {url for url in output_links if page_url_key(url) in official}
     evidence = {
         "public_provider_reads": calls,
         "foreground_observations": direct_receipts,
         "execution": work,
         "delivered_inspected_outputs": delivered_files,
+        "official_fetched_pages": sorted(official),
+        "accepted_verified_links": sorted(accepted_verified_links),
         "ledger": s.ledger([request["event_id"]]),
     }
     s.check(
@@ -1999,7 +2030,7 @@ async def search01(s):
         bool(
             official
             and any(s.spec["correct_text"] in " ".join(part.split()) for part in output_segments)
-            and any(official_source(url, s.spec) for url in output_links)
+            and accepted_verified_links
         ),
         request,
         evidence,
@@ -2199,6 +2230,47 @@ async def work05(s):
     )
 
 
+def verified_docx_image_captions(artifact, imports, conversions, expected):
+    def receipt_pages(row):
+        return {
+            key
+            for url in markdown_urls(row["output"].get("page_citation") or "")
+            if (key := page_url_key(url)) is not None
+        }
+
+    imported_pages = {page for row in imports for page in receipt_pages(row)}
+    converted_pages = {}
+    for row in conversions:
+        info = row["output"]
+        if info.get("format") == "png" and info.get("sha256"):
+            converted_pages.setdefault(info["sha256"], set()).update(receipt_pages(row))
+
+    images = artifact["decoded"].get("embedded_images", [])
+    provenance = []
+    for image in images:
+        if image.get("content_type") != "image/png":
+            continue
+        caption = set(image.get("caption_links", [])) | markdown_urls(image.get("caption_text", ""))
+        caption_pages = {key for url in caption if (key := page_url_key(url)) is not None}
+        matched = caption_pages & converted_pages.get(image["sha256"], set()) & imported_pages
+        provenance.append({"embedded_sha256": image["sha256"], "matched_pages": sorted(matched)})
+    matched_pages = {page for row in provenance for page in row["matched_pages"]}
+    distinct_hashes = {row["embedded_sha256"] for row in provenance}
+    verified = (
+        bool(artifact.get("sha256"))
+        and artifact.get("accepted_sha256") == artifact["sha256"]
+        and len(images) == len(provenance) == len(distinct_hashes) == expected
+        and len(matched_pages) == expected
+        and all(len(row["matched_pages"]) == 1 for row in provenance)
+    )
+    return {
+        "verified": verified,
+        "image_source_pairs": provenance,
+        "verified_source_link_count": len(matched_pages),
+        "embedded_png_count": len(distinct_hashes),
+    }
+
+
 async def search02(s):
     start = await s.event("request", latency=True)
     await s.app.execute_tick()
@@ -2231,43 +2303,16 @@ async def search02(s):
         >= expected,
         result,
     )
-    matching_files = False
-    public_links = {
-        url.rstrip("/")
-        for item in imports
-        for url in re.findall(r"https://[^\s)>，。]+", item["output"].get("page_citation") or "")
-    }
-    embedded_hashes = set()
-    converted_hashes = {
-        item["output"].get("sha256")
-        for item in conversions
-        if item["output"].get("format") == "png"
-    }
-    if len(artifacts) == 1:
-        artifact = artifacts[0]
-        decoded = artifact["decoded"]
-        addresses = set(decoded.get("links", []))
-        addresses.update(re.findall(r"https://[^\s）】。]+", decoded.get("text", "")))
-        retained_links = {url.rstrip("/") for url in addresses} & public_links
-        images = decoded.get("embedded_images", [])
-        embedded_hashes = {
-            image["sha256"] for image in images if image.get("content_type") == "image/png"
-        }
-        matching_files = (
-            artifact["accepted_sha256"] == artifact["sha256"]
-            and len(retained_links) >= expected
-            and len(images) == len(embedded_hashes) == expected
-            and embedded_hashes <= converted_hashes
-        )
+    binding = (
+        verified_docx_image_captions(artifacts[0], imports, conversions, expected)
+        if len(artifacts) == 1
+        else {"verified": False}
+    )
+    matching_files = binding["verified"]
     s.check(
         "source_manifest_and_delivered_file",
         matching_files,
-        {
-            "files": artifacts,
-            "execution": result,
-            "source_link_count": len(public_links),
-            "embedded_png_count": len(embedded_hashes),
-        },
+        {"files": artifacts, "execution": result, "caption_provenance": binding},
     )
     attempts = result["work"]["state"]
     delivered = [spool_text(item) for item in result["spool"] if item["payload"]["kind"] == "text"]
@@ -2404,6 +2449,10 @@ def native_audio(s):
     return target.read_bytes() if spoken.returncode == 0 and target.is_file() else None
 
 
+def identity_limitation_is_explicit(text):
+    return bool(re.search(r"不足|无法|不能|没法|看不出|(?:确定|确认|辨认|识别)不了", text))
+
+
 async def media01(s):
     source = await s.event(
         "image_seed",
@@ -2437,8 +2486,7 @@ async def media01(s):
     )
     s.check(
         "identity_inference_bounded",
-        pattern_all(merged, ["不足|无法|不能|无法确认|看不出"])
-        and s.spec["image_name"] not in descriptions,
+        identity_limitation_is_explicit(merged) and s.spec["image_name"] not in descriptions,
         first,
         photo,
     )
