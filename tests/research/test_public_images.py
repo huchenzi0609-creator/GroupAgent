@@ -22,11 +22,14 @@ from groupagent.research import (
     PublicImageRef,
     PublicImageService,
     ResearchSource,
+    SearchInput,
+    SearchOutput,
     register_public_image_tools,
     validate_research_citations,
 )
 from groupagent.runtime.toolkit import PublishInput, PublishOutput, RecordingGateway
 from groupagent.tools import (
+    EffectState,
     IdempotencyMode,
     PolicyDecision,
     ToolContext,
@@ -693,6 +696,195 @@ async def test_tools_are_opt_in_and_unknown_candidate_never_fetches(tmp_path, im
             )
             assert unknown.error_code == "public_image_candidate_unknown"
     assert observed == []
+
+
+async def test_scoped_search_alternatives_lead_to_real_image_after_two_refusals_and_resume(
+    tmp_path, image_context
+):
+    challenge_page = "https://challenge.example.com/gallery"
+    same_host_lead = "https://challenge.example.com/another"
+    denied_page = "https://denied.example.com/gallery"
+    accessible_page = "https://accessible.example.com/gallery"
+    image_bytes = frog_fixture(size=(320, 240))
+    observed = []
+    stamp = datetime.now(UTC)
+    results = tuple(
+        ResearchSource(
+            source_id=f"observed-{index}",
+            url=page,
+            title="Synthetic search result",
+            retrieved_at=stamp,
+            operation="search",
+            evidence_kind="search_result",
+            content_sha256=hashlib.sha256(b"").hexdigest(),
+            content_bytes_received=0,
+            content_bytes_returned=0,
+        )
+        for index, page in enumerate((challenge_page, same_host_lead, denied_page, accessible_page))
+    )
+
+    async def search(arguments, context):
+        return SearchOutput(
+            query=arguments.query,
+            retrieved_at=stamp,
+            results=results,
+            provider_result_count=len(results),
+            filtered_result_count=0,
+        )
+
+    def response(request):
+        host = request.headers["host"]
+        observed.append((host, request.url.path))
+        if host == "challenge.example.com":
+            return httpx.Response(
+                200, text="Verify you are human", headers={"content-type": "text/html"}
+            )
+        if host == "denied.example.com":
+            return httpx.Response(403)
+        assert host == "accessible.example.com"
+        if request.url.path == "/gallery":
+            return httpx.Response(
+                200, text='<img src="/verified.png">', headers={"content-type": "text/html"}
+            )
+        assert request.url.path == "/verified.png"
+        return httpx.Response(200, content=image_bytes, headers={"content-type": "image/png"})
+
+    context = replace(
+        image_context,
+        scope=replace(
+            image_context.scope,
+            allowed_tools=image_context.scope.allowed_tools | {"web_search"},
+        ),
+    )
+    sequence = 0
+
+    async def invoke(gateway, name, arguments):
+        nonlocal sequence
+        sequence += 1
+        return await gateway.invoke(
+            name,
+            arguments,
+            replace(context, call_id=f"call-{sequence}", idempotency_key=f"key-{sequence}"),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+        with ArtifactStore(tmp_path / "artifacts") as store:
+            worker = InlineSyntheticImageWorker()
+
+            def fresh_gateway(entries=()):
+                service = PublicImageService(
+                    MediaService(store, worker),
+                    resolver=public_resolver,
+                    client=http,
+                    max_discovery_attempts=3,
+                )
+                gateway = ToolGateway()
+                gateway.register(
+                    ToolDefinition(
+                        "web_search",
+                        "Synthetic observed source receipt",
+                        SearchInput,
+                        SearchOutput,
+                        search,
+                        idempotency_mode=IdempotencyMode.READ_ONLY,
+                    )
+                )
+                register_public_image_tools(gateway, service, source_factory=output_source)
+                gateway.bind_scope(context.scope)
+                gateway.restore_ledger(context.scope, entries)
+                return gateway
+
+            gateway = fresh_gateway()
+            search_receipt = await invoke(
+                gateway, "web_search", {"query": "synthetic public images"}
+            )
+            assert search_receipt.success
+            failed = await invoke(gateway, "web_image_candidates", {"page_url": challenge_page})
+            assert failed.error_code == "browser_captcha"
+            assert failed.effect_state == EffectState.NO_EFFECT and failed.output["definite"]
+            assert failed.output["search_alternatives"] == [
+                {"page_url": denied_page, "source_id": "observed-2"},
+                {"page_url": accessible_page, "source_id": "observed-3"},
+                {"page_url": same_host_lead, "source_id": "observed-1"},
+            ]
+
+            # A second process holds the same trusted ledger, no page cache.
+            gateway = fresh_gateway(gateway.export_ledger(context.scope))
+            retry = await invoke(
+                gateway,
+                "web_image_candidates",
+                {
+                    "page_url": challenge_page.upper().replace("/GALLERY", "/gallery"),
+                    "limit": 1,
+                },
+            )
+            assert retry.error_code == "browser_captcha"
+            assert retry.effect_state == EffectState.NOT_STARTED
+            assert observed == [("challenge.example.com", "/gallery")]
+
+            next_page = retry.output["search_alternatives"][0]["page_url"]
+            denied = await invoke(gateway, "web_image_candidates", {"page_url": next_page})
+            assert denied.error_code == "browser_access_blocked" and denied.output["definite"]
+            assert denied.output["search_alternatives"][0]["page_url"] == accessible_page
+            gateway = fresh_gateway(gateway.export_ledger(context.scope))
+            duplicate_denied = await invoke(
+                gateway, "web_image_candidates", {"page_url": denied_page, "limit": 20}
+            )
+            assert duplicate_denied.effect_state == EffectState.NOT_STARTED
+            exact_lead = duplicate_denied.output["search_alternatives"][0]["page_url"]
+            assert exact_lead in [item["url"] for item in search_receipt.output["results"]]
+            found = await invoke(gateway, "web_image_candidates", {"page_url": exact_lead})
+            assert found.success
+            (candidate,) = found.output["candidates"]
+            imported = await invoke(
+                gateway, "web_image_import", {"candidate_id": candidate["candidate_id"]}
+            )
+            assert imported.success and imported.output["page_citation"].startswith(accessible_page)
+            scope = ArtifactScope(context.group_id, context.work_id, context.actor.member_id)
+            version = store.get(scope, imported.output["file_id"], imported.output["version_id"])
+            assert store.read(scope, version.file_id, version.version_id) == image_bytes
+            assert version.sha256 == hashlib.sha256(image_bytes).hexdigest()
+            assert version.provenance["public_image"]["page_sha256"] == found.output["html_sha256"]
+
+    assert observed == [
+        ("challenge.example.com", "/gallery"),
+        ("denied.example.com", "/gallery"),
+        ("accessible.example.com", "/gallery"),
+        ("accessible.example.com", "/verified.png"),
+    ]
+    assert worker.calls == ["image_validate"]
+
+
+async def test_html_rate_limit_remains_retryable_without_definite_refusal(tmp_path, image_context):
+    replies = [
+        httpx.Response(429),
+        httpx.Response(
+            200, text='<img src="/available.png">', headers={"content-type": "text/html"}
+        ),
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: replies.pop(0))) as http:
+        with ArtifactStore(tmp_path / "artifacts") as store:
+            gateway = ToolGateway()
+            service = PublicImageService(
+                MediaService(store, InlineSyntheticImageWorker()),
+                resolver=public_resolver,
+                client=http,
+            )
+            register_public_image_tools(gateway, service, source_factory=output_source)
+            gateway.bind_scope(image_context.scope)
+            args = {"page_url": "https://limited.example.com/gallery"}
+            transient = await gateway.invoke("web_image_candidates", args, image_context)
+            assert transient.error_code == "browser_access_blocked"
+            assert (
+                transient.effect_state == EffectState.NO_EFFECT and not transient.output["definite"]
+            )
+            available = await gateway.invoke(
+                "web_image_candidates",
+                args,
+                replace(image_context, call_id="second-attempt", idempotency_key="second-attempt"),
+            )
+            assert available.success and available.output["candidates"]
+    assert replies == []
 
 
 async def test_page_challenge_encoding_and_size_are_bounded(tmp_path, image_context):

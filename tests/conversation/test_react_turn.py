@@ -90,6 +90,43 @@ async def test_answer_or_observe_in_one_model_call_without_fast_semantics(conver
 
 
 @pytest.mark.postgres
+@pytest.mark.parametrize("control", ["resume", "retry"])
+async def test_continuation_of_live_work_reports_current_facts_without_a_revision(
+    conversation_env, control
+):
+    env = conversation_env
+    original = source(env, "Pot，把两种封套的实际对照结果写成小结。")
+    with env.store.transaction(env.actor) as tx:
+        work = tx.create_work("两种封套的对照小结", original.id)
+        tx.claim_work(work.id, "synthetic-active-worker", ttl_seconds=300)
+        running = tx.get_work(work.id)
+
+    event = source(env, "Pot，刚才那份小结有进展吗？接着做就好。")
+    selector = {"basis": "ids", "ids": [work.id]}
+
+    def check_current_state(request):
+        receipt = tool_receipt(request)
+        assert receipt["status"] == "observed" and receipt["committed"] is False
+        assert receipt["code"] == "work_control_state_observed"
+        (fact,) = receipt["facts"]["facts"]
+        assert fact["id"] == work.id and fact["state"] == "running"
+        assert fact["revision"] == running.revision
+        return finish("两种封套的对照小结正在处理。")
+
+    model = ModelScript(
+        call("control_work", "continuation", work_selector=selector, control=control),
+        check_current_state,
+    )
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.decision.response == "两种封套的对照小结正在处理。"
+    assert result.delivery_id
+    with env.store.transaction(env.actor) as tx:
+        assert tx.get_work(work.id) == running
+        assert len(tx.list_work()) == len(tx.list_delivery()) == 1
+
+
+@pytest.mark.postgres
 async def test_failed_probe_then_real_action_and_truthful_mixed_reply(conversation_env):
     env = conversation_env
     event = source(env, "Pot，这个数为什么大概是3？还请实际用 Python 算一下。")
@@ -158,13 +195,19 @@ async def test_paired_finish_uses_verified_commit_and_one_canonical_delivery(
     conversation_env, supplement
 ):
     env = conversation_env
-    event = source(env, "Pot，请运行 Python 计算 13 的平方。")
+    text = "Pot，请运行 Python 计算 13 的平方。"
+    if supplement:
+        text += "同时先告诉我平方是什么意思。"
+    event = source(env, text)
 
     def plan(request):
         fields = offered_properties(request, "start_work")
         assert "topic_id" not in fields
         assert fields["input_versions"]["maxItems"] == fields["input_event_ids"]["maxItems"] == 0
-        return pair(queued_compute(event), finish(supplement, reports=[("compute", "queued")]))
+        return pair(
+            queued_compute(event, admission_ack="deferred"),
+            finish(supplement, reports=[("compute", "queued")]),
+        )
 
     model = ModelScript(plan)
     env.models[event.id] = model
@@ -281,7 +324,7 @@ async def test_canonical_research_receipt_names_the_committed_goal_on_every_path
         finish_on_commit=mode == "finish_on_commit",
     )
     if mode == "paired":
-        model = ModelScript(pair(start, finish()))
+        model = ModelScript(pair(start, finish("我已开始安排接下来的核对。")))
     elif mode == "finish_on_commit":
         model = ModelScript(start)
     else:
@@ -294,6 +337,7 @@ async def test_canonical_research_receipt_names_the_committed_goal_on_every_path
         assert work.goal == goal and work.state == WorkState.QUEUED
         assert delivery.payload_ref == "text:" + outcome.decision.response
         assert goal in outcome.decision.response
+        assert "接下来的核对" not in outcome.decision.response
         assert outcome.delivery_id == delivery.id
         assert delivery.idempotency_key == (
             ("early_ack:" if mode == "immediate" else "reply:") + event.id + ":1"
@@ -348,9 +392,9 @@ async def test_same_turn_repair_retires_only_unattempted_receipt_with_stale_goal
 
 
 @pytest.mark.postgres
-@pytest.mark.parametrize("supplement", [None, "已保留表格的列名。"])
+@pytest.mark.parametrize("finisher_text", [None, "材料已经交给后台制作。"])
 async def test_real_queued_ack_precedes_same_work_refinement_and_is_not_repeated(
-    conversation_env, supplement
+    conversation_env, finisher_text
 ):
     env = conversation_env
     event = source(env, "Pot，请从同一份资料生成 Word、PDF 和 PPT。")
@@ -402,7 +446,7 @@ async def test_real_queued_ack_precedes_same_work_refinement_and_is_not_repeated
         receipt = tool_receipt(request)
         assert receipt["committed"] is True and receipt["satisfies_kind"] == "start_work", receipt
         assert receipt["work_admission"]["delivery_id"] == admission_ids[0]
-        return finish(supplement, reports=[("refined", "committed")])
+        return finish(finisher_text, reports=[("refined", "committed")])
 
     model = ModelScript(initial, refine, close)
     env.models[event.id] = model
@@ -413,17 +457,11 @@ async def test_real_queued_ack_precedes_same_work_refinement_and_is_not_repeated
         assert work.goal_revision == 2
         assert {row["format"] for row in work.scope["outputs"]} == {"docx", "pdf", "pptx"}
         assert len(tx.list_work()) == 1
-        deliveries = tx.list_delivery()
-        assert len(deliveries) == 1 + (supplement is not None)
-        admitted = next(row for row in deliveries if row.id == admission_ids[0])
+        (admitted,) = tx.list_delivery()
+        assert admitted.id == admission_ids[0]
         assert admitted.state == DeliveryState.ACCEPTED
-        if supplement:
-            answer = next(row for row in deliveries if row.id != admission_ids[0])
-            assert answer.payload_ref == "text:" + supplement
-            assert result.delivery_id == answer.id
-        else:
-            assert result.delivery_id == admitted.id
-            assert result.decision.response == admitted.payload_ref.removeprefix("text:")
+        assert result.delivery_id == admitted.id
+        assert result.decision.response == admitted.payload_ref.removeprefix("text:")
         assert tx.get_decision(event.id)["work_admission"]["delivery_id"] == admitted.id
 
 
@@ -441,6 +479,35 @@ async def test_untyped_model_ack_uses_the_already_queued_canonical_receipt(conve
         assert result.delivery_id == admission.id
         assert result.decision.response == admission.payload_ref.removeprefix("text:")
         assert admission.idempotency_key == "early_ack:" + event.id + ":1"
+
+
+@pytest.mark.postgres
+async def test_immediate_admission_keeps_a_later_committed_action_receipt(conversation_env):
+    env = conversation_env
+    event = source(env, "Pot，请用 Python 算 13 的平方，并记下项目代号是山鲸。")
+    additional = call(
+        "apply_business_action",
+        "remember-project",
+        action={"op": "remember", "predicate": "项目代号", "value": "山鲸"},
+    )
+    acknowledgements = []
+
+    def close(request):
+        receipt = tool_receipt(request)
+        assert receipt["committed"]
+        acknowledgements.append(receipt["host_message"])
+        return finish("我还安排了后台实算。")
+
+    env.models[event.id] = ModelScript(
+        queued_compute(event, admission_ack="immediate"), additional, close
+    )
+    result = await env.coordinator.process(event)
+    assert result.work_id and result.decision.response == acknowledgements[0]
+    with env.store.transaction(env.actor) as tx:
+        assert {row.idempotency_key: row.payload_ref for row in tx.list_delivery()} == {
+            "early_ack:" + event.id + ":1": "text:这项工作已排队。目标是「" + event.text + "」。",
+            "reply:" + event.id + ":1": "text:" + acknowledgements[0],
+        }
 
 
 @pytest.mark.postgres
@@ -463,11 +530,12 @@ async def test_existing_legacy_ack_slot_preserves_work_and_falls_back_to_final_r
     def close(request):
         receipt = tool_receipt(request)
         assert receipt["committed"] is True and receipt["work_admission"] is None
-        return finish()
+        return finish("已经把计算任务交给后台。")
 
     env.models[event.id] = ModelScript(queued_compute(event, admission_ack="immediate"), close)
     result = await env.coordinator.process(event)
     assert result.work_id and result.delivery_id != legacy.id
+    assert "交给后台" not in result.decision.response
     with env.store.transaction(env.actor) as tx:
         kept = tx.get_delivery(legacy.id)
         assert kept.state == DeliveryState.ACCEPTED
@@ -560,12 +628,13 @@ async def test_receipt_reused_after_model_interruption_and_event_replay(conversa
         prior = json.loads(request.messages[1].content)["prior_receipts"]
         assert len(prior) == 1 and prior[0]["tool_call_id"] == "python-start"
         assert prior[0]["work_admission"]["delivery_id"] == ack.id
-        return finish(reports=[("python-start", "queued")])
+        assert prior[0]["admission_ack"] == "immediate"
+        return finish("计算已交给后台处理。", reports=[("python-start", "queued")])
 
     model = ModelScript(resumed)
     env.models[event.id] = model
     result = await env.coordinator.process(event)
-    assert result.work_id and result.delivery_id
+    assert result.work_id and result.delivery_id == ack.id
     replay = await env.coordinator.process(event)
     assert replay.duplicate and replay.work_id == result.work_id
     assert len(model.requests) == 1

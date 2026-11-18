@@ -456,3 +456,71 @@ def test_restart_witness_reconciles_exact_intent_and_validates_distinct_pending_
     ]
     recreated = [accepted[0], part("new-intent", "reply", "wire-b")]
     assert not oracles.restart_witness(before, after, prior, recreated, {url}, spec)["reconciled"]
+
+
+@pytest.mark.parametrize(
+    ("text", "actionable"),
+    [
+        ("你把领件码发我（文字或照片都行）。", True),
+        ("发我领件码，我再核对。", True),
+        ("麻烦把领件码发我一下。", True),
+        ("请把已经填写的领件码发我。", True),
+        ("记录里没有领件码。你可以把它发我。", True),
+        ("你没发我领件码，我查不到。", False),
+        ("你还没把领件码发我。", False),
+        ("请不要把领件码发我。", False),
+        ("我已经看过你上次发我的领件码。", False),
+        ("你之前把领件码发我了。", False),
+        ("发我领件码了吗？", False),
+    ],
+)
+def test_colloquial_missing_input_requires_an_actual_request(oracles, text, actionable):
+    assert oracles.essential_artifact_input_reply(text, "领件码") is actionable
+
+
+def test_only_fresh_read_only_work_control_observation_counts_as_fact(oracles):
+    from types import SimpleNamespace
+
+    work = {"id": "running-work", "goal_revision": 4}
+    current = {**work, "state": "running"}
+    stale = {**work, "goal_revision": 3}
+    observed = {
+        "kind": "control_work",
+        "status": "observed",
+        "committed": False,
+        "code": "work_control_state_observed",
+        "facts": {"status": "matched", "facts": [current]},
+    }
+    request = {"event_id": "request"}
+
+    def extract(observation):
+        fixture = SimpleNamespace(
+            model_calls=[
+                {"source_event_id": "unrelated", "tool_observations": [observed]},
+                {"source_event_id": "request", "tool_observations": [observation]},
+            ]
+        )
+        return oracles.work_facts_observed(fixture, request)
+
+    assert extract(observed) == [current]
+    assert oracles.work_fact_has(extract(observed), work["id"], [work])
+    assert not oracles.work_fact_has(
+        extract({**observed, "facts": {"status": "matched", "facts": [stale]}}),
+        work["id"],
+        [work],
+    )
+    for changed in (
+        {"committed": True},
+        {"committed": None},
+        {"replayed": True},
+        {"work_effects": [{"id": work["id"]}]},
+        {"kind": "update_work"},
+        {"status": "rejected"},
+        {"code": "version_conflict"},
+        {"facts": {"status": "partial", "facts": [current]}},
+        {"facts": {"status": "matched", "facts": [current, stale]}},
+    ):
+        assert extract({**observed, **changed}) == []
+    assert extract({"kind": "read_work_facts", "status": "matched", "facts": [current]}) == [
+        current
+    ]

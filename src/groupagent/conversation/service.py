@@ -97,6 +97,7 @@ from .turns import TurnContract
 from .work_queries import query_work_in_tx, render_work_query
 
 ProviderFactory = Callable[[ActorContext, GroupEvent], DecisionProvider]
+_CONTINUATION_STATES = {"resume": WorkState.PAUSED, "retry": WorkState.FAILED}
 _ERRORS = {
     "work_selection_scope_required": (
         "已查到多个对象。若真人要求整组选定状态的工作，请按完整条件选择；"
@@ -682,11 +683,10 @@ class ConversationCoordinator(Coordinator):
                 "resume": WorkState.QUEUED,
                 "retry": WorkState.QUEUED,
             }[decision.control or "pause"]
+            continuation_state = _CONTINUATION_STATES.get(decision.control or "")
             eligible = (
-                {WorkState.PAUSED}
-                if decision.control == "resume"
-                else {WorkState.FAILED}
-                if decision.control == "retry"
+                {continuation_state}
+                if continuation_state is not None
                 else {
                     state
                     for state, transitions in WORK_TRANSITIONS.items()
@@ -697,9 +697,17 @@ class ConversationCoordinator(Coordinator):
                 raise DomainError(
                     "invalid_transition", "The selected states cannot accept this command"
                 )
-            selector = selector.model_copy(
-                update={"states": selector.states or tuple(sorted(eligible))}
+            observe_exact_state = (
+                context.get("_react_session")
+                and continuation_state is not None
+                and selector.basis != "query"
+                and selector.quantifier == "one"
+                and not selector.states
             )
+            if not observe_exact_state:
+                selector = selector.model_copy(
+                    update={"states": selector.states or tuple(sorted(eligible))}
+                )
         resolved = resolve_work_selection(
             actor,
             event,
@@ -1754,8 +1762,14 @@ class ConversationCoordinator(Coordinator):
                     )
                     and accepted
                 )
+            state_observed = result.decision.reason_code == "work_control_state_observed"
+            observed_facts = (
+                context.get("_last_work_fact_read")
+                if state_observed and not result.duplicate
+                else None
+            )
             return {
-                "status": "committed" if accepted else "rejected",
+                "status": "committed" if accepted else "observed" if state_observed else "rejected",
                 "committed": accepted,
                 "replayed": result.duplicate,
                 "tool_call_id": tool_call_id,
@@ -1764,8 +1778,14 @@ class ConversationCoordinator(Coordinator):
                 "code": result.decision.reason_code if not accepted else None,
                 "host_message": result.decision.response,
                 "work_admission": _admission_for_receipt(prior, recorded),
+                "admission_ack": recorded.get("admission_ack"),
                 "work_plan_text": recorded.get("work_plan_text"),
                 "result": self._model_aliases(result.model_dump(mode="json"), context),
+                **(
+                    {"facts": self._model_aliases(observed_facts, context)}
+                    if observed_facts is not None
+                    else {}
+                ),
             }
 
         context["_read_work_facts"] = read_facts
@@ -1872,6 +1892,9 @@ class ConversationCoordinator(Coordinator):
         work_admission = body.get("work_admission") or {}
         admission_id = work_admission.get("delivery_id")
         admission_text = work_admission.get("text")
+        reuse_admission = bool(
+            admission_id and context and context.get("_reuse_work_admission_id") == admission_id
+        )
         if body.get("agent_context_revoked"):
             # The running model still has its pre-forget transcript. Only the
             # source-free committed host acknowledgement may cross this boundary.
@@ -1914,6 +1937,7 @@ class ConversationCoordinator(Coordinator):
                     )
                     if not text and admission_id:
                         text = admission_text
+                        reuse_admission = True
                 template = (
                     decision
                     if (
@@ -1967,7 +1991,7 @@ class ConversationCoordinator(Coordinator):
             self._record_invoked_attachment(tx, event, final, admission)
         delivery_id = previous.delivery_id or admission_id
         if final.response and final.kind not in {"ignore", "observe"}:
-            if admission_id and final.response == admission_text:
+            if admission_id and reuse_admission:
                 delivery_id = admission_id
             else:
                 delivery = tx.enqueue_reply(
@@ -2248,6 +2272,7 @@ class ConversationCoordinator(Coordinator):
                         "work_effects": receipt.get("work_effects", []),
                         "satisfies_kind": receipt.get("satisfies_kind"),
                         "work_admission": _admission_for_receipt(previous, receipt),
+                        "admission_ack": receipt.get("admission_ack"),
                         "work_plan_text": receipt.get("work_plan_text"),
                         "committed": bool(
                             receipt.get("result", {}).get("work_id")
@@ -3025,6 +3050,25 @@ class ConversationCoordinator(Coordinator):
                                 tx.event_fingerprint(source.id)
                             )
                             selected.append(work)
+                        continuation_state = _CONTINUATION_STATES.get(decision.control or "")
+                        if (
+                            continuation_state is not None
+                            and len(selected) == 1
+                            and selected[0].state != continuation_state
+                        ):
+                            observed = WorkFacts(self.store).lookup_in_tx(
+                                tx,
+                                ids=(selected[0].id,),
+                                through_sequence=context["_snapshot"].get("through_sequence"),
+                            )
+                            context["_last_work_fact_read"] = observed
+                            context["_work_fact_source_ids"] = sorted(
+                                set(context.get("_work_fact_source_ids", []))
+                                | WorkFacts.source_dependencies_in_tx(tx, (selected[0].id,))
+                            )
+                            raise DomainError(
+                                "work_control_state_observed", render_work_query(observed)
+                            )
                         target = {
                             "cancel": WorkState.CANCELLED,
                             "pause": WorkState.PAUSED,
@@ -3073,14 +3117,17 @@ class ConversationCoordinator(Coordinator):
                         )
                         decision = decision.model_copy(update={"response": text})
             except (DomainError, ValidationError) as error:
-                context["_snapshot"] = original_snapshot
+                code = error.code if isinstance(error, DomainError) else "invalid_input"
+                if code != "work_control_state_observed":
+                    context["_snapshot"] = original_snapshot
                 if tool_call_id is not None and isinstance(error, DomainError) and error.retryable:
                     raise
-                code = error.code if isinstance(error, DomainError) else "invalid_input"
                 response = _ERRORS.get(code, "这项操作暂时无法完成，现有记录已保留。")
-                if code in {"schedule_time_missed", "room_nickname_verified"} and isinstance(
-                    error, DomainError
-                ):
+                if code in {
+                    "schedule_time_missed",
+                    "room_nickname_verified",
+                    "work_control_state_observed",
+                } and isinstance(error, DomainError):
                     response = str(error)
                 decision = Decision(
                     kind="clarify"
@@ -3159,16 +3206,23 @@ class ConversationCoordinator(Coordinator):
             ):
                 work_admission = None
             acknowledgement = context.get("_work_admission_ack")
+            admission_ack = None
             if (
                 tool_call_id is not None
                 and decision.kind == "start_work"
                 and work_id
-                and work_admission is None
-                and acknowledgement in {(tool_call_id, "silent"), (tool_call_id, "immediate")}
+                and acknowledgement
+                and acknowledgement[0] == tool_call_id
             ):
-                if acknowledgement[1] == "silent":
+                _, admission_ack, early_eligible = acknowledgement
+                if work_admission is None and admission_ack == "silent":
                     work_admission = {"work_id": work_id, "silent": True}
-                elif decision.response:
+                elif (
+                    work_admission is None
+                    and admission_ack == "immediate"
+                    and early_eligible
+                    and decision.response
+                ):
                     text = _work_receipt_text(work)
                     ack_delivery = tx.enqueue_work_admission(work_id, text)
                     if ack_delivery is not None:
@@ -3270,6 +3324,7 @@ class ConversationCoordinator(Coordinator):
                         "kind": receipt_kind,
                         "operation": receipt_operation,
                         "candidate_sha256": candidate_digest,
+                        **({"admission_ack": admission_ack} if admission_ack else {}),
                         **({"work_plan_text": work_plan_text} if work_plan_text else {}),
                         "satisfies_kind": "start_work"
                         if decision.reason_code == "repair_current_turn_admission"

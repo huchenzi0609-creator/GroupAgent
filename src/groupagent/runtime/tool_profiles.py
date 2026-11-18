@@ -46,6 +46,7 @@ _IMAGES = (
 
 _PUBLIC_IMAGES = (
     "Retrieve existing images with web_search, web_image_candidates, and web_image_import. Use the actual candidate resource instead of guessing URLs. Check real pixels and dimensions, preserve source citations, and stop once the requested distinct images are ready. Existing imported public_image file/version pairs can be reused directly in a document.",
+    "When an observed page returns an access challenge, access denial or non-HTML content, choose a different publisher from the tool's observed search alternatives or refine the public search. A search lead still requires actual page discovery and image import.",
 )
 
 _IMAGE_FILES = (

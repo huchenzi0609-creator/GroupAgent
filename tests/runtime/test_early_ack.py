@@ -11,6 +11,7 @@ from conversation.turn_model_fixture import finish_fixture_reply
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import Decision
 from groupagent.domain import DeliveryState, WorkState
+from groupagent.execution.kernel import KernelTool
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
 from .test_app import app_for, event
@@ -221,26 +222,58 @@ async def test_start_retires_only_old_ack_parts_that_were_never_submitted(runtim
         await app.close()
 
 
-async def test_real_admission_is_deliverable_while_foreground_still_waits(runtime_env):
+@pytest.mark.parametrize("preliminary_search", [False, True])
+async def test_real_admission_is_deliverable_while_foreground_still_waits(
+    runtime_env, preliminary_search
+):
     env = runtime_env
     app, _, _ = setup_chat(env)
-    request = event(env, "Pot，请运行 Python 计算一个合成数值。")
+    request = event(
+        env,
+        "Pot，请核实杉径阅读器的官方安装说明。"
+        if preliminary_search
+        else "Pot，请运行 Python 计算一个合成数值。",
+    )
     waiting, proceed = asyncio.Event(), asyncio.Event()
+    first_action_round = 2 if preliminary_search else 1
+
+    async def search_fixture(call):
+        assert call.arguments == {"query": "杉径阅读器 官方安装说明"}
+        return '{"status":"observed","evidence":{"sources":[]}}'
+
+    if preliminary_search:
+        app.coordinator.foreground_tools = lambda *_: (
+            KernelTool("web_search", "Read a synthetic result.", {}, search_fixture),
+        )
 
     class AdmittingFixture:
         calls = 0
 
         async def complete(self, model_request):
             self.calls += 1
-            if self.calls == 1:
+            if preliminary_search and self.calls == 1:
+                action = ModelToolCall(
+                    id="preliminary-search",
+                    name="web_search",
+                    arguments={"query": "杉径阅读器 官方安装说明"},
+                )
+            elif self.calls == first_action_round:
+                if preliminary_search:
+                    assert json.loads(model_request.messages[-1].content)["status"] == "observed"
                 action = ModelToolCall(
                     id="start",
                     name="start_work",
                     arguments={
-                        "goal": "Calculate the requested synthetic value",
+                        "goal": "核实杉径阅读器的官方安装说明"
+                        if preliminary_search
+                        else "Calculate the requested synthetic value",
                         "admission_ack": "immediate",
-                        "work_capabilities": ["compute"],
-                        "required_work_tools": ["python_compute"],
+                        "work_capabilities": ["public_research"]
+                        if preliminary_search
+                        else ["compute"],
+                        "required_work_tools": ["web_search"]
+                        if preliminary_search
+                        else ["python_compute"],
                         "outputs": [{"format": "text"}],
                     },
                 )
@@ -248,7 +281,18 @@ async def test_real_admission_is_deliverable_while_foreground_still_waits(runtim
                 waiting.set()
                 await proceed.wait()
                 action = ModelToolCall(
-                    id="close", name="finish_turn", arguments={"disposition": "reply"}
+                    id="close",
+                    name="finish_turn",
+                    arguments={
+                        "disposition": "reply",
+                        **(
+                            {
+                                "response": "我把安装资料的核对交给后台了。等查到权威出处，我会再把步骤发给你。"
+                            }
+                            if preliminary_search
+                            else {}
+                        ),
+                    },
                 )
             return ModelReply(
                 finish_reason="tool_calls",
@@ -292,11 +336,15 @@ async def test_real_admission_is_deliverable_while_foreground_still_waits(runtim
         proceed.set()
         await foreground
         assert await app.dispatcher.tick() == 0
+        assert sent(env) == ["【Pot】" + marker["text"]]
         with env.store.transaction(env.actor) as tx:
             final = tx.get_decision(request.id)
             assert not final["agent_pending_response"]
             assert final["result"]["delivery_id"] == current.id
             assert tx.get_delivery(current.id).state == DeliveryState.ACCEPTED
+            assert [row.id for row in tx.list_delivery() if row.request_event_id == request.id] == [
+                current.id
+            ]
     finally:
         proceed.set()
         await asyncio.gather(foreground, return_exceptions=True)

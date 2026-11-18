@@ -1367,12 +1367,26 @@ def foreground_tools(s, event):
 
 
 def work_facts_observed(s, turn):
-    return [
-        item
-        for observation in foreground_observations(s, turn)
-        if observation.get("kind") == "read_work_facts" and observation.get("status") == "matched"
-        for item in observation.get("facts", [])
-    ]
+    facts = []
+    for observation in foreground_observations(s, turn):
+        kind, status = observation.get("kind"), observation.get("status")
+        if kind == "read_work_facts" and status == "matched":
+            facts.extend(observation.get("facts", []))
+        elif (
+            kind == "control_work"
+            and status == "observed"
+            and observation.get("code") == "work_control_state_observed"
+            and observation.get("committed") is False
+            and not observation.get("replayed")
+            and not observation.get("work_effects")
+        ):
+            snapshot = observation.get("facts")
+            if not isinstance(snapshot, dict) or snapshot.get("status") != "matched":
+                continue
+            observed_facts = snapshot.get("facts")
+            if isinstance(observed_facts, list) and len(observed_facts) == 1:
+                facts.extend(observed_facts)
+    return facts
 
 
 def work_fact_has(facts, work_id, work_rows):
@@ -1834,11 +1848,32 @@ def essential_artifact_input_reply(text, subject):
         r"|提供|告诉我|贴(?:来|上|出)|补充|直接(?:念|报|说)(?:出|一遍|一下)"
     )
     negated = re.compile(r"(?:没有|没|尚未|未曾|未|不能|无法)\s*$")
-    return any(
+    clauses = re.split(r"[，,。；;！？!?\n]", text)
+    if any(
         not negated.search(clause[: request.start()])
-        for clause in re.split(r"[，,。；;！？!?\n]", text)
+        for clause in clauses
         for request in action.finditer(clause)
+    ):
+        return True
+
+    colloquial = re.compile(r"发\s*我(?!\s*[了过的])")
+    directed = re.compile(
+        r"^(?:请|麻烦|能否|可否|能不能|可以|你可以|你(?:先|再|直接)|(?:你\s*)?把)"
     )
+    contrary_directive = re.compile(
+        r"^(?:(?:请|麻烦|你(?:先|再|直接|可以)?|能否|可否|能不能|可以)\s*)?"
+        r"(?:别|不要|不必|无需|不用|不能|没有|没|尚未|未曾)"
+    )
+    for clause in clauses:
+        if re.search(r"(?:了|过)[吗嘛吧]$", clause.strip()):
+            continue
+        for request in colloquial.finditer(clause):
+            prefix = clause[: request.start()].strip()
+            if prefix and not directed.match(prefix):
+                continue
+            if not contrary_directive.search(prefix) and not negated.search(prefix):
+                return True
+    return False
 
 
 def foreground_observations(s, turn):

@@ -142,6 +142,7 @@ class PublicPageBroker:
                         raise DomainError(
                             prefix + "_access_blocked",
                             "Source requires access approval or has rate-limited this request",
+                            retryable=kind == "html" and response.status_code == 429,
                         )
                     if response.status_code != 200:
                         raise DomainError(

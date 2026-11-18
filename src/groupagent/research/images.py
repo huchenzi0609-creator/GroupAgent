@@ -20,11 +20,12 @@ from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
 import httpx
-from pydantic import AwareDatetime, Field, TypeAdapter
+from pydantic import AwareDatetime, Field, RootModel, StrictBool, TypeAdapter
 
 from groupagent.artifacts import ArtifactScope
 from groupagent.domain import DomainError
 from groupagent.media import MediaRef, MediaService, MediaSource
+from groupagent.security import redact_credentials
 from groupagent.tools import (
     EffectState,
     IdempotencyMode,
@@ -33,9 +34,10 @@ from groupagent.tools import (
     ToolDefinition,
     ToolGateway,
 )
-from groupagent.tools.models import ToolLedgerEntry
+from groupagent.tools.models import ToolFailure, ToolLedgerEntry
 
 from .browser import FetchedHTML, PublicPageBroker
+from .models import SearchOutput
 from .urls import Resolver, parse_public_url, system_resolver
 
 _PAGE_CACHE_SIZE = 6
@@ -108,6 +110,16 @@ _IMPORT_ATTEMPT_FAILURES = _PUBLIC_HTTP_FAILURES | frozenset(
 )
 
 
+_DEFINITE_PAGE_REFUSALS = frozenset(
+    {"browser_captcha", "browser_access_blocked", "browser_non_html"}
+)
+
+
+class ObservedImagePage(ToolData):
+    page_url: str = Field(min_length=1, max_length=2048)
+    source_id: str = Field(min_length=1, max_length=128)
+
+
 class ImageCandidatesInput(ToolData):
     page_url: str = Field(min_length=1, max_length=8192)
     limit: int = Field(default=10, ge=1, le=20)
@@ -145,6 +157,98 @@ class ImageCandidatesOutput(ToolData):
     filtered_candidate_count: int = Field(ge=0)
     truncated: bool
     untrusted_content: Literal[True] = True
+
+
+class ImagePageRefusal(ToolData):
+    scope_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    page_url_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    refused_host: str = Field(min_length=1, max_length=253)
+    definite: StrictBool
+    search_alternatives: tuple[ObservedImagePage, ...] = Field(max_length=5)
+
+
+class ImageDiscoveryResult(RootModel[ImageCandidatesOutput | ImagePageRefusal]):
+    """A successful discovery retains its existing wire shape."""
+
+
+def _page_url_digest(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()
+
+
+def _recorded_page_refusals(
+    entries: tuple[ToolLedgerEntry, ...], scope_fingerprint: str
+) -> dict[str, tuple[str, str]]:
+    refused: dict[str, tuple[str, str]] = {}
+    for entry in reversed(entries):
+        receipt = entry.receipt
+        code = receipt.error_code
+        if (
+            receipt.tool_name != "web_image_candidates"
+            or receipt.success
+            or code is None
+            or code not in _DEFINITE_PAGE_REFUSALS
+            or receipt.output is None
+        ):
+            continue
+        try:
+            refusal = ImagePageRefusal.model_validate(receipt.output)
+            if refusal.scope_fingerprint != scope_fingerprint or receipt.effect_state not in (
+                EffectState.NOT_STARTED,
+                EffectState.NO_EFFECT,
+            ):
+                raise ValueError("Unconfirmed or out-of-scope refusal")
+        except ValueError:
+            raise DomainError(
+                "public_image_evidence_invalid", "Page refusal provenance is invalid"
+            ) from None
+        if refusal.definite:
+            refused.setdefault(refusal.page_url_sha256, (code, refusal.refused_host))
+    return refused
+
+
+def _search_page_alternatives(
+    entries: tuple[ToolLedgerEntry, ...],
+    attempted: set[str],
+    refused_hosts: set[str],
+) -> tuple[ObservedImagePage, ...]:
+    attempted = set(attempted)
+    for entry in entries:
+        receipt = entry.receipt
+        if receipt.tool_name == "web_image_candidates" and receipt.success:
+            # restore_candidates has already checked the provenance of these pages.
+            page = receipt.output or {}
+            for field in ("requested_url", "final_url"):
+                if isinstance(observed := page.get(field), str):
+                    attempted.add(_page_url_digest(observed))
+
+    # One lead per host keeps choices diverse. A refusal is exact to its URL,
+    # so another observed page on that host remains eligible at lower priority.
+    choices: dict[str, ObservedImagePage] = {}
+    for entry in reversed(entries):
+        receipt = entry.receipt
+        if (
+            receipt.tool_name != "web_search"
+            or not receipt.success
+            or receipt.effect_state not in (EffectState.SUCCEEDED, EffectState.NO_EFFECT)
+        ):
+            continue
+        try:
+            observed_search = SearchOutput.model_validate(receipt.output)
+        except ValueError:
+            continue  # Historical or malformed data cannot contribute a lead.
+        for item in observed_search.results:
+            if item.evidence_kind != "search_result" or redact_credentials(item.url) != item.url:
+                continue
+            try:
+                canonical, host, _ = parse_public_url(item.url)
+                if host in choices or _page_url_digest(canonical) in attempted:
+                    continue
+                choices[host] = ObservedImagePage(page_url=canonical, source_id=item.source_id)
+            except (DomainError, ValueError):
+                continue
+    return tuple(
+        lead for _, lead in sorted(choices.items(), key=lambda item: item[0] in refused_hosts)[:5]
+    )
 
 
 class PublicImageRef(MediaRef):
@@ -551,6 +655,7 @@ class PublicImageService:
                 if (
                     receipt.tool_name == "web_image_candidates"
                     and receipt.error_code in _PAGE_ATTEMPT_FAILURES
+                    and receipt.effect_state != EffectState.NOT_STARTED
                 ):
                     _mark_attempt(
                         page_attempts,
@@ -779,12 +884,44 @@ def register_public_image_tools(
     async def candidates(
         arguments: ImageCandidatesInput, context: ToolContext
     ) -> ImageCandidatesOutput:
-        service.restore_candidates(
-            context,
-            gateway.export_ledger(context.scope),
-            page_url=arguments.page_url,
+        entries = gateway.export_ledger(context.scope)
+        service.restore_candidates(context, entries, page_url=arguments.page_url)
+        try:
+            canonical, host, _ = parse_public_url(arguments.page_url)
+        except DomainError:
+            return await service.candidates(context, arguments.page_url, limit=arguments.limit)
+        scope_fingerprint = service._scope_fingerprint(service._scope(context))
+        refused = _recorded_page_refusals(entries, scope_fingerprint)
+        page_digest = _page_url_digest(canonical)
+        previous = refused.get(page_digest)
+        definite = True
+        if previous is None:
+            try:
+                return await service.candidates(context, canonical, limit=arguments.limit)
+            except DomainError as error:
+                if error.code not in _DEFINITE_PAGE_REFUSALS:
+                    raise
+                code = error.code
+                definite = not error.retryable
+        else:
+            code, host = previous
+        refused_hosts = {hostname for _, hostname in refused.values()} | {host}
+        raise ToolFailure(
+            code,
+            "This source page declined the access or format request. "
+            "Use another observed public publisher from search_alternatives or revise the search query.",
+            no_effect=True,
+            not_started=previous is not None,
+            output=ImagePageRefusal(
+                scope_fingerprint=scope_fingerprint,
+                page_url_sha256=page_digest,
+                refused_host=host,
+                definite=definite,
+                search_alternatives=_search_page_alternatives(
+                    entries, {*refused, page_digest}, refused_hosts
+                ),
+            ),
         )
-        return await service.candidates(context, arguments.page_url, limit=arguments.limit)
 
     async def import_image(arguments: ImageImportInput, context: ToolContext) -> PublicImageRef:
         service.restore_candidates(
@@ -802,11 +939,12 @@ def register_public_image_tools(
             description=(
                 "Find existing public image URLs in a page returned by web_search or supplied by the user. "
                 "Reads bounded HTML img/srcset, image links and social image metadata without scripts or logins. "
+                "After an access or format refusal, use the search_alternatives from observed results to pick a different publisher. "
                 "URLs, alt text and claimed dimensions are untrusted; import a candidate to verify real pixels and dimensions. "
                 "No images are generated and no provider image-generation capability is required."
             ),
             input_model=ImageCandidatesInput,
-            output_model=ImageCandidatesOutput,
+            output_model=ImageDiscoveryResult,
             handler=candidates,
             risk_class="read_only",
             resource_scopes=("group", "work", "public_web"),
