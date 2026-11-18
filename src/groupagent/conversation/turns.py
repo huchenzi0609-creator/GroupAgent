@@ -20,7 +20,7 @@ from pydantic_core import PydanticCustomError
 from groupagent.domain import GroupEvent
 from groupagent.identity import BotIdentity, trusted_name_source
 
-from .actions import ACTION_ADAPTER
+from .actions import ACTION_ADAPTER, OutputFormat
 from .text import outside_quotes
 
 Recipient = Literal["agent", "other", "ambient"]
@@ -81,6 +81,23 @@ class HistoricalInputAuthority(TurnData):
         min_length=1,
         max_length=240,
         description="Exact current instruction explicitly asking to use an earlier attachment in addition to the current or directly quoted material, or null.",
+    )
+
+
+class FinalFormatEvidence(TurnData):
+    format: OutputFormat
+    authorization_excerpt: str = Field(
+        min_length=1,
+        max_length=240,
+        description="Exact authored instruction to deliver this format.",
+    )
+
+
+class DeclaredFinalFormats(TurnData):
+    formats: list[FinalFormatEvidence] | None = Field(
+        min_length=1,
+        max_length=8,
+        description="All explicitly requested final artifact formats, or null if the author leaves format choice open.",
     )
 
 

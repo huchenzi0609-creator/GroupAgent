@@ -39,6 +39,14 @@ def tool_receipt(request):
     return json.loads(next(row.content for row in reversed(request.messages) if row.role == "tool"))
 
 
+def reviewed_formats(excerpt, *formats):
+    return call(
+        "review_declared_final_formats",
+        "author-final-formats",
+        formats=[{"format": name, "authorization_excerpt": excerpt} for name in formats] or None,
+    )
+
+
 class ModelScript:
     def __init__(self, *steps):
         self.steps, self.requests = list(steps), []
@@ -451,12 +459,13 @@ async def test_shared_literal_outputs_enqueue_once_and_keep_per_format_requireme
                 {"format": "pdf"},
             ],
             expected_text=["仓号 EQ-73"],
-        )
+        ),
+        reviewed_formats("生成 Word 和 PDF", "docx", "pdf"),
     )
     env.models[event.id] = model
     result = await env.coordinator.process(event)
     assert result.work_id and result.delivery_id
-    assert len(model.requests) == 1
+    assert len(model.requests) == 2
     with env.store.transaction(env.actor) as tx:
         assert len(tx.list_work()) == len(tx.list_delivery()) == 1
         work = tx.get_work(result.work_id)
@@ -464,6 +473,150 @@ async def test_shared_literal_outputs_enqueue_once_and_keep_per_format_requireme
             "docx": ["明日交接", "仓号 EQ-73"],
             "pdf": ["仓号 EQ-73"],
         }
+
+
+@pytest.mark.postgres
+async def test_authored_final_formats_exclude_the_source_format_and_survive_refinement(
+    conversation_env,
+):
+    env = conversation_env
+    scope_excerpt = "最终交付 Word、PDF 和 PPT"
+    event = source(
+        env,
+        f"Pot，用我之前发的 Markdown 提纲，{scope_excerpt}。PDF 要一页，Word 标题写夏日盘点。",
+    )
+
+    def review(request):
+        assert len(request.messages) == 2
+        assert json.loads(request.messages[1].content) == {"current_utterance": event.text}
+        assert [tool["function"]["name"] for tool in request.tools] == [
+            "review_declared_final_formats"
+        ]
+        return call(
+            "review_declared_final_formats",
+            "review",
+            formats=[
+                *(
+                    {"format": name, "authorization_excerpt": scope_excerpt}
+                    for name in ("docx", "pdf", "pptx")
+                ),
+                {"format": "md", "authorization_excerpt": "另交一份 Markdown 文件"},
+            ],
+        )
+
+    def try_extra_format(request):
+        (effect,) = tool_receipt(request)["work_effects"]
+        with env.store.transaction(env.actor) as tx:
+            work = tx.get_work(effect["id"])
+        assert work.goal == event.text and work.acceptance_criteria == []
+        assert {row["format"] for row in work.scope["outputs"]} == {"docx", "pdf", "pptx"}
+        return call(
+            "update_work",
+            "extra-format",
+            target_work_id=work.id,
+            expected_revision=work.revision,
+            goal=event.text,
+            acceptance_criteria=["Deliver the original Markdown as one of the final files."],
+            outputs=[{"format": "md"}],
+            work_capabilities=["documents"],
+        )
+
+    def refine(request):
+        rejected = tool_receipt(request)
+        assert rejected["committed"] is False and rejected["code"] == "invalid_input"
+        with env.store.transaction(env.actor) as tx:
+            (work,) = tx.list_work()
+        assert work.goal_revision == 1
+        return call(
+            "update_work",
+            "repair",
+            target_work_id=work.id,
+            expected_revision=work.revision,
+            goal=event.text,
+            outputs=[{"format": "docx", "expected_text": ["夏日盘点"]}],
+            work_capabilities=["documents"],
+        )
+
+    def close(request):
+        receipt = tool_receipt(request)
+        assert receipt["committed"] is True, receipt
+        return finish(reports=[("repair", "committed")])
+
+    model = ModelScript(
+        call(
+            "start_work",
+            "initial",
+            admission_ack="immediate",
+            goal="Return the Markdown source as a required file, and prepare a Word document and PDF.",
+            acceptance_criteria=["Deliver an extra Markdown export."],
+            outputs=[{"format": "md"}, {"format": "docx"}, {"format": "pdf", "exact_units": 1}],
+            work_capabilities=["documents"],
+        ),
+        review,
+        try_extra_format,
+        refine,
+        close,
+    )
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.work_id and result.delivery_id and len(model.requests) == 5
+    with env.store.transaction(env.actor) as tx:
+        work = tx.get_work(result.work_id)
+    assert work.goal_revision == 2 and work.goal == event.text
+    assert work.acceptance_criteria == []
+    assert work.scope["declared_final_formats"] == ["docx", "pdf", "pptx"]
+    assert work.scope["outputs"] == [
+        {"format": "docx", "expected_text": ["夏日盘点"]},
+        {"format": "pdf", "exact_units": 1, "expected_text": []},
+        {"format": "pptx", "expected_text": []},
+    ]
+    assert set(work.required_checks) == {"result", "artifact:docx", "artifact:pdf", "artifact:pptx"}
+
+    later = source(env, "Pot，改一下刚才交办的工作，改成交付 Markdown 一份。")
+    env.models[later.id] = ModelScript(
+        call(
+            "update_work",
+            "later-human-revision",
+            target_work_id=work.id,
+            expected_revision=work.revision,
+            goal=later.text,
+            outputs=[{"format": "md"}],
+            finish_on_commit=True,
+        )
+    )
+    revised = await env.coordinator.process(later)
+    assert revised.work_id == work.id
+    with env.store.transaction(env.actor) as tx:
+        work = tx.get_work(work.id)
+    assert work.goal_revision == 3
+    assert work.scope["outputs"] == [{"format": "md", "expected_text": []}]
+
+
+@pytest.mark.postgres
+async def test_delegated_output_format_preserves_proposed_multiformat_plan(conversation_env):
+    env = conversation_env
+    event = source(env, "Pot，整理这批实验记录，交付文件用你觉得合适的格式。")
+    outputs = [{"format": "pdf"}, {"format": "md"}]
+    model = ModelScript(
+        call(
+            "start_work",
+            "delegated-formats",
+            admission_ack="immediate",
+            goal="整理实验记录",
+            outputs=outputs,
+            work_capabilities=["documents"],
+            finish_on_commit=True,
+        ),
+        reviewed_formats(""),
+    )
+    env.models[event.id] = model
+    result = await env.coordinator.process(event)
+    assert result.work_id and result.delivery_id and len(model.requests) == 2
+    with env.store.transaction(env.actor) as tx:
+        work = tx.get_work(result.work_id)
+    assert [row["format"] for row in work.scope["outputs"]] == ["pdf", "md"]
+    assert "declared_final_formats" not in work.scope
+    assert work.goal == "整理实验记录"
 
 
 @pytest.mark.postgres
@@ -842,7 +995,7 @@ async def test_real_queued_ack_precedes_same_work_refinement_and_is_not_repeated
         admission_ack="immediate",
         goal=event.text,
         work_capabilities=["documents"],
-        outputs=[{"format": "docx"}, {"format": "pdf"}],
+        outputs=[{"format": "docx"}],
     )
     admission_ids = []
 
@@ -886,10 +1039,12 @@ async def test_real_queued_ack_precedes_same_work_refinement_and_is_not_repeated
         assert receipt["work_admission"]["delivery_id"] == admission_ids[0]
         return finish(finisher_text, reports=[("refined", "committed")])
 
-    model = ModelScript(initial, refine, close)
+    model = ModelScript(
+        initial, refine, reviewed_formats("生成 Word、PDF 和 PPT", "docx", "pdf", "pptx"), close
+    )
     env.models[event.id] = model
     result = await env.coordinator.process(event)
-    assert result.work_id and len(model.requests) == 3
+    assert result.work_id and len(model.requests) == 4
     with env.store.transaction(env.actor) as tx:
         work = tx.get_work(result.work_id)
         assert work.goal_revision == 2

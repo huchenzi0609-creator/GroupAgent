@@ -86,7 +86,7 @@ from .intent import (
     requests_speech_reply,
     task_write_request,
 )
-from .output_requirements import literal_output_requirements
+from .output_requirements import final_output_requirements, literal_output_requirements
 from .participation import (
     explicit_policy_intent,
     fast_observe,
@@ -1966,6 +1966,7 @@ class ConversationCoordinator(Coordinator):
                 "original_goal": event.text,
                 "attachment_scope_restricted": work.scope.get("attachment_scope_restricted")
                 is True,
+                "declared_final_formats": _strings(work.scope.get("declared_final_formats")),
                 "facts": facts,
                 "instruction": "用update_work提交同一工作的完整修正计划，包含work_capabilities、outputs与明确输入；不要另起工作。",
             }
@@ -2594,6 +2595,13 @@ class ConversationCoordinator(Coordinator):
             restrict_attachments = (
                 tool_call_id is not None and context.get("_anchor_only_work_call") == tool_call_id
             )
+            review = context.get("_declared_final_formats")
+            final_formats: list[str] = (
+                list(review[1])
+                if tool_call_id is not None and review and review[0] == tool_call_id
+                else []
+            )
+            prior_outputs: list[JsonValue] = []
             if repair_admission:
                 repair_target = tx.get_work(decision.target_work_id or "")
                 expected_goal_revision = context.get("_admission_repair_targets", {}).get(
@@ -2615,6 +2623,30 @@ class ConversationCoordinator(Coordinator):
                         "version_conflict",
                         "Admission repair cannot override another goal or manual control",
                     )
+                final_formats = (
+                    _strings(repair_target.scope.get("declared_final_formats")) or final_formats
+                )
+                stored_outputs = repair_target.scope.get("outputs")
+                if isinstance(stored_outputs, list):
+                    prior_outputs = stored_outputs
+            if final_formats:
+                bound_outputs, removed = final_output_requirements(
+                    decision.outputs, final_formats, prior_outputs
+                )
+                decision = decision.model_copy(
+                    update={
+                        "outputs": bound_outputs,
+                        **(
+                            {
+                                "goal": event.text if event.text.strip() else decision.goal,
+                                "acceptance_criteria": [],
+                            }
+                            if removed
+                            else {}
+                        ),
+                    }
+                )
+            if repair_admission:
                 if (
                     decision.goal != event.text
                     or not decision.work_capabilities
@@ -2963,6 +2995,11 @@ class ConversationCoordinator(Coordinator):
                                     item.model_dump(mode="json", exclude_none=True)
                                     for item in outputs
                                 ],
+                                **(
+                                    {"declared_final_formats": [name for name in final_formats]}
+                                    if final_formats
+                                    else {}
+                                ),
                                 "research_message_only": message_only,
                                 "planner_outputs": planner_outputs,
                                 "admission_path": "deterministic_current_request"
@@ -3143,6 +3180,13 @@ class ConversationCoordinator(Coordinator):
                             )
                             if restrict_attachments:
                                 corrected_scope["attachment_scope_restricted"] = True
+                            if final_formats:
+                                corrected_scope["declared_final_formats"] = [
+                                    name for name in final_formats
+                                ]
+                                corrected_scope["planner_outputs"] = [
+                                    row for row in changed_outputs
+                                ]
                             tx.conn.execute(
                                 "UPDATE ga_work_orders SET scope=%s WHERE group_id=%s AND id=%s",
                                 (Jsonb(corrected_scope), actor.group_id, work.id),

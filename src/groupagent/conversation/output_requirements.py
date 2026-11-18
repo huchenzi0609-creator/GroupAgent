@@ -1,10 +1,32 @@
 """Normalize literal output assertions at the work boundary."""
 
 import re
-from collections.abc import Mapping, Set
+from collections.abc import Mapping, Sequence, Set
 from typing import Any
 
 _NUMBER_LITERAL = re.compile(r"[+\-−]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+\-−]?\d+)?[%％]?")
+
+
+def final_output_requirements(
+    outputs: list[dict[str, Any]],
+    formats: Sequence[str],
+    previous_outputs: Sequence[Any] = (),
+) -> tuple[list[dict[str, Any]], bool]:
+    """Keep authored finals and their typed requirements, including previously bound constraints."""
+    selected = [row for row in outputs if row["format"] == "text" or row["format"] in formats]
+    removed = len(selected) != len(outputs)
+    included = {row["format"] for row in selected}
+    previous = {
+        row.get("format"): row
+        for row in previous_outputs
+        if isinstance(row, dict) and isinstance(row.get("format"), str)
+    }
+    selected.extend(
+        previous.get(format_name, {"format": format_name})
+        for format_name in formats
+        if format_name not in included
+    )
+    return selected, removed
 
 
 def _given_literal(text: str, literal: str) -> bool:

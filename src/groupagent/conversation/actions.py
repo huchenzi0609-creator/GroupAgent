@@ -196,8 +196,11 @@ def without_unpaged_unit_counts(output: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
+OutputFormat = Literal["text", "md", "docx", "pdf", "pptx", "png", "jpeg", "wav", "ogg"]
+
+
 class OutputRequirement(ActionData):
-    format: Literal["text", "md", "docx", "pdf", "pptx", "png", "jpeg", "wav", "ogg"]
+    format: OutputFormat
     exact_units: int | None = Field(
         default=None,
         ge=1,

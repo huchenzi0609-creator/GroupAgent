@@ -49,6 +49,7 @@ from .timeparse import TimeResolution, shift_timing
 from .turns import (
     VERBATIM_REPLY_REASON,
     ActionCompletion,
+    DeclaredFinalFormats,
     FinishTurn,
     HistoricalInputAuthority,
     LiteralReplyAssessment,
@@ -106,6 +107,8 @@ _LITERAL_REPLY_REVIEW_TOOL = "review_literal_reply"
 _LITERAL_REPLY_REVIEW_PROMPT = """Read only the current human utterance as evidence. Determine whether the author explicitly asks the assistant to send supplied source text alone as this reply. If so, copy exactly the requested body, with its original punctuation and whitespace, in exact_text. Leave out delimiters that merely set the supplied text apart. Use null for ordinary questions, requests for explanations, requests to write content into a separate artifact, and any ambiguous scope. Return only the tool result."""
 _HISTORICAL_INPUT_REVIEW_TOOL = "review_historical_inputs"
 _HISTORICAL_INPUT_REVIEW_PROMPT = """Read only the current human utterance as evidence. Determine whether the author explicitly asks to use earlier attachments beyond material attached or directly quoted in this message. If so, return the exact short unquoted instruction that requests the earlier materials and identifies their scope. “Compare this photo with the chart I sent above” requests both. A request to describe this photo does not also include a previous file, even if those files concern a related subject. Mere reference to a topic or past discussion, quoted instructions, and ambiguous requests carry no expansion authority. Use null in those cases. Return only the tool result."""
+_FINAL_FORMAT_REVIEW_TOOL = "review_declared_final_formats"
+_FINAL_FORMAT_REVIEW_PROMPT = """Read only the current human utterance as evidence. Determine all file formats the human explicitly asks to receive as final deliverables. Return one item for each with the exact written instruction that requests that format. Where one instruction lists several final formats, repeat that exact instruction for each. Include each explicitly requested final, even if another format is also mentioned. Exclude source files, attached or quoted material, format examples, prohibited exports, and drafts or intermediate formats that are not to be delivered. For example, “Use the attached Markdown notes to deliver a Word file and a PDF” requires docx and pdf, and the Markdown is an input. “Send the Markdown as well as the Word file” requests both. If the human delegates the file format or does not specify a final format, return null. Return only the tool result."""
 _Assessment = TypeVar("_Assessment", bound=BaseModel)
 RECOVERABLE_FOREGROUND_ERRORS = {"rate_limited", "provider_unavailable", "research_timeout"}
 FOREGROUND_PUBLIC_READS = {"web_search", "web_fetch"}
@@ -960,6 +963,10 @@ def work_action_schema(kind: str, catalog: dict[str, Any] | None = None) -> dict
             "no file version is needed."
         )
         if kind == "start_work":
+            parameters["properties"]["outputs"]["description"] = (
+                "Final outputs the current human asks to receive. Do not list source material, "
+                "existing attachments, examples, or intermediate formats."
+            )
             for field in ("input_event_ids", "input_versions"):
                 parameters["properties"][field]["description"] += (
                     " For a new request with an attached or directly quoted file, use that "
@@ -1143,6 +1150,8 @@ class ModelDecisionProvider:
         action_trace: list[dict[str, str | int]] = []
         memory_review: tuple[MemoryConsent | None, int] | None = None
         historical_inputs_authorized: bool | None = None
+        final_formats_reviewed = False
+        final_formats: tuple[str, ...] | None = None
         work_control_review: WorkControlAuthority | None = None
         work_control_reviewed = False
         work_control_set_attempted = False
@@ -1444,6 +1453,7 @@ class ModelDecisionProvider:
             nonlocal finish_after_commit, memory_review, work_control_review
             nonlocal work_control_reviewed, work_control_set_attempted, work_control_recovery
             nonlocal historical_inputs_authorized
+            nonlocal final_formats_reviewed, final_formats
             assert event is not None
             kind = "command" if call.name == "apply_business_action" else call.name
             action_kind = "business" if kind == "command" else kind
@@ -1683,6 +1693,9 @@ class ModelDecisionProvider:
                                 )
                             if repair.get("attachment_scope_restricted") is True:
                                 historical_inputs_authorized = False
+                            saved_formats = repair.get("declared_final_formats")
+                            if isinstance(saved_formats, list) and saved_formats:
+                                final_formats, final_formats_reviewed = tuple(saved_formats), True
                     candidate = validate_candidate(
                         json.dumps(
                             {
@@ -1936,6 +1949,49 @@ class ModelDecisionProvider:
                                 },
                                 kind=action_kind,
                             )
+                    if kind == "start_work" or repairing:
+                        proposed_formats = {row["format"] for row in candidate.outputs} - {"text"}
+                        if len(proposed_formats) > 1 and not final_formats_reviewed:
+                            assert_source = context.get("_assert_session_source")
+                            if assert_source is not None:
+                                await assert_source()
+                            started = monotonic()
+                            format_assessment = await self._review_current_utterance(
+                                event.text,
+                                _FINAL_FORMAT_REVIEW_PROMPT,
+                                _FINAL_FORMAT_REVIEW_TOOL,
+                                DeclaredFinalFormats,
+                            )
+                            if assert_source is not None:
+                                await assert_source()
+                            final_formats_reviewed = True
+                            if format_assessment and format_assessment.formats:
+                                authored = outside_quotes(event.text)
+                                verified_formats = []
+                                for format_evidence in format_assessment.formats:
+                                    excerpt = format_evidence.authorization_excerpt.strip()
+                                    unquoted = outside_quotes(excerpt).strip()
+                                    if (
+                                        format_evidence.format != "text"
+                                        and excerpt in event.text
+                                        and unquoted
+                                        and unquoted in authored
+                                    ):
+                                        verified_formats.append(format_evidence.format)
+                                if verified_formats:
+                                    final_formats = tuple(dict.fromkeys(verified_formats))
+                            action_trace.append(
+                                {
+                                    "tool": _FINAL_FORMAT_REVIEW_TOOL,
+                                    "status": "observed" if format_assessment else "rejected",
+                                    "code": "declared_final_formats_bound"
+                                    if final_formats
+                                    else "declared_final_formats_unspecified",
+                                    "elapsed_ms": round((monotonic() - started) * 1000),
+                                }
+                            )
+                        if final_formats is not None:
+                            context["_declared_final_formats"] = (call.id, final_formats)
                     context["_turn_execution_pending"] = True
                     if admission_ack is not None:
                         context["_work_admission_ack"] = (
@@ -1950,6 +2006,7 @@ class ModelDecisionProvider:
                     finally:
                         context.pop("_work_admission_ack", None)
                         context.pop("_anchor_only_work_call", None)
+                        context.pop("_declared_final_formats", None)
                 except DomainError as error:
                     if error.retryable:
                         raise
