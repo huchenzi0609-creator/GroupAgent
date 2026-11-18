@@ -1575,6 +1575,17 @@ class ModelDecisionProvider:
                         "silent",
                     ):
                         raise _InvalidCandidate("admission_ack", "unknown_admission_ack_mode")
+                    if (
+                        admission_ack == "deferred"
+                        and call.id == early_admission_call
+                        and any(
+                            row.get("kind") in FOREGROUND_PUBLIC_READS
+                            and row.get("code") == "foreground_research_deferred"
+                            for row in receipts.values()
+                        )
+                    ):
+                        # The inline lane yielded and the model delegated without a paired answer.
+                        admission_ack = "immediate"
                     if admission_ack in {"immediate", "silent"}:
                         # Standalone admission publishes only the committed host receipt.
                         if arguments.get("response") is None or isinstance(

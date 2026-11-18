@@ -10,7 +10,7 @@ from conversation.turn_model_fixture import finish_fixture_reply
 
 from groupagent.conversation.provider import ModelDecisionProvider
 from groupagent.coordinator import Decision
-from groupagent.domain import DeliveryState, WorkState
+from groupagent.domain import DeliveryState, DomainError, WorkState
 from groupagent.execution.kernel import KernelTool
 from groupagent.execution.models import ModelReply, ModelToolCall, TokenUsage
 
@@ -222,9 +222,11 @@ async def test_start_retires_only_old_ack_parts_that_were_never_submitted(runtim
         await app.close()
 
 
-@pytest.mark.parametrize("preliminary_search", [False, True])
+@pytest.mark.parametrize(
+    ("preliminary_search", "deferred_lookup"), [(False, False), (True, False), (True, True)]
+)
 async def test_real_admission_is_deliverable_while_foreground_still_waits(
-    runtime_env, preliminary_search
+    runtime_env, preliminary_search, deferred_lookup
 ):
     env = runtime_env
     app, _, _ = setup_chat(env)
@@ -239,6 +241,8 @@ async def test_real_admission_is_deliverable_while_foreground_still_waits(
 
     async def search_fixture(call):
         assert call.arguments == {"query": "杉径阅读器 官方安装说明"}
+        if deferred_lookup:
+            raise DomainError("foreground_research_deferred", "The inline lookup window ended.")
         return '{"status":"observed","evidence":{"sources":[]}}'
 
     if preliminary_search:
@@ -259,7 +263,11 @@ async def test_real_admission_is_deliverable_while_foreground_still_waits(
                 )
             elif self.calls == first_action_round:
                 if preliminary_search:
-                    assert json.loads(model_request.messages[-1].content)["status"] == "observed"
+                    lookup = json.loads(model_request.messages[-1].content)
+                    if deferred_lookup:
+                        assert lookup["code"] == "foreground_research_deferred"
+                    else:
+                        assert lookup["status"] == "observed"
                 action = ModelToolCall(
                     id="start",
                     name="start_work",
@@ -267,7 +275,7 @@ async def test_real_admission_is_deliverable_while_foreground_still_waits(
                         "goal": "核实杉径阅读器的官方安装说明"
                         if preliminary_search
                         else "Calculate the requested synthetic value",
-                        "admission_ack": "immediate",
+                        "admission_ack": "deferred" if deferred_lookup else "immediate",
                         "work_capabilities": ["public_research"]
                         if preliminary_search
                         else ["compute"],
