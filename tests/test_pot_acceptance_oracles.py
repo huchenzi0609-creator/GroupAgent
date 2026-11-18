@@ -722,3 +722,29 @@ def test_direct_read_substitutes_only_for_a_real_injected_search_failure(oracles
         [],
         {official},
     )["successful_search"]
+
+
+def test_exact_one_off_delivery_requires_native_identity_exact_body_and_no_memory(oracles):
+    from types import SimpleNamespace
+
+    body = "紫格七码"
+    wire = native_text("exact-native-message", "【Pot】" + body)
+    receipt = SimpleNamespace(state="accepted", platform_message_id="exact-native-message")
+    assert oracles.exact_one_off_delivery(wire, receipt, body, [])
+    for changed_text in ("记下了：" + body, "【Pot】" + body + "。", body, "【Pot】 " + body):
+        assert not oracles.exact_one_off_delivery(
+            native_text("exact-native-message", changed_text), receipt, body, []
+        )
+    assert not oracles.exact_one_off_delivery(wire, None, body, [])
+    assert not oracles.exact_one_off_delivery(
+        wire,
+        SimpleNamespace(state="accepted", platform_message_id="another-native-message"),
+        body,
+        [],
+    )
+    assert not oracles.exact_one_off_delivery(
+        wire, SimpleNamespace(state="unknown", platform_message_id="exact-native-message"), body, []
+    )
+    assert not oracles.exact_one_off_delivery(
+        wire, receipt, body, [{"fact_id": "retained", "revision": 1, "state": "superseded"}]
+    )

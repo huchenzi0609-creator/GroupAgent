@@ -28,7 +28,7 @@ from groupagent.artifacts.worker_operations import unpack_document
 from groupagent.billing import BudgetLedger, PriceSnapshot
 from groupagent.config import AppConfig, GroupConfig, RuntimeConfig, SpendConfig
 from groupagent.domain import DomainError, EventKind, WorkState
-from groupagent.execution import LangGraphEngine
+from groupagent.execution import LangGraphEngine, ScriptedFakeModel
 from groupagent.execution.models import (
     EngineCheckpoint,
     ModelReply,
@@ -757,6 +757,111 @@ async def test_worker_reuses_read_attachment_instead_of_waiting_for_another_uplo
         run.work, run.lease, setup.env.actor, result, run.workspace
     )
     assert "artifact:md" in validated.checks
+
+
+@pytest.mark.parametrize("outcome", ["answered", "private", "malformed", "timeout", "withdrawn"])
+async def test_request_input_requires_current_necessary_missing_evidence(toolkit_setup, outcome):
+    setup = toolkit_setup
+    page = "https://example.com/workshop-program"
+    instructions = (
+        "Prepare a public workshop brief. Link to the program's official page for registration."
+        if outcome != "private"
+        else "Reconcile the registrations, using my private payment ledger as the authority."
+    )
+    source(setup.env, "Unrelated neighboring discussion")
+    run = await prepare(setup, goal="Prepare the requested report", request_text=instructions)
+    fetched = await call(run, "web_fetch", {"url": page})
+    assert fetched.success
+    usage = TokenUsage(input_tokens=20, output_tokens=10)
+
+    class InputReviewer:
+        name = "fixture-input-necessity-check"
+        requests = []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            assert not request.tools
+            assert request.max_output_tokens == run.prepared.request.budget.max_output_tokens
+            payload = json.loads(request.messages[-1].content)
+            provided = payload["human_requirements"]["requests"]
+            assert [item["source_event_id"] for item in provided] == [run.event.id]
+            assert provided[0]["text"] == instructions
+            assert "Unrelated neighboring discussion" not in request.messages[-1].content
+            assert payload["ready_input_files"] == []
+            assert "web_fetch" in payload["authorized_tools"]
+            assert page in payload["recent_successful_tools"][0]["output"]
+            assert payload["proposed_request"]["missing"] == missing
+            if outcome == "timeout":
+                raise TimeoutError()
+            if outcome == "withdrawn":
+                setup.toolkit.memory.forget(setup.env.actor, event_ids=[run.event.id])
+            verdict = {"needs_requester": outcome in {"private", "withdrawn"}}
+            if outcome == "malformed":
+                verdict["needs_requester"] = "true"
+            verdict["reason"] = (
+                "The private ledger has not been received."
+                if outcome in {"private", "withdrawn"}
+                else "Use the official program page already confirmed by web_fetch."
+            )
+            return ModelReply(text=json.dumps(verdict), usage=usage)
+
+    reviewer = InputReviewer()
+    setup.toolkit.model = reviewer
+    missing = (
+        [{"kind": "attachment", "reference": "payment-ledger.xlsx"}]
+        if outcome == "private"
+        else [{"kind": "information", "field": "registration link type"}]
+    )
+    worker = ScriptedFakeModel(
+        [
+            ModelReply(
+                tool_calls=(
+                    ModelToolCall(
+                        id="typed-input-proposal",
+                        name="request_input",
+                        arguments={
+                            "question": "Please confirm the required input.",
+                            "missing": missing,
+                        },
+                    ),
+                ),
+                finish_reason="tool_calls",
+                usage=usage,
+            ),
+            ModelReply(
+                text="Prepared the workshop brief with the official registration link.", usage=usage
+            ),
+        ]
+    )
+    engine = LangGraphEngine(worker, run.gateway)
+    result = await engine.wait(await engine.start(run.prepared.request))
+    assert len(reviewer.requests) == 1
+    checked = next(item for item in result.receipts if item.tool_name == "request_input")
+    if outcome == "private":
+        assert checked.control and result.state == RunState.WAITING_INPUT
+        assert result.checkpoint.input_request.required_inputs == ("payment-ledger.xlsx",)
+        assert len(worker.requests) == 1
+    elif outcome == "withdrawn":
+        assert checked.control is None and result.checkpoint.input_request is None
+        assert checked.error_code in {"stale_lease", "source_unavailable"}
+        assert failure_disposition(checked) == ToolFailureDisposition.FENCE
+        assert len(worker.requests) == 1
+    else:
+        assert checked.control is None and result.checkpoint.input_request is None
+        assert result.state == RunState.CANDIDATE and len(worker.requests) == 2
+        assert failure_disposition(checked) == ToolFailureDisposition.REPAIR
+        if outcome == "answered":
+            assert checked.error_code == "input_not_required"
+            assert "official program page" in worker.requests[1].messages[-1].content
+        else:
+            assert checked.error_code == "input_check_unavailable"
+    with setup.env.store.connect() as conn:
+        charge = conn.execute(
+            "SELECT state FROM ga_budget_reservations WHERE group_id=%s AND work_id=%s "
+            "AND operation='text'",
+            (setup.env.actor.group_id, run.work.id),
+        ).fetchone()
+    assert charge["state"] == ("unknown" if outcome == "timeout" else "settled")
 
 
 @pytest.mark.parametrize("phase", ["lookup_timeout", "after_scope_commit"])

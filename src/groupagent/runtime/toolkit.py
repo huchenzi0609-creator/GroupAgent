@@ -93,6 +93,7 @@ from groupagent.tools import (
     register_workspace_tools,
 )
 from groupagent.tools.compute import register_compute_tools
+from groupagent.tools.control import WorkInputRequest
 from groupagent.tools.models import (
     ToolFailure,
     ToolFailureDisposition,
@@ -104,6 +105,7 @@ from groupagent.tools.paths import open_parent
 from .artifact_tools import register_export_tool
 from .artifacts import ArtifactRegistry
 from .contracts import DeliveryDraft, PreparedExecution, ValidatedCandidate
+from .input_review import input_need_request, parse_input_need
 from .inputs import InputProcessor
 from .resource_profile import worker_limits, worker_tool_names
 from .review import (
@@ -831,7 +833,79 @@ class WorkToolkit:
 
         gateway = RecordingGateway(policy, self.registry, self.artifacts, actor, lease)
         input_refs: list[dict[str, Any]] = []
-        register_request_input_tool(gateway, prepared_files=lambda: input_refs)
+
+        def current_human_requirements() -> dict[str, Any]:
+            self._sources(actor, work, lease)
+            with self.store.transaction(actor) as tx:
+                memory_lock(tx)
+                tx.assert_lease(lease)
+                source = tx.get_event(work.request_event_id)
+                return _human_requirements(tx, work, _output_requirements(work, source))
+
+        async def review_missing(proposed: WorkInputRequest, context: ToolContext) -> None:
+            requirements = current_human_requirements()
+            review = MeteredModel(
+                self.model,
+                self.ledger,
+                actor,
+                price_id=self.config.spend.pricing_snapshot_id or "deepseek-20261114-text",
+                work_id=work.id,
+            )
+            proposal = input_need_request(
+                proposed,
+                human_requirements=requirements,
+                authorized_goal=work.goal,
+                prepared_files=input_refs,
+                allowed_tools=context.scope.allowed_tools,
+                receipts=(entry.receipt for entry in gateway.export_ledger(context.scope)),
+                max_output_tokens=request.budget.max_output_tokens,
+            )
+            try:
+                async with asyncio.timeout(request.budget.model_timeout_seconds):
+                    verdict = parse_input_need(await review.complete(proposal))
+            except DomainError as exc:
+                if exc.code in {
+                    "auth_required",
+                    "permission_denied",
+                    "policy_changed",
+                    "source_unavailable",
+                    "stale_lease",
+                }:
+                    raise
+                verdict = None
+            except TimeoutError:
+                verdict = None
+            if current_human_requirements() != requirements:
+                raise DomainError("source_unavailable", "Human instructions changed during review")
+            if verdict is None:
+                raise ToolFailure(
+                    "input_check_unavailable",
+                    "This question could not be verified. Continue using current authorized "
+                    "evidence, or narrow the question to a demonstrably missing prerequisite.",
+                    no_effect=True,
+                    origin=ToolFailureOrigin.PRECONDITION,
+                    disposition=ToolFailureDisposition.REPAIR,
+                )
+            if not verdict.needs_requester:
+                reason = (
+                    ""
+                    if _unindexed_human_history(work)
+                    else " " + visible_text(redact_credentials(verdict.reason))
+                )
+                raise ToolFailure(
+                    "input_not_required",
+                    "Continue with the authorized requirements and available evidence." + reason,
+                    no_effect=True,
+                    origin=ToolFailureOrigin.PRECONDITION,
+                    disposition=ToolFailureDisposition.REPAIR,
+                )
+
+        register_request_input_tool(
+            gateway,
+            prepared_files=lambda: input_refs,
+            review_missing=review_missing,
+            timeout_seconds=self.config.execution.tool_timeout_seconds,
+        )
         register_workspace_tools(gateway)
         if allows_silent_result(work.scope):
 

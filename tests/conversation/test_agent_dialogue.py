@@ -83,8 +83,9 @@ class ScriptedModel:
             "apply_business_action",
             "read_group_context",
             "finish_turn",
+            "review_memory_consent",
         }
-        assert "read_work_facts" in available
+        assert "read_work_facts" in available or available == {"review_memory_consent"}
         assert "Decision schema:" not in request.messages[0].content
         step = self.steps.pop(0)
         if isinstance(step, BaseException):
@@ -534,6 +535,7 @@ async def test_forget_inside_open_turn_drops_pre_forget_receipts_and_old_model_t
     env.models[request.id] = ScriptedModel(
         first,
         after_create,
+        call("review_memory_consent", {"authorized": True}, "erase-consent"),
         after_forget,
         required_actions=[{"kind": "start_work"}, {"kind": "business", "operation": "forget"}],
     )

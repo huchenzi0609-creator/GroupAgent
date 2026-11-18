@@ -43,6 +43,7 @@ from groupagent.execution import (
 )
 from groupagent.execution.engine import REPLY_ONLY_VALIDATION_KEY, SYSTEM_PROMPT
 from groupagent.execution.models import EngineEvent, PendingInput, ProgressPayload, UsageTotals
+from groupagent.memory.common import memory_lock
 from groupagent.persistence import PostgresStore
 from groupagent.resources import ResourceDeferred
 from groupagent.sandbox import DockerSandbox
@@ -1808,6 +1809,8 @@ class WorkSupervisor:
                         )
                     return self._get(actor, work.id)
                 with self.store.transaction(actor) as tx:
+                    if snapshot.state == RunState.WAITING_INPUT:
+                        memory_lock(tx)
                     current = tx.get_work(work.id)
                     tx.assert_lease(lease)
                     state = {
@@ -1829,6 +1832,7 @@ class WorkSupervisor:
                         state == WorkState.WAITING_INPUT
                         and snapshot.checkpoint.input_request is not None
                     ):
+                        tx._check_work_source(tx._work_row(work.id, lock=False))
                         question = snapshot.checkpoint.input_request.model_dump(mode="json")
                         question["question"] = visible_text(question["question"])
                         question["required_inputs"] = [

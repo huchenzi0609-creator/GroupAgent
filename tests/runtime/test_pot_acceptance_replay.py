@@ -287,3 +287,49 @@ def test_foreground_driver_distinguishes_pending_retry_from_final_observe(runtim
             (env.actor.group_id, event.id),
         )
     assert driver.foreground_status(event.id) == {"state": "decided"}
+
+
+def test_one_off_memory_witness_retains_superseded_source_revision(runtime_env, monkeypatch):
+    import importlib
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from groupagent.memory import MemoryService
+
+    env = runtime_env
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+    evaluator = importlib.import_module("pot_blind_acceptance")
+    scenario = SimpleNamespace(
+        store=env.store, app=SimpleNamespace(owner=env.actor), group=env.actor.group_id
+    )
+    replay = Replay(env)
+    initial = replay.source("合成初次请求")
+    changed = replay.source("合成更正")
+    unrelated = replay.source("另一条合成请求")
+    memory = MemoryService(env.store)
+    assert not evaluator.versioned_memory_from_event(scenario, initial.id)
+    fact = memory.record_fact(
+        env.actor, "fixture_entry", "value-1", source_event_ids=[initial.id], explicit=True
+    )
+    memory.record_fact(
+        env.actor, "unrelated_entry", "value-2", source_event_ids=[unrelated.id], explicit=True
+    )
+    revised = memory.correct_fact(
+        env.actor,
+        fact.id,
+        "changed",
+        expected_revision=fact.revision,
+        source_event_ids=[changed.id],
+        explicit=True,
+    )
+    witnesses = evaluator.versioned_memory_from_event(scenario, initial.id)
+    assert {row["fact_id"] for row in witnesses} == {fact.id}
+    assert {
+        "binding": "revision",
+        "fact_id": fact.id,
+        "revision": 1,
+        "state": "superseded",
+    } in witnesses
+    assert {
+        row["revision"] for row in evaluator.versioned_memory_from_event(scenario, changed.id)
+    } == {revised.revision}

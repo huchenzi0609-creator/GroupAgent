@@ -730,8 +730,34 @@ async def chat02(s):
     )
 
 
+def versioned_memory_from_event(s, event_id):
+    with s.store.transaction(s.app.owner) as tx:
+        return tx.conn.execute(
+            "SELECT 'revision' AS binding, fact_id, revision, state FROM ga_fact_revisions "
+            "WHERE group_id=%s AND source_event_ids ? %s "
+            "UNION ALL "
+            "SELECT 'current' AS binding, f.id, f.revision, f.state FROM ga_memory_facts f "
+            "WHERE f.group_id=%s AND (f.source_event_ids ? %s OR EXISTS ("
+            "SELECT 1 FROM ga_fact_sources a "
+            "WHERE a.group_id=f.group_id AND a.fact_id=f.id AND a.event_id=%s)) "
+            "ORDER BY fact_id, revision, binding",
+            (s.group, event_id, s.group, event_id, event_id),
+        ).fetchall()
+
+
+def exact_one_off_delivery(wire, receipt, expected_body, memory_witnesses):
+    return (
+        receipt is not None
+        and receipt.state == wire["receipt"]["state"] == "accepted"
+        and receipt.platform_message_id == wire["receipt"]["platform_message_id"]
+        and spool_text(wire) == "【Pot】" + expected_body
+        and not memory_witnesses
+    )
+
+
 async def chat03(s):
     first = await s.event("first", dispatch=False)
+    before_restart_facts = versioned_memory_from_event(s, first["event_id"])
     fault = await s.fault_dispatch()
     after_submit = s.spool()
     await s.close()
@@ -763,13 +789,19 @@ async def chat03(s):
         {"injected_after_submit": fault, "spool": after_restart},
     )
     receipt = await s.app.channel.lookup_delivery(s.group, wire["receipt"]["idempotency_key"])
+    persisted_facts = versioned_memory_from_event(s, first["event_id"])
     s.check(
         "exact_delivery_receipt",
-        receipt is not None
-        and receipt.state == "accepted"
-        and receipt.platform_message_id == native_id
-        and s.spec["patterns"][0] in spool_text(wire),
-        {"wire": wire, "lookup": receipt.model_dump(mode="json") if receipt else None},
+        exact_one_off_delivery(
+            wire, receipt, s.spec["patterns"][0], [*before_restart_facts, *persisted_facts]
+        ),
+        {
+            "wire": wire,
+            "lookup": receipt.model_dump(mode="json") if receipt else None,
+            "source_event_id": first["event_id"],
+            "memory_before_restart": before_restart_facts,
+            "memory_after_restart_and_echo": persisted_facts,
+        },
     )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Annotated, Literal
 
 from pydantic import Field
@@ -55,6 +55,8 @@ def register_request_input_tool(
     gateway: ToolGateway,
     *,
     prepared_files: Callable[[], Sequence[Mapping[str, object]]] | None = None,
+    review_missing: Callable[[WorkInputRequest, ToolContext], Awaitable[None]] | None = None,
+    timeout_seconds: float = 5,
 ) -> None:
     async def request_input(
         value: InputRequest | WorkInputRequest, context: ToolContext
@@ -92,6 +94,8 @@ def register_request_input_tool(
                     disposition=ToolFailureDisposition.REPAIR,
                 )
             required.append(reference)
+        if review_missing is not None:
+            await review_missing(value, context)
         return InputRequest(question=value.question, required_inputs=tuple(required))
 
     gateway.register(
@@ -99,18 +103,22 @@ def register_request_input_tool(
             name="request_input",
             description=(
                 "Pause this work and ask its requester for specific missing information or "
-                "an attachment that is genuinely unavailable. Inspect ready input_files and "
-                "successful tool receipts first. Use only when the accepted objective cannot "
-                "proceed without the specified input."
+                "an attachment that only this requester can supply. Inspect the authoritative "
+                "human requirements, ready input_files and available tool receipts first. "
+                "Use only when their accepted objective cannot proceed without the specified "
+                "input. Continue from available evidence and reasonable implementation defaults "
+                "when a choice is already answered, optional or obtainable with authorized tools."
             ),
-            input_model=WorkInputRequest if prepared_files is not None else InputRequest,
+            input_model=WorkInputRequest
+            if prepared_files is not None or review_missing is not None
+            else InputRequest,
             output_model=InputRequest,
             handler=request_input,
             resource_scopes=("group", "work"),
             risk_class="read_only",
             idempotency_mode=IdempotencyMode.READ_ONLY,
             control_kind="request_input",
-            timeout_seconds=5,
+            timeout_seconds=timeout_seconds,
             max_input_bytes=12_000,
             max_output_bytes=12_000,
         )

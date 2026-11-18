@@ -633,7 +633,10 @@ async def test_immediate_admission_keeps_a_later_committed_action_receipt(conver
         return finish("我还安排了后台实算。")
 
     env.models[event.id] = ModelScript(
-        queued_compute(event, admission_ack="immediate"), additional, close
+        queued_compute(event, admission_ack="immediate"),
+        additional,
+        call("review_memory_consent", "verdict", authorized=True),
+        close,
     )
     result = await env.coordinator.process(event)
     assert result.work_id and result.decision.response == acknowledgements[0]

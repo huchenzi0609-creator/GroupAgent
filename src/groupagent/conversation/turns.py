@@ -50,6 +50,10 @@ class ActionCompletion(TurnData):
     )
 
 
+class MemoryConsent(TurnData):
+    authorized: StrictBool
+
+
 class FinishTurn(TurnData):
     disposition: Literal["reply", "observe", "proactive"]
     open_request: StrictBool = Field(
