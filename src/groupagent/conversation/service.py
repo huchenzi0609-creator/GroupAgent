@@ -90,6 +90,7 @@ from .policy import (
     ingress_admission,
     interpret_policy,
     recipient_evidence_in_tx,
+    retire_delivery_in_tx,
 )
 from .references import authored_identifier, resolve_work_selection
 from .turns import TurnContract
@@ -158,10 +159,65 @@ def _work_admission_text(
     return "这项工作已排队；有结果或需要补充资料时我会回复。"
 
 
-def _early_admission_text(goal: str, plan: str) -> str:
-    subject = " ".join(visible_text(redact_credentials(goal)).split())
-    label = subject[:72].rstrip() + ("…" if len(subject) > 72 else "")
-    return f"这项工作已排队。目标是「{label}」。" + plan.removeprefix("这项工作已排队；")
+def _work_receipt_text(work: WorkOrder, plan: str = "") -> str:
+    subject = " ".join(visible_text(redact_credentials(work.goal)).split())
+    label = subject[:56].rstrip() + ("…" if len(subject) > 56 else "")
+    status = "已排队" if work.state == WorkState.QUEUED else "已登记"
+    return f"这项工作{status}。目标是「{label}」。" + plan.removeprefix("这项工作已排队；")
+
+
+def _committed_work_plan(tx: UnitOfWork, work: WorkOrder) -> str:
+    if work.state != WorkState.QUEUED:
+        return ""
+    outputs = work.scope.get("outputs")
+    formats = (
+        [
+            name
+            for row in outputs
+            if isinstance(row, dict) and isinstance(name := row.get("format"), str)
+        ]
+        if isinstance(outputs, list)
+        else []
+    )
+    return _work_admission_text(
+        _strings(work.scope.get("required_tools")),
+        formats,
+        research_required=work.scope.get("research_required") is True,
+        image_inputs=any(
+            tx.get_event(identifier).kind == EventKind.IMAGE
+            for identifier in _strings(work.scope.get("attachment_event_ids"))
+        ),
+    )
+
+
+def _retire_superseded_admission(
+    tx: UnitOfWork, work: WorkOrder, admission: dict[str, Any]
+) -> bool:
+    """Withdraw only an obsolete receipt with no native attempt."""
+    if (
+        admission.get("work_id") != work.id
+        or not admission.get("delivery_id")
+        or admission.get("text") == _work_receipt_text(work)
+    ):
+        return False
+    intent = tx.conn.execute(
+        "SELECT d.id FROM ga_deliveries d WHERE d.group_id=%s AND d.id=%s AND d.request_event_id=%s "
+        "AND d.created_by=%s AND d.idempotency_key='early_ack:'||d.request_event_id||':1' "
+        "AND d.payload_ref=%s AND d.state='pending' AND d.platform_message_id IS NULL "
+        "AND d.platform_job_id IS NULL AND NOT EXISTS (SELECT 1 FROM ga_delivery_parts p "
+        "WHERE p.group_id=d.group_id AND p.intent_id=d.id AND p.state<>'pending') FOR UPDATE",
+        (
+            tx.group_id,
+            admission["delivery_id"],
+            work.request_event_id,
+            work.requester_id,
+            "text:" + admission["text"],
+        ),
+    ).fetchone()
+    if intent is None:
+        return False
+    retire_delivery_in_tx(tx, intent["id"], reason="superseded_admission_before_dispatch")
+    return True
 
 
 def _admission_for_receipt(body: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any] | None:
@@ -1708,6 +1764,7 @@ class ConversationCoordinator(Coordinator):
                 "code": result.decision.reason_code if not accepted else None,
                 "host_message": result.decision.response,
                 "work_admission": _admission_for_receipt(prior, recorded),
+                "work_plan_text": recorded.get("work_plan_text"),
                 "result": self._model_aliases(result.model_dump(mode="json"), context),
             }
 
@@ -1838,12 +1895,23 @@ class ConversationCoordinator(Coordinator):
             else:
                 text = decision.response if decision is not None else None
                 if text is None:
-                    acknowledgements = [
-                        receipt.get("result", {}).get("decision", {}).get("response")
-                        for receipt in body.get("action_receipts", [])
-                        if _admission_for_receipt(body, receipt) is None
-                    ]
-                    text = "\n".join(dict.fromkeys(value for value in acknowledgements if value))
+                    acknowledgements = []
+                    repaired: set[str] = set()
+                    for receipt in reversed(body.get("action_receipts", [])):
+                        actual = receipt.get("result", {})
+                        work_id = actual.get("work_id")
+                        if work_id in repaired and (
+                            receipt.get("kind") == "start_work"
+                            or receipt.get("satisfies_kind") == "start_work"
+                        ):
+                            continue
+                        if receipt.get("satisfies_kind") == "start_work" and work_id:
+                            repaired.add(work_id)
+                        if _admission_for_receipt(body, receipt) is None:
+                            acknowledgements.append(actual.get("decision", {}).get("response"))
+                    text = "\n".join(
+                        dict.fromkeys(value for value in reversed(acknowledgements) if value)
+                    )
                     if not text and admission_id:
                         text = admission_text
                 template = (
@@ -2180,6 +2248,7 @@ class ConversationCoordinator(Coordinator):
                         "work_effects": receipt.get("work_effects", []),
                         "satisfies_kind": receipt.get("satisfies_kind"),
                         "work_admission": _admission_for_receipt(previous, receipt),
+                        "work_plan_text": receipt.get("work_plan_text"),
                         "committed": bool(
                             receipt.get("result", {}).get("work_id")
                             or receipt.get("result", {}).get("action_result") is not None
@@ -2441,6 +2510,7 @@ class ConversationCoordinator(Coordinator):
                 decision = Decision(kind="ignore", reason_code="verified_bot_receipt")
             decision = self._gate(tx, event, decision, context)
             work_id = delivery_id = None
+            work_plan_text = ""
             controlled_work_ids: list[str] = []
             action_result = None
             if (
@@ -2733,18 +2803,9 @@ class ConversationCoordinator(Coordinator):
                             ],
                         )
                         work_id = work.id
+                        work_plan_text = _committed_work_plan(tx, work)
                         decision = decision.model_copy(
-                            update={
-                                "response": _work_admission_text(
-                                    required_tools,
-                                    [item.format for item in outputs],
-                                    research_required=research_required,
-                                    image_inputs=any(
-                                        tx.get_event(identifier).kind == EventKind.IMAGE
-                                        for identifier in attachment_ids
-                                    ),
-                                )
-                            }
+                            update={"response": _work_receipt_text(work, work_plan_text)}
                         )
                     elif decision.kind == "update_work":
                         decision, attachment_ids = self._canonical_inputs(
@@ -2909,9 +2970,12 @@ class ConversationCoordinator(Coordinator):
                                 expected_revision=work.revision,
                                 reason="input_received",
                             )
-                        decision = decision.model_copy(
-                            update={"response": "已更新同一项工作的要求，旧结果不会覆盖新目标。"}
-                        )
+                        if repair_admission:
+                            work_plan_text = _committed_work_plan(tx, work)
+                            response = _work_receipt_text(work, work_plan_text)
+                        else:
+                            response = "已更新同一项工作的要求，旧结果不会覆盖新目标。"
+                        decision = decision.model_copy(update={"response": response})
                     elif decision.kind == "query_work":
                         # Compatibility for persisted/scripted Decision callers.
                         # The live agent reads via read_work_facts and supplies
@@ -3087,6 +3151,13 @@ class ConversationCoordinator(Coordinator):
                     ),
                 )
             work_admission = previous.get("work_admission") if previous else None
+            if (
+                repair_admission
+                and work_id
+                and isinstance(work_admission, dict)
+                and _retire_superseded_admission(tx, work, work_admission)
+            ):
+                work_admission = None
             acknowledgement = context.get("_work_admission_ack")
             if (
                 tool_call_id is not None
@@ -3098,7 +3169,7 @@ class ConversationCoordinator(Coordinator):
                 if acknowledgement[1] == "silent":
                     work_admission = {"work_id": work_id, "silent": True}
                 elif decision.response:
-                    text = _early_admission_text(work.goal, decision.response)
+                    text = _work_receipt_text(work)
                     ack_delivery = tx.enqueue_work_admission(work_id, text)
                     if ack_delivery is not None:
                         delivery_id = ack_delivery.id
@@ -3199,6 +3270,7 @@ class ConversationCoordinator(Coordinator):
                         "kind": receipt_kind,
                         "operation": receipt_operation,
                         "candidate_sha256": candidate_digest,
+                        **({"work_plan_text": work_plan_text} if work_plan_text else {}),
                         "satisfies_kind": "start_work"
                         if decision.reason_code == "repair_current_turn_admission"
                         else None,

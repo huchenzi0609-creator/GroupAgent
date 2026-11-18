@@ -54,7 +54,7 @@ SYSTEM = """你是群内协作伙伴，结合当前事件和观察自主选择�
 
 ACTION_GUIDANCE = """单个简短公开事实可先用获准的web_search、web_fetch快速查证，再直接回答。搜索摘要不能当成已阅读网页。需要交付产物、多步核查，或快速查证未取得足够证据时，用start_work委托完整目标。委托与前台公开查询分开调用；已经决定委托的调研无需在提交前重复查找。读取附件、运行计算、制作或修改产物直接用start_work；修订既有目标用update_work并定位同一个工作，控制用control_work。人类分工tasks、机器人works、提醒schedules不能混用。即时人类任务、记忆、提醒、偏好写入用apply_business_action；清楚的本人承诺或获授权分工应实际登记为人类任务，尚在讨论的草案只观察。本人认领claim_task，本人进展update_task，owner分工assign_task，群级策略仅owner。查到当前群昵称可直接回答。只有owner明确要求为缺少群昵称的在群成员登记姓名例外时才用confirm_name。成员事实中的request_reference对应真人在本条消息给出的编号，使用其成员别名和当前版本。只需此轮保持安静用observe。要求接下来保持静默时提交quiet以保存实际范围和状态，同时结束可见回复。静默与暂停工作分开。
 同一条真人请求的运行工作使用一个完整目标，可另行登记同时交办的提醒和分工。到点只需发送提醒或通知时，现在写好prepared_message，一次和周期提醒都用这条路径。要求逐字时用explicit_reminder。到点还需查资料、运算、判断或执行步骤时用goal。只改时间不填新goal或prepared_message。只用fact_source_ids引用定时内容确实所需的当前授权材料。
-时间以context.clock和真实规则为准。相对本条消息用after及原句的amount和unit，保留原数值与单位，明确的日历时刻用wall，指定地区采用其IANA time_zone。周期只改钟点用clock，整体移动用shift，改周期用daily/weekly/every且周一为0。多个时刻仍待选择或遇到缺失时刻，就问具体选项。夏令时重复而真人已选择时，fold_evidence引用本条明确选择的原话。主机计算生效时刻。核对本地时刻用read_group_context的clock和wall_time。若返回requires_author_choice，说明真实候选并请真人选择。此选择不交给搜索或后台工作猜。查询已设提醒只读schedules的规则和送达事实，平台接受数和时刻在latest_occurrence_status。新建、修改、取消需在request_evidence引用当前真人要求这项操作的原话。
+主机计算生效时刻。相对本条消息用after及原句的amount和unit，日历时刻用wall，指定地区采用其IANA time_zone。周期只改钟点用clock，整体移动用shift，改周期用daily/weekly/every且周一为0。核对本地时刻用read_group_context的clock和wall_time。时刻尚待真人选择时，说明候选并请对方选择。查询已设提醒读取schedules规则和latest_occurrence_status送达事实。新建、修改、取消需在request_evidence引用当前真人要求这项操作的原话。
 输出格式、页数、图片数量和逐字内容只取真人要求。真人明确要求用特定程序或手段取得结果时，在required_work_tools填实际工具（如明确用Python计算填python_compute，明确实际运行Shell填process_run，明确实际搜索填web_search）；代码示例不要求运行。exact_units精确、min_units下限、max_units上限；expected_text只含逐字内容或独立单元格，关系/禁止事项放acceptance_criteria。public_image_count须有真人来源。input_event_ids只填目标实际需要的已授权附件消息，input_versions只填需要处理的确切文件版本。纯文本、普通引用和公开查询线索写进goal，附件字段没有输入时留空。只填本次动作有关字段，null可能清空。
 被拒动作没有执行，结合具体host_message修正或说明阻碍；不要重提已成功提交的同一动作。不要求原已授权低风险操作再次批准。"""
 
@@ -1717,7 +1717,12 @@ class ModelDecisionProvider:
                     for row in receipts.values()
                     if row.get("work_admission") and (text := receipt_message(row))
                 ]
-                for message in [*messages, *repeated, admission_text]:
+                plans = [
+                    plan
+                    for row in receipts.values()
+                    if row.get("committed") and isinstance(plan := row.get("work_plan_text"), str)
+                ]
+                for message in [*messages, *repeated, *plans, admission_text]:
                     if message:
                         response = response.replace(message, "")
                 response = response.strip()
@@ -1932,7 +1937,7 @@ class ModelDecisionProvider:
             tools.append(
                 KernelTool(
                     name="read_group_context",
-                    description="Use current facts when they answer the request. Otherwise load authorized group references. Clock gives group-local time and the immutable event anchor. With wall_time, clock also returns the precise UTC candidates and local offsets for a named calendar time, including DST gaps and repeats. This is a read with no scheduling effect. Members returns nicknames, aliases and revisions. Set refresh=true for fresh channel member data. Optional term narrows memory. Foreground archive discovery yields after its short window or repeated results without new evidence.",
+                    description="Use current facts when they answer the request. Otherwise load authorized group references. Clock gives group-local time and the immutable event anchor. With wall_time, it previews a named calendar time in the selected zone without scheduling. Members returns nicknames, aliases and revisions. Set refresh=true for fresh channel member data. Optional term narrows memory. Foreground archive discovery yields after its short window or repeated results without new evidence.",
                     parameters={
                         "type": "object",
                         "additionalProperties": False,

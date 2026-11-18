@@ -464,6 +464,44 @@ async def test_validation_resource_deferral_reuses_candidate_without_new_model(e
         await restarted.close()
 
 
+async def test_validation_worker_dependency_retry_keeps_the_exact_candidate(env, resource_clock):
+    work = new_work(env)
+
+    class OldWorkerOnce(Validator):
+        async def validate(self, *args):
+            if self.calls == 0:
+                self.calls += 1
+                raise DomainError(
+                    "dependency_unavailable", "Synthetic stale worker", retryable=True
+                )
+            return await super().validate(*args)
+
+    first_factory, validator = Factory(), OldWorkerOnce()
+    first = supervisor(env, first_factory, validator)
+    try:
+        waiting = await first.run_once()
+        assert waiting.state == WorkState.QUEUED
+        assert waiting.scope[RECOVERY_SCOPE_KEY]["error_code"] == "dependency_unavailable"
+        checkpoint = env.state.load_checkpoint(env.actor, work.id)
+        assert checkpoint.state == RunState.CANDIDATE and checkpoint.safe_to_resume
+        assert checkpoint.candidate_text and not deliveries(env, work.id)
+    finally:
+        await first.close()
+
+    factory = Factory()
+    restarted = supervisor(env, factory, validator)
+    try:
+        advance_resources(resource_clock)
+        assert (await restarted.run_once()).state == WorkState.DELIVERING
+        assert not factory.models[0].requests and validator.calls == 2
+        after = env.state.load_checkpoint(env.actor, work.id)
+        assert after.usage.rounds == checkpoint.usage.rounds == 1
+        (sent,) = deliveries(env, work.id)
+        assert sent.payload_ref == "text:" + checkpoint.candidate_text
+    finally:
+        await restarted.close()
+
+
 @pytest.mark.parametrize(
     "backend", [{"sessions": {}, "version": "0.2.2rc2"}, {"execution_backend": "harness"}]
 )

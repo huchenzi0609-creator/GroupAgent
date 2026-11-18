@@ -264,6 +264,90 @@ async def test_invalid_paired_report_recovers_without_reexecuting_committed_writ
 
 
 @pytest.mark.postgres
+@pytest.mark.parametrize("mode", ["immediate", "deferred", "paired", "finish_on_commit"])
+async def test_canonical_research_receipt_names_the_committed_goal_on_every_path(
+    conversation_env, mode
+):
+    env = conversation_env
+    event = source(env, "Pot，请查证 Lumen Reader 的公开资料。")
+    goal = "核对 Lumen Reader 的官方下载说明"
+    start = call(
+        "start_work",
+        "lookup",
+        goal=goal,
+        work_capabilities=["public_research"],
+        outputs=[{"format": "text"}],
+        admission_ack="deferred" if mode == "deferred" else "immediate",
+        finish_on_commit=mode == "finish_on_commit",
+    )
+    if mode == "paired":
+        model = ModelScript(pair(start, finish()))
+    elif mode == "finish_on_commit":
+        model = ModelScript(start)
+    else:
+        model = ModelScript(start, finish())
+    env.models[event.id] = model
+    outcome = await env.coordinator.process(event)
+    with env.store.transaction(env.actor) as tx:
+        (delivery,) = tx.list_delivery()
+        (work,) = tx.list_work()
+        assert work.goal == goal and work.state == WorkState.QUEUED
+        assert delivery.payload_ref == "text:" + outcome.decision.response
+        assert goal in outcome.decision.response
+        assert outcome.delivery_id == delivery.id
+        assert delivery.idempotency_key == (
+            ("early_ack:" if mode == "immediate" else "reply:") + event.id + ":1"
+        )
+
+
+@pytest.mark.postgres
+async def test_same_turn_repair_retires_only_unattempted_receipt_with_stale_goal(conversation_env):
+    env = conversation_env
+    event = source(env, "Pot，核对 Lumen Reader 的官方安装资料，然后给我说明。")
+    start = call(
+        "start_work",
+        "draft",
+        goal="写一份关于火山的Word。",
+        work_capabilities=["documents"],
+        outputs=[{"format": "docx"}],
+        admission_ack="immediate",
+    )
+    first_intents = []
+
+    def repair(request):
+        observed = tool_receipt(request)
+        effect = observed["work_effects"][0]
+        first_intents.append(observed["work_admission"]["delivery_id"])
+        return call(
+            "update_work",
+            "repaired",
+            target_work_id=effect["id"],
+            expected_revision=effect["revision"],
+            goal=event.text,
+            work_capabilities=["public_research"],
+            outputs=[{"format": "text"}],
+        )
+
+    def complete(request):
+        assert tool_receipt(request)["committed"]
+        assert tool_receipt(request)["work_admission"] is None
+        return finish(reports=[("repaired", "committed")])
+
+    env.models[event.id] = ModelScript(start, repair, complete)
+    outcome = await env.coordinator.process(event)
+    assert "Lumen Reader" in outcome.decision.response
+    assert "Word" not in outcome.decision.response
+    with env.store.transaction(env.actor) as tx:
+        (work,) = tx.list_work()
+        assert work.goal_revision == 2
+        old = tx.get_delivery(first_intents[0])
+        final = tx.get_delivery(outcome.delivery_id)
+        assert old.state == DeliveryState.REJECTED and old.platform_message_id is None
+        assert final.state == DeliveryState.PENDING and final.id != old.id
+        assert final.request_event_id == old.request_event_id == event.id
+
+
+@pytest.mark.postgres
 @pytest.mark.parametrize("supplement", [None, "已保留表格的列名。"])
 async def test_real_queued_ack_precedes_same_work_refinement_and_is_not_repeated(
     conversation_env, supplement

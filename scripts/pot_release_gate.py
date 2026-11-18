@@ -35,6 +35,82 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _worker_source_summary(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "files": len(manifest["files"]),
+        "sha256": hashlib.sha256(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+
+
+def _expected_worker_manifest() -> dict[str, Any]:
+    package = ROOT / "src" / "groupagent"
+    return {
+        "files": {
+            path.relative_to(package).as_posix(): sha256(path)
+            for path in package.rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+        },
+        "supervisor": sha256(package / "sandbox" / "supervisor.py"),
+    }
+
+
+def observe_worker_source(worker_image: str, docker_host: str | None) -> dict[str, Any]:
+    """Look through the actual isolated interpreter rather than trusting an image label."""
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", worker_image):
+        raise ValueError("Worker image must be an immutable SHA-256 image ID")
+    command = ["docker"]
+    if docker_host:
+        command.extend(["--host", docker_host])
+    probe = """
+import hashlib, json
+from pathlib import Path
+import groupagent
+
+package = Path(groupagent.__file__).resolve().parent
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+print(json.dumps({
+    "files": {
+        path.relative_to(package).as_posix(): sha(path)
+        for path in package.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+    },
+    "supervisor": sha(Path("/opt/groupagent-worker.py")),
+}))
+"""
+    try:
+        result = subprocess.run(
+            [
+                *command,
+                "run",
+                "--rm",
+                "--pull=never",
+                "--network=none",
+                "--read-only",
+                "--entrypoint",
+                "python3",
+                worker_image,
+                "-I",
+                "-c",
+                probe,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=45,
+        )
+        actual = json.loads(result.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as error:
+        raise ValueError("Unable to verify code loaded by the pinned worker image") from error
+    expected = _expected_worker_manifest()
+    if actual != expected:
+        raise ValueError("Pinned worker code differs from the candidate; rebuild before acceptance")
+    return _worker_source_summary(expected)
+
+
 def write_json(path: Path, data: Any) -> None:
     tmp = path.with_suffix(".pending")
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
@@ -134,6 +210,9 @@ def replay(args: argparse.Namespace) -> int:
     requested = args.cases.split(",") if args.cases else list(rows)
     if not requested or not set(requested) <= rows.keys() or len(set(requested)) != len(requested):
         raise ValueError("Provide comma-separated, unique catalog IDs")
+    worker_source = (
+        observe_worker_source(args.worker_image, args.docker_host) if args.worker_image else None
+    )
     args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
     start = bindings()
     nodes = list(dict.fromkeys(node for identity in requested for node in rows[identity]["replay"]))
@@ -192,6 +271,7 @@ def replay(args: argparse.Namespace) -> int:
                 "channel": "local_spool_and_explicit_transport_fault_fixtures",
                 "platform": platform.platform(),
                 "worker_image": args.worker_image,
+                "worker_source": worker_source,
                 "python": platform.python_version(),
             },
             "fixture_sha256": fixture_before,
@@ -347,6 +427,12 @@ def score(args: argparse.Namespace) -> int:
             environment["worker_image"] != replay_report["environment"].get("worker_image")
         ):
             raise ValueError("Blind and replay worker image pins differ")
+        required_worker_source = _worker_source_summary(_expected_worker_manifest())
+        if environment.get("worker_source") != required_worker_source or (
+            replay_report
+            and replay_report["environment"].get("worker_source") != required_worker_source
+        ):
+            raise ValueError("Acceptance worker byte identity does not match the candidate")
         for identity, row in blind_rows.items():
             evidence = {key: value for key, value in row.items() if key != "evidence_sha256"}
             if row.get("evidence_sha256") is None:

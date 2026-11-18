@@ -1897,6 +1897,25 @@ class WorkSupervisor:
                 if exc.code == "resource_deferred" and snapshot.checkpoint.safe_to_resume:
                     self._defer_resources(owned, "validation")
                     return self._get(actor, work.id)
+                if (
+                    exc.code == "dependency_unavailable"
+                    and exc.retryable
+                    and safe_recovery_checkpoint(snapshot.checkpoint)
+                ):
+                    self.state.save_checkpoint(
+                        actor, lease, snapshot.checkpoint, source_event_ids=self._source_ids(work)
+                    )
+                    with self.store.transaction(actor) as tx:
+                        tx.assert_lease(lease)
+                        self._queue_recovery(
+                            tx,
+                            tx.get_work(work.id),
+                            exc.code,
+                            checkpoint=snapshot.checkpoint,
+                            lease=lease,
+                            diagnostic=redact_credentials(exc.message),
+                        )
+                    return self._get(actor, work.id)
                 if exc.code == "validation_failed" and self._repair(owned, snapshot, exc, 0):
                     return self._get(actor, work.id)
                 raise

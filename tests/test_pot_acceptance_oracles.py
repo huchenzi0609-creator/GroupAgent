@@ -377,3 +377,71 @@ def test_native_quote_accepts_exact_preloaded_work_version_without_an_extra_read
         source,
         target,
     )
+
+
+def test_native_markdown_does_not_include_autolink_delimiters(oracles):
+    text = (
+        "Verified: <https://example.org/pages/one?query=guide>\n"
+        "另见 [source](https://example.org/pages/topic_(details)).\n"
+        "Plain source https://example.org/pages/plain。"
+    )
+    assert oracles.markdown_urls(text) == {
+        "https://example.org/pages/one?query=guide",
+        "https://example.org/pages/topic_(details)",
+        "https://example.org/pages/plain",
+    }
+
+
+def test_queued_progress_proves_the_same_loaded_subject_and_phase(oracles):
+    from types import SimpleNamespace
+
+    work = SimpleNamespace(
+        id="real-one",
+        goal="核对 PONDA 门户并制作 PDF",
+        model_dump=lambda **_: {"id": "real-one", "goal_revision": 3},
+    )
+    facts = [{"id": "real-one", "goal_revision": 3, "state": "queued", "goal": work.goal}]
+    text = {"receipts": [native_text("reply", "还在排队，尚未开始核对 PONDA。")]}
+    assert oracles.queued_progress_subjects(text, facts, work) == {"ponda"}
+    generic = {"receipts": [native_text("reply", "这份 PDF 还在排队。")]}
+    assert not oracles.queued_progress_subjects(generic, facts, work)
+    assert not oracles.queued_progress_subjects(text, [{**facts[0], "goal_revision": 2}], work)
+    assert not oracles.queued_progress_subjects(text, [{**facts[0], "state": "completed"}], work)
+
+
+def test_restart_witness_reconciles_exact_intent_and_validates_distinct_pending_reply(oracles):
+    spec = {
+        "official_domains": ["example.org"],
+        "official_source_patterns": [r"example\.org/manual"],
+    }
+    url = "https://example.org/manual"
+    before = [native_text("wire-a", "已登记检查工作。")]
+    verified = native_text("wire-b", "已打开核对了官方手册 https://example.org/manual。")
+    after = [*before, verified]
+
+    def part(intent, slot, native=None):
+        return {
+            "intent_id": intent,
+            "idempotency_key": slot + ":source:1",
+            "payload_hash": "hash-" + intent,
+            "position": 0 if native else None,
+            "platform_message_id": native,
+            "part_state": "accepted" if native else None,
+        }
+
+    prior = [part("ack", "early_ack"), part("distinct", "reply")]
+    accepted = [part("ack", "early_ack", "wire-a"), part("distinct", "reply", "wire-b")]
+    assert oracles.restart_witness(before, after, prior, accepted, {url}, spec) == {
+        "reconciled": True,
+        "verified_separate_reply_ids": ["wire-b"],
+    }
+    generic = native_text("wire-b", "已登记核对 https://example.org/manual 的工作。")
+    assert not oracles.restart_witness(before, [*before, generic], prior, accepted, {url}, spec)[
+        "reconciled"
+    ]
+    assert not oracles.restart_witness(before, after, prior, accepted, set(), spec)["reconciled"]
+    assert not oracles.restart_witness(before, [*after, verified], prior, accepted, {url}, spec)[
+        "reconciled"
+    ]
+    recreated = [accepted[0], part("new-intent", "reply", "wire-b")]
+    assert not oracles.restart_witness(before, after, prior, recreated, {url}, spec)["reconciled"]

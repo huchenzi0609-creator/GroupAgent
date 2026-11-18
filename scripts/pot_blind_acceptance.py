@@ -21,12 +21,14 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
+from markdown_it import MarkdownIt
 from pot_release_gate import (
     BLIND_LOCK,
     bindings,
     blind_status,
     coverage,
     junit_status,
+    observe_worker_source,
     postgres_identity,
     print_summary,
     read_json,
@@ -166,6 +168,21 @@ def page_url_key(value):
             "",
         )
     )
+
+
+def markdown_urls(text):
+    """Read link destinations separately from native Markdown delimiters."""
+    urls = set()
+    for token in MarkdownIt("commonmark").parse(text):
+        for child in token.children or ():
+            if child.type == "link_open" and (href := child.attrGet("href")):
+                urls.add(href)
+            elif child.type == "text":
+                urls.update(
+                    url.rstrip(".,，。；;：:")
+                    for url in re.findall(r"https?://[^\s<>\[\]()（）]+", child.content)
+                )
+    return urls
 
 
 def fetch_source_urls(output):
@@ -1051,7 +1068,7 @@ async def chat04(s):
     if not markdown:
         return
     body = markdown["decoded"].get("text", "")
-    urls = {page_url_key(url) for url in re.findall(r"https://[^\s)。]+", body)}
+    urls = {page_url_key(url) for url in markdown_urls(body)}
     fetched_pages = {
         url
         for receipt in successful_tools(work, {"web_fetch", "browser_open"})
@@ -1391,6 +1408,50 @@ def quoted_work_context(observations, source_event_id, work_id):
     return facts
 
 
+def queued_progress_subjects(turn, facts, work):
+    """Reply against an actual work identity, version, phase and named subject."""
+    accepted_text = response(turn)
+    if not useful_text(turn) or not re.search(
+        r"排队|待执行|等待开始|尚未开始|还没开始", accepted_text
+    ):
+        return set()
+    if work is None:
+        return set()
+
+    def terms(text):
+        return set(
+            re.findall(r"(?<![A-Za-z0-9])(?:[a-z][a-z0-9-]{2,})(?![A-Za-z0-9])", text.lower())
+        )
+
+    common_words = {
+        "pdf",
+        "word",
+        "markdown",
+        "docx",
+        "pptx",
+        "python",
+        "http",
+        "https",
+        "www",
+        "com",
+        "org",
+        "html",
+        "json",
+        "the",
+        "and",
+        "for",
+    }
+    seen = set()
+    for fact in facts:
+        if (
+            fact.get("state") == "queued"
+            and work_fact_has([fact], work.id, [work])
+            and isinstance(fact.get("goal"), str)
+        ):
+            seen.update(terms(fact["goal"]) & terms(work.goal) & terms(accepted_text))
+    return seen - common_words
+
+
 async def work02(s):
     empty = await s.event("empty", latency=True)
     empty_read = foreground_observations(s, empty)
@@ -1428,6 +1489,8 @@ async def work02(s):
     progress = await s.event("progress", latency=True)
     after_progress = s.work_state()
     progress_facts = work_facts_observed(s, progress)
+    progress_work = next((work for work in initial if work.id == second["work_id"]), None)
+    progress_subjects = queued_progress_subjects(progress, progress_facts, progress_work)
     output = await s.settle(first["work_id"])
     old = None
     if output and output["spool"]:
@@ -1443,7 +1506,7 @@ async def work02(s):
     s.check(
         "same_version_for_progress_and_quote",
         same_work
-        and useful_text(progress, s.spec["progress_patterns"])
+        and (useful_text(progress, s.spec["progress_patterns"]) or bool(progress_subjects))
         and old is not None
         and useful_text(old, s.spec["old_patterns"])
         and output is not None
@@ -1457,7 +1520,11 @@ async def work02(s):
         progress,
         old or {"quote": "no original receipt"},
         output or {"execution": "missing"},
-        {"quoted_host_facts": old_quote_facts, "read_work_facts": old_observed_facts},
+        {
+            "quoted_host_facts": old_quote_facts,
+            "read_work_facts": old_observed_facts,
+            "grounded_progress_subjects": sorted(progress_subjects),
+        },
     )
     s.check(
         "no_write_from_lookup",
@@ -1613,25 +1680,30 @@ async def time03(s):
         {"rules": s.snapshot(), "spool_count": len(s.spool())},
     )
     extra = await s.event("cross_zone", event_time=s.clock)
-    before_fold = {rule.id: rule for rule in s.rules()}
-    cross = next((rule for rule in before_fold.values() if rule.time_zone == s.spec["zone"]), None)
-    ambiguous = await s.event("ambiguous", event_time=s.clock)
-    after_fold = {rule.id: rule for rule in s.rules()}
+    named_zone_rules = s.rules()
+    cross = next((rule for rule in named_zone_rules if rule.time_zone == s.spec["zone"]), None)
+    expected_due = dt(s.spec["expected_named_zone_due"])
     s.check(
-        "cross_zone_dst_policy",
+        "named_zone_calculation",
         bool(
             cross
             and cross.timing.kind == "weekly"
-            and cross.next_due_at == dt(s.spec["expected_dst_next_due"])
-            and before_fold == after_fold
-            and useful_text(ambiguous, ["两次|第一次|第二次|重叠|夏令时|前一次|后一次"])
-            and not any(item.get("committed") for item in foreground_observations(s, ambiguous))
+            and cross.execution_kind.value == "explicit_reminder"
+            and list(cross.timing.weekdays) == s.spec["cross_zone_weekdays"]
+            and cross.timing.local_time.isoformat() == s.spec["cross_zone_local_time"]
+            and cross.next_due_at == expected_due
+            and useful_text(
+                extra, [re.escape(s.spec["zone"]) + "|" + re.escape(s.spec["zone_label"])]
+            )
+            and clock_display(
+                response(extra), s.spec["cross_zone_local_time"], seconds_required=False
+            )
         ),
         extra,
-        ambiguous,
         {
-            "rules_before_fold": s.snapshot(list(before_fold.values())),
-            "rules_after_fold": s.snapshot(list(after_fold.values())),
+            "saved_rules": s.snapshot(named_zone_rules),
+            "expected_local_due": expected_due.isoformat(),
+            "expected_utc_due": expected_due.astimezone(UTC).isoformat(),
         },
     )
     if not cross or not cross.next_due_at:
@@ -1648,6 +1720,7 @@ async def time03(s):
     s.check(
         "concurrent_restart_one_occurrence",
         len(native) == len(occurrences) == 1
+        and stamp == expected_due
         and cross.execution_kind.value == "explicit_reminder"
         and spool_text(native[0]).removeprefix("【Pot】") == s.spec["cross_zone_payload"]
         and occurrences[0].delivery_id is not None
@@ -1898,11 +1971,90 @@ async def search01(s):
     )
 
 
+def original_source_outbox(s, event_id):
+    with s.store.transaction(s.app.owner) as tx:
+        return tx.conn.execute(
+            "SELECT d.id AS intent_id,d.idempotency_key,d.payload_hash,p.position,"
+            "p.platform_message_id,p.state AS part_state "
+            "FROM ga_deliveries d LEFT JOIN ga_delivery_parts p ON d.group_id=p.group_id AND d.id=p.intent_id "
+            "WHERE d.group_id=%s AND d.request_event_id=%s ORDER BY d.created_at,p.position",
+            (s.group, event_id),
+        ).fetchall()
+
+
+def verified_finding(wire, observed_pages, spec):
+    if wire["payload"]["kind"] != "text":
+        return False
+    text = spool_text(wire)
+    return bool(
+        re.search(
+            r"(?<!未)(?<!没)(?:已经|已|刚才|刚刚|实际|确实)\s*(?:亲自|在线)?"
+            r"\s*(?:打开|查到|查阅|读取|核对)",
+            text,
+        )
+        and any(
+            official_source(url, spec) and page_url_key(url) in observed_pages
+            for url in markdown_urls(text)
+        )
+    )
+
+
+def restart_witness(before, after, source_intents, observed_parts, observed_pages, spec):
+    """Permit the rest of a send or an already-queued distinct verified finding."""
+    prior = {item["receipt"]["platform_message_id"]: item for item in before}
+    observed = {item["receipt"]["platform_message_id"]: item for item in after}
+    intent_signatures = {
+        row["intent_id"]: (row["idempotency_key"], row["payload_hash"]) for row in source_intents
+    }
+    observed_signatures = {
+        row["intent_id"]: (row["idempotency_key"], row["payload_hash"]) for row in observed_parts
+    }
+    parts = {
+        row["platform_message_id"]: (row["intent_id"], row["position"])
+        for row in observed_parts
+        if row["part_state"] == "accepted" and row["platform_message_id"]
+    }
+    resumed_intents = {parts[native][0] for native in prior if native in parts}
+    new_parts = set(observed) - set(prior)
+    separate = {
+        native
+        for native in new_parts
+        if native in parts and parts[native][0] not in resumed_intents
+    }
+    verified_separate = {
+        native
+        for native in separate
+        if observed_signatures[parts[native][0]][0].startswith("reply:")
+        and verified_finding(observed[native], observed_pages, spec)
+    }
+    reconciled = (
+        bool(prior)
+        and len(prior) == len(before)
+        and len(observed) == len(after)
+        and all(observed.get(native) == item for native, item in prior.items())
+        and intent_signatures == observed_signatures
+        and set(observed) == set(parts)
+        and len(set(parts.values())) == len(parts)
+        and all(item["receipt"]["state"] == "accepted" for item in observed.values())
+        and separate == verified_separate
+    )
+    return {"reconciled": reconciled, "verified_separate_reply_ids": sorted(verified_separate)}
+
+
 async def work05(s):
     calls = inject_first_public_read(s)
     delegated = await s.event("work", dispatch=False)
     injected = await s.fault_dispatch()
     before = s.spool()
+    before_outbox = original_source_outbox(s, delegated["event_id"])
+    foreground_pages = {
+        url
+        for observation in foreground_observations(s, delegated)
+        if observation.get("kind") in {"web_fetch", "browser_open"}
+        and observation.get("status") == "observed"
+        and isinstance(observation.get("evidence"), dict)
+        for url in fetch_source_urls(observation["evidence"])
+    }
     await s.close()
     await s.open()
     inject_first_public_read(s, calls)
@@ -1922,8 +2074,20 @@ async def work05(s):
         await s.app.process_pending(batched=False)
         await s.app.dispatcher.tick()
     after = s.spool()
+    after_outbox = original_source_outbox(s, delegated["event_id"])
+    reconciliation = restart_witness(
+        before, after, before_outbox, after_outbox, foreground_pages, s.spec
+    )
     result = await s.settle(delegated["work_id"])
     verified = successful_public_calls(calls, s.spec)
+    work_count = len(s.work_state())
+    reconciled_once = bool(
+        injected
+        and original
+        and original.state == "accepted"
+        and reconciliation["reconciled"]
+        and work_count == int(bool(delegated["work_id"]))
+    )
     s.check(
         "failure_visible_and_fallback_advances",
         explicit_changed_fallback(calls) and bool(verified),
@@ -1932,9 +2096,18 @@ async def work05(s):
     )
     s.check(
         "restart_and_duplicate_at_most_once",
-        injected and bool(original) and before == after and original.state == "accepted",
+        reconciled_once,
         delegated,
-        {"before": before, "after": after, "same_receipt": bool(original)},
+        {
+            "before": before,
+            "after": after,
+            "same_receipt": bool(original),
+            "before_outbox": before_outbox,
+            "after_outbox": after_outbox,
+            "foreground_fetched_pages": sorted(foreground_pages),
+            "reconciliation": reconciliation,
+            "work_count_after_replay": work_count,
+        },
     )
     missing = await s.event("missing")
     missing_orders = [
@@ -1960,16 +2133,25 @@ async def work05(s):
         missing_output or {"asked_from_foreground": True},
         {"work_ids_created_by_the_missing_input_turn": [work.id for work in missing_orders]},
     )
-    final_receipts = result["spool"] if result else before
+    final_receipts = result["spool"] if result else after
     final_text = "\n".join(spool_text(item) for item in final_receipts)
+    fetched_result_pages = set(foreground_pages)
+    if result:
+        for receipt in successful_tools(result, {"web_fetch", "browser_open"}):
+            fetched_result_pages.update(fetch_source_urls(receipt["output"]))
+    accepted_verified_links = {
+        url
+        for url in markdown_urls(final_text)
+        if official_source(url, s.spec) and page_url_key(url) in fetched_result_pages
+    }
     s.check(
         "no_false_completion_or_spin",
-        bool(verified and original and original.state == "accepted" and before and after == before)
+        reconciled_once
+        and bool(verified)
         and (not result or result["work"]["state"] == "completed")
         and len(final_receipts) == 1
-        and any(
-            official_source(url, s.spec) for url in re.findall(r"https://[^\s）】。]+", final_text)
-        )
+        and all(item["receipt"]["state"] == "accepted" for item in final_receipts)
+        and bool(accepted_verified_links)
         and not any(
             left["operation"] == middle["operation"] == right["operation"]
             and left["arguments"] == middle["arguments"] == right["arguments"]
@@ -1978,6 +2160,7 @@ async def work05(s):
         ),
         delegated,
         result or {"direct_verified_call_count": len(verified), "public_calls": len(calls)},
+        {"accepted_verified_links": sorted(accepted_verified_links)},
     )
 
 
@@ -2264,14 +2447,14 @@ async def proactive01(s):
     if not observer:
         return
 
-    async def add(key, finish=False):
+    async def add(key, finish=False, *, title=None, due_in_seconds=720):
         event = await s.event(key, process=False)
         s.record_read_only_fixture(event, "blind_task_observation_seed")
         with s.store.transaction(s.app.owner) as tx:
             body = s.spec[key]
             task = tx.create_team_task(
-                body[:6],
-                due_at=datetime.now(UTC) + timedelta(minutes=12),
+                title or body[:6],
+                due_at=datetime.now(UTC) + timedelta(seconds=due_in_seconds),
                 source_event_id=event["event_id"],
             )
             return tx.update_team_task(
@@ -2313,16 +2496,51 @@ async def proactive01(s):
         }
     )
     await s.open()
-    current = await add("actionable")
+    current = await add(
+        "active_actionable",
+        title=s.spec["active_title"],
+        due_in_seconds=s.spec["active_due_seconds"],
+    )
     for _ in range(5):
         await s.app.observer.tick()
         await s.app.dispatcher.tick()
     before_quiet = s.spool()
-    matching = [row for row in before_quiet if s.spec["required_candidate"] in spool_text(row)]
+    with s.store.transaction(s.app.owner) as tx:
+        active = tx.conn.execute(
+            "SELECT o.resource_id,o.state,o.reason_code,o.delivery_id,o.proposal_sha256,"
+            "d.state AS delivery_state,p.state AS part_state,p.platform_message_id "
+            "FROM ga_react_observations o "
+            "LEFT JOIN ga_deliveries d ON d.group_id=o.group_id AND d.id=o.delivery_id "
+            "LEFT JOIN ga_delivery_parts p ON p.group_id=d.group_id AND p.intent_id=d.id "
+            "WHERE o.group_id=%s AND o.resource_id=%s",
+            (s.group, current.id),
+        ).fetchall()
+    accepted_ids = {
+        row["platform_message_id"]
+        for row in active
+        if row["proposal_sha256"]
+        and row["part_state"] == row["delivery_state"] == "accepted"
+        and row["platform_message_id"]
+    }
+    matching = [
+        row
+        for row in before_quiet
+        if row["receipt"]["state"] == "accepted"
+        and row["receipt"]["platform_message_id"] in accepted_ids
+        and pattern_all(spool_text(row), s.spec["active_notice_patterns"])
+    ]
     s.check(
         "enabled_valid_notice_once",
-        len(matching) == 1,
-        {"observed_task_id": current.id, "spool": before_quiet},
+        current.id != pending.id
+        and current.title != pending.title
+        and current.due_at < pending.due_at
+        and len(matching) == len(accepted_ids) == len(before_quiet) == 1,
+        {
+            "observed_task_id": current.id,
+            "active_observations": active,
+            "task": current.model_dump(mode="json"),
+            "spool": before_quiet,
+        },
     )
     quiet = await s.event("quiet")
     for _ in range(3):
@@ -2681,6 +2899,7 @@ async def run(args):
     destination = args.output.absolute()
     if destination != destination.resolve() or args.dataset.stat().st_mode & 0o077:
         raise ValueError("Use a private dataset and a canonical output directory")
+    worker_source = observe_worker_source(args.worker_image, args.docker_host)
     destination.mkdir(parents=True, exist_ok=False, mode=0o700)
     started = bindings()
     runner_hash = sha256(Path(__file__))
@@ -2708,6 +2927,7 @@ async def run(args):
             },
             "postgres": postgres,
             "worker_image": args.worker_image,
+            "worker_source": worker_source,
             "platform": platform.platform(),
             "python": platform.python_version(),
             "channel": "LocalChannel",

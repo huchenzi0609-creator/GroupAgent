@@ -244,6 +244,20 @@ async def test_runtime_host_does_not_parse_office_and_legacy_protocol_defaults_e
         await service.read(context, version.file_id)
 
 
+async def test_missing_scoped_docx_protocol_is_a_retryable_dependency_error(read_runtime):
+    store, service, _, context = read_runtime
+    version = store.create(ArtifactScope("g", "w", "m"), "fixture.docx", b"fixture")
+
+    class PreviousWorkerFixture:
+        async def run(self, *_args, **_kwargs):
+            return {"units": [], "metadata": {"native_table_count": "0"}}, ()
+
+    service.worker = PreviousWorkerFixture()
+    with pytest.raises(DomainError, match="scoped image-page protocol") as failure:
+        await service.read(context, version.file_id, docx_image_pages={"a" * 64: ["b" * 64]})
+    assert failure.value.code == "dependency_unavailable" and failure.value.retryable
+
+
 @pytest.mark.parametrize("bad_count", [42, "-1", "1.0", "01", " 1 ", "NaN", "1\n2"])
 async def test_count_protocol_requires_a_canonical_nonnegative_integer_string(
     read_runtime, bad_count

@@ -289,15 +289,22 @@ class IsolatedDocumentService:
                 ) from None
         if docx_image_pages:
             unverified = metadata.get("unverified_public_image_occurrences")
-            hashes = json.loads(metadata.get("unverified_public_image_hashes", "[]"))
+            if unverified is None or "unverified_public_image_hashes" not in metadata:
+                raise DomainError(
+                    "dependency_unavailable",
+                    "The isolated document worker lacks the scoped image-page protocol. "
+                    "Use the reviewed worker build for this controller version and revalidate "
+                    "the existing artifact.",
+                    retryable=True,
+                )
+            hashes = json.loads(metadata["unverified_public_image_hashes"])
             if (
-                unverified is None
-                or bool(int(unverified)) != bool(hashes)
+                bool(int(unverified)) != bool(hashes)
                 or len(hashes) > int(unverified)
                 or not set(hashes).issubset(docx_image_pages)
             ):
                 raise DomainError(
-                    "invalid_document", "Document worker omitted the scoped image-page check"
+                    "invalid_document", "Document worker returned inconsistent image-page evidence"
                 )
         return DocumentRead(
             file_id,

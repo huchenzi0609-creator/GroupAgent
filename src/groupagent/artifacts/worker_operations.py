@@ -33,7 +33,6 @@ from .formats import (
     extract,
 )
 from .models import (
-    PUBLIC_IMAGE_PAGE_CAPTION,
     ArtifactError,
     ArtifactScope,
     ChartData,
@@ -152,7 +151,7 @@ def pack_document(document: Report | Deck) -> tuple[dict[str, Any], tuple[bytes,
     return value, tuple(inputs)
 
 
-def _check_docx_public_image_pages(document, image_hashes, expected) -> dict[str, str]:
+def _docx_image_page_evidence(document, image_hashes, expected) -> dict[str, str]:
     """Check actual scoped images against visible locators in their own figure blocks."""
     from docx.oxml.ns import qn
     from docx.text.paragraph import Paragraph
@@ -161,14 +160,11 @@ def _check_docx_public_image_pages(document, image_hashes, expected) -> dict[str
 
     unverified = 0
     hashes: set[str] = set()
+    actual_bindings: list[str] = []
     for shape in document.inline_shapes:
         embeds = shape._inline.xpath(".//a:blip/@r:embed")
-        matched = {
-            image_hashes[identifier]
-            for identifier in embeds
-            if identifier in image_hashes and image_hashes[identifier] in expected
-        }
-        if not matched:
+        actual = {image_hashes[identifier] for identifier in embeds if identifier in image_hashes}
+        if not actual:
             continue
         picture = next(shape._inline.iterancestors(qn("w:p")), None)
         urls: set[str] = set()
@@ -178,15 +174,22 @@ def _check_docx_public_image_pages(document, image_hashes, expected) -> dict[str
             if not urls and caption is not None and caption.tag == qn("w:p"):
                 if not caption.xpath(".//wp:inline"):
                     urls = {url for url, _, _ in _citation_urls(Paragraph(caption, document).text)}
-        for digest in matched:
+        for digest in actual:
             bindings = {image_page_binding(digest, url) for url in urls}
-            if not bindings or not bindings.issubset(expected[digest]):
+            # One placement can provide one binding to a managed image
+            # reference. Multiple copies still need separate captions.
+            if len(bindings) == 1:
+                actual_bindings.extend(bindings)
+            if digest in expected and (not bindings or not bindings.issubset(expected[digest])):
                 unverified += 1
                 hashes.add(digest)
-    return {
-        "unverified_public_image_occurrences": str(unverified),
-        "unverified_public_image_hashes": json.dumps(sorted(hashes)[:10]),
-    }
+    evidence = {}
+    if 0 < len(actual_bindings) <= 10:
+        evidence["embedded_image_page_bindings"] = json.dumps(sorted(actual_bindings))
+    if expected:
+        evidence["unverified_public_image_occurrences"] = str(unverified)
+        evidence["unverified_public_image_hashes"] = json.dumps(sorted(hashes)[:10])
+    return evidence
 
 
 def document_operation(
@@ -298,29 +301,11 @@ def document_operation(
                 metadata["distinct_embedded_image_count"] = str(len(embedded_hashes))
                 if len(embedded_hashes) <= 10:
                     metadata["embedded_image_sha256"] = json.dumps(embedded_hashes)
-                bindings = []
-                paragraphs = word_document.paragraphs
-                for picture, caption in zip(paragraphs, paragraphs[1:], strict=False):
-                    # One actual inline picture followed by one visible source
-                    # line. An unlinked provenance paragraph cannot count.
-                    if picture._p.getnext() != caption._p:
-                        continue
-                    sources = [
-                        line.removeprefix(PUBLIC_IMAGE_PAGE_CAPTION)
-                        for line in caption.text.splitlines()
-                        if line.startswith(PUBLIC_IMAGE_PAGE_CAPTION)
-                    ]
-                    if len(sources) != 1 or not sources[0]:
-                        continue
-                    ids = picture._p.xpath(".//wp:inline//a:blip/@r:embed")
-                    if len(ids) == 1 and ids[0] in image_hashes:
-                        bindings.append(image_page_binding(image_hashes[ids[0]], sources[0]))
-                if 0 < len(bindings) <= 10:
-                    metadata["embedded_image_page_bindings"] = json.dumps(sorted(bindings))
-            if expected_pages := params.get("docx_image_pages"):
-                metadata.update(
-                    _check_docx_public_image_pages(word_document, image_hashes, expected_pages)
+            metadata.update(
+                _docx_image_page_evidence(
+                    word_document, image_hashes, params.get("docx_image_pages", {})
                 )
+            )
         return {
             "units": [asdict(unit) for unit in units[start : start + count]],
             "total_units": len(units),

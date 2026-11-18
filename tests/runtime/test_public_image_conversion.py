@@ -224,13 +224,32 @@ async def test_docx_keeps_exact_source_with_each_verified_image_and_rejects_a_sw
     )
     assert "artifact:docx" in accepted.checks
 
+    # The same managed source refs and exact bytes remain provable if the
+    # visible source caption uses another style or wording.
+    scope = ArtifactScope(setup.env.actor.group_id, run.work.id, setup.env.actor.member_id)
+    for caption, url in zip(captions, source_pages, strict=True):
+        caption.runs[-1].text = "Original page " + url
+    relabelled = io.BytesIO()
+    actual.save(relabelled)
+    version = setup.env.artifacts.revise(
+        scope, version.file_id, relabelled.getvalue(), expected_version_id=version.version_id
+    )
+    setup.env.registry.register(setup.env.actor, run.lease, version, purpose="candidate")
+    selected = await call(
+        run, "artifact_deliver", {"version_ids": [version.version_id]}, key="deliver-relabelled"
+    )
+    assert selected.success
+    verified = await setup.toolkit.validate(
+        run.work, run.lease, setup.env.actor, candidate(run, "已整理两张图片。"), run.workspace
+    )
+    assert any(draft.payload_hash == version.sha256 for draft in verified.deliveries)
+
     # Both source URLs still occur in the swapped file. A list of document
     # URLs and image counts cannot detect this wrong placement.
     for caption, wrong_url in zip(captions, reversed(source_pages), strict=True):
         caption.runs[-1].text = "图片来源：" + wrong_url
     swapped = io.BytesIO()
     actual.save(swapped)
-    scope = ArtifactScope(setup.env.actor.group_id, run.work.id, setup.env.actor.member_id)
     replaced = setup.env.artifacts.revise(
         scope, version.file_id, swapped.getvalue(), expected_version_id=version.version_id
     )

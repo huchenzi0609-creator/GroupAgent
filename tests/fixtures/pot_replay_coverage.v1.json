@@ -1,6 +1,6 @@
 {
   "format_version": 1,
-  "catalog_sha256": "fd793d311077cb5411f9013ea8690b52831100f6d2f80b83107c5c71f951cd44",
+  "catalog_sha256": "493d97c7c11f43b6601c62f739918513702e00502d4b23c6d61a4bd9469e6c39",
   "cases": [
     {
       "id": "CHAT-01",
@@ -230,13 +230,13 @@
       "blind_level": "deepseek_local",
       "blind_checks": [
         "recurring_rule_updated_in_place",
-        "cross_zone_dst_policy",
+        "named_zone_calculation",
         "cancel_stops_future_receipts",
         "concurrent_restart_one_occurrence"
       ],
       "replay": [
-        "tests/scheduling/test_recurrence.py::test_nonexistent_dst_wall_time_is_skipped",
-        "tests/scheduling/test_recurrence.py::test_repeated_dst_wall_time_runs_once_at_first_fold",
+        "tests/scheduling/test_recurrence.py::test_daily_shanghai_is_explicit_and_utc_persistable",
+        "tests/scheduling/test_postgres_scheduler.py::test_all_supported_rules_and_defaults",
         "tests/scheduling/test_postgres_scheduler.py::test_restart_concurrent_scanners_and_clock_rollback_do_not_duplicate",
         "tests/scheduling/test_postgres_scheduler.py::test_revision_update_preserves_occurrence_history",
         "tests/scheduling/test_postgres_scheduler.py::test_pause_resume_and_cancel_revoke_work_leases",
